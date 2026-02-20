@@ -1,0 +1,15 @@
+[package]
+name = "game_server"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+axum = "0.8.8"
+clap.workspace = true
+env_logger.workspace = true
+game_shared = { path = "../game_shared" }
+log.workspace = true
+renet.workspace = true
+renet_cross = { workspace = true, features = ["axum"] }
+tokio.workspace = true
+vleue_navigator = "0.15.0"

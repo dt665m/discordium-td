@@ -1,0 +1,8 @@
+[package]
+name = "game_shared"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bincode.workspace = true
+serde.workspace = true

@@ -1,0 +1,91 @@
+# AGENTS.md
+
+This file defines project-specific guidance for coding agents working in this repository.
+
+## Scope
+
+- Applies to the entire workspace rooted at `discordium-td/`.
+- Favor consistency and correctness over ad-hoc local fixes.
+
+## Bevy 0.18 Core Conventions
+
+- Coordinate system:
+  - `+Y` is up.
+  - Forward is `-Z`.
+  - Right is `+X`.
+- Keep simulation/world logic in canonical world space.
+- Treat camera orientation as presentation.
+- If controls are camera-relative, transform input from camera basis to world basis in one place only.
+
+## Input and Directionality Rules
+
+- Do not stack multiple axis flips in different systems.
+- Keep a single source of truth for input mapping (`capture_input`-style system).
+- If movement feels mirrored or rotated:
+  - Verify camera transform and up vector first.
+  - Verify world-to-scene conversion second.
+  - Verify input projection last.
+- Prefer adding temporary axis debug visuals over guessing sign flips.
+
+## ECS Patterns (Required)
+
+- Put game state in components/resources; avoid parallel ad-hoc maps unless strictly needed for indexing.
+- Use reusable components for shared mechanics (e.g., facing, attack profile, attack state, health/mana).
+- Prefer data-driven systems over branching by entity id or player id.
+- Keep rendering-only effects in client-only components/systems.
+- Server remains authoritative for gameplay state transitions.
+
+## System Ordering and Dependencies
+
+- Explicitly order dependent systems using `.chain()` or explicit schedules.
+- Recommended high-level order per frame:
+  - Input capture
+  - Network receive/apply snapshot
+  - Prediction/reconciliation
+  - Gameplay visual sync
+  - FX / UI updates
+- Fixed-step gameplay commands should run in `FixedUpdate`.
+- Do not rely on incidental ordering from registration order when dependency is real.
+
+## Networking and Prediction
+
+- Authoritative state must originate from server simulation.
+- Client prediction may smooth movement/rotation, but must reconcile to server snapshots.
+- Keep predicted-only state isolated and reset safely when authoritative actor disappears/rejoins.
+
+## Combat and Movement
+
+- Movement lock during attack windup/recovery is intentional for readability.
+- Facing determines directional attacks; keep facing updates explicit and deterministic.
+- Enemy AI should stop at attack range and commit attack before moving again.
+
+## Refactoring Guidance
+
+- Keep `main.rs` thin; put logic in plugins/modules.
+- Prefer small focused systems and helper functions over giant monolithic systems.
+- Reuse existing components/resources before introducing new ones.
+
+## What to Search First
+
+When unsure, search these topics in Bevy 0.18 docs/examples:
+
+- Transforms and directions:
+  - `Transform`, `GlobalTransform`, `forward`, `right`, `looking_at`
+- Scheduling and ordering:
+  - `Update`, `FixedUpdate`, `SystemSet`, `.chain()`, `in_set`, `before`, `after`
+- ECS data flow:
+  - `Component`, `Resource`, `Query`, `Commands`, `ChildOf`
+- Camera/input:
+  - camera-relative movement, world-space movement
+- UI diagnostics:
+  - Bevy dev tools FPS overlay
+
+## Validation Before Finishing
+
+- Run:
+  - `cargo fmt --all`
+  - `cargo check --workspace --all-targets`
+  - `cargo test --workspace`
+- If a recipe exists, also run:
+  - `just check`
+

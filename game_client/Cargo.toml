@@ -1,0 +1,14 @@
+[package]
+name = "game_client"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bevy = { version = "0.18.0", default-features = true, features = ["bevy_dev_tools"] }
+clap.workspace = true
+env_logger.workspace = true
+game_server = { path = "../game_server" }
+game_shared = { path = "../game_shared" }
+log.workspace = true
+renet.workspace = true
+renet_cross.workspace = true

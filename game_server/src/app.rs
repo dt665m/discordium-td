@@ -1,12 +1,16 @@
 use std::{
     collections::{HashSet, VecDeque},
     net::SocketAddr,
+    path::PathBuf,
     sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
 };
 
-use crate::{http_api, simulation::Simulation};
+use crate::{
+    http_api::{self, HttpTlsConfig},
+    simulation::Simulation,
+};
 use clap::Parser;
 use game_shared::{FIXED_DT_SECONDS, PROTOCOL_ID, ReliableServerMessage, WorldDelta, encode};
 use renet::{ConnectionConfig, DefaultChannel, RenetServer, ServerEvent};
@@ -18,8 +22,12 @@ use renet_cross::{
 #[derive(Debug, Clone, Parser)]
 #[command(name = "game_server")]
 pub struct ServerArgs {
-    #[arg(long, env = "TD_HTTP_BIND", default_value = "0.0.0.0:8080")]
-    http_bind: SocketAddr,
+    #[arg(long, env = "TD_HTTP_BIND")]
+    http_bind: Option<SocketAddr>,
+    #[arg(long, env = "TD_HTTP_TLS_CERT")]
+    http_tls_cert: Option<PathBuf>,
+    #[arg(long, env = "TD_HTTP_TLS_KEY")]
+    http_tls_key: Option<PathBuf>,
     #[arg(long, env = "TD_UDP_BIND", default_value = "0.0.0.0:5000")]
     udp_bind: SocketAddr,
     #[arg(long, env = "TD_WEBRTC_BIND", default_value = "0.0.0.0:5001")]
@@ -28,32 +36,89 @@ pub struct ServerArgs {
     public_udp_addr: SocketAddr,
     #[arg(long, env = "TD_PUBLIC_WEBRTC_ADDR", default_value = "127.0.0.1:5001")]
     public_webrtc_addr: SocketAddr,
-    #[arg(
-        long,
-        env = "TD_PUBLIC_HTTP_BASE",
-        default_value = "http://127.0.0.1:8080"
-    )]
-    public_http_base: String,
+    #[arg(long, env = "TD_PUBLIC_HTTP_BASE")]
+    public_http_base: Option<String>,
+}
+
+fn default_http_bind(tls_enabled: bool) -> SocketAddr {
+    if tls_enabled {
+        SocketAddr::from(([0, 0, 0, 0], 443))
+    } else {
+        SocketAddr::from(([0, 0, 0, 0], 8080))
+    }
+}
+
+fn default_public_http_base(http_bind: SocketAddr, tls_enabled: bool) -> String {
+    let scheme = if tls_enabled { "https" } else { "http" };
+    let default_host = "127.0.0.1";
+    let default_port = if tls_enabled { 443 } else { 80 };
+
+    if http_bind.port() == default_port {
+        format!("{scheme}://{default_host}")
+    } else {
+        format!("{scheme}://{default_host}:{}", http_bind.port())
+    }
 }
 
 pub fn run(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let ServerArgs {
+        http_bind,
+        http_tls_cert,
+        http_tls_key,
+        udp_bind,
+        webrtc_bind,
+        public_udp_addr,
+        public_webrtc_addr,
+        public_http_base,
+    } = args;
+
+    let http_tls = match (http_tls_cert, http_tls_key) {
+        (Some(cert_path), Some(key_path)) => Some(HttpTlsConfig {
+            cert_path,
+            key_path,
+        }),
+        (None, None) => None,
+        (Some(_), None) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "TD_HTTP_TLS_CERT was set but TD_HTTP_TLS_KEY is missing",
+            )
+            .into());
+        }
+        (None, Some(_)) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "TD_HTTP_TLS_KEY was set but TD_HTTP_TLS_CERT is missing",
+            )
+            .into());
+        }
+    };
+    let tls_enabled = http_tls.is_some();
+    let http_bind = http_bind.unwrap_or_else(|| default_http_bind(tls_enabled));
+    let mut public_http_base =
+        public_http_base.unwrap_or_else(|| default_public_http_base(http_bind, tls_enabled));
+    if tls_enabled && public_http_base.starts_with("http://") {
+        public_http_base = format!("https://{}", public_http_base.trim_start_matches("http://"));
+    }
+
     log::info!(
-        "starting server: http_bind={} udp_bind={} webrtc_bind={} public_http_base={} public_udp_addr={} public_webrtc_addr={}",
-        args.http_bind,
-        args.udp_bind,
-        args.webrtc_bind,
-        args.public_http_base,
-        args.public_udp_addr,
-        args.public_webrtc_addr
+        "starting server: http_bind={} http_tls={} udp_bind={} webrtc_bind={} public_http_base={} public_udp_addr={} public_webrtc_addr={}",
+        http_bind,
+        http_tls.is_some(),
+        udp_bind,
+        webrtc_bind,
+        public_http_base,
+        public_udp_addr,
+        public_webrtc_addr
     );
 
     let server = RenetServer::new(ConnectionConfig::default());
     let shared_transport = Arc::new(Mutex::new(
         MixedTransportBuilder::new(PROTOCOL_ID)
-            .udp_bind(args.udp_bind)
-            .webrtc_bind(args.webrtc_bind)
-            .public_udp_addr(args.public_udp_addr)
-            .public_webrtc_addr(args.public_webrtc_addr)
+            .udp_bind(udp_bind)
+            .webrtc_bind(webrtc_bind)
+            .public_udp_addr(public_udp_addr)
+            .public_webrtc_addr(public_webrtc_addr)
             .max_clients(8)
             .authentication(ServerAuthentication::Unsecure)
             .build()?,
@@ -62,9 +127,9 @@ pub fn run(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
     let bootstrap = Arc::new(BootstrapService::new(
         BootstrapConfig {
             session_ttl: Duration::from_secs(120),
-            public_udp_addr: args.public_udp_addr,
-            public_webrtc_addr: args.public_webrtc_addr,
-            public_http_base: args.public_http_base,
+            public_udp_addr,
+            public_webrtc_addr,
+            public_http_base,
         },
         MonotonicClientIdAllocator::new(1),
         UnsecureDevAuthPolicy,
@@ -73,8 +138,9 @@ pub fn run(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
     let _http_thread = http_api::spawn_http_server_thread(
         Arc::clone(&bootstrap),
         Arc::clone(&shared_transport),
-        args.http_bind,
-        args.public_webrtc_addr,
+        http_bind,
+        public_webrtc_addr,
+        http_tls,
     );
 
     run_game_loop(server, shared_transport, bootstrap)

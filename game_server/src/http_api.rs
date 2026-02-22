@@ -1,19 +1,28 @@
 use std::{
     net::SocketAddr,
+    path::PathBuf,
     sync::{Arc, Mutex},
 };
 
+use axum_server::tls_rustls::RustlsConfig;
 use renet_cross::{
     BootstrapAxumState, DefaultBootstrapService, MixedServerTransport, SdpHttpHookConfig,
     bootstrap_router,
 };
 use tower_http::cors::{Any, CorsLayer};
 
+#[derive(Clone)]
+pub struct HttpTlsConfig {
+    pub cert_path: PathBuf,
+    pub key_path: PathBuf,
+}
+
 pub fn spawn_http_server_thread(
     bootstrap: Arc<DefaultBootstrapService>,
     transport: Arc<Mutex<MixedServerTransport>>,
     bind_addr: SocketAddr,
     webrtc_candidate_addr: SocketAddr,
+    http_tls: Option<HttpTlsConfig>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("discordium-http".to_owned())
@@ -42,17 +51,47 @@ pub fn spawn_http_server_thread(
                         .allow_methods(Any)
                         .allow_headers(Any),
                 );
-                let listener = match tokio::net::TcpListener::bind(bind_addr).await {
-                    Ok(listener) => listener,
-                    Err(err) => {
-                        log::error!("failed to bind HTTP bootstrap listener on {bind_addr}: {err}");
-                        return;
-                    }
-                };
 
-                log::info!("bootstrap/signaling server listening on http://{bind_addr}");
-                if let Err(err) = axum::serve(listener, app).await {
-                    log::error!("HTTP server exited with error: {err}");
+                if let Some(tls) = http_tls {
+                    let tls_config = match RustlsConfig::from_pem_file(
+                        tls.cert_path.clone(),
+                        tls.key_path.clone(),
+                    )
+                    .await
+                    {
+                        Ok(config) => config,
+                        Err(err) => {
+                            log::error!(
+                                "failed to load TLS cert/key cert_path={} key_path={}: {err}",
+                                tls.cert_path.display(),
+                                tls.key_path.display()
+                            );
+                            return;
+                        }
+                    };
+
+                    log::info!("bootstrap/signaling server listening on https://{bind_addr}");
+                    if let Err(err) = axum_server::bind_rustls(bind_addr, tls_config)
+                        .serve(app.into_make_service())
+                        .await
+                    {
+                        log::error!("HTTPS server exited with error: {err}");
+                    }
+                } else {
+                    let listener = match tokio::net::TcpListener::bind(bind_addr).await {
+                        Ok(listener) => listener,
+                        Err(err) => {
+                            log::error!(
+                                "failed to bind HTTP bootstrap listener on {bind_addr}: {err}"
+                            );
+                            return;
+                        }
+                    };
+
+                    log::info!("bootstrap/signaling server listening on http://{bind_addr}");
+                    if let Err(err) = axum::serve(listener, app).await {
+                        log::error!("HTTP server exited with error: {err}");
+                    }
                 }
             });
         })

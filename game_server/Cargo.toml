@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 axum = "0.8.8"
+axum-server = { version = "0.7.2", features = ["tls-rustls"] }
 clap.workspace = true
 env_logger.workspace = true
 game_shared = { path = "../game_shared" }

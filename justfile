@@ -13,7 +13,7 @@ test:
     cargo test --workspace
 
 server http_bind="127.0.0.1:8080" udp_bind="0.0.0.0:5000" webrtc_bind="0.0.0.0:5001":
-    cargo run -p game_server -- \
+    cargo run --release -p game_server -- \
       --http-bind {{http_bind}} \
       --udp-bind {{udp_bind}} \
       --webrtc-bind {{webrtc_bind}} \

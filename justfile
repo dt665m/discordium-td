@@ -40,6 +40,9 @@ web-client http_base="http://127.0.0.1:8080" address="127.0.0.1" port="1420":
       TD_WEB_HTTP_BASE="{{http_base}}" \
       trunk serve --release --config Trunk.toml --address {{address}} --port {{port}}
 
+web-deploy:
+    npx wrangler pages deploy /Users/dt665m/Projects/games/discordium-td/game_client/dist --project-name=discordium-td
+
 web-play http_base="http://127.0.0.1:8080" address="127.0.0.1" port="1420":
     #!/usr/bin/env bash
     set -euo pipefail

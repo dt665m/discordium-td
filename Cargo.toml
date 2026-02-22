@@ -15,3 +15,13 @@ renet = "2.0.0"
 renet-cross = "0.1.0" 
 serde = { version = "1.0.228", features = ["derive"] }
 tokio = { version = "1.49.0", features = ["rt-multi-thread", "macros", "time", "net"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+
+[profile.dist]
+inherits = "release"
+opt-level = 3

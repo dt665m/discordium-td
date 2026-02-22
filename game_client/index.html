@@ -62,7 +62,13 @@
         touch-action: none;
       }
     </style>
-    <link data-trunk rel="rust" data-bin="game_client" />
+    <link
+      data-trunk
+      rel="rust"
+      data-bin="game_client"
+      data-wasm-opt="z"
+      data-wasm-opt-params="--enable-bulk-memory --enable-nontrapping-float-to-int --strip-debug --strip-dwarf --strip-producers"
+    />
   </head>
   <body>
     <section class="top-note">

@@ -4,6 +4,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use axum::http::HeaderValue;
 use axum_server::tls_rustls::RustlsConfig;
 use renet_cross::{
     BootstrapAxumState, DefaultBootstrapService, MixedServerTransport, SdpHttpHookConfig,
@@ -23,6 +24,7 @@ pub fn spawn_http_server_thread(
     bind_addr: SocketAddr,
     webrtc_candidate_addr: SocketAddr,
     http_tls: Option<HttpTlsConfig>,
+    cors_allowed_origins: Option<Vec<HeaderValue>>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("discordium-http".to_owned())
@@ -45,12 +47,25 @@ pub fn spawn_http_server_thread(
                     hook_config: SdpHttpHookConfig::new(webrtc_candidate_addr),
                 };
 
-                let app = bootstrap_router(app_state).layer(
+                let cors = if let Some(origins) = cors_allowed_origins {
+                    let origin_list = origins
+                        .iter()
+                        .map(|origin| origin.to_str().unwrap_or("<non-utf8-origin>"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    log::info!("HTTP CORS allowlist enabled: {origin_list}");
+                    CorsLayer::new()
+                        .allow_origin(origins)
+                        .allow_methods(Any)
+                        .allow_headers(Any)
+                } else {
+                    log::info!("HTTP CORS allowlist not set; allowing any origin");
                     CorsLayer::new()
                         .allow_origin(Any)
                         .allow_methods(Any)
-                        .allow_headers(Any),
-                );
+                        .allow_headers(Any)
+                };
+                let app = bootstrap_router(app_state).layer(cors);
 
                 if let Some(tls) = http_tls {
                     let tls_config = match RustlsConfig::from_pem_file(

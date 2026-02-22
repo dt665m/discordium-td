@@ -134,6 +134,7 @@ At minimum:
 TD_HTTP_TLS_CERT=/etc/ssl/cloudflare/origin-cert.pem \
 TD_HTTP_TLS_KEY=/etc/ssl/cloudflare/origin-key.pem \
 TD_PUBLIC_HTTP_BASE=https://game.example.com \
+TD_CORS_ALLOWED_ORIGINS=https://play.example.com,https://discordium-td.pages.dev \
 cargo run -p game_server -- \
   --http-bind 0.0.0.0:443 \
   --udp-bind 0.0.0.0:5000 \
@@ -147,6 +148,8 @@ Notes:
 - `TD_HTTP_TLS_CERT` and `TD_HTTP_TLS_KEY` must both be set together.
 - If TLS is enabled and `TD_HTTP_BIND` is omitted, default bind becomes `0.0.0.0:443`.
 - `TD_PUBLIC_HTTP_BASE` should be your public HTTPS URL.
+- `TD_CORS_ALLOWED_ORIGINS` is optional comma-separated CORS allowlist for browser clients on other origins.
+- If `TD_CORS_ALLOWED_ORIGINS` is unset (or `*`), server allows any origin.
 - `--public-udp-addr` and `--public-webrtc-addr` must be publicly reachable addresses for gameplay transport.
 
 ### 7) Verify HTTPS from outside

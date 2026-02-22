@@ -11,6 +11,7 @@ use crate::{
     http_api::{self, HttpTlsConfig},
     simulation::Simulation,
 };
+use axum::http::HeaderValue;
 use clap::Parser;
 use game_shared::{FIXED_DT_SECONDS, PROTOCOL_ID, ReliableServerMessage, WorldDelta, encode};
 use renet::{ConnectionConfig, DefaultChannel, RenetServer, ServerEvent};
@@ -38,6 +39,8 @@ pub struct ServerArgs {
     public_webrtc_addr: SocketAddr,
     #[arg(long, env = "TD_PUBLIC_HTTP_BASE")]
     public_http_base: Option<String>,
+    #[arg(long, env = "TD_CORS_ALLOWED_ORIGINS")]
+    cors_allowed_origins: Option<String>,
 }
 
 fn default_http_bind(tls_enabled: bool) -> SocketAddr {
@@ -60,6 +63,55 @@ fn default_public_http_base(http_bind: SocketAddr, tls_enabled: bool) -> String 
     }
 }
 
+fn parse_cors_allowed_origins(
+    raw: Option<String>,
+) -> Result<Option<Vec<HeaderValue>>, std::io::Error> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+
+    let origins: Vec<&str> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|origin| !origin.is_empty())
+        .collect();
+
+    if origins.is_empty() || (origins.len() == 1 && origins[0] == "*") {
+        return Ok(None);
+    }
+
+    if origins.contains(&"*") {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "TD_CORS_ALLOWED_ORIGINS cannot mix '*' with explicit origins",
+        ));
+    }
+
+    let mut values = Vec::with_capacity(origins.len());
+    for origin in origins {
+        let value = HeaderValue::from_str(origin).map_err(|err| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid CORS origin '{origin}': {err}"),
+            )
+        })?;
+        values.push(value);
+    }
+
+    Ok(Some(values))
+}
+
+fn cors_origins_label(origins: Option<&[HeaderValue]>) -> String {
+    let Some(origins) = origins else {
+        return "*".to_owned();
+    };
+    origins
+        .iter()
+        .map(|origin| origin.to_str().unwrap_or("<non-utf8-origin>"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 pub fn run(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
     let ServerArgs {
         http_bind,
@@ -70,6 +122,7 @@ pub fn run(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
         public_udp_addr,
         public_webrtc_addr,
         public_http_base,
+        cors_allowed_origins,
     } = args;
 
     let http_tls = match (http_tls_cert, http_tls_key) {
@@ -100,16 +153,19 @@ pub fn run(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
     if tls_enabled && public_http_base.starts_with("http://") {
         public_http_base = format!("https://{}", public_http_base.trim_start_matches("http://"));
     }
+    let cors_allowed_origins = parse_cors_allowed_origins(cors_allowed_origins)?;
+    let cors_origins = cors_origins_label(cors_allowed_origins.as_deref());
 
     log::info!(
-        "starting server: http_bind={} http_tls={} udp_bind={} webrtc_bind={} public_http_base={} public_udp_addr={} public_webrtc_addr={}",
+        "starting server: http_bind={} http_tls={} udp_bind={} webrtc_bind={} public_http_base={} public_udp_addr={} public_webrtc_addr={} cors_allowed_origins={}",
         http_bind,
         http_tls.is_some(),
         udp_bind,
         webrtc_bind,
         public_http_base,
         public_udp_addr,
-        public_webrtc_addr
+        public_webrtc_addr,
+        cors_origins
     );
 
     let server = RenetServer::new(ConnectionConfig::default());
@@ -141,6 +197,7 @@ pub fn run(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
         http_bind,
         public_webrtc_addr,
         http_tls,
+        cors_allowed_origins,
     );
 
     run_game_loop(server, shared_transport, bootstrap)

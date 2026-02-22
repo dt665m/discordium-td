@@ -32,6 +32,8 @@ pub const HERO_POWER_DECAY_PER_INTERVAL: f32 = 1.25;
 pub const HERO_POWERED_ATTACK_DAMAGE_MULTIPLIER: f32 = 2.0;
 pub const HERO_POWERED_ABILITY_MANA_COST_MULTIPLIER: f32 = 0.5;
 pub const HERO_POWERED_ABILITY_COOLDOWN_MULTIPLIER: f32 = 0.5;
+pub const HERO_POWERED_ABILITY_RADIUS_MULTIPLIER: f32 = 3.0;
+pub const HERO_POWERED_REGULAR_ATTACK_RANGE_MULTIPLIER: f32 = 10.0;
 
 pub const TOWER_BUILD_COST: u32 = 110;
 pub const BUILD_COMMAND_MAX_DISTANCE: f32 = 6.5;
@@ -41,6 +43,7 @@ pub const TOWER_RELOAD_TICKS: u32 = SERVER_TICK_HZ;
 pub const TOWER_COLLIDER_RADIUS: f32 = 0.68;
 
 pub const OBJECTIVE_MAX_HP: f32 = 100.0;
+pub const OBJECTIVE_COLLIDER_RADIUS: f32 = 1.05;
 pub const ENEMY_OBJECTIVE_DAMAGE: f32 = 17.0;
 pub const INITIAL_TEAM_LIFE: i32 = 10;
 pub const INITIAL_GOLD: u32 = 180;
@@ -55,7 +58,8 @@ pub const ENEMY_REGULAR_ATTACK_RECOVERY_TICKS: u32 = 11;
 
 pub const WAVE_PREP_TICKS: u32 = SERVER_TICK_HZ * 4;
 pub const WAVE_SPAWN_INTERVAL_TICKS: u32 = SERVER_TICK_HZ / 2;
-pub const MAX_WAVES: u32 = 6;
+pub const MATCH_RESET_TICKS: u32 = SERVER_TICK_HZ * 5;
+pub const MAX_WAVES: u32 = 20;
 pub const BASE_ENEMIES_PER_WAVE: u32 = 8;
 pub const EXTRA_ENEMIES_PER_WAVE: u32 = 4;
 
@@ -214,6 +218,8 @@ pub struct PoweredUpModifiersComponent {
     pub attack_damage_multiplier: f32,
     pub ability_mana_cost_multiplier: f32,
     pub ability_cooldown_multiplier: f32,
+    pub ability_radius_multiplier: f32,
+    pub regular_attack_range_multiplier: f32,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
@@ -260,6 +266,8 @@ pub const HERO_POWERED_MODIFIERS: PoweredUpModifiersComponent = PoweredUpModifie
     attack_damage_multiplier: HERO_POWERED_ATTACK_DAMAGE_MULTIPLIER,
     ability_mana_cost_multiplier: HERO_POWERED_ABILITY_MANA_COST_MULTIPLIER,
     ability_cooldown_multiplier: HERO_POWERED_ABILITY_COOLDOWN_MULTIPLIER,
+    ability_radius_multiplier: HERO_POWERED_ABILITY_RADIUS_MULTIPLIER,
+    regular_attack_range_multiplier: HERO_POWERED_REGULAR_ATTACK_RANGE_MULTIPLIER,
 };
 
 pub fn enemy_collider_radius(enemy_type: EnemyType) -> f32 {
@@ -336,6 +344,7 @@ pub enum ReliableGameEvent {
     AbilityCast {
         owner: u64,
         pos: [f32; 2],
+        radius: f32,
     },
     EnemyKilled {
         enemy_id: u64,
@@ -409,6 +418,7 @@ pub struct ObjectiveSnapshot {
 pub struct WorldDelta {
     pub tick: u32,
     pub phase: MatchPhase,
+    pub match_restart_ticks_remaining: Option<u32>,
     pub wave: u32,
     pub team_life: i32,
     pub objectives: Vec<ObjectiveSnapshot>,

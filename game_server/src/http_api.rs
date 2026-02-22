@@ -7,6 +7,7 @@ use renet_cross::{
     BootstrapAxumState, DefaultBootstrapService, MixedServerTransport, SdpHttpHookConfig,
     bootstrap_router,
 };
+use tower_http::cors::{Any, CorsLayer};
 
 pub fn spawn_http_server_thread(
     bootstrap: Arc<DefaultBootstrapService>,
@@ -35,7 +36,12 @@ pub fn spawn_http_server_thread(
                     hook_config: SdpHttpHookConfig::new(webrtc_candidate_addr),
                 };
 
-                let app = bootstrap_router(app_state);
+                let app = bootstrap_router(app_state).layer(
+                    CorsLayer::new()
+                        .allow_origin(Any)
+                        .allow_methods(Any)
+                        .allow_headers(Any),
+                );
                 let listener = match tokio::net::TcpListener::bind(bind_addr).await {
                     Ok(listener) => listener,
                     Err(err) => {

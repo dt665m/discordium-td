@@ -9,12 +9,13 @@ use game_shared::{
     HERO_ABILITY_DAMAGE, HERO_ABILITY_MANA_COST, HERO_ABILITY_RADIUS, HERO_CHARGE_PROFILE,
     HERO_COLLIDER_RADIUS, HERO_MANA_REGEN_PER_TICK, HERO_MAX_HP, HERO_MAX_MANA,
     HERO_POWER_DECAY_PROFILE, HERO_POWERED_MODIFIERS, HERO_REGULAR_ATTACK, HERO_SPEED,
-    INITIAL_GOLD, INITIAL_TEAM_LIFE, JoinSnapshot, MAX_WAVES, MatchPhase, OBJECTIVE_MAX_HP,
-    ObjectiveSnapshot, PowerDecayProfileComponent, PoweredUpModifiersComponent, ReliableGameEvent,
-    TOWER_BUILD_COST, TOWER_COLLIDER_RADIUS, TOWER_DAMAGE, TOWER_RANGE, TOWER_RELOAD_TICKS,
-    TowerSnapshot, TowerType, WAVE_PREP_TICKS, WAVE_SPAWN_INTERVAL_TICKS, WORLD_HALF_HEIGHT,
-    WORLD_HALF_WIDTH, WorldDelta, cardinalize_dir_or, clamp_to_world, directional_attack_can_hit,
-    distance_sq, enemy_collider_radius, is_newer_input_seq, normalize_or_zero,
+    INITIAL_GOLD, INITIAL_TEAM_LIFE, JoinSnapshot, MATCH_RESET_TICKS, MAX_WAVES, MatchPhase,
+    OBJECTIVE_COLLIDER_RADIUS, OBJECTIVE_MAX_HP, ObjectiveSnapshot, PowerDecayProfileComponent,
+    PoweredUpModifiersComponent, ReliableGameEvent, TOWER_BUILD_COST, TOWER_COLLIDER_RADIUS,
+    TOWER_DAMAGE, TOWER_RANGE, TOWER_RELOAD_TICKS, TowerSnapshot, TowerType, WAVE_PREP_TICKS,
+    WAVE_SPAWN_INTERVAL_TICKS, WORLD_HALF_HEIGHT, WORLD_HALF_WIDTH, WorldDelta, cardinalize_dir_or,
+    clamp_to_world, directional_attack_can_hit, distance_sq, enemy_collider_radius,
+    is_newer_input_seq, normalize_or_zero,
 };
 use vleue_navigator::NavMesh;
 
@@ -26,6 +27,7 @@ const ENEMY_STEERING_SEPARATION_WEIGHT: f32 = 1.7;
 const ENEMY_SEPARATION_BUFFER: f32 = 0.55;
 const ENEMY_ACCEL_FACTOR: f32 = 18.0;
 const ENEMY_DAMPING_FACTOR: f32 = 4.3;
+const ENEMY_SPATIAL_CELL_MIN_SIZE: f32 = 0.5;
 const ENEMY_REPATH_TICKS: u32 = 8;
 const ENEMY_WAYPOINT_REACH_RADIUS: f32 = 0.65;
 const ENEMY_COLLISION_DAMPING: f32 = 0.82;
@@ -97,6 +99,13 @@ struct EnemyMotionSnapshot {
 }
 
 #[derive(Debug, Clone, Copy)]
+struct EnemyCollisionSnapshot {
+    id: u64,
+    pos: [f32; 2],
+    radius: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
 struct TowerState {
     id: u64,
     owner: u64,
@@ -130,6 +139,7 @@ pub struct Simulation {
     next_spawn_tick: u32,
     next_spawn_point_index: usize,
     intermission_until: u32,
+    reset_at_tick: Option<u32>,
 }
 
 impl Default for Simulation {
@@ -158,6 +168,7 @@ impl Simulation {
             next_spawn_tick: 0,
             next_spawn_point_index: 0,
             intermission_until: WAVE_PREP_TICKS,
+            reset_at_tick: None,
         }
     }
 
@@ -209,6 +220,10 @@ impl Simulation {
         if removed_any_tower {
             self.navmesh_dirty = true;
         }
+    }
+
+    pub fn has_players(&self) -> bool {
+        !self.heroes.is_empty()
     }
 
     pub fn queue_command(&mut self, client_id: u64, command: ClientCommand) {
@@ -292,6 +307,7 @@ impl Simulation {
         WorldDelta {
             tick: self.tick,
             phase: self.phase,
+            match_restart_ticks_remaining: self.match_restart_ticks_remaining(),
             wave: self.wave,
             team_life: self.team_life,
             objectives,
@@ -302,11 +318,17 @@ impl Simulation {
         }
     }
 
+    fn match_restart_ticks_remaining(&self) -> Option<u32> {
+        self.reset_at_tick
+            .map(|reset_at_tick| reset_at_tick.saturating_sub(self.tick))
+    }
+
     pub fn step(&mut self) -> TickOutput {
         self.tick = self.tick.wrapping_add(1);
 
         let mut reliable_events = Vec::new();
         if self.phase != MatchPhase::InProgress {
+            self.maybe_reset_match();
             return TickOutput { reliable_events };
         }
 
@@ -318,6 +340,7 @@ impl Simulation {
 
         if self.team_life <= 0 && self.phase == MatchPhase::InProgress {
             self.phase = MatchPhase::Defeat;
+            self.schedule_match_reset();
             reliable_events.push(ReliableGameEvent::Defeat);
         }
 
@@ -402,15 +425,17 @@ impl Simulation {
         hero.ability_cooldown_ticks = hero_ability_cooldown_ticks(hero);
         hero.mana -= mana_cost;
         let cast_origin = hero.pos;
+        let ability_radius = hero_ability_radius(hero);
         let damage_multiplier = hero_attack_damage_multiplier(hero);
 
         reliable_events.push(ReliableGameEvent::AbilityCast {
             owner: client_id,
             pos: cast_origin,
+            radius: ability_radius,
         });
 
         let mut targets = Vec::new();
-        let radius_sq = HERO_ABILITY_RADIUS * HERO_ABILITY_RADIUS;
+        let radius_sq = ability_radius * ability_radius;
         for enemy in self.enemies.values() {
             if distance_sq(enemy.pos, cast_origin) <= radius_sq {
                 targets.push(enemy.id);
@@ -435,7 +460,8 @@ impl Simulation {
             return;
         }
 
-        let _ = start_attack(&mut hero.regular_attack, hero.regular_attack_profile);
+        let regular_attack_profile = hero_regular_attack_profile(hero);
+        let _ = start_attack(&mut hero.regular_attack, regular_attack_profile);
     }
 
     fn try_set_charging(&mut self, client_id: u64, active: bool) {
@@ -550,6 +576,7 @@ impl Simulation {
             let Some(hero) = self.heroes.get_mut(&hero_id) else {
                 continue;
             };
+            let regular_attack_profile = hero_regular_attack_profile(hero);
 
             if hero.lock_mode_active {
                 if hero
@@ -560,12 +587,16 @@ impl Simulation {
                 } else if hero.lock_target_id.is_none() {
                     hero.lock_target_id = nearest_enemy_id(hero.pos, &enemy_positions);
                 }
+
+                if hero.lock_target_id.is_none() {
+                    hero.lock_mode_active = false;
+                }
             } else {
                 hero.lock_target_id = None;
             }
 
             let attack_triggered =
-                advance_attack_state(&mut hero.regular_attack, hero.regular_attack_profile);
+                advance_attack_state(&mut hero.regular_attack, regular_attack_profile);
             if attack_triggered {
                 triggered_attackers.push(hero_id);
             }
@@ -610,6 +641,7 @@ impl Simulation {
             let Some(hero) = self.heroes.get(&attacker_id).copied() else {
                 continue;
             };
+            let regular_attack_profile = hero_regular_attack_profile(&hero);
 
             let mut hit_targets: Vec<(u64, f32)> = self
                 .enemies
@@ -619,7 +651,7 @@ impl Simulation {
                         hero.pos,
                         hero.facing.dir,
                         enemy.pos,
-                        hero.regular_attack_profile,
+                        regular_attack_profile,
                     )
                     .then_some((enemy.id, distance_sq(hero.pos, enemy.pos)))
                 })
@@ -640,7 +672,7 @@ impl Simulation {
                 hit_targets.swap(0, locked_idx);
             }
 
-            let damage = hero.regular_attack_profile.damage * hero_attack_damage_multiplier(&hero);
+            let damage = regular_attack_profile.damage * hero_attack_damage_multiplier(&hero);
             for (enemy_id, _) in hit_targets {
                 self.apply_enemy_damage(enemy_id, damage, attacker_id, reliable_events);
             }
@@ -747,6 +779,33 @@ impl Simulation {
         }
 
         for snapshot in &hero_snapshots {
+            let mut delta = [
+                snapshot.pos[0] - BASE_POSITION[0],
+                snapshot.pos[1] - BASE_POSITION[1],
+            ];
+            let mut dist_sq = delta[0] * delta[0] + delta[1] * delta[1];
+            let min_dist = HERO_COLLIDER_RADIUS + OBJECTIVE_COLLIDER_RADIUS;
+            let min_dist_sq = min_dist * min_dist;
+            if dist_sq >= min_dist_sq {
+                continue;
+            }
+
+            if dist_sq <= f32::EPSILON {
+                delta = [1.0, 0.0];
+                dist_sq = 1.0;
+            }
+
+            let dist = dist_sq.sqrt();
+            let normal = [delta[0] / dist, delta[1] / dist];
+            let overlap = (min_dist - dist).max(0.0);
+            add_displacement(
+                &mut displacements,
+                snapshot.client_id,
+                [normal[0] * overlap, normal[1] * overlap],
+            );
+        }
+
+        for snapshot in &hero_snapshots {
             for enemy in &enemy_snapshots {
                 let mut delta = [
                     snapshot.pos[0] - enemy.pos[0],
@@ -800,6 +859,11 @@ impl Simulation {
                 radius: enemy.radius,
             })
             .collect();
+        let separation_cell_size = separation_spatial_cell_size(&motion_snapshots);
+        let separation_cells =
+            build_spatial_cells(&motion_snapshots, separation_cell_size, |snapshot| {
+                snapshot.pos
+            });
         let mut pending_hero_hits: Vec<(u64, f32)> = Vec::new();
         let mut pending_objective_hits: Vec<u64> = Vec::new();
 
@@ -810,6 +874,12 @@ impl Simulation {
             let previous_target = enemy.target_pos;
             enemy.target_pos =
                 enemy_target_attack_anchor(target, enemy.id, enemy.regular_attack_profile.range);
+            let facing_to_target =
+                normalize_or_zero([target_pos[0] - enemy.pos[0], target_pos[1] - enemy.pos[1]]);
+            if facing_to_target != [0.0, 0.0] {
+                // AI lock-on: face the active attack target (hero/base), not the steering anchor.
+                enemy.facing.dir = facing_to_target;
+            }
 
             let attack_triggered =
                 advance_attack_state(&mut enemy.regular_attack, enemy.regular_attack_profile);
@@ -844,11 +914,6 @@ impl Simulation {
                 continue;
             }
 
-            let to_target = [target_pos[0] - enemy.pos[0], target_pos[1] - enemy.pos[1]];
-            if to_target != [0.0, 0.0] {
-                enemy.facing.dir = cardinalize_dir_or(to_target, enemy.facing.dir);
-            }
-
             if distance_sq(enemy.pos, target_pos)
                 <= enemy.regular_attack_profile.range * enemy.regular_attack_profile.range
             {
@@ -880,8 +945,14 @@ impl Simulation {
                 ]);
             }
 
-            let separation =
-                enemy_separation_direction(enemy.id, enemy.pos, enemy.radius, &motion_snapshots);
+            let separation = enemy_separation_direction(
+                enemy.id,
+                enemy.pos,
+                enemy.radius,
+                &motion_snapshots,
+                &separation_cells,
+                separation_cell_size,
+            );
             let steer = normalize_or_zero([
                 desired[0] * ENEMY_STEERING_TARGET_WEIGHT
                     + separation[0] * ENEMY_STEERING_SEPARATION_WEIGHT,
@@ -960,13 +1031,6 @@ impl Simulation {
     }
 
     fn resolve_enemy_collisions(&mut self) {
-        #[derive(Clone, Copy)]
-        struct EnemyCollisionSnapshot {
-            id: u64,
-            pos: [f32; 2],
-            radius: f32,
-        }
-
         let snapshots: Vec<EnemyCollisionSnapshot> = self
             .enemies
             .values()
@@ -976,12 +1040,18 @@ impl Simulation {
                 radius: enemy.radius,
             })
             .collect();
+        let collision_cell_size = collision_spatial_cell_size(&snapshots);
+        let collision_cells =
+            build_spatial_cells(&snapshots, collision_cell_size, |snapshot| snapshot.pos);
 
         let mut displacements: HashMap<u64, [f32; 2]> = HashMap::new();
 
         for i in 0..snapshots.len() {
-            for j in (i + 1)..snapshots.len() {
-                let a = snapshots[i];
+            let a = snapshots[i];
+            for_each_spatial_neighbor(&collision_cells, collision_cell_size, a.pos, |j| {
+                if j <= i {
+                    return;
+                }
                 let b = snapshots[j];
 
                 let mut delta = [b.pos[0] - a.pos[0], b.pos[1] - a.pos[1]];
@@ -990,7 +1060,7 @@ impl Simulation {
                 let min_dist_sq = min_dist * min_dist;
 
                 if dist_sq >= min_dist_sq {
-                    continue;
+                    return;
                 }
 
                 if dist_sq <= f32::EPSILON {
@@ -1014,7 +1084,7 @@ impl Simulation {
                     b.id,
                     [normal[0] * push, normal[1] * push],
                 );
-            }
+            });
         }
 
         for snapshot in &snapshots {
@@ -1045,6 +1115,34 @@ impl Simulation {
                     [normal[0] * overlap, normal[1] * overlap],
                 );
             }
+        }
+
+        for snapshot in &snapshots {
+            let mut delta = [
+                snapshot.pos[0] - BASE_POSITION[0],
+                snapshot.pos[1] - BASE_POSITION[1],
+            ];
+            let mut dist_sq = delta[0] * delta[0] + delta[1] * delta[1];
+            let min_dist = snapshot.radius + OBJECTIVE_COLLIDER_RADIUS;
+            let min_dist_sq = min_dist * min_dist;
+
+            if dist_sq >= min_dist_sq {
+                continue;
+            }
+
+            if dist_sq <= f32::EPSILON {
+                delta = [1.0, 0.0];
+                dist_sq = 1.0;
+            }
+
+            let dist = dist_sq.sqrt();
+            let normal = [delta[0] / dist, delta[1] / dist];
+            let overlap = (min_dist - dist).max(0.0);
+            add_displacement(
+                &mut displacements,
+                snapshot.id,
+                [normal[0] * overlap, normal[1] * overlap],
+            );
         }
 
         for (enemy_id, displacement) in displacements {
@@ -1143,6 +1241,7 @@ impl Simulation {
 
             if self.wave >= MAX_WAVES {
                 self.phase = MatchPhase::Victory;
+                self.schedule_match_reset();
                 reliable_events.push(ReliableGameEvent::Victory);
                 return;
             }
@@ -1238,6 +1337,58 @@ impl Simulation {
         let next = self.next_entity_id;
         self.next_entity_id = self.next_entity_id.wrapping_add(1);
         next
+    }
+
+    fn schedule_match_reset(&mut self) {
+        if self.reset_at_tick.is_some() {
+            return;
+        }
+        self.reset_at_tick = Some(self.tick.saturating_add(MATCH_RESET_TICKS));
+    }
+
+    fn maybe_reset_match(&mut self) {
+        let Some(reset_at_tick) = self.reset_at_tick else {
+            return;
+        };
+        if self.tick < reset_at_tick {
+            return;
+        }
+        self.reset_match_state();
+    }
+
+    fn reset_match_state(&mut self) {
+        self.phase = MatchPhase::InProgress;
+        self.team_life = INITIAL_TEAM_LIFE;
+        self.wave = 0;
+        self.objective_hp = OBJECTIVE_MAX_HP;
+        self.enemies.clear();
+        self.towers.clear();
+        self.node_occupancy.clear();
+        self.navmesh_dirty = true;
+        self.pending_commands.clear();
+        self.wave_remaining = 0;
+        self.next_spawn_tick = 0;
+        self.next_spawn_point_index = 0;
+        self.intermission_until = self.tick + WAVE_PREP_TICKS;
+        self.reset_at_tick = None;
+
+        for (client_id, hero) in &mut self.heroes {
+            hero.pos = spawn_position_for_client(*client_id);
+            hero.move_dir = [0.0, 0.0];
+            hero.facing = FacingComponent::default();
+            hero.lock_mode_active = false;
+            hero.lock_target_id = None;
+            hero.regular_attack = DirectionalAttackStateComponent::default();
+            hero.regular_attack_profile = HERO_REGULAR_ATTACK;
+            hero.charge_profile = HERO_CHARGE_PROFILE;
+            hero.power_decay_profile = HERO_POWER_DECAY_PROFILE;
+            hero.powered_modifiers = HERO_POWERED_MODIFIERS;
+            hero.charge_state = ChargeStateComponent::default();
+            hero.hp = HERO_MAX_HP;
+            hero.mana = HERO_MAX_MANA;
+            hero.gold = INITIAL_GOLD;
+            hero.ability_cooldown_ticks = 0;
+        }
     }
 
     fn navmesh_for_tick(&mut self) -> NavMesh {
@@ -1338,35 +1489,99 @@ fn enemy_separation_direction(
     enemy_pos: [f32; 2],
     enemy_radius: f32,
     snapshots: &[EnemyMotionSnapshot],
+    separation_cells: &HashMap<(i32, i32), Vec<usize>>,
+    separation_cell_size: f32,
 ) -> [f32; 2] {
     let mut separation = [0.0, 0.0];
 
-    for other in snapshots {
-        if other.id == enemy_id {
-            continue;
-        }
+    for_each_spatial_neighbor(
+        separation_cells,
+        separation_cell_size,
+        enemy_pos,
+        |other_idx| {
+            let other = snapshots[other_idx];
+            if other.id == enemy_id {
+                return;
+            }
 
-        let mut delta = [enemy_pos[0] - other.pos[0], enemy_pos[1] - other.pos[1]];
-        let mut dist_sq = delta[0] * delta[0] + delta[1] * delta[1];
-        let avoid_distance = enemy_radius + other.radius + ENEMY_SEPARATION_BUFFER;
-        let avoid_distance_sq = avoid_distance * avoid_distance;
-        if dist_sq >= avoid_distance_sq {
-            continue;
-        }
+            let mut delta = [enemy_pos[0] - other.pos[0], enemy_pos[1] - other.pos[1]];
+            let mut dist_sq = delta[0] * delta[0] + delta[1] * delta[1];
+            let avoid_distance = enemy_radius + other.radius + ENEMY_SEPARATION_BUFFER;
+            let avoid_distance_sq = avoid_distance * avoid_distance;
+            if dist_sq >= avoid_distance_sq {
+                return;
+            }
 
-        if dist_sq <= f32::EPSILON {
-            let angle = ((enemy_id ^ (other.id << 1)) % 6283) as f32 * 0.001;
-            delta = [angle.cos(), angle.sin()];
-            dist_sq = 1.0;
-        }
+            if dist_sq <= f32::EPSILON {
+                let angle = ((enemy_id ^ (other.id << 1)) % 6283) as f32 * 0.001;
+                delta = [angle.cos(), angle.sin()];
+                dist_sq = 1.0;
+            }
 
-        let dist = dist_sq.sqrt();
-        let weight = ((avoid_distance - dist) / avoid_distance).clamp(0.0, 1.0);
-        separation[0] += (delta[0] / dist) * weight;
-        separation[1] += (delta[1] / dist) * weight;
-    }
+            let dist = dist_sq.sqrt();
+            let weight = ((avoid_distance - dist) / avoid_distance).clamp(0.0, 1.0);
+            separation[0] += (delta[0] / dist) * weight;
+            separation[1] += (delta[1] / dist) * weight;
+        },
+    );
 
     normalize_or_zero(separation)
+}
+
+fn separation_spatial_cell_size(snapshots: &[EnemyMotionSnapshot]) -> f32 {
+    let max_radius = snapshots
+        .iter()
+        .map(|snapshot| snapshot.radius)
+        .fold(0.0, f32::max);
+    (max_radius * 2.0 + ENEMY_SEPARATION_BUFFER).max(ENEMY_SPATIAL_CELL_MIN_SIZE)
+}
+
+fn collision_spatial_cell_size(snapshots: &[EnemyCollisionSnapshot]) -> f32 {
+    let max_radius = snapshots
+        .iter()
+        .map(|snapshot| snapshot.radius)
+        .fold(0.0, f32::max);
+    (max_radius * 2.0).max(ENEMY_SPATIAL_CELL_MIN_SIZE)
+}
+
+fn build_spatial_cells<T>(
+    values: &[T],
+    cell_size: f32,
+    pos_of: impl Fn(&T) -> [f32; 2],
+) -> HashMap<(i32, i32), Vec<usize>> {
+    let mut cells: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
+    for (index, value) in values.iter().enumerate() {
+        let cell = spatial_cell_key(pos_of(value), cell_size);
+        cells.entry(cell).or_default().push(index);
+    }
+    cells
+}
+
+fn for_each_spatial_neighbor(
+    cells: &HashMap<(i32, i32), Vec<usize>>,
+    cell_size: f32,
+    pos: [f32; 2],
+    mut f: impl FnMut(usize),
+) {
+    let (cx, cy) = spatial_cell_key(pos, cell_size);
+    for dy in -1..=1 {
+        for dx in -1..=1 {
+            let key = (cx + dx, cy + dy);
+            let Some(indices) = cells.get(&key) else {
+                continue;
+            };
+            for &index in indices {
+                f(index);
+            }
+        }
+    }
+}
+
+fn spatial_cell_key(pos: [f32; 2], cell_size: f32) -> (i32, i32) {
+    (
+        (pos[0] / cell_size).floor() as i32,
+        (pos[1] / cell_size).floor() as i32,
+    )
 }
 
 fn is_charge_locked(state: ChargeStateComponent) -> bool {
@@ -1531,6 +1746,25 @@ fn hero_attack_damage_multiplier(hero: &HeroState) -> f32 {
     } else {
         1.0
     }
+}
+
+fn hero_ability_radius(hero: &HeroState) -> f32 {
+    if hero.charge_state.power_active {
+        HERO_ABILITY_RADIUS * hero.powered_modifiers.ability_radius_multiplier.max(0.0)
+    } else {
+        HERO_ABILITY_RADIUS
+    }
+}
+
+fn hero_regular_attack_profile(hero: &HeroState) -> DirectionalAttackComponent {
+    let mut profile = hero.regular_attack_profile;
+    if hero.charge_state.power_active {
+        profile.range *= hero
+            .powered_modifiers
+            .regular_attack_range_multiplier
+            .max(0.0);
+    }
+    profile
 }
 
 fn hero_ability_mana_cost(hero: &HeroState) -> f32 {
@@ -1894,6 +2128,45 @@ mod tests {
     }
 
     #[test]
+    fn objective_collision_blocks_hero_from_entering_base() {
+        let mut sim = Simulation::new();
+        sim.add_player(1);
+
+        if let Some(hero) = sim.heroes.get_mut(&1) {
+            hero.pos = [
+                BASE_POSITION[0] + OBJECTIVE_COLLIDER_RADIUS + HERO_COLLIDER_RADIUS - 0.2,
+                BASE_POSITION[1],
+            ];
+            hero.move_dir = [0.0, 0.0];
+        }
+
+        sim.step();
+        let hero = sim.heroes.get(&1).expect("hero should exist");
+        let dist = distance_sq(hero.pos, BASE_POSITION).sqrt();
+        assert!(dist + 0.0001 >= OBJECTIVE_COLLIDER_RADIUS + HERO_COLLIDER_RADIUS - 0.01);
+    }
+
+    #[test]
+    fn enemy_facing_tracks_locked_target_position() {
+        let mut sim = Simulation::new();
+        sim.add_player(1);
+        insert_static_enemy(&mut sim, 1099, [0.0, 0.0], 100.0);
+
+        if let Some(hero) = sim.heroes.get_mut(&1) {
+            hero.pos = [0.0, 3.0];
+            hero.move_dir = [0.0, 0.0];
+        }
+        if let Some(enemy) = sim.enemies.get_mut(&1099) {
+            enemy.facing = FacingComponent { dir: [1.0, 0.0] };
+        }
+
+        sim.step();
+        let enemy = sim.enemies.get(&1099).expect("enemy should exist");
+        assert!(enemy.facing.dir[1] > 0.95);
+        assert!(enemy.facing.dir[0].abs() < 0.2);
+    }
+
+    #[test]
     fn lock_target_retargets_when_enemy_removed_if_mode_active() {
         let mut sim = Simulation::new();
         sim.add_player(1);
@@ -1924,6 +2197,46 @@ mod tests {
                 .get(&1)
                 .map(|hero| hero.lock_mode_active)
                 .unwrap_or(false)
+        );
+    }
+
+    #[test]
+    fn lock_mode_disables_when_no_targets_remain() {
+        let mut sim = Simulation::new();
+        sim.add_player(1);
+        insert_static_enemy(&mut sim, 1101, [2.0, 0.0], 100.0);
+
+        sim.queue_command(
+            1,
+            ClientCommand::SetLockTarget {
+                seq: 1,
+                target_id: Some(1101),
+            },
+        );
+        sim.step();
+        assert!(
+            sim.heroes
+                .get(&1)
+                .map(|hero| hero.lock_mode_active)
+                .unwrap_or(false)
+        );
+        assert_eq!(
+            sim.heroes.get(&1).and_then(|hero| hero.lock_target_id),
+            Some(1101)
+        );
+
+        sim.enemies.remove(&1101);
+        sim.step();
+
+        assert_eq!(
+            sim.heroes.get(&1).and_then(|hero| hero.lock_target_id),
+            None
+        );
+        assert!(
+            !sim.heroes
+                .get(&1)
+                .map(|hero| hero.lock_mode_active)
+                .unwrap_or(true)
         );
     }
 
@@ -2207,6 +2520,85 @@ mod tests {
     }
 
     #[test]
+    fn powered_ability_radius_hits_farther_targets() {
+        let mut sim = Simulation::new();
+        sim.add_player(1);
+        insert_static_enemy(&mut sim, 3101, [9.0, 0.0], 200.0);
+
+        if let Some(hero) = sim.heroes.get_mut(&1) {
+            hero.pos = [0.0, 0.0];
+            hero.facing = FacingComponent { dir: [1.0, 0.0] };
+            hero.charge_state.power_active = true;
+            hero.charge_state.power_meter = hero.charge_profile.power_meter_max;
+            hero.charge_state.power_decay_ticks_remaining = 10_000;
+            hero.power_decay_profile.interval_ticks = 10_000;
+        }
+
+        sim.queue_command(
+            1,
+            ClientCommand::CastAbility {
+                seq: 1,
+                ability: AbilityId::ArcBurst,
+            },
+        );
+        sim.step();
+
+        let hp_after = sim
+            .enemies
+            .get(&3101)
+            .map(|enemy| enemy.hp)
+            .expect("enemy should exist");
+        assert!((hp_after - (200.0 - HERO_ABILITY_DAMAGE * 2.0)).abs() < 0.001);
+    }
+
+    #[test]
+    fn powered_regular_attack_range_reaches_far_targets() {
+        let mut baseline = Simulation::new();
+        baseline.add_player(1);
+        insert_static_enemy(&mut baseline, 3201, [8.0, 0.0], 200.0);
+
+        if let Some(hero) = baseline.heroes.get_mut(&1) {
+            hero.pos = [0.0, 0.0];
+            hero.facing = FacingComponent { dir: [1.0, 0.0] };
+        }
+
+        baseline.queue_command(1, ClientCommand::BasicAttack { seq: 1 });
+        for _ in 0..=HERO_REGULAR_ATTACK.windup_ticks {
+            baseline.step();
+        }
+        let baseline_hp = baseline
+            .enemies
+            .get(&3201)
+            .map(|enemy| enemy.hp)
+            .expect("enemy should exist");
+        assert!((baseline_hp - 200.0).abs() < 0.001);
+
+        let mut powered = Simulation::new();
+        powered.add_player(1);
+        insert_static_enemy(&mut powered, 3201, [8.0, 0.0], 200.0);
+
+        if let Some(hero) = powered.heroes.get_mut(&1) {
+            hero.pos = [0.0, 0.0];
+            hero.facing = FacingComponent { dir: [1.0, 0.0] };
+            hero.charge_state.power_active = true;
+            hero.charge_state.power_meter = hero.charge_profile.power_meter_max;
+            hero.charge_state.power_decay_ticks_remaining = 10_000;
+            hero.power_decay_profile.interval_ticks = 10_000;
+        }
+
+        powered.queue_command(1, ClientCommand::BasicAttack { seq: 1 });
+        for _ in 0..=HERO_REGULAR_ATTACK.windup_ticks {
+            powered.step();
+        }
+        let powered_hp = powered
+            .enemies
+            .get(&3201)
+            .map(|enemy| enemy.hp)
+            .expect("enemy should exist");
+        assert!((powered_hp - (200.0 - HERO_REGULAR_ATTACK.damage * 2.0)).abs() < 0.001);
+    }
+
+    #[test]
     fn partial_power_meter_decays_without_activating_power_mode() {
         let mut sim = Simulation::new();
         sim.add_player(1);
@@ -2288,6 +2680,80 @@ mod tests {
             hero.ability_cooldown_ticks,
             HERO_ABILITY_COOLDOWN_TICKS / 2 - 1
         );
+    }
+
+    #[test]
+    fn defeat_phase_auto_resets_match_state() {
+        let mut sim = Simulation::new();
+        sim.add_player(1);
+
+        if let Some(hero) = sim.heroes.get_mut(&1) {
+            hero.gold = 999;
+            hero.hp = 12.0;
+            hero.mana = 4.0;
+            hero.pos = [7.0, -3.0];
+            hero.lock_mode_active = true;
+            hero.lock_target_id = Some(42);
+        }
+        sim.towers.insert(
+            777,
+            TowerState {
+                id: 777,
+                owner: 1,
+                lane: 0,
+                node_id: BUILD_NODES[0].node_id,
+                pos: BUILD_NODES[0].pos,
+                reload_ticks: 0,
+            },
+        );
+        sim.node_occupancy.insert(BUILD_NODES[0].node_id, 777);
+        sim.team_life = 0;
+        sim.wave = 9;
+
+        sim.step();
+        assert_eq!(sim.phase, MatchPhase::Defeat);
+        let reset_at = sim.reset_at_tick.expect("reset should be scheduled");
+
+        while sim.tick < reset_at {
+            sim.step();
+        }
+
+        assert_eq!(sim.phase, MatchPhase::InProgress);
+        assert_eq!(sim.wave, 0);
+        assert_eq!(sim.team_life, INITIAL_TEAM_LIFE);
+        assert_eq!(sim.objective_hp, OBJECTIVE_MAX_HP);
+        assert!(sim.towers.is_empty());
+        assert!(sim.node_occupancy.is_empty());
+        assert!(sim.reset_at_tick.is_none());
+        let hero = sim.heroes.get(&1).expect("hero should exist");
+        assert_eq!(hero.gold, INITIAL_GOLD);
+        assert!((hero.hp - HERO_MAX_HP).abs() < 0.001);
+        assert!((hero.mana - HERO_MAX_MANA).abs() < 0.001);
+        assert!(!hero.lock_mode_active);
+        assert!(hero.lock_target_id.is_none());
+    }
+
+    #[test]
+    fn victory_phase_auto_resets_match_state() {
+        let mut sim = Simulation::new();
+        sim.add_player(1);
+        sim.wave = MAX_WAVES;
+        sim.wave_remaining = 0;
+        sim.intermission_until = 0;
+
+        sim.step();
+        assert_eq!(sim.phase, MatchPhase::Victory);
+        let reset_at = sim.reset_at_tick.expect("reset should be scheduled");
+
+        while sim.tick < reset_at {
+            sim.step();
+        }
+
+        assert_eq!(sim.phase, MatchPhase::InProgress);
+        assert_eq!(sim.wave, 0);
+        assert_eq!(sim.team_life, INITIAL_TEAM_LIFE);
+        assert!(sim.intermission_until > sim.tick);
+        assert!(sim.reset_at_tick.is_none());
     }
 
     #[test]

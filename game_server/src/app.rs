@@ -54,7 +54,7 @@ pub fn run(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
             .webrtc_bind(args.webrtc_bind)
             .public_udp_addr(args.public_udp_addr)
             .public_webrtc_addr(args.public_webrtc_addr)
-            .max_clients(256)
+            .max_clients(8)
             .authentication(ServerAuthentication::Unsecure)
             .build()?,
     ));
@@ -136,22 +136,25 @@ fn run_game_loop(
         while accumulator >= tick_dt {
             send_pending_joins(&mut server, &sim, &mut pending_join_snapshots);
 
-            let tick_output = sim.step();
-            for event in tick_output.reliable_events {
-                let payload = encode(&ReliableServerMessage::Event(event));
-                server.broadcast_message(DefaultChannel::ReliableOrdered, payload);
+            if sim.has_players() {
+                let tick_output = sim.step();
+                for event in tick_output.reliable_events {
+                    let payload = encode(&ReliableServerMessage::Event(event));
+                    server.broadcast_message(DefaultChannel::ReliableOrdered, payload);
+                }
+
+                broadcast_world_deltas(&mut server, &sim);
+
+                if sim.tick().is_multiple_of(120) {
+                    log::debug!(
+                        "authoritative tick={} clients={}",
+                        sim.tick(),
+                        server.clients_id().len()
+                    );
+                }
             }
 
-            broadcast_world_deltas(&mut server, &sim);
             accumulator -= tick_dt;
-
-            if sim.tick().is_multiple_of(120) {
-                log::debug!(
-                    "authoritative tick={} clients={}",
-                    sim.tick(),
-                    server.clients_id().len()
-                );
-            }
         }
 
         {

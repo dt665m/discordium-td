@@ -12,4 +12,5 @@ log.workspace = true
 renet.workspace = true
 renet_cross = { workspace = true, features = ["axum"] }
 tokio.workspace = true
+tower-http = { version = "0.6.6", features = ["cors"] }
 vleue_navigator = "0.15.0"

@@ -1,33 +1,39 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
-    thread,
     time::Duration,
 };
+#[cfg(not(target_arch = "wasm32"))]
+use std::{
+    net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
+    thread,
+};
 
+use bevy::dev_tools::fps_overlay::{FpsOverlayConfig, FpsOverlayPlugin, FrameTimeGraphConfig};
 use bevy::{
     app::AppExit,
-    dev_tools::fps_overlay::{FpsOverlayConfig, FpsOverlayPlugin, FrameTimeGraphConfig},
+    asset::RenderAssetUsages,
+    light::NotShadowCaster,
     prelude::*,
+    render::render_resource::{Extent3d, TextureDimension, TextureFormat},
 };
+#[cfg(not(target_arch = "wasm32"))]
 use clap::Parser;
+#[cfg(not(target_arch = "wasm32"))]
 use game_server::{ServerArgs, run as run_server};
 use game_shared::{
     AbilityId, AttackPhase, BASE_POSITION, BUILD_COMMAND_MAX_DISTANCE, BUILD_NODES, BuildNodeDef,
     ChargePhase, ClientCommand, DirectionalAttackStateComponent, ENEMY_REGULAR_ATTACK,
-    EnemySnapshot, FIXED_DT_SECONDS, HERO_ABILITY_RADIUS, HERO_COLLIDER_RADIUS, HERO_MAX_HP,
-    HERO_MAX_MANA, HERO_REGULAR_ATTACK, HERO_SPEED, HeroSnapshot, JoinSnapshot, MatchPhase,
-    ObjectiveSnapshot, PROTOCOL_ID, ReliableGameEvent, ReliableServerMessage, SERVER_TICK_HZ,
-    TOWER_COLLIDER_RADIUS, TowerSnapshot, TowerType, WorldDelta, clamp_to_world, distance_sq,
-    encode, enemy_collider_radius, is_newer_input_seq, normalize_or_zero,
+    EnemySnapshot, FIXED_DT_SECONDS, HERO_COLLIDER_RADIUS, HERO_MAX_HP, HERO_MAX_MANA,
+    HERO_REGULAR_ATTACK, HERO_SPEED, HeroSnapshot, JoinSnapshot, MatchPhase, ObjectiveSnapshot,
+    PROTOCOL_ID, ReliableGameEvent, ReliableServerMessage, TOWER_COLLIDER_RADIUS, TowerSnapshot,
+    TowerType, WorldDelta, clamp_to_world, distance_sq, encode, enemy_collider_radius,
+    is_newer_input_seq, normalize_or_zero,
 };
 use renet::{DefaultChannel, RenetClient};
-use renet_cross::UdpNetcodeClientTransport;
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen_futures::spawn_local;
 
-use super::lock_on::{
-    LockMarkerConfig, LockMarkerSource, LockMode, LockOnPlugin, LockTarget, LockableTarget,
-    select_next_lock_target, sync_lock_markers,
-};
+use super::lock_on::{LockOnPlugin, select_next_lock_target};
 
 const ABILITY_EFFECT_DURATION_SECONDS: f32 = 0.55;
 const ABILITY_EFFECT_START_RADIUS: f32 = 0.8;
@@ -70,19 +76,78 @@ const UNIT_BAR_ENEMY_Y: f32 = 0.78;
 const UNIT_BAR_ROW_GAP: f32 = 0.17;
 const UNIT_BAR_FILL_Z: f32 = 0.03;
 const MIN_BAR_FILL_RATIO: f32 = 0.01;
+#[cfg(not(target_arch = "wasm32"))]
 const LOCAL_HOST_HTTP_PORT: u16 = 18080;
+#[cfg(not(target_arch = "wasm32"))]
 const LOCAL_HOST_UDP_PORT: u16 = 15000;
+#[cfg(not(target_arch = "wasm32"))]
 const LOCAL_HOST_WEBRTC_PORT: u16 = 15001;
 const MENU_BUTTON_NORMAL: Color = Color::srgb(0.15, 0.19, 0.23);
 const MENU_BUTTON_HOVERED: Color = Color::srgb(0.22, 0.29, 0.34);
 const MENU_BUTTON_PRESSED: Color = Color::srgb(0.28, 0.43, 0.5);
-const MENU_PANEL_COLOR: Color = Color::srgba(0.03, 0.04, 0.05, 0.88);
+const MENU_BUTTON_DISABLED: Color = Color::srgba(0.2, 0.21, 0.23, 0.74);
+const MENU_PANEL_COLOR: Color = Color::srgba(0.03, 0.04, 0.05, 0.76);
+const SPECIAL_SKILL_ICON_SIZE: f32 = 76.0;
+const SPECIAL_SKILL_ICON_MARGIN: f32 = 18.0;
+const SPECIAL_SKILL_ICON_READY_BG: Color = Color::srgba(0.11, 0.2, 0.32, 0.58);
+const SPECIAL_SKILL_ICON_COOLDOWN_BG: Color = Color::srgba(0.08, 0.09, 0.1, 0.46);
+const SPECIAL_SKILL_ICON_BORDER: Color = Color::srgba(0.64, 0.76, 0.88, 0.8);
+const SPECIAL_SKILL_ICON_KEY_COLOR: Color = Color::srgb(0.95, 0.98, 1.0);
+const SPECIAL_SKILL_ICON_OVERLAY: Color = Color::srgba(0.44, 0.46, 0.5, 0.5);
+const POWER_PIE_SLOT_SIZE: f32 = 126.0;
+const POWER_PIE_BASE_SIZE: f32 = 92.0;
+const POWER_PIE_ACTIVE_SIZE: f32 = 106.0;
+const POWER_PIE_ACTIVE_PULSE_SIZE: f32 = 8.0;
+const POWER_PIE_LEFT_OFFSET: f32 = SPECIAL_SKILL_ICON_MARGIN;
+const POWER_PIE_BOTTOM_OFFSET: f32 = SPECIAL_SKILL_ICON_MARGIN - 12.0;
+const SPECIAL_SKILL_ICON_LEFT_OFFSET: f32 = POWER_PIE_LEFT_OFFSET + POWER_PIE_SLOT_SIZE + 12.0;
+const POWER_PIE_TEXTURE_SIZE: u32 = 96;
+const POWER_PIE_EMPTY_COLOR: Color = Color::srgba(0.11, 0.12, 0.16, 0.62);
+const POWER_PIE_FILL_COLOR: Color = Color::srgba(0.31, 0.92, 0.98, 0.82);
+const POWER_PIE_FILL_ACTIVE_COLOR: Color = Color::srgba(1.0, 0.86, 0.25, 0.9);
+const POWER_PIE_BORDER_COLOR: Color = Color::srgb(0.42, 0.74, 0.98);
+const POWER_PIE_BORDER_ACTIVE_COLOR: Color = Color::srgb(1.0, 0.92, 0.44);
+const POWER_PIE_BG_COLOR: Color = Color::srgba(0.05, 0.08, 0.12, 0.58);
+const POWER_PIE_BG_ACTIVE_COLOR: Color = Color::srgba(0.21, 0.16, 0.06, 0.64);
+const POWER_PIE_FLASH_HZ: f32 = 7.0;
+const POWER_PIE_FLASH_BUCKETS: u32 = 18;
+const LOCKED_HEALTH_BAR_SCALE_MULTIPLIER: f32 = 1.5;
+const GOLD_HUD_PANEL_COLOR: Color = Color::srgba(0.05, 0.07, 0.08, 0.6);
+const GOLD_HUD_BORDER_COLOR: Color = Color::srgba(0.47, 0.55, 0.6, 0.78);
+const GOLD_HUD_LABEL_COLOR: Color = Color::srgb(0.86, 0.9, 0.95);
+const GOLD_HUD_VALUE_COLOR: Color = Color::srgb(1.0, 0.9, 0.45);
+const GOLD_SPEND_TEXT_COLOR: Color = Color::srgba(1.0, 0.23, 0.2, 0.95);
+const GOLD_HUD_RIGHT_OFFSET: f32 = 16.0;
+const GOLD_HUD_TOP_OFFSET: f32 = 12.0;
+const GOLD_SPEND_POPUP_DURATION_SECONDS: f32 = 0.75;
+const GOLD_SPEND_POPUP_START_TOP: f32 = 34.0;
+const GOLD_SPEND_POPUP_RISE_PIXELS: f32 = 16.0;
+const MATCH_END_OVERLAY_BG: Color = Color::srgba(0.04, 0.07, 0.1, 0.74);
+const MATCH_END_OVERLAY_BORDER: Color = Color::srgba(0.53, 0.65, 0.76, 0.84);
+const MATCH_END_OVERLAY_TITLE: Color = Color::srgb(0.94, 0.97, 1.0);
+const MATCH_END_OVERLAY_DEFEAT_TITLE: Color = Color::srgb(1.0, 0.78, 0.72);
 
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone, Resource, Parser)]
 #[command(name = "game_client")]
 pub struct ClientArgs {
     #[arg(long, env = "TD_HTTP_BASE", default_value = "http://127.0.0.1:8080")]
     http_base: String,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Debug, Clone, Resource)]
+pub struct ClientArgs {
+    http_base: String,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl Default for ClientArgs {
+    fn default() -> Self {
+        Self {
+            http_base: default_http_base(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -91,16 +156,21 @@ struct PendingMove {
     dir: [f32; 2],
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+type ClientTransport = renet_cross::UdpNetcodeClientTransport;
+#[cfg(target_arch = "wasm32")]
+type ClientTransport = renet_cross::WebRtcNetcodeClientTransport;
+
 struct NetworkRuntime {
     client_id: u64,
     next_seq: u32,
     pending_moves: VecDeque<PendingMove>,
     renet: RenetClient,
-    transport: UdpNetcodeClientTransport,
+    transport: ClientTransport,
 }
 
 impl NetworkRuntime {
-    fn new(client_id: u64, renet: RenetClient, transport: UdpNetcodeClientTransport) -> Self {
+    fn new(client_id: u64, renet: RenetClient, transport: ClientTransport) -> Self {
         Self {
             client_id,
             next_seq: 0,
@@ -110,10 +180,29 @@ impl NetworkRuntime {
         }
     }
 
+    fn transport_update(&mut self, duration: Duration) -> Result<(), String> {
+        self.transport
+            .update(duration, &mut self.renet)
+            .map_err(|err| err.to_string())
+    }
+
+    fn transport_send_packets(&mut self) -> Result<(), String> {
+        self.transport
+            .send_packets(&mut self.renet)
+            .map_err(|err| err.to_string())
+    }
+
     fn next_command_seq(&mut self) -> u32 {
         self.next_seq = self.next_seq.wrapping_add(1);
         self.next_seq
     }
+}
+
+#[cfg(target_arch = "wasm32")]
+struct PendingWebBootstrap {
+    slot: std::rc::Rc<
+        std::cell::RefCell<Option<Result<(RenetClient, ClientTransport, u64), String>>>,
+    >,
 }
 
 #[derive(Resource, Default)]
@@ -151,11 +240,13 @@ struct HudState {
 
 #[derive(Clone, Copy)]
 enum MenuAction {
+    #[cfg(not(target_arch = "wasm32"))]
     SinglePlayer,
     ConnectDev,
 }
 
 #[derive(Clone)]
+#[cfg(not(target_arch = "wasm32"))]
 struct LocalHostedServer {
     local_http_base: String,
     public_http_base: String,
@@ -164,7 +255,9 @@ struct LocalHostedServer {
 #[derive(Resource)]
 struct MainMenuState {
     pending_action: Option<MenuAction>,
+    connect_request_in_flight: bool,
     status: String,
+    #[cfg(not(target_arch = "wasm32"))]
     hosted_server: Option<LocalHostedServer>,
 }
 
@@ -172,10 +265,43 @@ impl Default for MainMenuState {
     fn default() -> Self {
         Self {
             pending_action: None,
+            connect_request_in_flight: false,
             status: "Select a mode to start.".to_owned(),
+            #[cfg(not(target_arch = "wasm32"))]
             hosted_server: None,
         }
     }
+}
+
+#[derive(Resource, Default)]
+struct SpecialSkillCooldownUiState {
+    last_ticks_remaining: u32,
+    max_ticks_remaining: u32,
+}
+
+#[derive(Resource)]
+struct PowerPieUiTexture {
+    handle: Handle<Image>,
+}
+
+#[derive(Resource, Default)]
+struct PowerPieUiState {
+    last_ratio: f32,
+    last_flash_bucket: u32,
+    last_power_active: bool,
+    initialized: bool,
+}
+
+#[derive(Resource)]
+struct PowerPieRasterCache {
+    size: u32,
+    inside: Vec<bool>,
+    clockwise_angle: Vec<f32>,
+}
+
+#[derive(Resource, Default)]
+struct GoldHudState {
+    last_gold: Option<u32>,
 }
 
 #[derive(Resource)]
@@ -214,6 +340,7 @@ struct RenderIndex {
 struct WorldView {
     tick: u32,
     phase: MatchPhase,
+    match_restart_ticks_remaining: Option<u32>,
     wave: u32,
     team_life: i32,
     you: Option<u64>,
@@ -234,6 +361,7 @@ impl WorldView {
     fn apply_delta(&mut self, delta: WorldDelta) {
         self.tick = delta.tick;
         self.phase = delta.phase;
+        self.match_restart_ticks_remaining = delta.match_restart_ticks_remaining;
         self.wave = delta.wave;
         self.team_life = delta.team_life;
         self.objectives = delta.objectives;
@@ -271,7 +399,7 @@ struct EnemyActor;
 #[derive(Component)]
 struct TowerActor;
 
-#[derive(Component, Clone, Copy)]
+#[derive(Component, Clone, Copy, PartialEq)]
 struct TowerBuildNode {
     node_id: u32,
 }
@@ -288,6 +416,35 @@ struct ObjectiveMarker;
 struct HudText;
 
 #[derive(Component)]
+struct SpecialSkillIcon;
+
+#[derive(Component)]
+struct SpecialSkillCooldownOverlay;
+
+#[derive(Component)]
+struct SpecialSkillKeyText;
+
+#[derive(Component)]
+struct PowerPieHudRoot;
+
+#[derive(Component)]
+struct PowerPieCircle;
+
+#[derive(Component)]
+struct PowerPieFillImage;
+
+#[derive(Component)]
+struct GoldHudRoot;
+
+#[derive(Component)]
+struct GoldHudValueText;
+
+#[derive(Component)]
+struct GoldSpendPopup {
+    age_seconds: f32,
+}
+
+#[derive(Component)]
 struct MainMenuRoot;
 
 #[derive(Component)]
@@ -295,6 +452,12 @@ struct MainMenuStatusText;
 
 #[derive(Component, Clone, Copy)]
 struct MainMenuButton(MenuAction);
+
+#[derive(Component)]
+struct MatchEndOverlayRoot;
+
+#[derive(Component)]
+struct MatchEndOverlayText;
 
 #[derive(Component)]
 struct UnitBarCamera;
@@ -355,25 +518,25 @@ enum BarStat {
     Power,
 }
 
-#[derive(Component, Clone, Copy)]
+#[derive(Component, Clone, Copy, PartialEq)]
 struct HealthStat {
     current: f32,
     max: f32,
 }
 
-#[derive(Component, Clone, Copy)]
+#[derive(Component, Clone, Copy, PartialEq)]
 struct ManaStat {
     current: f32,
     max: f32,
 }
 
-#[derive(Component, Clone, Copy)]
+#[derive(Component, Clone, Copy, PartialEq)]
 struct PowerStat {
     current: f32,
     max: f32,
 }
 
-#[derive(Component, Clone, Copy)]
+#[derive(Component, Clone, Copy, PartialEq)]
 struct ChargeStateStat {
     phase: ChargePhase,
     power_active: bool,
@@ -427,12 +590,12 @@ impl Default for UnitBarBillboardState {
 #[derive(Component)]
 struct FacingIndicatorVisual;
 
-#[derive(Component, Clone, Copy)]
+#[derive(Component, Clone, Copy, PartialEq)]
 struct FacingStat {
     dir: [f32; 2],
 }
 
-#[derive(Component, Clone, Copy)]
+#[derive(Component, Clone, Copy, PartialEq)]
 struct RegularAttackStat {
     phase: AttackPhase,
     ticks_remaining: u32,
@@ -456,10 +619,6 @@ struct DesiredActor {
     power: Option<PowerStat>,
     charge_state: Option<ChargeStateStat>,
     tower_node: Option<TowerBuildNode>,
-    lock_mode: Option<LockMode>,
-    lock_target: Option<LockTarget>,
-    lock_marker_source: bool,
-    lockable_target: Option<LockableTarget>,
 }
 
 #[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -479,6 +638,9 @@ impl Plugin for GameClientPlugin {
             .insert_resource(LocalHeroSmoothing::default())
             .insert_resource(UnitBarCameraCache::default())
             .insert_resource(HudState::default())
+            .insert_resource(SpecialSkillCooldownUiState::default())
+            .insert_resource(PowerPieUiState::default())
+            .insert_resource(GoldHudState::default())
             .insert_resource(MainMenuState::default())
             .insert_resource(WorldView::default())
             .insert_resource(RenderIndex::default())
@@ -492,22 +654,6 @@ impl Plugin for GameClientPlugin {
                 }),
                 ..Default::default()
             }))
-            .add_plugins(FpsOverlayPlugin {
-                config: FpsOverlayConfig {
-                    text_config: TextFont {
-                        font_size: 16.0,
-                        ..Default::default()
-                    },
-                    text_color: Color::srgb(0.85, 0.95, 0.9),
-                    refresh_interval: std::time::Duration::from_millis(120),
-                    enabled: true,
-                    frame_time_graph_config: FrameTimeGraphConfig {
-                        enabled: false,
-                        min_fps: 30.0,
-                        target_fps: 60.0,
-                    },
-                },
-            })
             .add_plugins(LockOnPlugin)
             .add_systems(Startup, (setup_scene, setup_main_menu))
             .configure_sets(
@@ -532,7 +678,12 @@ impl Plugin for GameClientPlugin {
             .add_systems(Update, capture_input.in_set(ClientUpdateSet::Input))
             .add_systems(
                 Update,
-                (send_action_commands, network_update)
+                (
+                    send_action_commands,
+                    #[cfg(target_arch = "wasm32")]
+                    poll_web_bootstrap,
+                    network_update,
+                )
                     .chain()
                     .in_set(ClientUpdateSet::Network),
             )
@@ -544,26 +695,35 @@ impl Plugin for GameClientPlugin {
                     update_tower_shot_effects,
                     update_regular_attack_effects,
                     sync_dynamic_actors,
-                    sync_lock_markers,
-                    cleanup_orphan_unit_bars,
+                    cleanup_orphan_unit_bars.run_if(resource_changed::<WorldView>),
                     update_actor_facing_and_attack_visuals,
                     update_local_hero_power_flicker,
                     update_hero_hit_reactions,
                     update_enemy_hit_reactions,
                     update_tower_fire_reactions,
-                    update_unit_bars,
-                    update_unit_bar_visibility,
+                    update_unit_bars.run_if(resource_changed::<WorldView>),
+                    update_unit_bar_background_scales.run_if(resource_changed::<WorldView>),
+                    update_unit_bar_visibility.run_if(resource_changed::<WorldView>),
                     publish_unit_bar_camera_updates,
                     orient_unit_bars_to_camera,
-                    update_build_node_markers,
-                    update_objective_markers,
+                    update_build_node_markers.run_if(resource_changed::<WorldView>),
+                    update_objective_markers.run_if(resource_changed::<WorldView>),
                 )
                     .chain()
                     .in_set(ClientUpdateSet::Visual),
             )
             .add_systems(
                 Update,
-                (update_hud, sync_main_menu_state)
+                (
+                    update_hud,
+                    update_gold_hud.run_if(resource_changed::<WorldView>),
+                    update_gold_spend_popups,
+                    update_special_skill_hud.run_if(resource_changed::<WorldView>),
+                    update_power_pie_hud,
+                    update_match_end_overlay.run_if(resource_changed::<WorldView>),
+                    sync_menu_button_visual_state,
+                    sync_main_menu_state,
+                )
                     .chain()
                     .in_set(ClientUpdateSet::Ui),
             )
@@ -573,6 +733,23 @@ impl Plugin for GameClientPlugin {
             )
             .add_observer(apply_unit_bar_camera_update)
             .add_systems(FixedUpdate, send_movement_commands);
+
+        app.add_plugins(FpsOverlayPlugin {
+            config: FpsOverlayConfig {
+                text_config: TextFont {
+                    font_size: 16.0,
+                    ..Default::default()
+                },
+                text_color: Color::srgb(0.85, 0.95, 0.9),
+                refresh_interval: std::time::Duration::from_millis(120),
+                enabled: true,
+                frame_time_graph_config: FrameTimeGraphConfig {
+                    enabled: false,
+                    min_fps: 30.0,
+                    target_fps: 60.0,
+                },
+            },
+        });
     }
 }
 
@@ -580,6 +757,7 @@ fn setup_scene(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut images: ResMut<Assets<Image>>,
 ) {
     let hero_mesh = meshes.add(Capsule3d::new(0.45, 0.8));
     let enemy_mesh = meshes.add(Sphere::new(0.5));
@@ -752,6 +930,18 @@ fn setup_scene(
         UnitBarCamera,
     ));
 
+    let power_pie_raster_cache = build_power_pie_raster_cache(POWER_PIE_TEXTURE_SIZE);
+    let power_pie_texture = images.add(build_power_pie_image(
+        &power_pie_raster_cache,
+        0.0,
+        POWER_PIE_FILL_COLOR,
+        POWER_PIE_EMPTY_COLOR,
+    ));
+    commands.insert_resource(PowerPieUiTexture {
+        handle: power_pie_texture.clone(),
+    });
+    commands.insert_resource(power_pie_raster_cache);
+
     commands.spawn((
         Node {
             position_type: PositionType::Absolute,
@@ -763,6 +953,167 @@ fn setup_scene(
         TextColor(Color::WHITE),
         HudText,
     ));
+
+    commands
+        .spawn((
+            MatchEndOverlayRoot,
+            Node {
+                position_type: PositionType::Absolute,
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                display: Display::None,
+                ..Default::default()
+            },
+            GlobalZIndex(32),
+        ))
+        .with_children(|parent| {
+            parent.spawn((
+                Node {
+                    padding: UiRect::axes(Val::Px(26.0), Val::Px(16.0)),
+                    border: UiRect::all(Val::Px(2.0)),
+                    border_radius: BorderRadius::all(Val::Px(12.0)),
+                    ..Default::default()
+                },
+                BorderColor::all(MATCH_END_OVERLAY_BORDER),
+                BackgroundColor(MATCH_END_OVERLAY_BG),
+                Text::new(""),
+                TextFont {
+                    font_size: 30.0,
+                    ..Default::default()
+                },
+                TextLayout::new_with_justify(Justify::Center),
+                TextColor(MATCH_END_OVERLAY_TITLE),
+                MatchEndOverlayText,
+            ));
+        });
+
+    commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Px(SPECIAL_SKILL_ICON_LEFT_OFFSET),
+                bottom: Val::Px(SPECIAL_SKILL_ICON_MARGIN),
+                width: Val::Px(SPECIAL_SKILL_ICON_SIZE),
+                height: Val::Px(SPECIAL_SKILL_ICON_SIZE),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                border: UiRect::all(Val::Px(2.0)),
+                border_radius: BorderRadius::all(Val::Px(7.0)),
+                overflow: Overflow::clip(),
+                ..Default::default()
+            },
+            BorderColor::all(SPECIAL_SKILL_ICON_BORDER),
+            BackgroundColor(SPECIAL_SKILL_ICON_READY_BG),
+            SpecialSkillIcon,
+        ))
+        .with_children(|parent| {
+            parent.spawn((
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: Val::Px(0.0),
+                    right: Val::Px(0.0),
+                    bottom: Val::Px(0.0),
+                    height: Val::Percent(0.0),
+                    ..Default::default()
+                },
+                BackgroundColor(SPECIAL_SKILL_ICON_OVERLAY),
+                Visibility::Hidden,
+                SpecialSkillCooldownOverlay,
+            ));
+            parent.spawn((
+                Text::new("K"),
+                TextFont {
+                    font_size: 34.0,
+                    ..Default::default()
+                },
+                TextColor(SPECIAL_SKILL_ICON_KEY_COLOR),
+                SpecialSkillKeyText,
+            ));
+        });
+
+    let pie_inset = (POWER_PIE_SLOT_SIZE - POWER_PIE_BASE_SIZE) * 0.5;
+    commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Px(POWER_PIE_LEFT_OFFSET),
+                bottom: Val::Px(POWER_PIE_BOTTOM_OFFSET),
+                width: Val::Px(POWER_PIE_SLOT_SIZE),
+                height: Val::Px(POWER_PIE_SLOT_SIZE),
+                ..Default::default()
+            },
+            PowerPieHudRoot,
+        ))
+        .with_children(|parent| {
+            parent
+                .spawn((
+                    Node {
+                        position_type: PositionType::Absolute,
+                        left: Val::Px(pie_inset),
+                        bottom: Val::Px(pie_inset),
+                        width: Val::Px(POWER_PIE_BASE_SIZE),
+                        height: Val::Px(POWER_PIE_BASE_SIZE),
+                        border: UiRect::all(Val::Px(2.0)),
+                        border_radius: BorderRadius::all(Val::Px(9999.0)),
+                        overflow: Overflow::clip(),
+                        ..Default::default()
+                    },
+                    BorderColor::all(POWER_PIE_BORDER_COLOR),
+                    BackgroundColor(POWER_PIE_BG_COLOR),
+                    PowerPieCircle,
+                ))
+                .with_children(|circle| {
+                    circle.spawn((
+                        Node {
+                            width: Val::Percent(100.0),
+                            height: Val::Percent(100.0),
+                            ..Default::default()
+                        },
+                        ImageNode::new(power_pie_texture.clone()),
+                        PowerPieFillImage,
+                    ));
+                });
+        });
+
+    commands
+        .spawn((
+            GoldHudRoot,
+            Node {
+                position_type: PositionType::Absolute,
+                right: Val::Px(GOLD_HUD_RIGHT_OFFSET),
+                top: Val::Px(GOLD_HUD_TOP_OFFSET),
+                padding: UiRect::axes(Val::Px(14.0), Val::Px(8.0)),
+                border: UiRect::all(Val::Px(1.0)),
+                border_radius: BorderRadius::all(Val::Px(8.0)),
+                flex_direction: FlexDirection::Column,
+                align_items: AlignItems::FlexEnd,
+                row_gap: Val::Px(2.0),
+                ..Default::default()
+            },
+            BorderColor::all(GOLD_HUD_BORDER_COLOR),
+            BackgroundColor(GOLD_HUD_PANEL_COLOR),
+        ))
+        .with_children(|parent| {
+            parent.spawn((
+                Text::new("GOLD"),
+                TextFont {
+                    font_size: 13.0,
+                    ..Default::default()
+                },
+                TextColor(GOLD_HUD_LABEL_COLOR),
+            ));
+            parent.spawn((
+                Text::new("0"),
+                TextFont {
+                    font_size: 30.0,
+                    ..Default::default()
+                },
+                TextColor(GOLD_HUD_VALUE_COLOR),
+                GoldHudValueText,
+            ));
+        });
 }
 
 fn setup_main_menu(mut commands: Commands) {
@@ -811,6 +1162,7 @@ fn setup_main_menu(mut commands: Commands) {
                         TextColor(Color::srgb(0.7, 0.78, 0.84)),
                     ));
 
+                    #[cfg(not(target_arch = "wasm32"))]
                     panel
                         .spawn((
                             Button,
@@ -887,10 +1239,16 @@ fn handle_menu_buttons(
     >,
 ) {
     for (interaction, button_action, mut background_color) in &mut button_query {
+        if menu_state.connect_request_in_flight {
+            *background_color = MENU_BUTTON_DISABLED.into();
+            continue;
+        }
+
         match *interaction {
             Interaction::Pressed => {
                 menu_state.pending_action = Some(button_action.0);
-                *background_color = MENU_BUTTON_PRESSED.into();
+                menu_state.connect_request_in_flight = true;
+                *background_color = MENU_BUTTON_DISABLED.into();
             }
             Interaction::Hovered => {
                 *background_color = MENU_BUTTON_HOVERED.into();
@@ -902,9 +1260,34 @@ fn handle_menu_buttons(
     }
 }
 
+fn sync_menu_button_visual_state(
+    menu_state: Res<MainMenuState>,
+    mut buttons: Query<(&Interaction, &mut BackgroundColor), With<MainMenuButton>>,
+) {
+    if !menu_state.is_changed() {
+        return;
+    }
+
+    for (interaction, mut background_color) in &mut buttons {
+        *background_color = if menu_state.connect_request_in_flight {
+            MENU_BUTTON_DISABLED
+        } else {
+            match *interaction {
+                Interaction::Pressed => MENU_BUTTON_PRESSED,
+                Interaction::Hovered => MENU_BUTTON_HOVERED,
+                Interaction::None => MENU_BUTTON_NORMAL,
+            }
+        }
+        .into();
+    }
+}
+
 fn process_menu_actions(world: &mut World) {
     let action = {
         let mut menu_state = world.resource_mut::<MainMenuState>();
+        if !menu_state.connect_request_in_flight {
+            return;
+        }
         menu_state.pending_action.take()
     };
     let Some(action) = action else {
@@ -920,6 +1303,7 @@ fn process_menu_actions(world: &mut World) {
             );
             connect_to_bootstrap(world, &http_base, 1);
         }
+        #[cfg(not(target_arch = "wasm32"))]
         MenuAction::SinglePlayer => {
             let Some((local_http_base, public_http_base)) = ensure_local_server_running(world)
             else {
@@ -937,6 +1321,7 @@ fn process_menu_actions(world: &mut World) {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn ensure_local_server_running(world: &mut World) -> Option<(String, String)> {
     if let Some(hosted) = world.resource::<MainMenuState>().hosted_server.clone() {
         return Some((hosted.local_http_base, hosted.public_http_base));
@@ -983,6 +1368,7 @@ fn ensure_local_server_running(world: &mut World) -> Option<(String, String)> {
     Some((local_http_base, public_http_base))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn connect_to_bootstrap(world: &mut World, http_base: &str, attempts: u32) {
     if let Some(mut existing) = world.remove_non_send_resource::<NetworkRuntime>() {
         graceful_disconnect_runtime(&mut existing, "reconnect");
@@ -996,13 +1382,7 @@ fn connect_to_bootstrap(world: &mut World, http_base: &str, attempts: u32) {
             renet_cross::NativeConnectOptions::default(),
         ) {
             Ok((renet, transport, client_id)) => {
-                world.insert_non_send_resource(NetworkRuntime::new(client_id, renet, transport));
-                world.resource_mut::<WorldView>().you = Some(client_id);
-                set_menu_status(
-                    world,
-                    format!("Connected via {http_base}. Waiting for join snapshot..."),
-                );
-                log::info!("bootstrap session created with client_id={client_id}");
+                on_bootstrap_connected(world, http_base, client_id, renet, transport);
                 return;
             }
             Err(err) => {
@@ -1018,8 +1398,83 @@ fn connect_to_bootstrap(world: &mut World, http_base: &str, attempts: u32) {
         "Connect failed via {http_base}: {}",
         last_error.unwrap_or_else(|| "unknown error".to_owned())
     );
+    on_bootstrap_failed(world, &message);
+}
+
+#[cfg(target_arch = "wasm32")]
+fn connect_to_bootstrap(world: &mut World, http_base: &str, _attempts: u32) {
+    if let Some(mut existing) = world.remove_non_send_resource::<NetworkRuntime>() {
+        graceful_disconnect_runtime(&mut existing, "reconnect");
+    }
+    world.remove_non_send_resource::<PendingWebBootstrap>();
+
+    let http_base = http_base.trim_end_matches('/').to_owned();
+    let slot = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let slot_clone = std::rc::Rc::clone(&slot);
+    let request_base = http_base.clone();
+    spawn_local(async move {
+        let result = renet_cross::connect_via_sdp_http(&request_base, PROTOCOL_ID)
+            .await
+            .map_err(|err| err.to_string());
+        *slot_clone.borrow_mut() = Some(result);
+    });
+    world.insert_non_send_resource(PendingWebBootstrap { slot });
+    set_menu_status(
+        world,
+        format!("Connecting via {http_base} (WebRTC bootstrap)..."),
+    );
+}
+
+fn on_bootstrap_connected(
+    world: &mut World,
+    http_base: &str,
+    client_id: u64,
+    renet: RenetClient,
+    transport: ClientTransport,
+) {
+    world.insert_non_send_resource(NetworkRuntime::new(client_id, renet, transport));
+    world.resource_mut::<WorldView>().you = Some(client_id);
+    world
+        .resource_mut::<MainMenuState>()
+        .connect_request_in_flight = false;
+    set_menu_status(
+        world,
+        format!("Connected via {http_base}. Waiting for join snapshot..."),
+    );
+    log::info!("bootstrap session created with client_id={client_id}");
+}
+
+fn on_bootstrap_failed(world: &mut World, message: &str) {
+    world
+        .resource_mut::<MainMenuState>()
+        .connect_request_in_flight = false;
     log::error!("{message}");
-    set_menu_status(world, message);
+    set_menu_status(world, message.to_owned());
+}
+
+#[cfg(target_arch = "wasm32")]
+fn poll_web_bootstrap(world: &mut World) {
+    let result = {
+        let Some(pending) = world.get_non_send_resource_mut::<PendingWebBootstrap>() else {
+            return;
+        };
+        pending.slot.borrow_mut().take()
+    };
+    let Some(result) = result else {
+        return;
+    };
+
+    match result {
+        Ok((renet, transport, client_id)) => {
+            let http_base = world.resource::<ClientArgs>().http_base.clone();
+            on_bootstrap_connected(world, &http_base, client_id, renet, transport);
+        }
+        Err(err) => {
+            let http_base = world.resource::<ClientArgs>().http_base.clone();
+            on_bootstrap_failed(world, &format!("Connect failed via {http_base}: {err}"));
+        }
+    }
+    world.remove_non_send_resource::<PendingWebBootstrap>();
 }
 
 fn graceful_disconnect_runtime(runtime: &mut NetworkRuntime, reason: &str) {
@@ -1028,7 +1483,7 @@ fn graceful_disconnect_runtime(runtime: &mut NetworkRuntime, reason: &str) {
     }
 
     runtime.renet.disconnect();
-    if let Err(err) = runtime.transport.update(Duration::ZERO, &mut runtime.renet) {
+    if let Err(err) = runtime.transport_update(Duration::ZERO) {
         log::warn!("failed to send disconnect packet during {reason}: {err}");
     } else {
         log::info!("sent graceful disconnect packet during {reason}");
@@ -1054,6 +1509,7 @@ fn set_menu_status(world: &mut World, status: String) {
     world.resource_mut::<HudState>().last_event = status;
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn detect_lan_ip() -> Option<IpAddr> {
     let socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))).ok()?;
     socket
@@ -1062,27 +1518,37 @@ fn detect_lan_ip() -> Option<IpAddr> {
     Some(socket.local_addr().ok()?.ip())
 }
 
+#[cfg(target_arch = "wasm32")]
+fn default_http_base() -> String {
+    if let Some(configured) = option_env!("TD_WEB_HTTP_BASE") {
+        let trimmed = configured.trim();
+        if !trimmed.is_empty() {
+            return trimmed.trim_end_matches('/').to_owned();
+        }
+    }
+
+    web_sys::window()
+        .and_then(|window| window.location().origin().ok())
+        .unwrap_or_else(|| "http://127.0.0.1:8080".to_owned())
+}
+
 fn sync_main_menu_state(
     runtime: Option<NonSend<NetworkRuntime>>,
     menu_state: Res<MainMenuState>,
-    mut menu_root: Query<&mut Node, With<MainMenuRoot>>,
-    mut status_text: Query<&mut Text, With<MainMenuStatusText>>,
+    mut menu_root: Single<&mut Node, With<MainMenuRoot>>,
+    mut status_text: Single<&mut Text, With<MainMenuStatusText>>,
 ) {
-    if let Ok(mut root) = menu_root.single_mut() {
-        root.display = if runtime
-            .as_ref()
-            .map(|runtime| runtime.renet.is_connected())
-            .unwrap_or(false)
-        {
-            Display::None
-        } else {
-            Display::Flex
-        };
-    }
+    let runtime_active = runtime
+        .as_ref()
+        .map(|runtime| runtime.renet.is_connected() || runtime.renet.is_connecting())
+        .unwrap_or(false);
 
-    if let Ok(mut text) = status_text.single_mut() {
-        text.0 = menu_state.status.clone();
-    }
+    menu_root.display = if runtime_active {
+        Display::None
+    } else {
+        Display::Flex
+    };
+    status_text.0 = menu_state.status.clone();
 }
 
 fn capture_input(keyboard: Res<ButtonInput<KeyCode>>, mut input_state: ResMut<InputState>) {
@@ -1263,13 +1729,8 @@ fn network_update(
 
     let dt = Duration::from_secs_f32(time.delta_secs().clamp(0.0, 0.1));
     runtime_inner.renet.update(dt);
-    {
-        let NetworkRuntime {
-            transport, renet, ..
-        } = runtime_inner;
-        if let Err(err) = transport.update(dt, renet) {
-            log::warn!("client transport update failed: {err}");
-        }
+    if let Err(err) = runtime_inner.transport_update(dt) {
+        log::warn!("client transport update failed: {err}");
     }
 
     while let Some(bytes) = runtime_inner
@@ -1288,8 +1749,14 @@ fn network_update(
             }
             Ok(ReliableServerMessage::Event(event)) => {
                 match &event {
-                    ReliableGameEvent::AbilityCast { pos, .. } => {
-                        spawn_ability_effect(&mut commands, &mut materials, &scene_assets, *pos);
+                    ReliableGameEvent::AbilityCast { pos, radius, .. } => {
+                        spawn_ability_effect(
+                            &mut commands,
+                            &mut materials,
+                            &scene_assets,
+                            *pos,
+                            *radius,
+                        );
                     }
                     _ => {}
                 }
@@ -1319,6 +1786,7 @@ fn network_update(
                         &scene_assets,
                         attack.pos,
                         attack.facing,
+                        attack.range,
                         attack.enemy,
                     );
                 }
@@ -1381,13 +1849,8 @@ fn network_update(
         }
     }
 
-    {
-        let NetworkRuntime {
-            transport, renet, ..
-        } = runtime_inner;
-        if let Err(err) = transport.send_packets(renet) {
-            log::warn!("client send_packets error: {err}");
-        }
+    if let Err(err) = runtime_inner.transport_send_packets() {
+        log::warn!("client send_packets error: {err}");
     }
 }
 
@@ -1396,6 +1859,7 @@ fn spawn_ability_effect(
     materials: &mut Assets<StandardMaterial>,
     scene_assets: &SceneAssets,
     pos: [f32; 2],
+    radius: f32,
 ) {
     let material = materials.add(StandardMaterial {
         base_color: Color::srgba(0.25, 0.88, 1.0, 0.46),
@@ -1417,7 +1881,7 @@ fn spawn_ability_effect(
         AbilityEffectVisual {
             age_seconds: 0.0,
             duration_seconds: ABILITY_EFFECT_DURATION_SECONDS,
-            max_radius: HERO_ABILITY_RADIUS,
+            max_radius: radius.max(0.0),
             material,
         },
     ));
@@ -1457,6 +1921,7 @@ fn spawn_regular_attack_effect(
     scene_assets: &SceneAssets,
     pos: [f32; 2],
     facing: [f32; 2],
+    range: f32,
     enemy: bool,
 ) {
     let scene_dir = world_to_scene_plane(normalize_or_zero(facing));
@@ -1466,17 +1931,12 @@ fn spawn_regular_attack_effect(
 
     let dir = Vec3::new(scene_dir[0], 0.0, scene_dir[1]).normalize();
     let rotation = Quat::from_rotation_arc(Vec3::Z, dir);
-    let (range, cone_mesh) = if enemy {
-        (
-            ENEMY_REGULAR_ATTACK.range,
-            scene_assets.enemy_attack_cone_mesh.clone(),
-        )
+    let cone_mesh = if enemy {
+        scene_assets.enemy_attack_cone_mesh.clone()
     } else {
-        (
-            HERO_REGULAR_ATTACK.range,
-            scene_assets.hero_attack_cone_mesh.clone(),
-        )
+        scene_assets.hero_attack_cone_mesh.clone()
     };
+    let range = range.max(0.0);
 
     let (base_color, emissive) = if enemy {
         (
@@ -1560,6 +2020,7 @@ fn build_unit_attack_cone_mesh(arc_dot_threshold: f32, segments: usize) -> Mesh 
 struct RegularAttackStart {
     pos: [f32; 2],
     facing: [f32; 2],
+    range: f32,
     enemy: bool,
 }
 
@@ -1611,6 +2072,7 @@ fn detect_regular_attack_starts(world: &WorldView, delta: &WorldDelta) -> Vec<Re
             starts.push(RegularAttackStart {
                 pos: hero.pos,
                 facing: hero.facing.dir,
+                range: hero_regular_attack_effect_range(hero),
                 enemy: false,
             });
         }
@@ -1628,12 +2090,24 @@ fn detect_regular_attack_starts(world: &WorldView, delta: &WorldDelta) -> Vec<Re
             starts.push(RegularAttackStart {
                 pos: enemy.pos,
                 facing: enemy.facing.dir,
+                range: ENEMY_REGULAR_ATTACK.range,
                 enemy: true,
             });
         }
     }
 
     starts
+}
+
+fn hero_regular_attack_effect_range(hero: &HeroSnapshot) -> f32 {
+    let multiplier = if hero.charge_state.power_active {
+        hero.powered_modifiers
+            .regular_attack_range_multiplier
+            .max(0.0)
+    } else {
+        1.0
+    };
+    HERO_REGULAR_ATTACK.range * multiplier
 }
 
 fn detect_fired_tower_ids(
@@ -2007,7 +2481,19 @@ fn sync_dynamic_actors(
     mut render_index: ResMut<RenderIndex>,
     assets: Res<SceneAssets>,
     runtime: Option<NonSend<NetworkRuntime>>,
-    mut transforms: Query<&mut Transform>,
+    mut actors: Query<
+        (
+            &mut Transform,
+            Option<&mut HealthStat>,
+            Option<&mut ManaStat>,
+            Option<&mut PowerStat>,
+            Option<&mut ChargeStateStat>,
+            Option<&mut FacingStat>,
+            Option<&mut RegularAttackStat>,
+            Option<&mut TowerBuildNode>,
+        ),
+        With<DynamicActor>,
+    >,
 ) {
     let dt = time.delta_secs();
     let local_client_id = runtime.as_ref().map(|runtime| runtime.client_id);
@@ -2101,23 +2587,12 @@ fn sync_dynamic_actors(
                     current: hero.mana,
                     max: HERO_MAX_MANA,
                 }),
-                power: Some(PowerStat {
-                    current: hero.charge_state.power_meter,
-                    max: hero.charge_profile.power_meter_max,
-                }),
+                power: None,
                 charge_state: Some(ChargeStateStat {
                     phase: hero.charge_state.phase,
                     power_active: hero.charge_state.power_active,
                 }),
                 tower_node: None,
-                lock_mode: Some(LockMode {
-                    active: hero.lock_mode_active,
-                }),
-                lock_target: Some(LockTarget {
-                    target_id: hero.lock_target_id,
-                }),
-                lock_marker_source: local,
-                lockable_target: None,
             },
         );
     }
@@ -2140,10 +2615,6 @@ fn sync_dynamic_actors(
                 power: None,
                 charge_state: None,
                 tower_node: None,
-                lock_mode: None,
-                lock_target: None,
-                lock_marker_source: false,
-                lockable_target: Some(LockableTarget { id: enemy.id }),
             },
         );
     }
@@ -2163,17 +2634,23 @@ fn sync_dynamic_actors(
                 tower_node: Some(TowerBuildNode {
                     node_id: tower.node_id,
                 }),
-                lock_mode: None,
-                lock_target: None,
-                lock_marker_source: false,
-                lockable_target: None,
             },
         );
     }
 
     for (id, actor) in &desired {
         if let Some(existing_entity) = render_index.by_id.get(id).copied() {
-            if let Ok(mut transform) = transforms.get_mut(existing_entity) {
+            if let Ok((
+                mut transform,
+                health,
+                mana,
+                power,
+                charge_state,
+                facing,
+                regular_attack,
+                tower_node,
+            )) = actors.get_mut(existing_entity)
+            {
                 let target_translation = world_to_translation(actor.pos, actor_y(actor.kind));
                 if let Some(smooth_rate) = actor_smoothing_rate(actor.kind) {
                     if transform.translation.distance_squared(target_translation)
@@ -2189,8 +2666,18 @@ fn sync_dynamic_actors(
                 } else {
                     transform.translation = target_translation;
                 }
-                apply_actor_stats(&mut commands, existing_entity, *actor);
-                apply_actor_metadata(&mut commands, existing_entity, *actor);
+                sync_existing_actor_components(
+                    &mut commands,
+                    existing_entity,
+                    *actor,
+                    health,
+                    mana,
+                    power,
+                    charge_state,
+                    facing,
+                    regular_attack,
+                    tower_node,
+                );
                 continue;
             }
 
@@ -2216,12 +2703,42 @@ fn sync_dynamic_actors(
     }
 }
 
+fn local_locked_target_entity(
+    world: &WorldView,
+    runtime: Option<&NetworkRuntime>,
+    render_index: &RenderIndex,
+) -> Option<Entity> {
+    let hero = world.heroes.get(&runtime?.client_id)?;
+    if !hero.lock_mode_active {
+        return None;
+    }
+    let target_id = hero.lock_target_id?;
+    render_index.by_id.get(&target_id).copied()
+}
+
+fn health_bar_width_multiplier(
+    stat: BarStat,
+    parent_entity: Entity,
+    locked_entity: Option<Entity>,
+) -> f32 {
+    if stat == BarStat::Health && Some(parent_entity) == locked_entity {
+        LOCKED_HEALTH_BAR_SCALE_MULTIPLIER
+    } else {
+        1.0
+    }
+}
+
 fn update_unit_bars(
+    world: Res<WorldView>,
+    render_index: Res<RenderIndex>,
+    runtime: Option<NonSend<NetworkRuntime>>,
     mut bars: Query<(&UnitBarFill, &UnitBarLayout, &UnitBarFollow, &mut Transform)>,
     health_stats: Query<&HealthStat>,
     mana_stats: Query<&ManaStat>,
     power_stats: Query<&PowerStat>,
 ) {
+    let locked_entity = local_locked_target_entity(&world, runtime.as_deref(), &render_index);
+
     for (bar, layout, follow, mut transform) in &mut bars {
         let parent_entity = follow.target;
 
@@ -2262,7 +2779,25 @@ fn update_unit_bars(
         };
 
         let scaled = ratio.max(MIN_BAR_FILL_RATIO);
-        transform.scale.x = scaled * layout.max_scale_x;
+        let width_multiplier = health_bar_width_multiplier(bar.stat, parent_entity, locked_entity);
+        transform.scale.x = scaled * layout.max_scale_x * width_multiplier;
+    }
+}
+
+fn update_unit_bar_background_scales(
+    world: Res<WorldView>,
+    render_index: Res<RenderIndex>,
+    runtime: Option<NonSend<NetworkRuntime>>,
+    mut bars: Query<
+        (&UnitBarRow, &UnitBarFollow, &UnitBarLayout, &mut Transform),
+        (With<UnitBarVisual>, Without<UnitBarFill>),
+    >,
+) {
+    let locked_entity = local_locked_target_entity(&world, runtime.as_deref(), &render_index);
+
+    for (row, follow, layout, mut transform) in &mut bars {
+        let width_multiplier = health_bar_width_multiplier(row.stat, follow.target, locked_entity);
+        transform.scale.x = layout.max_scale_x * width_multiplier;
     }
 }
 
@@ -2341,16 +2876,37 @@ fn update_objective_markers(
     }
 }
 
+fn update_match_end_overlay(
+    world: Res<WorldView>,
+    mut root: Single<&mut Node, With<MatchEndOverlayRoot>>,
+    overlay_text: Single<(&mut Text, &mut TextColor), With<MatchEndOverlayText>>,
+) {
+    let (title, title_color) = match world.phase {
+        MatchPhase::InProgress => {
+            root.display = Display::None;
+            return;
+        }
+        MatchPhase::Victory => ("Victory", MATCH_END_OVERLAY_TITLE),
+        MatchPhase::Defeat => ("Defeat", MATCH_END_OVERLAY_DEFEAT_TITLE),
+    };
+
+    root.display = Display::Flex;
+    let ticks_remaining = world.match_restart_ticks_remaining.unwrap_or_default();
+    let seconds_remaining = ticks_remaining as f32 * FIXED_DT_SECONDS;
+    let (mut text, mut text_color) = overlay_text.into_inner();
+    text.0 = format!(
+        "{title}\nNext match starts in {:.1}s",
+        seconds_remaining.max(0.0)
+    );
+    text_color.0 = title_color;
+}
+
 fn update_hud(
     world: Res<WorldView>,
     runtime: Option<NonSend<NetworkRuntime>>,
     hud_state: Res<HudState>,
-    mut query: Query<&mut Text, With<HudText>>,
+    mut hud_text: Single<&mut Text, With<HudText>>,
 ) {
-    let Ok(mut hud_text) = query.single_mut() else {
-        return;
-    };
-
     let status = runtime
         .as_ref()
         .map(|runtime| {
@@ -2364,68 +2920,338 @@ fn update_hud(
         })
         .unwrap_or("offline");
 
+    let restart_line = match (world.phase, world.match_restart_ticks_remaining) {
+        (MatchPhase::InProgress, _) => "restart: --".to_owned(),
+        (_, Some(ticks)) => format!("restart: {:.1}s", ticks as f32 * FIXED_DT_SECONDS),
+        (_, None) => "restart: pending".to_owned(),
+    };
+
+    hud_text.0 = format!(
+        "Discordium TD MVP\nstatus: {status}\nphase: {:?}\nwave: {}\nteam life: {}\n{restart_line}\ncontrols: WASD move, Left Click/J regular attack, K special attack, Space hold charge, Q lock/cycle, E clear lock\n{}",
+        world.phase, world.wave, world.team_life, hud_state.last_event
+    );
+}
+
+fn update_gold_hud(
+    mut commands: Commands,
+    world: Res<WorldView>,
+    runtime: Option<NonSend<NetworkRuntime>>,
+    mut gold_hud_state: ResMut<GoldHudState>,
+    root_entity: Single<Entity, With<GoldHudRoot>>,
+    mut value_text: Single<&mut Text, With<GoldHudValueText>>,
+) {
+    let local_gold = runtime
+        .as_ref()
+        .and_then(|runtime| world.heroes.get(&runtime.client_id))
+        .map(|hero| hero.gold);
+
+    let Some(gold) = local_gold else {
+        gold_hud_state.last_gold = None;
+        value_text.0 = "--".to_owned();
+        return;
+    };
+
+    value_text.0 = gold.to_string();
+    if let Some(previous_gold) = gold_hud_state.last_gold {
+        if gold < previous_gold {
+            let spent = previous_gold - gold;
+            commands.entity(*root_entity).with_children(|parent| {
+                parent.spawn((
+                    GoldSpendPopup { age_seconds: 0.0 },
+                    Node {
+                        position_type: PositionType::Absolute,
+                        right: Val::Px(0.0),
+                        top: Val::Px(GOLD_SPEND_POPUP_START_TOP),
+                        ..Default::default()
+                    },
+                    Text::new(format!("-{spent}")),
+                    TextFont {
+                        font_size: 21.0,
+                        ..Default::default()
+                    },
+                    TextColor(GOLD_SPEND_TEXT_COLOR),
+                ));
+            });
+        }
+    }
+    gold_hud_state.last_gold = Some(gold);
+}
+
+fn update_gold_spend_popups(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut popups: Query<(Entity, &mut GoldSpendPopup, &mut Node, &mut TextColor)>,
+) {
+    for (popup_entity, mut popup, mut node, mut text_color) in &mut popups {
+        popup.age_seconds += time.delta_secs();
+        let ratio = (popup.age_seconds / GOLD_SPEND_POPUP_DURATION_SECONDS).clamp(0.0, 1.0);
+        node.top = Val::Px(GOLD_SPEND_POPUP_START_TOP - GOLD_SPEND_POPUP_RISE_PIXELS * ratio);
+        let base = GOLD_SPEND_TEXT_COLOR.to_srgba();
+        text_color.0 = Color::srgba(base.red, base.green, base.blue, 1.0 - ratio);
+        if ratio >= 1.0 {
+            commands.entity(popup_entity).despawn();
+        }
+    }
+}
+
+fn update_special_skill_hud(
+    world: Res<WorldView>,
+    runtime: Option<NonSend<NetworkRuntime>>,
+    mut cooldown_ui_state: ResMut<SpecialSkillCooldownUiState>,
+    mut icon_color: Single<&mut BackgroundColor, With<SpecialSkillIcon>>,
+    mut key_color: Single<&mut TextColor, With<SpecialSkillKeyText>>,
+    overlay: Single<(&mut Node, &mut Visibility), With<SpecialSkillCooldownOverlay>>,
+) {
+    let (mut overlay_node, mut overlay_visibility) = overlay.into_inner();
+
     let local_hero = runtime
         .as_ref()
         .and_then(|runtime| world.heroes.get(&runtime.client_id));
+    let Some(local_hero) = local_hero else {
+        cooldown_ui_state.last_ticks_remaining = 0;
+        cooldown_ui_state.max_ticks_remaining = 0;
+        overlay_node.height = Val::Percent(0.0);
+        *overlay_visibility = Visibility::Hidden;
+        icon_color.0 = SPECIAL_SKILL_ICON_READY_BG;
+        key_color.0 = SPECIAL_SKILL_ICON_KEY_COLOR;
+        return;
+    };
 
-    let gold = local_hero.map(|hero| hero.gold).unwrap_or(0);
-    let lock_status = local_hero
+    let ticks_remaining = local_hero.ability_cooldown_ticks;
+    if ticks_remaining > cooldown_ui_state.last_ticks_remaining {
+        cooldown_ui_state.max_ticks_remaining = ticks_remaining;
+    }
+    cooldown_ui_state.last_ticks_remaining = ticks_remaining;
+    if ticks_remaining == 0 {
+        cooldown_ui_state.max_ticks_remaining = 0;
+    }
+
+    if ticks_remaining == 0 {
+        overlay_node.height = Val::Percent(0.0);
+        *overlay_visibility = Visibility::Hidden;
+        icon_color.0 = SPECIAL_SKILL_ICON_READY_BG;
+        key_color.0 = SPECIAL_SKILL_ICON_KEY_COLOR;
+        return;
+    }
+
+    let max_ticks = cooldown_ui_state.max_ticks_remaining.max(ticks_remaining);
+    let fill_ratio = (ticks_remaining as f32 / max_ticks as f32).clamp(0.0, 1.0);
+    overlay_node.height = Val::Percent(fill_ratio * 100.0);
+    *overlay_visibility = Visibility::Inherited;
+    icon_color.0 = SPECIAL_SKILL_ICON_COOLDOWN_BG;
+    key_color.0 = Color::srgb(0.86, 0.89, 0.93);
+}
+
+fn update_power_pie_hud(
+    time: Res<Time>,
+    world: Res<WorldView>,
+    runtime: Option<NonSend<NetworkRuntime>>,
+    power_pie_texture: Option<Res<PowerPieUiTexture>>,
+    power_pie_raster_cache: Option<Res<PowerPieRasterCache>>,
+    mut power_pie_state: ResMut<PowerPieUiState>,
+    mut images: ResMut<Assets<Image>>,
+    circle: Single<(&mut Node, &mut BorderColor, &mut BackgroundColor), With<PowerPieCircle>>,
+) {
+    let Some(power_pie_texture) = power_pie_texture else {
+        return;
+    };
+    let Some(power_pie_raster_cache) = power_pie_raster_cache else {
+        return;
+    };
+    let (mut circle_node, mut border_color, mut background_color) = circle.into_inner();
+    let Some(image) = images.get_mut(&power_pie_texture.handle) else {
+        return;
+    };
+
+    let local_hero = runtime
+        .as_ref()
+        .and_then(|runtime| world.heroes.get(&runtime.client_id));
+    let (ratio, power_active) = local_hero
         .map(|hero| {
-            if !hero.lock_mode_active {
-                "off".to_owned()
-            } else {
-                hero.lock_target_id
-                    .map(|target_id| format!("enemy {target_id}"))
-                    .unwrap_or_else(|| "searching".to_owned())
-            }
-        })
-        .unwrap_or_else(|| "none".to_owned());
-    let charge_status = local_hero
-        .map(|hero| match hero.charge_state.phase {
-            ChargePhase::Idle => "idle",
-            ChargePhase::Startup => "startup",
-            ChargePhase::Charging => "charging",
-            ChargePhase::Recovery => "recovery",
-        })
-        .unwrap_or("n/a");
-    let power_status = local_hero
-        .map(|hero| {
-            let active = if hero.charge_state.power_active {
-                " x2-active"
-            } else {
-                ""
-            };
-            format!(
-                "{:.0}/{:.0}{}",
-                hero.charge_state.power_meter, hero.charge_profile.power_meter_max, active
+            let max = hero.charge_profile.power_meter_max.max(f32::EPSILON);
+            (
+                (hero.charge_state.power_meter / max).clamp(0.0, 1.0),
+                hero.charge_state.power_active,
             )
         })
-        .unwrap_or_else(|| "n/a".to_owned());
-    let special_status = local_hero
-        .map(|hero| {
-            if hero.ability_cooldown_ticks == 0 {
-                "READY".to_owned()
-            } else {
-                let seconds = hero.ability_cooldown_ticks as f32 / SERVER_TICK_HZ as f32;
-                format!("{seconds:.1}s")
-            }
-        })
-        .unwrap_or_else(|| "n/a".to_owned());
+        .unwrap_or((0.0, false));
 
-    hud_text.0 = format!(
-        "Discordium TD MVP\nstatus: {status}\nphase: {:?}\nwave: {}\nteam life: {}\ngold: {}\nlock: {lock_status}\ncharge: {charge_status}\npower: {power_status}\nspecial (K): {special_status}\ncontrols: WASD move, Left Click/J regular attack, K special attack, Space hold charge, Q lock/cycle, E clear lock, B build\n{}",
-        world.phase, world.wave, world.team_life, gold, hud_state.last_event
+    let flash = if power_active {
+        let phase = time.elapsed_secs() * POWER_PIE_FLASH_HZ * std::f32::consts::TAU;
+        0.5 + 0.5 * phase.sin()
+    } else {
+        0.0
+    };
+    let flash_bucket = if power_active {
+        ((flash * POWER_PIE_FLASH_BUCKETS as f32).floor() as u32)
+            .min(POWER_PIE_FLASH_BUCKETS.saturating_sub(1))
+    } else {
+        0
+    };
+    let ratio_changed = (ratio - power_pie_state.last_ratio).abs() > 0.0005;
+    let active_changed = power_active != power_pie_state.last_power_active;
+    let flash_changed = power_active && flash_bucket != power_pie_state.last_flash_bucket;
+    let visuals_changed =
+        !power_pie_state.initialized || ratio_changed || active_changed || flash_changed;
+
+    if !visuals_changed {
+        return;
+    }
+
+    let size = if power_active {
+        POWER_PIE_ACTIVE_SIZE + flash * POWER_PIE_ACTIVE_PULSE_SIZE
+    } else {
+        POWER_PIE_BASE_SIZE
+    };
+    let inset = (POWER_PIE_SLOT_SIZE - size).max(0.0) * 0.5;
+    circle_node.left = Val::Px(inset);
+    circle_node.bottom = Val::Px(inset);
+    circle_node.width = Val::Px(size);
+    circle_node.height = Val::Px(size);
+
+    let fill_color = if power_active {
+        POWER_PIE_FILL_ACTIVE_COLOR.mix(&POWER_PIE_FILL_COLOR, 1.0 - flash * 0.45)
+    } else {
+        POWER_PIE_FILL_COLOR
+    };
+    let bg_color = if power_active {
+        POWER_PIE_BG_ACTIVE_COLOR.mix(&POWER_PIE_BG_COLOR, 1.0 - flash * 0.35)
+    } else {
+        POWER_PIE_BG_COLOR
+    };
+    *border_color = BorderColor::all(if power_active {
+        POWER_PIE_BORDER_ACTIVE_COLOR.mix(&POWER_PIE_BORDER_COLOR, 1.0 - flash * 0.25)
+    } else {
+        POWER_PIE_BORDER_COLOR
+    });
+    background_color.0 = bg_color;
+
+    draw_power_pie_image(
+        image,
+        &power_pie_raster_cache,
+        ratio,
+        fill_color,
+        POWER_PIE_EMPTY_COLOR,
     );
+    power_pie_state.last_ratio = ratio;
+    power_pie_state.last_flash_bucket = flash_bucket;
+    power_pie_state.last_power_active = power_active;
+    power_pie_state.initialized = true;
+}
+
+fn build_power_pie_image(
+    cache: &PowerPieRasterCache,
+    ratio: f32,
+    fill: Color,
+    empty: Color,
+) -> Image {
+    let size = cache.size;
+    let mut image = Image::new_fill(
+        Extent3d {
+            width: size,
+            height: size,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        &[0, 0, 0, 0],
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
+    );
+    draw_power_pie_image(&mut image, cache, ratio, fill, empty);
+    image
+}
+
+fn build_power_pie_raster_cache(size: u32) -> PowerPieRasterCache {
+    let mut inside = Vec::with_capacity((size * size) as usize);
+    let mut clockwise_angle = Vec::with_capacity((size * size) as usize);
+
+    if size == 0 {
+        return PowerPieRasterCache {
+            size,
+            inside,
+            clockwise_angle,
+        };
+    }
+
+    let radius = size as f32 * 0.5;
+    let center = radius - 0.5;
+
+    for y in 0..size {
+        for x in 0..size {
+            let dx = (x as f32 - center) / radius;
+            let dy = (y as f32 - center) / radius;
+            let dist_sq = dx * dx + dy * dy;
+            if dist_sq > 1.0 {
+                inside.push(false);
+                clockwise_angle.push(0.0);
+                continue;
+            }
+
+            // Angle starts at 12 o'clock and increases clockwise.
+            let mut angle = dx.atan2(-dy);
+            if angle < 0.0 {
+                angle += std::f32::consts::TAU;
+            }
+            inside.push(true);
+            clockwise_angle.push(angle);
+        }
+    }
+
+    PowerPieRasterCache {
+        size,
+        inside,
+        clockwise_angle,
+    }
+}
+
+fn draw_power_pie_image(
+    image: &mut Image,
+    cache: &PowerPieRasterCache,
+    ratio: f32,
+    fill: Color,
+    empty: Color,
+) {
+    let size = cache.size;
+    if size == 0 || image.texture_descriptor.size.width != size {
+        return;
+    }
+    let Some(data) = image.data.as_mut() else {
+        return;
+    };
+
+    let sweep = ratio.clamp(0.0, 1.0) * std::f32::consts::TAU;
+    let fill = fill.to_srgba().to_u8_array();
+    let empty = empty.to_srgba().to_u8_array();
+    let width = size as usize;
+    let total = width * width;
+    if cache.inside.len() != total || cache.clockwise_angle.len() != total {
+        return;
+    }
+    if data.len() < total * 4 {
+        return;
+    }
+
+    for i in 0..total {
+        let base = i * 4;
+        if !cache.inside[i] {
+            data[base..base + 4].copy_from_slice(&[0, 0, 0, 0]);
+            continue;
+        }
+        let color = if cache.clockwise_angle[i] <= sweep {
+            fill
+        } else {
+            empty
+        };
+        data[base..base + 4].copy_from_slice(&color);
+    }
 }
 
 fn publish_unit_bar_camera_updates(
     mut commands: Commands,
     camera_cache: Res<UnitBarCameraCache>,
-    cameras: Query<(&Transform, Ref<Transform>), With<UnitBarCamera>>,
+    camera: Single<(&Transform, Ref<Transform>), With<UnitBarCamera>>,
 ) {
-    let Some((camera_transform, camera_ref)) = cameras.iter().next() else {
-        return;
-    };
+    let (camera_transform, camera_ref) = camera.into_inner();
 
     if camera_cache.initialized && !camera_ref.is_changed() {
         return;
@@ -2452,9 +3278,13 @@ fn apply_unit_bar_camera_update(
 
 fn orient_unit_bars_to_camera(
     camera_cache: Res<UnitBarCameraCache>,
+    world: Res<WorldView>,
+    render_index: Res<RenderIndex>,
+    runtime: Option<NonSend<NetworkRuntime>>,
     actor_query: Query<Ref<Transform>, (With<DynamicActor>, Without<UnitBarVisual>)>,
     mut bars: Query<
         (
+            &UnitBarRow,
             &UnitBarFollow,
             &UnitBarLayout,
             &mut UnitBarBillboardState,
@@ -2467,7 +3297,9 @@ fn orient_unit_bars_to_camera(
         return;
     }
 
-    for (follow, layout, mut billboard_state, mut transform) in &mut bars {
+    let locked_entity = local_locked_target_entity(&world, runtime.as_deref(), &render_index);
+
+    for (row, follow, layout, mut billboard_state, mut transform) in &mut bars {
         let Ok(actor_transform) = actor_query.get(follow.target) else {
             continue;
         };
@@ -2485,9 +3317,11 @@ fn orient_unit_bars_to_camera(
 
         transform.rotation = camera_cache.world_rotation;
 
-        let fill_ratio = (transform.scale.x / layout.max_scale_x).clamp(MIN_BAR_FILL_RATIO, 1.0);
+        let width_multiplier = health_bar_width_multiplier(row.stat, follow.target, locked_entity);
+        let effective_max_scale_x = layout.max_scale_x * width_multiplier;
+        let fill_ratio = (transform.scale.x / effective_max_scale_x).clamp(MIN_BAR_FILL_RATIO, 1.0);
         let local_x = if layout.fill {
-            -UNIT_BAR_WIDTH * layout.max_scale_x * 0.5 * (1.0 - fill_ratio)
+            -UNIT_BAR_WIDTH * effective_max_scale_x * 0.5 * (1.0 - fill_ratio)
         } else {
             0.0
         };
@@ -2692,30 +3526,48 @@ fn apply_actor_metadata(commands: &mut Commands, entity: Entity, actor: DesiredA
     } else {
         entity_commands.remove::<TowerBuildNode>();
     }
+}
 
-    if let Some(lock_mode) = actor.lock_mode {
-        entity_commands.insert(lock_mode);
-    } else {
-        entity_commands.remove::<LockMode>();
-    }
+fn sync_existing_actor_components(
+    commands: &mut Commands,
+    entity: Entity,
+    actor: DesiredActor,
+    health: Option<Mut<HealthStat>>,
+    mana: Option<Mut<ManaStat>>,
+    power: Option<Mut<PowerStat>>,
+    charge_state: Option<Mut<ChargeStateStat>>,
+    facing: Option<Mut<FacingStat>>,
+    regular_attack: Option<Mut<RegularAttackStat>>,
+    tower_node: Option<Mut<TowerBuildNode>>,
+) {
+    sync_optional_component(commands, entity, health, actor.health);
+    sync_optional_component(commands, entity, mana, actor.mana);
+    sync_optional_component(commands, entity, power, actor.power);
+    sync_optional_component(commands, entity, charge_state, actor.charge_state);
+    sync_optional_component(commands, entity, facing, actor.facing);
+    sync_optional_component(commands, entity, regular_attack, actor.regular_attack);
+    sync_optional_component(commands, entity, tower_node, actor.tower_node);
+}
 
-    if let Some(lock_target) = actor.lock_target {
-        entity_commands.insert(lock_target);
-    } else {
-        entity_commands.remove::<LockTarget>();
-    }
-
-    if actor.lock_marker_source {
-        entity_commands.insert((LockMarkerSource, LockMarkerConfig::default()));
-    } else {
-        entity_commands.remove::<LockMarkerSource>();
-        entity_commands.remove::<LockMarkerConfig>();
-    }
-
-    if let Some(lockable_target) = actor.lockable_target {
-        entity_commands.insert(lockable_target);
-    } else {
-        entity_commands.remove::<LockableTarget>();
+fn sync_optional_component<T: Component + Copy + PartialEq>(
+    commands: &mut Commands,
+    entity: Entity,
+    current: Option<Mut<T>>,
+    desired: Option<T>,
+) {
+    match (current, desired) {
+        (Some(mut current), Some(desired)) => {
+            if *current != desired {
+                *current = desired;
+            }
+        }
+        (None, Some(desired)) => {
+            commands.entity(entity).insert(desired);
+        }
+        (Some(_), None) => {
+            commands.entity(entity).remove::<T>();
+        }
+        (None, None) => {}
     }
 }
 
@@ -2770,6 +3622,7 @@ fn attach_unit_bars(
                     1.0,
                     1.0,
                 )),
+                NotShadowCaster,
                 UnitBarVisual,
                 UnitBarRow { stat },
                 follow,
@@ -2781,6 +3634,7 @@ fn attach_unit_bars(
                 MeshMaterial3d(fill_material),
                 Transform::from_xyz(anchor.x, anchor.y + y, anchor.z + UNIT_BAR_FILL_Z)
                     .with_scale(Vec3::new(width_scale, 1.0, 1.0)),
+                NotShadowCaster,
                 UnitBarFill { stat },
                 UnitBarVisual,
                 UnitBarRow { stat },

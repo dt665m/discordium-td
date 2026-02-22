@@ -5,10 +5,16 @@ edition.workspace = true
 
 [dependencies]
 bevy = { version = "0.18.0", default-features = true, features = ["bevy_dev_tools"] }
-clap.workspace = true
-env_logger.workspace = true
-game_server = { path = "../game_server" }
 game_shared = { path = "../game_shared" }
 log.workspace = true
 renet.workspace = true
 renet_cross.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+clap.workspace = true
+game_server = { path = "../game_server" }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2.17", features = ["js"] }
+wasm-bindgen-futures = "0.4.55"
+web-sys = { version = "0.3.82", features = ["Window", "Location"] }

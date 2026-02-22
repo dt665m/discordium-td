@@ -8,7 +8,7 @@ bevy = { version = "0.18.0", default-features = true, features = ["bevy_dev_tool
 game_shared = { path = "../game_shared" }
 log.workspace = true
 renet.workspace = true
-renet_cross.workspace = true
+renet-cross.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 clap.workspace = true

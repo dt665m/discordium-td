@@ -174,6 +174,16 @@ Web client (Trunk):
 just web-client http_base=https://game.example.com
 ```
 
+### 9) Troubleshooting hosted WebRTC
+
+If hosted play is worse than localhost or server logs are flooded with SCTP parse warnings:
+
+- Keep Cloudflare proxy only on the HTTPS bootstrap host (`TD_PUBLIC_HTTP_BASE`).
+- Use a direct public socket for `--public-webrtc-addr` (IP:port), not a proxied Cloudflare hostname.
+- Confirm UDP firewall/NAT forwarding for the WebRTC port (example: `5001/udp`).
+- Consider a less common high UDP port for WebRTC in production to reduce background internet scanner traffic.
+- Server default logging now suppresses noisy SCTP parser warnings from unrelated malformed packets.
+
 ## Validation
 
 ```bash

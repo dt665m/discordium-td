@@ -56,8 +56,9 @@ const HERO_HIT_REACTION_DURATION_SECONDS: f32 = 0.16;
 const ENEMY_HIT_REACTION_DURATION_SECONDS: f32 = 0.16;
 const TOWER_FIRE_REACTION_DURATION_SECONDS: f32 = 0.14;
 const ENEMY_RENDER_SMOOTH_RATE: f32 = 18.0;
-const LOCAL_HERO_RECONCILE_RATE: f32 = 24.0;
+const LOCAL_HERO_CORRECTION_RATE: f32 = 16.0;
 const LOCAL_HERO_RENDER_SMOOTH_RATE: f32 = 30.0;
+const LOCAL_HERO_SNAP_OFFSET_SQ: f32 = 4.0;
 const LOCAL_HERO_SNAP_DISTANCE_SQ: f32 = 9.0;
 const LOCAL_HERO_COLLISION_MAX_CORRECTION_PER_STEP: f32 = HERO_SPEED * FIXED_DT_SECONDS * 0.65;
 const LOCAL_HERO_COLLISION_MAX_TOTAL_CORRECTION: f32 = HERO_SPEED * FIXED_DT_SECONDS * 1.05;
@@ -427,7 +428,10 @@ fn lerp_pos(a: [f32; 2], b: [f32; 2], t: f32) -> [f32; 2] {
 
 #[derive(Resource, Default)]
 struct LocalHeroSmoothing {
-    predicted_pos: Option<[f32; 2]>,
+    /// Accumulated visual offset from server corrections. Decays to zero.
+    /// When a server state causes the raw prediction to jump, the jump is absorbed
+    /// here so the visual position doesn't teleport.
+    visual_offset: [f32; 2],
     render_pos: Option<[f32; 2]>,
 }
 
@@ -1955,6 +1959,7 @@ fn network_update(
     mut world: ResMut<WorldView>,
     mut net_stats: ResMut<NetStats>,
     mut snapshot_buffer: ResMut<SnapshotBuffer>,
+    mut local_smoothing: ResMut<LocalHeroSmoothing>,
     mut hud_state: ResMut<HudState>,
     render_index: Res<RenderIndex>,
     mut commands: Commands,
@@ -1988,6 +1993,8 @@ fn network_update(
                 );
                 runtime_inner.client_id = snapshot.you;
                 snapshot_buffer.clear();
+                local_smoothing.visual_offset = [0.0, 0.0];
+                local_smoothing.render_pos = None;
                 world.apply_join(snapshot);
                 hud_state.last_event = "Joined authoritative match".to_owned();
             }
@@ -2109,6 +2116,15 @@ fn network_update(
                     }
                 }
 
+                // Compute old prediction BEFORE ack+apply so we can detect
+                // how much the server correction shifts our predicted position.
+                let old_prediction = world
+                    .you
+                    .and_then(|cid| world.heroes.get(&cid))
+                    .map(|hero| {
+                        predict_local_position(hero.pos, &runtime_inner.pending_moves)
+                    });
+
                 acknowledge_pending_moves(
                     &mut runtime_inner.pending_moves,
                     delta.your_last_input_seq,
@@ -2125,6 +2141,34 @@ fn network_update(
 
                 // Apply to world view for HUD scalars, local hero, etc.
                 world.apply_delta(delta);
+
+                // Compute new prediction AFTER ack+apply. The difference from
+                // old_prediction is the server correction — absorb it into the
+                // visual offset so the player character doesn't teleport.
+                if let Some(old_pred) = old_prediction {
+                    if let Some(hero) = world
+                        .you
+                        .and_then(|cid| world.heroes.get(&cid))
+                    {
+                        let new_pred =
+                            predict_local_position(hero.pos, &runtime_inner.pending_moves);
+                        let correction = [
+                            new_pred[0] - old_pred[0],
+                            new_pred[1] - old_pred[1],
+                        ];
+                        // Absorb correction into offset (negative so visual stays put)
+                        local_smoothing.visual_offset[0] -= correction[0];
+                        local_smoothing.visual_offset[1] -= correction[1];
+                        // Snap offset to zero if it's gotten too large
+                        let offset_sq = local_smoothing.visual_offset[0]
+                            * local_smoothing.visual_offset[0]
+                            + local_smoothing.visual_offset[1]
+                                * local_smoothing.visual_offset[1];
+                        if offset_sq > LOCAL_HERO_SNAP_OFFSET_SQ {
+                            local_smoothing.visual_offset = [0.0, 0.0];
+                        }
+                    }
+                }
             }
             Err(err) => {
                 log::warn!("failed to decode ServerWorldMessage: {err}");
@@ -2882,7 +2926,7 @@ fn sync_dynamic_actors(
         .and_then(|client_id| world.heroes.get(&client_id))
         .is_some();
     if !has_local_hero {
-        local_smoothing.predicted_pos = None;
+        local_smoothing.visual_offset = [0.0, 0.0];
         local_smoothing.render_pos = None;
     }
 
@@ -4144,41 +4188,51 @@ fn predict_local_overstep_position(
 
 fn update_local_hero_smoothing(
     smoothing: &mut LocalHeroSmoothing,
-    authoritative_predicted: [f32; 2],
+    raw_prediction: [f32; 2],
     input_dir: [f32; 2],
     overstep_fraction: f32,
     dt: f32,
     world: &WorldView,
     local_client_id: u64,
 ) -> [f32; 2] {
-    let predicted = match smoothing.predicted_pos {
-        Some(current) => {
-            if distance_sq(current, authoritative_predicted) > LOCAL_HERO_SNAP_DISTANCE_SQ {
-                authoritative_predicted
-            } else {
-                let alpha = 1.0 - (-LOCAL_HERO_RECONCILE_RATE * dt).exp();
-                [
-                    current[0] + (authoritative_predicted[0] - current[0]) * alpha.clamp(0.0, 1.0),
-                    current[1] + (authoritative_predicted[1] - current[1]) * alpha.clamp(0.0, 1.0),
-                ]
-            }
-        }
-        None => authoritative_predicted,
-    };
-    let predicted = resolve_local_hero_collisions(predicted, world, local_client_id);
-    smoothing.predicted_pos = Some(predicted);
+    // Decay the visual correction offset toward zero.
+    // This is the ONLY smoothing on the local hero — it blends out server
+    // corrections over ~150ms while letting raw prediction (input) be instant.
+    let alpha: f32 = 1.0 - (-LOCAL_HERO_CORRECTION_RATE * dt).exp();
+    smoothing.visual_offset[0] *= 1.0 - alpha;
+    smoothing.visual_offset[1] *= 1.0 - alpha;
 
-    let render_target = predict_local_overstep_position(predicted, input_dir, overstep_fraction);
+    // Snap tiny residual offsets to zero
+    let offset_sq = smoothing.visual_offset[0] * smoothing.visual_offset[0]
+        + smoothing.visual_offset[1] * smoothing.visual_offset[1];
+    if offset_sq < 0.0001 {
+        smoothing.visual_offset = [0.0, 0.0];
+    }
+
+    // Visual position = raw prediction + correction offset
+    let corrected = [
+        raw_prediction[0] + smoothing.visual_offset[0],
+        raw_prediction[1] + smoothing.visual_offset[1],
+    ];
+    let corrected = resolve_local_hero_collisions(corrected, world, local_client_id);
+
+    // Add overstep extrapolation for sub-tick smoothness
+    let render_target =
+        predict_local_overstep_position(corrected, input_dir, overstep_fraction);
     let render_target = resolve_local_hero_collisions(render_target, world, local_client_id);
+
+    // Light render smoothing for visual polish (very fast — barely noticeable)
     let render = match smoothing.render_pos {
         Some(current) => {
             if distance_sq(current, render_target) > LOCAL_HERO_SNAP_DISTANCE_SQ {
                 render_target
             } else {
-                let alpha = 1.0 - (-LOCAL_HERO_RENDER_SMOOTH_RATE * dt).exp();
+                let render_alpha: f32 = 1.0 - (-LOCAL_HERO_RENDER_SMOOTH_RATE * dt).exp();
                 [
-                    current[0] + (render_target[0] - current[0]) * alpha.clamp(0.0, 1.0),
-                    current[1] + (render_target[1] - current[1]) * alpha.clamp(0.0, 1.0),
+                    current[0]
+                        + (render_target[0] - current[0]) * render_alpha.clamp(0.0, 1.0),
+                    current[1]
+                        + (render_target[1] - current[1]) * render_alpha.clamp(0.0, 1.0),
                 ]
             }
         }

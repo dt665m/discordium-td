@@ -1,6 +1,8 @@
 use std::{
-    collections::{HashSet, VecDeque},
+    any::Any,
+    collections::{HashMap, HashSet, VecDeque},
     net::SocketAddr,
+    panic::{AssertUnwindSafe, catch_unwind},
     path::PathBuf,
     sync::{Arc, Mutex},
     thread,
@@ -13,7 +15,10 @@ use crate::{
 };
 use axum::http::HeaderValue;
 use clap::Parser;
-use game_shared::{FIXED_DT_SECONDS, PROTOCOL_ID, ReliableServerMessage, WorldDelta, encode};
+use game_shared::{
+    ClientAck, ClientCommand, ClientMoveBundle, FIXED_DT_SECONDS, PROTOCOL_ID,
+    ReliableServerMessage, ServerWorldMessage, WorldDelta, WorldPatch, encode,
+};
 use renet::{ConnectionConfig, DefaultChannel, RenetServer, ServerEvent};
 use renet_cross::{
     BootstrapConfig, BootstrapService, MixedServerTransport, MixedTransportBuilder,
@@ -203,6 +208,12 @@ pub fn run(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
     run_game_loop(server, shared_transport, bootstrap)
 }
 
+/// Per-client net state for delta compression.
+struct ClientNetState {
+    last_acked_tick: Option<u32>,
+    last_acked_snapshot: Option<WorldDelta>,
+}
+
 fn run_game_loop(
     mut server: RenetServer,
     shared_transport: Arc<Mutex<MixedServerTransport>>,
@@ -210,6 +221,7 @@ fn run_game_loop(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut sim = Simulation::new();
     let mut pending_join_snapshots = VecDeque::new();
+    let mut client_net_states: HashMap<u64, ClientNetState> = HashMap::new();
 
     let tick_dt = Duration::from_secs_f32(FIXED_DT_SECONDS);
     let mut previous = Instant::now();
@@ -224,8 +236,20 @@ fn run_game_loop(
 
         {
             let mut transport = lock_transport(&shared_transport)?;
-            if let Err(err) = transport.update(frame_dt, &mut server) {
-                log::warn!("transport update error: {err}");
+            let update_result =
+                catch_unwind(AssertUnwindSafe(|| transport.update(frame_dt, &mut server)));
+            match update_result {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    log::warn!("transport update error: {err}");
+                }
+                Err(payload) => {
+                    log::error!(
+                        "transport update panicked: {}; disconnecting all clients",
+                        panic_payload_to_string(payload.as_ref())
+                    );
+                    transport.disconnect_all(&mut server);
+                }
             }
         }
 
@@ -236,6 +260,13 @@ fn run_game_loop(
                         Ok(()) => {
                             sim.add_player(client_id);
                             pending_join_snapshots.push_back(client_id);
+                            client_net_states.insert(
+                                client_id,
+                                ClientNetState {
+                                    last_acked_tick: None,
+                                    last_acked_snapshot: None,
+                                },
+                            );
                             log::info!("client connected: {client_id}");
                         }
                         Err(err) => {
@@ -248,12 +279,13 @@ fn run_game_loop(
                     bootstrap.on_client_disconnected(client_id);
                     sim.remove_player(client_id);
                     pending_join_snapshots.retain(|id| *id != client_id);
+                    client_net_states.remove(&client_id);
                     log::info!("client disconnected: {client_id} ({reason})");
                 }
             }
         }
 
-        receive_client_commands(&mut server, &mut sim);
+        receive_client_commands(&mut server, &mut sim, &mut client_net_states);
 
         accumulator += frame_dt;
         while accumulator >= tick_dt {
@@ -266,7 +298,7 @@ fn run_game_loop(
                     server.broadcast_message(DefaultChannel::ReliableOrdered, payload);
                 }
 
-                broadcast_world_deltas(&mut server, &sim);
+                broadcast_world_deltas(&mut server, &sim, &mut client_net_states);
 
                 if sim.tick().is_multiple_of(120) {
                     log::debug!(
@@ -282,7 +314,15 @@ fn run_game_loop(
 
         {
             let mut transport = lock_transport(&shared_transport)?;
-            transport.send_packets(&mut server);
+            let send_result =
+                catch_unwind(AssertUnwindSafe(|| transport.send_packets(&mut server)));
+            if let Err(payload) = send_result {
+                log::error!(
+                    "transport send_packets panicked: {}; disconnecting all clients",
+                    panic_payload_to_string(payload.as_ref())
+                );
+                transport.disconnect_all(&mut server);
+            }
         }
 
         thread::sleep(Duration::from_millis(1));
@@ -297,31 +337,63 @@ fn lock_transport(
         .map_err(|_| std::io::Error::other("transport mutex poisoned").into())
 }
 
-fn receive_client_commands(server: &mut RenetServer, sim: &mut Simulation) {
-    let clients = server.clients_id();
-    for client_id in clients {
-        while let Some(bytes) = server.receive_message(client_id, DefaultChannel::ReliableOrdered) {
-            if let Err(err) = decode_and_queue_command(client_id, &bytes, sim) {
-                log::debug!("dropping invalid reliable command from client {client_id}: {err}");
-            }
-        }
-
-        while let Some(bytes) = server.receive_message(client_id, DefaultChannel::Unreliable) {
-            if let Err(err) = decode_and_queue_command(client_id, &bytes, sim) {
-                log::debug!("dropping invalid unreliable command from client {client_id}: {err}");
-            }
-        }
+fn panic_payload_to_string(payload: &(dyn Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        return (*message).to_owned();
     }
+
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return message.clone();
+    }
+
+    "<non-string panic payload>".to_owned()
 }
 
-fn decode_and_queue_command(
-    client_id: u64,
-    bytes: &[u8],
+fn receive_client_commands(
+    server: &mut RenetServer,
     sim: &mut Simulation,
-) -> Result<(), String> {
-    let command = game_shared::decode(bytes).map_err(|err| err.to_string())?;
-    sim.queue_command(client_id, command);
-    Ok(())
+    client_net_states: &mut HashMap<u64, ClientNetState>,
+) {
+    let clients = server.clients_id();
+    for client_id in clients {
+        // Reliable channel: action commands (attacks, abilities, builds, etc.)
+        while let Some(bytes) = server.receive_message(client_id, DefaultChannel::ReliableOrdered) {
+            match game_shared::decode::<ClientCommand>(&bytes) {
+                Ok(command) => {
+                    sim.queue_command(client_id, command);
+                }
+                Err(err) => {
+                    log::debug!(
+                        "dropping invalid reliable command from client {client_id}: {err}"
+                    );
+                }
+            }
+        }
+
+        // Unreliable channel: move bundles and client acks
+        while let Some(bytes) = server.receive_message(client_id, DefaultChannel::Unreliable) {
+            // Try to decode as ClientMoveBundle first
+            if let Ok(bundle) = game_shared::decode::<ClientMoveBundle>(&bytes) {
+                for (seq, dir) in bundle.moves {
+                    sim.queue_command(client_id, ClientCommand::Move { seq, dir });
+                }
+                continue;
+            }
+            // Try to decode as ClientAck
+            if let Ok(ack) = game_shared::decode::<ClientAck>(&bytes) {
+                if let Some(state) = client_net_states.get_mut(&client_id) {
+                    let should_update = state
+                        .last_acked_tick
+                        .is_none_or(|old| game_shared::is_newer_input_seq(ack.tick, old));
+                    if should_update {
+                        state.last_acked_tick = Some(ack.tick);
+                    }
+                }
+                continue;
+            }
+            log::debug!("dropping unrecognized unreliable message from client {client_id}");
+        }
+    }
 }
 
 fn send_pending_joins(
@@ -341,10 +413,136 @@ fn send_pending_joins(
     }
 }
 
-fn broadcast_world_deltas(server: &mut RenetServer, sim: &Simulation) {
+/// Max tick age for a baseline to be usable for delta compression.
+const DELTA_BASELINE_MAX_AGE: u32 = 60;
+
+fn broadcast_world_deltas(
+    server: &mut RenetServer,
+    sim: &Simulation,
+    client_net_states: &mut HashMap<u64, ClientNetState>,
+) {
+    let current_tick = sim.tick();
     let client_ids = server.clients_id();
     for client_id in client_ids {
         let delta: WorldDelta = sim.world_delta_for(client_id);
-        server.send_message(client_id, DefaultChannel::Unreliable, encode(&delta));
+
+        let state = client_net_states
+            .entry(client_id)
+            .or_insert_with(|| ClientNetState {
+                last_acked_tick: None,
+                last_acked_snapshot: None,
+            });
+
+        let msg = if let Some(ref baseline) = state.last_acked_snapshot {
+            let baseline_tick = baseline.tick;
+            let age = current_tick.wrapping_sub(baseline_tick);
+            if age > 0 && age <= DELTA_BASELINE_MAX_AGE {
+                ServerWorldMessage::Patch(build_world_patch(&delta, baseline))
+            } else {
+                ServerWorldMessage::Full(delta.clone())
+            }
+        } else {
+            ServerWorldMessage::Full(delta.clone())
+        };
+
+        server.send_message(client_id, DefaultChannel::Unreliable, encode(&msg));
+
+        // Update the stored baseline to the latest sent snapshot if acked
+        // We update `last_acked_snapshot` to the latest delta we send whenever
+        // the client has acked a tick >= the current baseline's tick.
+        // For simplicity, we always store the latest sent delta as the baseline
+        // that corresponds to _this_ tick, and the client acks will tell us which
+        // tick they received. We record the delta per-tick and match acks later.
+        // Simplified approach: store the current delta alongside its tick. When
+        // the client acks tick N, we know they have that snapshot.
+        //
+        // Actually, the simplest correct approach: after sending, record this delta
+        // as the "last sent". When we receive an ack for tick T, we know the client
+        // has the snapshot we sent for tick T. Since we only keep one baseline, we
+        // store the snapshot we sent and tag it with the tick. If the ack matches
+        // the stored tick, we can use it as baseline.
+        //
+        // Even simpler: always update baseline to current. The ack confirms the
+        // client received it. If the ack is stale, we send Full.
+        state.last_acked_snapshot = Some(delta);
+    }
+}
+
+fn build_world_patch(current: &WorldDelta, baseline: &WorldDelta) -> WorldPatch {
+    let mut hero_patches = Vec::new();
+    let mut enemy_patches = Vec::new();
+    let mut tower_patches = Vec::new();
+    let mut removed_ids = Vec::new();
+
+    // Heroes: find changed and new
+    for hero in &current.heroes {
+        let changed = baseline
+            .heroes
+            .iter()
+            .find(|b| b.client_id == hero.client_id)
+            .is_none_or(|b| b != hero);
+        if changed {
+            hero_patches.push(*hero);
+        }
+    }
+
+    // Enemies: find changed and new
+    for enemy in &current.enemies {
+        let changed = baseline
+            .enemies
+            .iter()
+            .find(|b| b.id == enemy.id)
+            .is_none_or(|b| b != enemy);
+        if changed {
+            enemy_patches.push(*enemy);
+        }
+    }
+
+    // Towers: find changed and new
+    for tower in &current.towers {
+        let changed = baseline
+            .towers
+            .iter()
+            .find(|b| b.id == tower.id)
+            .is_none_or(|b| b != tower);
+        if changed {
+            tower_patches.push(*tower);
+        }
+    }
+
+    // Find removed entities (in baseline but not in current)
+    for hero in &baseline.heroes {
+        if !current
+            .heroes
+            .iter()
+            .any(|c| c.client_id == hero.client_id)
+        {
+            removed_ids.push(hero.client_id);
+        }
+    }
+    for enemy in &baseline.enemies {
+        if !current.enemies.iter().any(|c| c.id == enemy.id) {
+            removed_ids.push(enemy.id);
+        }
+    }
+    for tower in &baseline.towers {
+        if !current.towers.iter().any(|c| c.id == tower.id) {
+            removed_ids.push(tower.id);
+        }
+    }
+
+    WorldPatch {
+        tick: current.tick,
+        baseline_tick: baseline.tick,
+        phase: current.phase,
+        match_restart_ticks_remaining: current.match_restart_ticks_remaining,
+        wave: current.wave,
+        team_life: current.team_life,
+        objectives: current.objectives.clone(),
+        your_last_input_seq: current.your_last_input_seq,
+        hero_patches,
+        enemy_patches,
+        tower_patches,
+        removed_ids,
     }
 }

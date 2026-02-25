@@ -31,3 +31,6 @@ strip = true
 [profile.dist]
 inherits = "release"
 opt-level = 3
+
+[patch.crates-io]
+str0m = { git = "https://github.com/dt665m/str0m.git", branch = "codex/dtls-buf-65535" }

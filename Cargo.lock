@@ -2519,9 +2519,9 @@ dependencies = [
 
 [[package]]
 name = "deranged"
-version = "0.5.6"
+version = "0.3.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cc3dc5ad92c2e2d1c193bbbbdf2ea477cb81331de4f3103f267ca18368b988c4"
+checksum = "b42b6fa04a440b495c8b04d0e71b707c585f83cb9cb28cf8cd0d976c315e31b4"
 dependencies = [
  "powerfmt",
 ]
@@ -2551,9 +2551,9 @@ dependencies = [
 
 [[package]]
 name = "dimpl"
-version = "0.2.7"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f9ef6a775c3c382927accaee1d2ecc09c2f0b97881ceec92748c6fbc36292517"
+checksum = "53382532e53576983721038702387751067de126c43c3150af8341962e85b456"
 dependencies = [
  "arrayvec",
  "aws-lc-rs",
@@ -4358,9 +4358,9 @@ dependencies = [
 
 [[package]]
 name = "num-conv"
-version = "0.2.0"
+version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf97ec579c3c42f953ef76dbf8d55ac91fb219dde70e49aa4a6b7d74e9919050"
+checksum = "51d515d32fb182ee37cda2ccdcb92950d6a3c2893aa280e540671c2cd0f3b1d9"
 
 [[package]]
 name = "num-derive"
@@ -6013,8 +6013,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 [[package]]
 name = "str0m"
 version = "0.16.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f5f0c25390231e9e2eafea5c3b254bf1c4ef315cec88f49a5d7d00f907d45e16"
+source = "git+https://github.com/dt665m/str0m.git?branch=codex%2Fdtls-buf-65535#64c041c662d1122e17474b44e0eba9dd0b794541"
 dependencies = [
  "arrayvec",
  "combine",
@@ -6026,29 +6025,30 @@ dependencies = [
  "str0m-aws-lc-rs",
  "str0m-proto",
  "subtle",
+ "time",
  "tracing",
 ]
 
 [[package]]
 name = "str0m-aws-lc-rs"
 version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e29008922b65621ad4696d03440910365118d5007ab90d0d9e75a3a75a4186f"
+source = "git+https://github.com/dt665m/str0m.git?branch=codex%2Fdtls-buf-65535#64c041c662d1122e17474b44e0eba9dd0b794541"
 dependencies = [
  "aws-lc-rs",
  "dimpl",
  "str0m-proto",
+ "time",
 ]
 
 [[package]]
 name = "str0m-proto"
 version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "132cc3c4a8197f7d514887dc6cf5341447d3cbe290773641081b9fa04126c994"
+source = "git+https://github.com/dt665m/str0m.git?branch=codex%2Fdtls-buf-65535#64c041c662d1122e17474b44e0eba9dd0b794541"
 dependencies = [
  "base64ct",
  "dimpl",
  "subtle",
+ "time",
 ]
 
 [[package]]
@@ -6212,30 +6212,30 @@ dependencies = [
 
 [[package]]
 name = "time"
-version = "0.3.47"
+version = "0.3.36"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "743bd48c283afc0388f9b8827b976905fb217ad9e647fae3a379a9283c4def2c"
+checksum = "5dfd88e563464686c916c7e46e623e520ddc6d79fa6641390f2e3fa86e83e885"
 dependencies = [
  "deranged",
  "itoa",
  "num-conv",
  "powerfmt",
- "serde_core",
+ "serde",
  "time-core",
  "time-macros",
 ]
 
 [[package]]
 name = "time-core"
-version = "0.1.8"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7694e1cfe791f8d31026952abf09c69ca6f6fa4e1a1229e18988f06a04a12dca"
+checksum = "ef927ca75afb808a4d64dd374f00a2adf8d0fcff8e7b184af886c3c87ec4a3f3"
 
 [[package]]
 name = "time-macros"
-version = "0.2.27"
+version = "0.2.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2e70e4c5a0e0a8a4823ad65dfe1a6930e4f4d756dcd9dd7939022b5e8c501215"
+checksum = "3f252a68540fde3a3877aeea552b832b40ab9a69e318efd078774a01ddee1ccf"
 dependencies = [
  "num-conv",
  "time-core",

@@ -428,6 +428,52 @@ pub struct WorldDelta {
     pub your_last_input_seq: Option<u32>,
 }
 
+/// Client-to-server: bundled recent movement inputs for redundancy.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ClientMoveBundle {
+    pub moves: Vec<(u32, [f32; 2])>, // (seq, dir) pairs, oldest first
+}
+
+/// Client-to-server: acknowledges the latest received server tick.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClientAck {
+    pub tick: u32,
+}
+
+/// Client unreliable message: either a move bundle or a tick ack (or both).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum ClientUnreliableMessage {
+    MoveBundle(ClientMoveBundle),
+    MoveBundleWithAck {
+        moves: Vec<(u32, [f32; 2])>,
+        ack_tick: u32,
+    },
+}
+
+/// Server-to-client: either a full snapshot or a delta patch.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum ServerWorldMessage {
+    Full(WorldDelta),
+    Patch(WorldPatch),
+}
+
+/// Delta-compressed world update.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WorldPatch {
+    pub tick: u32,
+    pub baseline_tick: u32,
+    pub phase: MatchPhase,
+    pub match_restart_ticks_remaining: Option<u32>,
+    pub wave: u32,
+    pub team_life: i32,
+    pub objectives: Vec<ObjectiveSnapshot>,
+    pub your_last_input_seq: Option<u32>,
+    pub hero_patches: Vec<HeroSnapshot>,
+    pub enemy_patches: Vec<EnemySnapshot>,
+    pub tower_patches: Vec<TowerSnapshot>,
+    pub removed_ids: Vec<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct JoinSnapshot {
     pub you: u64,

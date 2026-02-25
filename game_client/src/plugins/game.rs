@@ -22,11 +22,12 @@ use clap::Parser;
 use game_server::{ServerArgs, run as run_server};
 use game_shared::{
     AbilityId, AttackPhase, BASE_POSITION, BUILD_COMMAND_MAX_DISTANCE, BUILD_NODES, BuildNodeDef,
-    ChargePhase, ClientCommand, DirectionalAttackStateComponent, ENEMY_REGULAR_ATTACK,
-    EnemySnapshot, FIXED_DT_SECONDS, HERO_COLLIDER_RADIUS, HERO_MAX_HP, HERO_MAX_MANA,
-    HERO_REGULAR_ATTACK, HERO_SPEED, HeroSnapshot, JoinSnapshot, MatchPhase, ObjectiveSnapshot,
-    PROTOCOL_ID, ReliableGameEvent, ReliableServerMessage, TOWER_COLLIDER_RADIUS, TowerSnapshot,
-    TowerType, WorldDelta, clamp_to_world, distance_sq, encode, enemy_collider_radius,
+    ChargePhase, ClientCommand, ClientMoveBundle, DirectionalAttackStateComponent,
+    ENEMY_REGULAR_ATTACK, EnemySnapshot, FIXED_DT_SECONDS,
+    HERO_COLLIDER_RADIUS, HERO_MAX_HP, HERO_MAX_MANA, HERO_REGULAR_ATTACK, HERO_SPEED,
+    HeroSnapshot, JoinSnapshot, MatchPhase, ObjectiveSnapshot, PROTOCOL_ID, ReliableGameEvent,
+    ReliableServerMessage, ServerWorldMessage, TOWER_COLLIDER_RADIUS, TowerSnapshot, TowerType,
+    WorldDelta, WorldPatch, clamp_to_world, distance_sq, encode, enemy_collider_radius,
     is_newer_input_seq, normalize_or_zero,
 };
 use renet::{DefaultChannel, RenetClient};
@@ -54,9 +55,7 @@ const POWER_FLICKER_HIDDEN_DUTY: f32 = 0.28;
 const HERO_HIT_REACTION_DURATION_SECONDS: f32 = 0.16;
 const ENEMY_HIT_REACTION_DURATION_SECONDS: f32 = 0.16;
 const TOWER_FIRE_REACTION_DURATION_SECONDS: f32 = 0.14;
-const ENEMY_RENDER_LEAD_SECONDS: f32 = FIXED_DT_SECONDS * 1.2;
 const ENEMY_RENDER_SMOOTH_RATE: f32 = 18.0;
-const REMOTE_HERO_RENDER_SMOOTH_RATE: f32 = 14.0;
 const LOCAL_HERO_RECONCILE_RATE: f32 = 24.0;
 const LOCAL_HERO_RENDER_SMOOTH_RATE: f32 = 30.0;
 const LOCAL_HERO_SNAP_DISTANCE_SQ: f32 = 9.0;
@@ -208,6 +207,222 @@ struct PendingWebBootstrap {
 #[derive(Resource, Default)]
 struct InputState {
     dir: [f32; 2],
+}
+
+#[derive(Resource)]
+struct NetStats {
+    rtt_ema: f32,
+    jitter_ema: f32,
+    last_seq_send_times: VecDeque<(u32, f32)>,
+}
+
+impl Default for NetStats {
+    fn default() -> Self {
+        Self {
+            rtt_ema: 0.1,
+            jitter_ema: 0.02,
+            last_seq_send_times: VecDeque::new(),
+        }
+    }
+}
+
+impl NetStats {
+    fn update_rtt_sample(&mut self, sample: f32) {
+        const ALPHA: f32 = 0.1;
+        let jitter_sample = (sample - self.rtt_ema).abs();
+        self.rtt_ema += ALPHA * (sample - self.rtt_ema);
+        self.jitter_ema += ALPHA * (jitter_sample - self.jitter_ema);
+    }
+
+    fn enemy_render_lead(&self) -> f32 {
+        let one_way = self.rtt_ema * 0.5;
+        one_way.clamp(FIXED_DT_SECONDS * 0.5, 0.15)
+    }
+}
+
+#[derive(Clone)]
+struct TimestampedSnapshot {
+    server_tick: u32,
+    receive_time: f32,
+    world: WorldDelta,
+}
+
+#[derive(Resource)]
+struct SnapshotBuffer {
+    snapshots: VecDeque<TimestampedSnapshot>,
+    interpolation_delay: f32,
+    render_time: f32,
+}
+
+impl Default for SnapshotBuffer {
+    fn default() -> Self {
+        Self {
+            snapshots: VecDeque::with_capacity(12),
+            interpolation_delay: FIXED_DT_SECONDS * 2.0,
+            render_time: 0.0,
+        }
+    }
+}
+
+/// Positions interpolated from the snapshot buffer for remote entities.
+struct InterpolatedPositions {
+    heroes: HashMap<u64, [f32; 2]>,
+    enemies: HashMap<u64, ([f32; 2], [f32; 2])>, // (pos, vel)
+}
+
+impl SnapshotBuffer {
+    fn push(&mut self, snapshot: TimestampedSnapshot) {
+        // Discard out-of-order snapshots
+        if let Some(last) = self.snapshots.back() {
+            if !game_shared::is_newer_input_seq(snapshot.server_tick, last.server_tick)
+                && snapshot.server_tick != last.server_tick
+            {
+                return;
+            }
+        }
+        self.snapshots.push_back(snapshot);
+        while self.snapshots.len() > 12 {
+            self.snapshots.pop_front();
+        }
+    }
+
+    fn update_interpolation_delay(&mut self, net_stats: &NetStats) {
+        let target = (net_stats.rtt_ema * 0.5 + net_stats.jitter_ema * 3.0)
+            .max(FIXED_DT_SECONDS * 2.0)
+            .min(0.2);
+        const DELAY_ALPHA: f32 = 0.05;
+        self.interpolation_delay += DELAY_ALPHA * (target - self.interpolation_delay);
+    }
+
+    fn advance_render_time(&mut self, dt: f32) {
+        self.render_time += dt;
+    }
+
+    /// Sync render_time to latest snapshot receive_time minus interpolation_delay.
+    /// Called when a new snapshot arrives to keep the clock on track.
+    fn sync_render_clock(&mut self) {
+        if let Some(latest) = self.snapshots.back() {
+            let target_render_time = latest.receive_time - self.interpolation_delay;
+            // Softly chase the target to avoid jumps
+            let diff = target_render_time - self.render_time;
+            if diff.abs() > 0.5 {
+                // Too far off — snap
+                self.render_time = target_render_time;
+            }
+            // Otherwise render_time advances naturally via advance_render_time
+        }
+    }
+
+    fn sample(&self, render_time: f32, enemy_lead: f32) -> InterpolatedPositions {
+        let mut heroes = HashMap::new();
+        let mut enemies = HashMap::new();
+
+        if self.snapshots.is_empty() {
+            return InterpolatedPositions { heroes, enemies };
+        }
+
+        // Find bracketing snapshots
+        let (older, newer, t) = self.find_bracketing(render_time);
+
+        // Interpolate heroes
+        for hero_new in &newer.world.heroes {
+            if let Some(hero_old) = older
+                .world
+                .heroes
+                .iter()
+                .find(|h| h.client_id == hero_new.client_id)
+            {
+                let pos = lerp_pos(hero_old.pos, hero_new.pos, t);
+                heroes.insert(hero_new.client_id, pos);
+            } else {
+                heroes.insert(hero_new.client_id, hero_new.pos);
+            }
+        }
+
+        // Interpolate enemies
+        for enemy_new in &newer.world.enemies {
+            if let Some(enemy_old) = older
+                .world
+                .enemies
+                .iter()
+                .find(|e| e.id == enemy_new.id)
+            {
+                let pos = lerp_pos(enemy_old.pos, enemy_new.pos, t);
+                // Apply extrapolation lead on top of interpolated position
+                let led_pos = clamp_to_world([
+                    pos[0] + enemy_new.vel[0] * enemy_lead,
+                    pos[1] + enemy_new.vel[1] * enemy_lead,
+                ]);
+                enemies.insert(enemy_new.id, (led_pos, enemy_new.vel));
+            } else {
+                let led_pos = clamp_to_world([
+                    enemy_new.pos[0] + enemy_new.vel[0] * enemy_lead,
+                    enemy_new.pos[1] + enemy_new.vel[1] * enemy_lead,
+                ]);
+                enemies.insert(enemy_new.id, (led_pos, enemy_new.vel));
+            }
+        }
+
+        InterpolatedPositions { heroes, enemies }
+    }
+
+    fn find_bracketing(&self, render_time: f32) -> (&TimestampedSnapshot, &TimestampedSnapshot, f32) {
+        let len = self.snapshots.len();
+        if len < 2 {
+            let snap = &self.snapshots[0];
+            return (snap, snap, 1.0);
+        }
+
+        // Find the newest snapshot with receive_time <= render_time
+        let mut older_idx = 0;
+        for i in 0..len {
+            if self.snapshots[i].receive_time <= render_time {
+                older_idx = i;
+            } else {
+                break;
+            }
+        }
+        let newer_idx = (older_idx + 1).min(len - 1);
+        if older_idx == newer_idx {
+            // render_time is past all snapshots — use last two and extrapolate (clamp t to 1.0)
+            if len >= 2 {
+                let older = &self.snapshots[len - 2];
+                let newer = &self.snapshots[len - 1];
+                return (older, newer, 1.0);
+            }
+            let snap = &self.snapshots[0];
+            return (snap, snap, 1.0);
+        }
+
+        let older = &self.snapshots[older_idx];
+        let newer = &self.snapshots[newer_idx];
+        let span = newer.receive_time - older.receive_time;
+        let t = if span > f32::EPSILON {
+            ((render_time - older.receive_time) / span).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        (older, newer, t)
+    }
+
+    fn has_enough_data(&self) -> bool {
+        self.snapshots.len() >= 2
+    }
+
+    fn clear(&mut self) {
+        self.snapshots.clear();
+        self.render_time = 0.0;
+        self.interpolation_delay = FIXED_DT_SECONDS * 2.0;
+    }
+
+    /// Find a snapshot by tick for delta reconstruction.
+    fn find_by_tick(&self, tick: u32) -> Option<&TimestampedSnapshot> {
+        self.snapshots.iter().find(|s| s.server_tick == tick)
+    }
+}
+
+fn lerp_pos(a: [f32; 2], b: [f32; 2], t: f32) -> [f32; 2] {
+    [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]
 }
 
 #[derive(Resource, Default)]
@@ -635,6 +850,8 @@ pub struct GameClientPlugin;
 impl Plugin for GameClientPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(InputState::default())
+            .insert_resource(NetStats::default())
+            .insert_resource(SnapshotBuffer::default())
             .insert_resource(LocalHeroSmoothing::default())
             .insert_resource(UnitBarCameraCache::default())
             .insert_resource(HudState::default())
@@ -1572,8 +1789,10 @@ fn capture_input(keyboard: Res<ButtonInput<KeyCode>>, mut input_state: ResMut<In
 }
 
 fn send_movement_commands(
+    time: Res<Time>,
     input_state: Res<InputState>,
     runtime: Option<NonSendMut<NetworkRuntime>>,
+    mut net_stats: ResMut<NetStats>,
 ) {
     let Some(mut runtime) = runtime else {
         return;
@@ -1584,13 +1803,15 @@ fn send_movement_commands(
     }
 
     let seq = runtime.next_command_seq();
-    let command = ClientCommand::Move {
-        seq,
-        dir: input_state.dir,
-    };
-    runtime
-        .renet
-        .send_message(DefaultChannel::Unreliable, encode(&command));
+
+    // Record send time for RTT measurement
+    let wall_time = time.elapsed_secs();
+    net_stats.last_seq_send_times.push_back((seq, wall_time));
+    while net_stats.last_seq_send_times.len() > 256 {
+        net_stats.last_seq_send_times.pop_front();
+    }
+
+    // Build a move bundle: include all pending unacked moves + the new one
     runtime.pending_moves.push_back(PendingMove {
         seq,
         dir: input_state.dir,
@@ -1598,6 +1819,22 @@ fn send_movement_commands(
     while runtime.pending_moves.len() > 256 {
         runtime.pending_moves.pop_front();
     }
+
+    let bundle_moves: Vec<(u32, [f32; 2])> = runtime
+        .pending_moves
+        .iter()
+        .rev()
+        .take(8)
+        .map(|pm| (pm.seq, pm.dir))
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+
+    let bundle = ClientMoveBundle { moves: bundle_moves };
+    runtime
+        .renet
+        .send_message(DefaultChannel::Unreliable, encode(&bundle));
 }
 
 fn send_action_commands(
@@ -1716,6 +1953,8 @@ fn network_update(
     time: Res<Time>,
     runtime: Option<NonSendMut<NetworkRuntime>>,
     mut world: ResMut<WorldView>,
+    mut net_stats: ResMut<NetStats>,
+    mut snapshot_buffer: ResMut<SnapshotBuffer>,
     mut hud_state: ResMut<HudState>,
     render_index: Res<RenderIndex>,
     mut commands: Commands,
@@ -1727,11 +1966,15 @@ fn network_update(
     };
     let runtime_inner: &mut NetworkRuntime = &mut runtime;
 
-    let dt = Duration::from_secs_f32(time.delta_secs().clamp(0.0, 0.1));
+    let dt_secs = time.delta_secs().clamp(0.0, 0.1);
+    let dt = Duration::from_secs_f32(dt_secs);
     runtime_inner.renet.update(dt);
     if let Err(err) = runtime_inner.transport_update(dt) {
         log::warn!("client transport update failed: {err}");
     }
+
+    // Advance the interpolation render clock
+    snapshot_buffer.advance_render_time(dt_secs);
 
     while let Some(bytes) = runtime_inner
         .renet
@@ -1744,6 +1987,7 @@ fn network_update(
                     snapshot.world.your_last_input_seq,
                 );
                 runtime_inner.client_id = snapshot.you;
+                snapshot_buffer.clear();
                 world.apply_join(snapshot);
                 hud_state.last_event = "Joined authoritative match".to_owned();
             }
@@ -1768,12 +2012,23 @@ fn network_update(
         }
     }
 
+    let wall_time = time.elapsed_secs();
     while let Some(bytes) = runtime_inner
         .renet
         .receive_message(DefaultChannel::Unreliable)
     {
-        match game_shared::decode::<WorldDelta>(&bytes) {
-            Ok(delta) => {
+        match game_shared::decode::<ServerWorldMessage>(&bytes) {
+            Ok(msg) => {
+                let delta = match msg {
+                    ServerWorldMessage::Full(d) => d,
+                    ServerWorldMessage::Patch(patch) => {
+                        match reconstruct_from_patch(&snapshot_buffer, patch) {
+                            Some(d) => d,
+                            None => continue, // baseline not found, skip
+                        }
+                    }
+                };
+
                 let hit_enemy_ids = detect_hit_enemy_ids(&world.enemies, &delta);
                 let hit_hero_ids = detect_hit_hero_ids(&world.heroes, &delta);
                 let fired_tower_ids = detect_fired_tower_ids(&world.towers, &delta);
@@ -1837,21 +2092,145 @@ fn network_update(
                     }
                 }
 
+                // RTT measurement: match your_last_input_seq to recorded send times
+                if let Some(ack_seq) = delta.your_last_input_seq {
+                    if let Some(idx) = net_stats
+                        .last_seq_send_times
+                        .iter()
+                        .position(|(seq, _)| *seq == ack_seq)
+                    {
+                        let (_, send_time) = net_stats.last_seq_send_times[idx];
+                        let rtt_sample = wall_time - send_time;
+                        if rtt_sample > 0.0 && rtt_sample < 2.0 {
+                            net_stats.update_rtt_sample(rtt_sample);
+                        }
+                        // Remove all entries up to and including this one
+                        net_stats.last_seq_send_times.drain(..=idx);
+                    }
+                }
+
                 acknowledge_pending_moves(
                     &mut runtime_inner.pending_moves,
                     delta.your_last_input_seq,
                 );
+
+                // Push into snapshot buffer for interpolation
+                snapshot_buffer.push(TimestampedSnapshot {
+                    server_tick: delta.tick,
+                    receive_time: wall_time,
+                    world: delta.clone(),
+                });
+                snapshot_buffer.update_interpolation_delay(&net_stats);
+                snapshot_buffer.sync_render_clock();
+
+                // Apply to world view for HUD scalars, local hero, etc.
                 world.apply_delta(delta);
             }
             Err(err) => {
-                log::warn!("failed to decode WorldDelta: {err}");
+                log::warn!("failed to decode ServerWorldMessage: {err}");
             }
         }
+    }
+
+    // Send client ack for the latest received tick (piggy-backed on next unreliable send)
+    if let Some(latest) = snapshot_buffer.snapshots.back() {
+        let ack = game_shared::ClientAck {
+            tick: latest.server_tick,
+        };
+        runtime_inner
+            .renet
+            .send_message(DefaultChannel::Unreliable, encode(&ack));
     }
 
     if let Err(err) = runtime_inner.transport_send_packets() {
         log::warn!("client send_packets error: {err}");
     }
+}
+
+/// Reconstruct a full WorldDelta from a patch and its baseline in the snapshot buffer.
+fn reconstruct_from_patch(buffer: &SnapshotBuffer, patch: WorldPatch) -> Option<WorldDelta> {
+    let baseline = buffer.find_by_tick(patch.baseline_tick)?;
+    let base = &baseline.world;
+
+    // Start with baseline entity lists
+    let mut heroes: Vec<HeroSnapshot> = Vec::new();
+    let mut enemies: Vec<EnemySnapshot> = Vec::new();
+    let mut towers: Vec<TowerSnapshot> = Vec::new();
+
+    let removed: HashSet<u64> = patch.removed_ids.into_iter().collect();
+
+    // Heroes: start from baseline, apply patches
+    for hero in &base.heroes {
+        if removed.contains(&hero.client_id) {
+            continue;
+        }
+        if let Some(patched) = patch
+            .hero_patches
+            .iter()
+            .find(|h| h.client_id == hero.client_id)
+        {
+            heroes.push(*patched);
+        } else {
+            heroes.push(*hero);
+        }
+    }
+    // Add new heroes (in patch but not in baseline)
+    for patched in &patch.hero_patches {
+        if !base
+            .heroes
+            .iter()
+            .any(|h| h.client_id == patched.client_id)
+        {
+            heroes.push(*patched);
+        }
+    }
+
+    // Enemies: start from baseline, apply patches
+    for enemy in &base.enemies {
+        if removed.contains(&enemy.id) {
+            continue;
+        }
+        if let Some(patched) = patch.enemy_patches.iter().find(|e| e.id == enemy.id) {
+            enemies.push(*patched);
+        } else {
+            enemies.push(*enemy);
+        }
+    }
+    for patched in &patch.enemy_patches {
+        if !base.enemies.iter().any(|e| e.id == patched.id) {
+            enemies.push(*patched);
+        }
+    }
+
+    // Towers: start from baseline, apply patches
+    for tower in &base.towers {
+        if removed.contains(&tower.id) {
+            continue;
+        }
+        if let Some(patched) = patch.tower_patches.iter().find(|t| t.id == tower.id) {
+            towers.push(*patched);
+        } else {
+            towers.push(*tower);
+        }
+    }
+    for patched in &patch.tower_patches {
+        if !base.towers.iter().any(|t| t.id == patched.id) {
+            towers.push(*patched);
+        }
+    }
+
+    Some(WorldDelta {
+        tick: patch.tick,
+        phase: patch.phase,
+        match_restart_ticks_remaining: patch.match_restart_ticks_remaining,
+        wave: patch.wave,
+        team_life: patch.team_life,
+        objectives: patch.objectives,
+        heroes,
+        enemies,
+        towers,
+        your_last_input_seq: patch.your_last_input_seq,
+    })
 }
 
 fn spawn_ability_effect(
@@ -2478,6 +2857,8 @@ fn sync_dynamic_actors(
     input_state: Res<InputState>,
     mut local_smoothing: ResMut<LocalHeroSmoothing>,
     world: Res<WorldView>,
+    net_stats: Res<NetStats>,
+    snapshot_buffer: Res<SnapshotBuffer>,
     mut render_index: ResMut<RenderIndex>,
     assets: Res<SceneAssets>,
     runtime: Option<NonSend<NetworkRuntime>>,
@@ -2504,6 +2885,13 @@ fn sync_dynamic_actors(
         local_smoothing.predicted_pos = None;
         local_smoothing.render_pos = None;
     }
+
+    // Sample interpolated positions from the snapshot buffer
+    let interpolated = if snapshot_buffer.has_enough_data() {
+        Some(snapshot_buffer.sample(snapshot_buffer.render_time, net_stats.enemy_render_lead()))
+    } else {
+        None
+    };
 
     let mut desired = HashMap::new();
     for hero in world.heroes.values() {
@@ -2533,7 +2921,11 @@ fn sync_dynamic_actors(
                 hero.client_id,
             )
         } else {
-            hero.pos
+            // Remote hero: use interpolated position if available
+            interpolated
+                .as_ref()
+                .and_then(|interp| interp.heroes.get(&hero.client_id).copied())
+                .unwrap_or(hero.pos)
         };
         let visual_facing = if local {
             if hero.lock_mode_active {
@@ -2598,10 +2990,15 @@ fn sync_dynamic_actors(
     }
 
     for enemy in world.enemies.values() {
+        // Use interpolated position if available, otherwise fall back to prediction
+        let pos = interpolated
+            .as_ref()
+            .and_then(|interp| interp.enemies.get(&enemy.id).map(|(p, _)| *p))
+            .unwrap_or_else(|| predict_enemy_position(enemy, net_stats.enemy_render_lead()));
         desired.insert(
             enemy.id,
             DesiredActor {
-                pos: predict_enemy_position(enemy),
+                pos,
                 kind: ActorKind::Enemy,
                 facing: Some(FacingStat {
                     dir: enemy.facing.dir,
@@ -3406,16 +3803,19 @@ fn actor_y(kind: ActorKind) -> f32 {
 
 fn actor_smoothing_rate(kind: ActorKind) -> Option<f32> {
     match kind {
-        ActorKind::Hero { local: true } | ActorKind::Tower => None,
-        ActorKind::Hero { local: false } => Some(REMOTE_HERO_RENDER_SMOOTH_RATE),
+        // Local hero: no smoothing (prediction handles it)
+        // Remote hero: no exponential smoothing (snapshot interpolation handles it)
+        // Tower: no smoothing (static)
+        ActorKind::Hero { .. } | ActorKind::Tower => None,
+        // Enemy: keep a mild smoothing as fallback for when interpolation has gaps
         ActorKind::Enemy => Some(ENEMY_RENDER_SMOOTH_RATE),
     }
 }
 
-fn predict_enemy_position(enemy: &EnemySnapshot) -> [f32; 2] {
+fn predict_enemy_position(enemy: &EnemySnapshot, lead_seconds: f32) -> [f32; 2] {
     clamp_to_world([
-        enemy.pos[0] + enemy.vel[0] * ENEMY_RENDER_LEAD_SECONDS,
-        enemy.pos[1] + enemy.vel[1] * ENEMY_RENDER_LEAD_SECONDS,
+        enemy.pos[0] + enemy.vel[0] * lead_seconds,
+        enemy.pos[1] + enemy.vel[1] * lead_seconds,
     ])
 }
 

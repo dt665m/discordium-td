@@ -210,8 +210,13 @@ pub fn run(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
 
 /// Per-client net state for delta compression.
 struct ClientNetState {
+    /// The tick the client last confirmed receiving.
     last_acked_tick: Option<u32>,
-    last_acked_snapshot: Option<WorldDelta>,
+    /// The snapshot that the client confirmed receiving (set when ack matches sent_history).
+    /// Only this snapshot is used as a baseline for patches — never an unconfirmed one.
+    confirmed_baseline: Option<WorldDelta>,
+    /// Ring buffer of recently sent snapshots so we can look up the one matching an ack.
+    sent_history: VecDeque<(u32, WorldDelta)>,
 }
 
 fn run_game_loop(
@@ -264,7 +269,8 @@ fn run_game_loop(
                                 client_id,
                                 ClientNetState {
                                     last_acked_tick: None,
-                                    last_acked_snapshot: None,
+                                    confirmed_baseline: None,
+                                    sent_history: VecDeque::new(),
                                 },
                             );
                             log::info!("client connected: {client_id}");
@@ -387,6 +393,17 @@ fn receive_client_commands(
                         .is_none_or(|old| game_shared::is_newer_input_seq(ack.tick, old));
                     if should_update {
                         state.last_acked_tick = Some(ack.tick);
+                        // Promote the acked snapshot from sent_history to confirmed_baseline
+                        if let Some(pos) = state
+                            .sent_history
+                            .iter()
+                            .position(|(t, _)| *t == ack.tick)
+                        {
+                            state.confirmed_baseline =
+                                Some(state.sent_history[pos].1.clone());
+                            // Drop everything older — we'll never need it
+                            state.sent_history.drain(..pos);
+                        }
                     }
                 }
                 continue;
@@ -430,12 +447,13 @@ fn broadcast_world_deltas(
             .entry(client_id)
             .or_insert_with(|| ClientNetState {
                 last_acked_tick: None,
-                last_acked_snapshot: None,
+                confirmed_baseline: None,
+                sent_history: VecDeque::new(),
             });
 
-        let msg = if let Some(ref baseline) = state.last_acked_snapshot {
-            let baseline_tick = baseline.tick;
-            let age = current_tick.wrapping_sub(baseline_tick);
+        // Only build a patch against a baseline the client has confirmed receiving.
+        let msg = if let Some(ref baseline) = state.confirmed_baseline {
+            let age = current_tick.wrapping_sub(baseline.tick);
             if age > 0 && age <= DELTA_BASELINE_MAX_AGE {
                 ServerWorldMessage::Patch(build_world_patch(&delta, baseline))
             } else {
@@ -447,24 +465,11 @@ fn broadcast_world_deltas(
 
         server.send_message(client_id, DefaultChannel::Unreliable, encode(&msg));
 
-        // Update the stored baseline to the latest sent snapshot if acked
-        // We update `last_acked_snapshot` to the latest delta we send whenever
-        // the client has acked a tick >= the current baseline's tick.
-        // For simplicity, we always store the latest sent delta as the baseline
-        // that corresponds to _this_ tick, and the client acks will tell us which
-        // tick they received. We record the delta per-tick and match acks later.
-        // Simplified approach: store the current delta alongside its tick. When
-        // the client acks tick N, we know they have that snapshot.
-        //
-        // Actually, the simplest correct approach: after sending, record this delta
-        // as the "last sent". When we receive an ack for tick T, we know the client
-        // has the snapshot we sent for tick T. Since we only keep one baseline, we
-        // store the snapshot we sent and tag it with the tick. If the ack matches
-        // the stored tick, we can use it as baseline.
-        //
-        // Even simpler: always update baseline to current. The ack confirms the
-        // client received it. If the ack is stale, we send Full.
-        state.last_acked_snapshot = Some(delta);
+        // Store in sent_history so we can promote to confirmed_baseline when acked.
+        state.sent_history.push_back((delta.tick, delta));
+        while state.sent_history.len() > 64 {
+            state.sent_history.pop_front();
+        }
     }
 }
 

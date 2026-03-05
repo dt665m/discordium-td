@@ -1,4 +1,7 @@
-use std::{collections::HashMap, f32::consts::TAU};
+use std::{
+    collections::{HashMap, VecDeque},
+    f32::consts::TAU,
+};
 
 use game_shared::{
     AbilityId, AttackPhase, BASE_ENEMIES_PER_WAVE, BASE_POSITION, BUILD_COMMAND_MAX_DISTANCE,
@@ -134,6 +137,7 @@ pub struct Simulation {
     navmesh_cache: Option<NavMesh>,
     navmesh_dirty: bool,
     pending_commands: Vec<(u64, ClientCommand)>,
+    move_queues: HashMap<u64, VecDeque<(u32, [f32; 2])>>,
     next_entity_id: u64,
     wave_remaining: u32,
     next_spawn_tick: u32,
@@ -163,6 +167,7 @@ impl Simulation {
             navmesh_cache: None,
             navmesh_dirty: true,
             pending_commands: Vec::new(),
+            move_queues: HashMap::new(),
             next_entity_id: 1_000_000,
             wave_remaining: 0,
             next_spawn_tick: 0,
@@ -198,10 +203,12 @@ impl Simulation {
                 last_processed_seq: None,
             },
         );
+        self.move_queues.insert(client_id, VecDeque::new());
     }
 
     pub fn remove_player(&mut self, client_id: u64) {
         self.heroes.remove(&client_id);
+        self.move_queues.remove(&client_id);
 
         let owned_towers: Vec<u64> = self
             .towers
@@ -333,6 +340,7 @@ impl Simulation {
         }
 
         self.apply_pending_commands(&mut reliable_events);
+        self.consume_move_queues();
         self.advance_enemies(&mut reliable_events);
         self.advance_heroes(&mut reliable_events);
         self.resolve_tower_attacks(&mut reliable_events);
@@ -366,15 +374,31 @@ impl Simulation {
                 continue;
             }
 
-            if let Some(hero_mut) = self.heroes.get_mut(&client_id) {
-                hero_mut.last_processed_seq = Some(seq);
+            // For Move commands, queue them for 1:1 tick consumption instead of
+            // applying immediately. Don't update last_processed_seq here — let
+            // consume_move_queues handle it when the move is actually consumed.
+            // For all other commands, update last_processed_seq and process immediately.
+            match &command {
+                ClientCommand::Move { .. } => {}
+                _ => {
+                    if let Some(hero_mut) = self.heroes.get_mut(&client_id) {
+                        hero_mut.last_processed_seq = Some(seq);
+                    }
+                }
             }
 
             match command {
                 ClientCommand::Move { dir, .. } => {
-                    if let Some(hero_mut) = self.heroes.get_mut(&client_id) {
-                        let dir = normalize_or_zero(dir);
-                        hero_mut.move_dir = dir;
+                    let queue = self.move_queues.entry(client_id).or_default();
+                    // Also reject moves already queued but not yet consumed.
+                    // The client re-sends unacked moves in every bundle for
+                    // packet-loss resilience; without this check, duplicates
+                    // pile up and the queue grows unboundedly.
+                    let dominated_by_queue = queue
+                        .back()
+                        .is_some_and(|(last_q, _)| !is_newer_input_seq(seq, *last_q));
+                    if !dominated_by_queue {
+                        queue.push_back((seq, normalize_or_zero(dir)));
                     }
                 }
                 ClientCommand::SetLockTarget { target_id, .. } => {
@@ -396,6 +420,50 @@ impl Simulation {
                 } => {
                     self.try_build_tower(client_id, node_id, tower_type, reliable_events);
                 }
+            }
+        }
+    }
+
+    fn consume_move_queues(&mut self) {
+        let client_ids: Vec<u64> = self.move_queues.keys().copied().collect();
+        for client_id in client_ids {
+            // Pop consumed moves from queue first (separate borrow from heroes)
+            let consumed = {
+                let Some(queue) = self.move_queues.get_mut(&client_id) else {
+                    continue;
+                };
+                let first = queue.pop_front();
+                // Anti-buildup: if queue is growing (sustained jitter), drain an extra
+                // move to prevent ever-increasing input lag
+                let extra = if queue.len() > 4 {
+                    queue.pop_front()
+                } else {
+                    None
+                };
+                (first, extra)
+            };
+
+            let Some(hero) = self.heroes.get_mut(&client_id) else {
+                continue;
+            };
+
+            if let Some((seq, dir)) = consumed.0 {
+                hero.move_dir = dir;
+                hero.last_processed_seq = Some(seq);
+            } else {
+                // No input this tick — stop (don't replay stale direction)
+                hero.move_dir = [0.0, 0.0];
+            }
+
+            if let Some((seq, dir)) = consumed.1 {
+                // Apply first move's displacement, then set second move's direction.
+                // advance_heroes will apply the second move's displacement normally.
+                hero.pos = clamp_to_world([
+                    hero.pos[0] + hero.move_dir[0] * HERO_SPEED * FIXED_DT_SECONDS,
+                    hero.pos[1] + hero.move_dir[1] * HERO_SPEED * FIXED_DT_SECONDS,
+                ]);
+                hero.move_dir = dir;
+                hero.last_processed_seq = Some(seq);
             }
         }
     }
@@ -2354,7 +2422,17 @@ mod tests {
             .unwrap_or(0);
         let mut steps_after_release = 0_u32;
         let mut resumed_x = release_x;
+        let mut next_seq = 5_u32;
         while steps_after_release <= release_lag_ticks.saturating_add(2) {
+            // Send a move command each tick (like a real client would)
+            sim.queue_command(
+                1,
+                ClientCommand::Move {
+                    seq: next_seq,
+                    dir: [1.0, 0.0],
+                },
+            );
+            next_seq += 1;
             sim.step();
             steps_after_release += 1;
             resumed_x = sim.heroes.get(&1).map(|hero| hero.pos[0]).unwrap_or(0.0);

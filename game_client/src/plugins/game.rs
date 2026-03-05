@@ -56,9 +56,9 @@ const HERO_HIT_REACTION_DURATION_SECONDS: f32 = 0.16;
 const ENEMY_HIT_REACTION_DURATION_SECONDS: f32 = 0.16;
 const TOWER_FIRE_REACTION_DURATION_SECONDS: f32 = 0.14;
 const ENEMY_RENDER_SMOOTH_RATE: f32 = 18.0;
-const LOCAL_HERO_CORRECTION_RATE: f32 = 16.0;
+const LOCAL_HERO_CORRECTION_DECAY: f32 = 15.0;
+const LOCAL_HERO_OVERSTEP_SCALE: f32 = 0.7;
 const LOCAL_HERO_RENDER_SMOOTH_RATE: f32 = 30.0;
-const LOCAL_HERO_SNAP_OFFSET_SQ: f32 = 4.0;
 const LOCAL_HERO_SNAP_DISTANCE_SQ: f32 = 9.0;
 const LOCAL_HERO_COLLISION_MAX_CORRECTION_PER_STEP: f32 = HERO_SPEED * FIXED_DT_SECONDS * 0.65;
 const LOCAL_HERO_COLLISION_MAX_TOTAL_CORRECTION: f32 = HERO_SPEED * FIXED_DT_SECONDS * 1.05;
@@ -456,6 +456,24 @@ impl Default for UnitBarCameraCache {
 struct HudState {
     last_event: String,
 }
+
+#[derive(Resource)]
+struct DebugOverlayState {
+    visible: bool,
+    recent_msg_types: VecDeque<bool>, // true=Full, false=Patch, last 32
+}
+
+impl Default for DebugOverlayState {
+    fn default() -> Self {
+        Self {
+            visible: false,
+            recent_msg_types: VecDeque::with_capacity(32),
+        }
+    }
+}
+
+#[derive(Component)]
+struct DebugOverlayText;
 
 #[derive(Clone, Copy)]
 enum MenuAction {
@@ -859,6 +877,7 @@ impl Plugin for GameClientPlugin {
             .insert_resource(LocalHeroSmoothing::default())
             .insert_resource(UnitBarCameraCache::default())
             .insert_resource(HudState::default())
+            .insert_resource(DebugOverlayState::default())
             .insert_resource(SpecialSkillCooldownUiState::default())
             .insert_resource(PowerPieUiState::default())
             .insert_resource(GoldHudState::default())
@@ -897,6 +916,7 @@ impl Plugin for GameClientPlugin {
                     .in_set(ClientUpdateSet::Input),
             )
             .add_systems(Update, capture_input.in_set(ClientUpdateSet::Input))
+            .add_systems(Update, toggle_debug_overlay.in_set(ClientUpdateSet::Input))
             .add_systems(
                 Update,
                 (
@@ -944,6 +964,7 @@ impl Plugin for GameClientPlugin {
                     update_match_end_overlay.run_if(resource_changed::<WorldView>),
                     sync_menu_button_visual_state,
                     sync_main_menu_state,
+                    update_debug_overlay,
                 )
                     .chain()
                     .in_set(ClientUpdateSet::Ui),
@@ -1173,6 +1194,23 @@ fn setup_scene(
         Text::new("connecting..."),
         TextColor(Color::WHITE),
         HudText,
+    ));
+
+    commands.spawn((
+        Node {
+            position_type: PositionType::Absolute,
+            top: Val::Px(12.0),
+            right: Val::Px(12.0),
+            ..Default::default()
+        },
+        Text::new(""),
+        TextFont {
+            font_size: 13.0,
+            ..Default::default()
+        },
+        TextColor(Color::srgba(0.7, 0.9, 1.0, 0.85)),
+        Visibility::Hidden,
+        DebugOverlayText,
     ));
 
     commands
@@ -1961,6 +1999,7 @@ fn network_update(
     mut snapshot_buffer: ResMut<SnapshotBuffer>,
     mut local_smoothing: ResMut<LocalHeroSmoothing>,
     mut hud_state: ResMut<HudState>,
+    mut debug_overlay: ResMut<DebugOverlayState>,
     render_index: Res<RenderIndex>,
     mut commands: Commands,
     scene_assets: Res<SceneAssets>,
@@ -2020,12 +2059,40 @@ fn network_update(
     }
 
     let wall_time = time.elapsed_secs();
+
+    // Pre-loop prediction for batched correction — skip during attack/charge lock
+    // to avoid computing corrections for movement the server isn't applying.
+    let movement_allowed_for_correction = world
+        .you
+        .and_then(|cid| world.heroes.get(&cid))
+        .map(|hero| {
+            hero.regular_attack.phase == AttackPhase::Ready
+                && hero.charge_state.phase == ChargePhase::Idle
+        })
+        .unwrap_or(false);
+
+    let pre_loop_prediction = if movement_allowed_for_correction {
+        world
+            .you
+            .and_then(|cid| world.heroes.get(&cid))
+            .map(|hero| predict_local_position(hero.pos, &runtime_inner.pending_moves, &world))
+    } else {
+        None
+    };
+
     while let Some(bytes) = runtime_inner
         .renet
         .receive_message(DefaultChannel::Unreliable)
     {
         match game_shared::decode::<ServerWorldMessage>(&bytes) {
             Ok(msg) => {
+                // Track message type for debug overlay
+                let is_full = matches!(&msg, ServerWorldMessage::Full(_));
+                if debug_overlay.recent_msg_types.len() >= 32 {
+                    debug_overlay.recent_msg_types.pop_front();
+                }
+                debug_overlay.recent_msg_types.push_back(is_full);
+
                 let delta = match msg {
                     ServerWorldMessage::Full(d) => d,
                     ServerWorldMessage::Patch(patch) => {
@@ -2116,15 +2183,6 @@ fn network_update(
                     }
                 }
 
-                // Compute old prediction BEFORE ack+apply so we can detect
-                // how much the server correction shifts our predicted position.
-                let old_prediction = world
-                    .you
-                    .and_then(|cid| world.heroes.get(&cid))
-                    .map(|hero| {
-                        predict_local_position(hero.pos, &runtime_inner.pending_moves)
-                    });
-
                 acknowledge_pending_moves(
                     &mut runtime_inner.pending_moves,
                     delta.your_last_input_seq,
@@ -2141,38 +2199,29 @@ fn network_update(
 
                 // Apply to world view for HUD scalars, local hero, etc.
                 world.apply_delta(delta);
-
-                // Compute new prediction AFTER ack+apply. The difference from
-                // old_prediction is the server correction — absorb it into the
-                // visual offset so the player character doesn't teleport.
-                if let Some(old_pred) = old_prediction {
-                    if let Some(hero) = world
-                        .you
-                        .and_then(|cid| world.heroes.get(&cid))
-                    {
-                        let new_pred =
-                            predict_local_position(hero.pos, &runtime_inner.pending_moves);
-                        let correction = [
-                            new_pred[0] - old_pred[0],
-                            new_pred[1] - old_pred[1],
-                        ];
-                        // Absorb correction into offset (negative so visual stays put)
-                        local_smoothing.visual_offset[0] -= correction[0];
-                        local_smoothing.visual_offset[1] -= correction[1];
-                        // Snap offset to zero if it's gotten too large
-                        let offset_sq = local_smoothing.visual_offset[0]
-                            * local_smoothing.visual_offset[0]
-                            + local_smoothing.visual_offset[1]
-                                * local_smoothing.visual_offset[1];
-                        if offset_sq > LOCAL_HERO_SNAP_OFFSET_SQ {
-                            local_smoothing.visual_offset = [0.0, 0.0];
-                        }
-                    }
-                }
             }
             Err(err) => {
                 log::warn!("failed to decode ServerWorldMessage: {err}");
             }
+        }
+    }
+
+    // Batched correction: compute post-loop prediction and absorb single
+    // correction for the entire frame (telescoping sum: post - pre).
+    if let Some(pre_pred) = pre_loop_prediction {
+        if let Some(hero) = world
+            .you
+            .and_then(|cid| world.heroes.get(&cid))
+        {
+            let post_pred =
+                predict_local_position(hero.pos, &runtime_inner.pending_moves, &world);
+            let correction = [
+                post_pred[0] - pre_pred[0],
+                post_pred[1] - pre_pred[1],
+            ];
+            // Absorb raw correction into offset (negative so visual stays put)
+            local_smoothing.visual_offset[0] -= correction[0];
+            local_smoothing.visual_offset[1] -= correction[1];
         }
     }
 
@@ -2946,7 +2995,7 @@ fn sync_dynamic_actors(
             let predicted = if movement_allowed {
                 runtime
                     .as_ref()
-                    .map(|runtime| predict_local_position(hero.pos, &runtime.pending_moves))
+                    .map(|runtime| predict_local_position(hero.pos, &runtime.pending_moves, &world))
                     .unwrap_or(hero.pos)
             } else {
                 hero.pos
@@ -3314,6 +3363,63 @@ fn update_objective_markers(
         let y_scale = 0.35 + ratio * 1.65;
         transform.scale.y = y_scale;
         transform.translation.y = 0.35 + y_scale * 0.5;
+    }
+}
+
+fn toggle_debug_overlay(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    mut state: ResMut<DebugOverlayState>,
+    mut query: Query<&mut Visibility, With<DebugOverlayText>>,
+) {
+    if keyboard.just_pressed(KeyCode::F3) {
+        state.visible = !state.visible;
+        for mut vis in &mut query {
+            *vis = if state.visible {
+                Visibility::Inherited
+            } else {
+                Visibility::Hidden
+            };
+        }
+    }
+}
+
+fn update_debug_overlay(
+    state: Res<DebugOverlayState>,
+    net_stats: Res<NetStats>,
+    snapshot_buffer: Res<SnapshotBuffer>,
+    runtime: Option<NonSend<NetworkRuntime>>,
+    local_smoothing: Res<LocalHeroSmoothing>,
+    world: Res<WorldView>,
+    mut query: Query<&mut Text, With<DebugOverlayText>>,
+) {
+    if !state.visible {
+        return;
+    }
+    let rtt_ms = net_stats.rtt_ema * 1000.0;
+    let jitter_ms = net_stats.jitter_ema * 1000.0;
+    let snap_count = snapshot_buffer.snapshots.len();
+    let interp_ms = snapshot_buffer.interpolation_delay * 1000.0;
+    let pending = runtime
+        .as_ref()
+        .map(|r| r.pending_moves.len())
+        .unwrap_or(0);
+    let offset_mag = (local_smoothing.visual_offset[0] * local_smoothing.visual_offset[0]
+        + local_smoothing.visual_offset[1] * local_smoothing.visual_offset[1])
+    .sqrt();
+    let msgs: String = state
+        .recent_msg_types
+        .iter()
+        .map(|&full| if full { 'F' } else { 'P' })
+        .collect();
+
+    for mut text in &mut query {
+        text.0 = format!(
+            "rtt: {rtt_ms:.0}ms  jitter: {jitter_ms:.0}ms\n\
+             snaps: {snap_count}  interp: {interp_ms:.0}ms\n\
+             pending: {pending}  offset: {offset_mag:.3}\n\
+             tick: {}  msgs: {msgs}",
+            world.tick
+        );
     }
 }
 
@@ -4158,13 +4264,28 @@ fn pick_nearest_build_node(
     best.map(|(node_id, _)| node_id)
 }
 
-fn predict_local_position(base: [f32; 2], pending_moves: &VecDeque<PendingMove>) -> [f32; 2] {
+fn predict_local_position(
+    base: [f32; 2],
+    pending_moves: &VecDeque<PendingMove>,
+    world: &WorldView,
+) -> [f32; 2] {
     let mut pos = base;
     for pending in pending_moves {
         pos = clamp_to_world([
             pos[0] + pending.dir[0] * HERO_SPEED * FIXED_DT_SECONDS,
             pos[1] + pending.dir[1] * HERO_SPEED * FIXED_DT_SECONDS,
         ]);
+        // Resolve tower collisions to match server behavior.
+        // Only towers (static, always known) — enemy/hero collisions are dynamic
+        // and not worth predicting.
+        for tower in world.towers.values() {
+            pos = push_out_of_collider(
+                pos,
+                tower.pos,
+                HERO_COLLIDER_RADIUS + TOWER_COLLIDER_RADIUS,
+                HERO_SPEED * FIXED_DT_SECONDS,
+            );
+        }
     }
     pos
 }
@@ -4195,10 +4316,8 @@ fn update_local_hero_smoothing(
     world: &WorldView,
     local_client_id: u64,
 ) -> [f32; 2] {
-    // Decay the visual correction offset toward zero.
-    // This is the ONLY smoothing on the local hero — it blends out server
-    // corrections over ~150ms while letting raw prediction (input) be instant.
-    let alpha: f32 = 1.0 - (-LOCAL_HERO_CORRECTION_RATE * dt).exp();
+    // Single fast decay: ~63% of correction absorbed per server tick (33ms)
+    let alpha: f32 = 1.0 - (-LOCAL_HERO_CORRECTION_DECAY * dt).exp();
     smoothing.visual_offset[0] *= 1.0 - alpha;
     smoothing.visual_offset[1] *= 1.0 - alpha;
 
@@ -4216,9 +4335,10 @@ fn update_local_hero_smoothing(
     ];
     let corrected = resolve_local_hero_collisions(corrected, world, local_client_id);
 
-    // Add overstep extrapolation for sub-tick smoothness
-    let render_target =
-        predict_local_overstep_position(corrected, input_dir, overstep_fraction);
+    // Add scaled overstep extrapolation for sub-tick smoothness
+    let render_target = predict_local_overstep_position(
+        corrected, input_dir, overstep_fraction * LOCAL_HERO_OVERSTEP_SCALE,
+    );
     let render_target = resolve_local_hero_collisions(render_target, world, local_client_id);
 
     // Light render smoothing for visual polish (very fast — barely noticeable)

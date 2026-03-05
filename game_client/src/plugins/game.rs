@@ -433,6 +433,14 @@ struct LocalHeroSmoothing {
     /// here so the visual position doesn't teleport.
     visual_offset: [f32; 2],
     render_pos: Option<[f32; 2]>,
+    /// Whether prediction was active last frame. Used to detect transitions
+    /// between predicting (movement allowed) and not-predicting (attack/charge lock)
+    /// so we can absorb the prediction delta into visual_offset for continuity.
+    prediction_active: bool,
+    /// Set when client sends a movement-locking command (BasicAttack, SetCharging active).
+    /// Prevents new moves from being predicted and freezes visual offset until the server
+    /// confirms the hero is back to Ready+Idle.
+    local_input_lock: bool,
 }
 
 #[derive(Resource)]
@@ -1835,7 +1843,12 @@ fn send_movement_commands(
     input_state: Res<InputState>,
     runtime: Option<NonSendMut<NetworkRuntime>>,
     mut net_stats: ResMut<NetStats>,
+    local_smoothing: Res<LocalHeroSmoothing>,
 ) {
+    if local_smoothing.local_input_lock {
+        return;
+    }
+
     let Some(mut runtime) = runtime else {
         return;
     };
@@ -1886,6 +1899,7 @@ fn send_action_commands(
     world: Res<WorldView>,
     towers: Query<&TowerBuildNode, With<TowerActor>>,
     mut hud_state: ResMut<HudState>,
+    mut local_smoothing: ResMut<LocalHeroSmoothing>,
 ) {
     let Some(mut runtime) = runtime else {
         return;
@@ -1941,6 +1955,7 @@ fn send_action_commands(
             DefaultChannel::ReliableOrdered,
             encode(&ClientCommand::BasicAttack { seq }),
         );
+        local_smoothing.local_input_lock = true;
     }
 
     if keyboard.just_pressed(KeyCode::KeyK) {
@@ -1960,6 +1975,7 @@ fn send_action_commands(
             DefaultChannel::ReliableOrdered,
             encode(&ClientCommand::SetCharging { seq, active: true }),
         );
+        local_smoothing.local_input_lock = true;
         hud_state.last_event = "Charge started".to_owned();
     }
 
@@ -2060,25 +2076,17 @@ fn network_update(
 
     let wall_time = time.elapsed_secs();
 
-    // Pre-loop prediction for batched correction — skip during attack/charge lock
-    // to avoid computing corrections for movement the server isn't applying.
-    let movement_allowed_for_correction = world
+    // Save raw hero position before delta loop for locked-mode offset absorption
+    let pre_hero_pos = world
         .you
         .and_then(|cid| world.heroes.get(&cid))
-        .map(|hero| {
-            hero.regular_attack.phase == AttackPhase::Ready
-                && hero.charge_state.phase == ChargePhase::Idle
-        })
-        .unwrap_or(false);
+        .map(|h| h.pos);
 
-    let pre_loop_prediction = if movement_allowed_for_correction {
-        world
-            .you
-            .and_then(|cid| world.heroes.get(&cid))
-            .map(|hero| predict_local_position(hero.pos, &runtime_inner.pending_moves, &world))
-    } else {
-        None
-    };
+    // Pre-loop prediction for batched correction (normal unlocked mode)
+    let pre_loop_prediction = world
+        .you
+        .and_then(|cid| world.heroes.get(&cid))
+        .map(|hero| predict_local_position(hero.pos, &runtime_inner.pending_moves, &world));
 
     while let Some(bytes) = runtime_inner
         .renet
@@ -2206,22 +2214,48 @@ fn network_update(
         }
     }
 
-    // Batched correction: compute post-loop prediction and absorb single
-    // correction for the entire frame (telescoping sum: post - pre).
-    if let Some(pre_pred) = pre_loop_prediction {
-        if let Some(hero) = world
+    // Dual-mode correction: locked mode absorbs raw pos changes, unlocked mode
+    // absorbs prediction changes.
+    let locked = local_smoothing.local_input_lock
+        || world
             .you
             .and_then(|cid| world.heroes.get(&cid))
-        {
+            .map(|hero| {
+                hero.regular_attack.phase != AttackPhase::Ready
+                    || hero.charge_state.phase != ChargePhase::Idle
+            })
+            .unwrap_or(true);
+
+    if locked {
+        // Absorb raw hero.pos changes so visual stays frozen
+        if let Some(pre_pos) = pre_hero_pos {
+            if let Some(hero) = world.you.and_then(|cid| world.heroes.get(&cid)) {
+                local_smoothing.visual_offset[0] -= hero.pos[0] - pre_pos[0];
+                local_smoothing.visual_offset[1] -= hero.pos[1] - pre_pos[1];
+            }
+        }
+    } else if let Some(pre_pred) = pre_loop_prediction {
+        // Normal prediction-based correction
+        if let Some(hero) = world.you.and_then(|cid| world.heroes.get(&cid)) {
             let post_pred =
                 predict_local_position(hero.pos, &runtime_inner.pending_moves, &world);
-            let correction = [
-                post_pred[0] - pre_pred[0],
-                post_pred[1] - pre_pred[1],
-            ];
-            // Absorb raw correction into offset (negative so visual stays put)
-            local_smoothing.visual_offset[0] -= correction[0];
-            local_smoothing.visual_offset[1] -= correction[1];
+            local_smoothing.visual_offset[0] -= post_pred[0] - pre_pred[0];
+            local_smoothing.visual_offset[1] -= post_pred[1] - pre_pred[1];
+        }
+    }
+
+    // Clear local input lock when server confirms hero is back to Ready+Idle
+    if local_smoothing.local_input_lock {
+        if world
+            .you
+            .and_then(|cid| world.heroes.get(&cid))
+            .map(|hero| {
+                hero.regular_attack.phase == AttackPhase::Ready
+                    && hero.charge_state.phase == ChargePhase::Idle
+            })
+            .unwrap_or(false)
+        {
+            local_smoothing.local_input_lock = false;
         }
     }
 
@@ -2977,6 +3011,8 @@ fn sync_dynamic_actors(
     if !has_local_hero {
         local_smoothing.visual_offset = [0.0, 0.0];
         local_smoothing.render_pos = None;
+        local_smoothing.prediction_active = false;
+        local_smoothing.local_input_lock = false;
     }
 
     // Sample interpolated positions from the snapshot buffer
@@ -2990,16 +3026,37 @@ fn sync_dynamic_actors(
     for hero in world.heroes.values() {
         let local = Some(hero.client_id) == local_client_id;
         let movement_allowed = hero.regular_attack.phase == AttackPhase::Ready
-            && hero.charge_state.phase == ChargePhase::Idle;
+            && hero.charge_state.phase == ChargePhase::Idle
+            && !local_smoothing.local_input_lock;
         let pos = if local {
+            // Always compute the full prediction so we can handle transitions
+            let full_prediction = runtime
+                .as_ref()
+                .map(|runtime| predict_local_position(hero.pos, &runtime.pending_moves, &world))
+                .unwrap_or(hero.pos);
+            let pred_delta = [
+                full_prediction[0] - hero.pos[0],
+                full_prediction[1] - hero.pos[1],
+            ];
+
             let predicted = if movement_allowed {
-                runtime
-                    .as_ref()
-                    .map(|runtime| predict_local_position(hero.pos, &runtime.pending_moves, &world))
-                    .unwrap_or(hero.pos)
+                // Transition: locked → unlocked — subtract prediction from offset
+                // so the visual doesn't jump forward when prediction resumes.
+                if !local_smoothing.prediction_active {
+                    local_smoothing.visual_offset[0] -= pred_delta[0];
+                    local_smoothing.visual_offset[1] -= pred_delta[1];
+                }
+                full_prediction
             } else {
+                // Transition: unlocked → locked — absorb the dropped prediction
+                // into visual_offset so the visual doesn't jump backward.
+                if local_smoothing.prediction_active {
+                    local_smoothing.visual_offset[0] += pred_delta[0];
+                    local_smoothing.visual_offset[1] += pred_delta[1];
+                }
                 hero.pos
             };
+            local_smoothing.prediction_active = movement_allowed;
             update_local_hero_smoothing(
                 &mut local_smoothing,
                 predicted,
@@ -3012,6 +3069,7 @@ fn sync_dynamic_actors(
                 dt,
                 &world,
                 hero.client_id,
+                !movement_allowed,
             )
         } else {
             // Remote hero: use interpolated position if available
@@ -4315,11 +4373,15 @@ fn update_local_hero_smoothing(
     dt: f32,
     world: &WorldView,
     local_client_id: u64,
+    locked: bool,
 ) -> [f32; 2] {
     // Single fast decay: ~63% of correction absorbed per server tick (33ms)
-    let alpha: f32 = 1.0 - (-LOCAL_HERO_CORRECTION_DECAY * dt).exp();
-    smoothing.visual_offset[0] *= 1.0 - alpha;
-    smoothing.visual_offset[1] *= 1.0 - alpha;
+    // Skip decay during lock so the visual stays frozen in place.
+    if !locked {
+        let alpha: f32 = 1.0 - (-LOCAL_HERO_CORRECTION_DECAY * dt).exp();
+        smoothing.visual_offset[0] *= 1.0 - alpha;
+        smoothing.visual_offset[1] *= 1.0 - alpha;
+    }
 
     // Snap tiny residual offsets to zero
     let offset_sq = smoothing.visual_offset[0] * smoothing.visual_offset[0]

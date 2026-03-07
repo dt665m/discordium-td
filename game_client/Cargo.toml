@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 bevy = { version = "0.18.0", default-features = true, features = ["bevy_dev_tools"] }
 game_shared = { path = "../game_shared" }
+game_sim = { path = "../game_sim", features = ["bevy"] }
 log.workspace = true
 renet.workspace = true
 renet-cross.workspace = true

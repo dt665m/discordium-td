@@ -21,6 +21,16 @@ server http_bind="127.0.0.1:8080" udp_bind="0.0.0.0:5000" webrtc_bind="0.0.0.0:5
       --public-udp-addr 127.0.0.1:5000 \
       --public-webrtc-addr 127.0.0.1:5001
 
+server-ui http_bind="127.0.0.1:8080" udp_bind="0.0.0.0:5000" webrtc_bind="0.0.0.0:5001":
+    cargo run --release -p game_server --features ui -- \
+      --ui \
+      --http-bind {{http_bind}} \
+      --udp-bind {{udp_bind}} \
+      --webrtc-bind {{webrtc_bind}} \
+      --public-http-base http://127.0.0.1:8080 \
+      --public-udp-addr 127.0.0.1:5000 \
+      --public-webrtc-addr 127.0.0.1:5001
+
 client http_base="http://127.0.0.1:8080":
     cargo run -p game_client -- --http-base {{http_base}}
 

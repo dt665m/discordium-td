@@ -14,7 +14,7 @@ use game_shared::{
     HERO_POWER_DECAY_PROFILE, HERO_POWERED_MODIFIERS, HERO_REGULAR_ATTACK, HERO_SPEED,
     INITIAL_GOLD, INITIAL_TEAM_LIFE, JoinSnapshot, MATCH_RESET_TICKS, MAX_WAVES, MatchPhase,
     OBJECTIVE_COLLIDER_RADIUS, OBJECTIVE_MAX_HP, ObjectiveSnapshot, PowerDecayProfileComponent,
-    PoweredUpModifiersComponent, ReliableGameEvent, TOWER_BUILD_COST, TOWER_COLLIDER_RADIUS,
+    PoweredUpModifiersComponent, ReliableGameEvent, SimMeta, TOWER_BUILD_COST, TOWER_COLLIDER_RADIUS,
     TOWER_DAMAGE, TOWER_RANGE, TOWER_RELOAD_TICKS, TowerSnapshot, TowerType, WAVE_PREP_TICKS,
     WAVE_SPAWN_INTERVAL_TICKS, WORLD_HALF_HEIGHT, WORLD_HALF_WIDTH, WorldDelta, cardinalize_dir_or,
     clamp_to_world, directional_attack_can_hit, distance_sq, enemy_collider_radius,
@@ -124,6 +124,7 @@ pub struct TickOutput {
 }
 
 #[derive(Debug)]
+#[cfg_attr(feature = "bevy", derive(bevy::prelude::Resource))]
 pub struct Simulation {
     tick: u32,
     phase: MatchPhase,
@@ -322,7 +323,82 @@ impl Simulation {
             enemies,
             towers,
             your_last_input_seq,
+            sim_meta: Some(self.sim_meta()),
         }
+    }
+
+    pub fn sim_meta(&self) -> SimMeta {
+        SimMeta {
+            next_entity_id: self.next_entity_id,
+            wave_remaining: self.wave_remaining,
+            next_spawn_tick: self.next_spawn_tick,
+            next_spawn_point_index: self.next_spawn_point_index as u8,
+            intermission_until: self.intermission_until,
+        }
+    }
+
+    pub fn set_tick(&mut self, tick: u32) {
+        self.tick = tick;
+    }
+
+    pub fn from_snapshot(delta: &WorldDelta, meta: &SimMeta) -> Self {
+        let mut sim = Self {
+            tick: delta.tick,
+            phase: delta.phase,
+            team_life: delta.team_life,
+            wave: delta.wave,
+            objective_hp: delta
+                .objectives
+                .first()
+                .map(|o| o.hp)
+                .unwrap_or(OBJECTIVE_MAX_HP),
+            heroes: HashMap::new(),
+            enemies: HashMap::new(),
+            towers: HashMap::new(),
+            node_occupancy: HashMap::new(),
+            navmesh_cache: None,
+            navmesh_dirty: true,
+            pending_commands: Vec::new(),
+            move_queues: HashMap::new(),
+            next_entity_id: meta.next_entity_id,
+            wave_remaining: meta.wave_remaining,
+            next_spawn_tick: meta.next_spawn_tick,
+            next_spawn_point_index: meta.next_spawn_point_index as usize,
+            intermission_until: meta.intermission_until,
+            reset_at_tick: delta
+                .match_restart_ticks_remaining
+                .map(|remaining| delta.tick.wrapping_add(remaining)),
+        };
+        populate_from_delta(&mut sim, delta);
+        sim
+    }
+
+    pub fn apply_snapshot(&mut self, delta: &WorldDelta, meta: &SimMeta) {
+        self.tick = delta.tick;
+        self.phase = delta.phase;
+        self.team_life = delta.team_life;
+        self.wave = delta.wave;
+        self.objective_hp = delta
+            .objectives
+            .first()
+            .map(|o| o.hp)
+            .unwrap_or(OBJECTIVE_MAX_HP);
+        self.next_entity_id = meta.next_entity_id;
+        self.wave_remaining = meta.wave_remaining;
+        self.next_spawn_tick = meta.next_spawn_tick;
+        self.next_spawn_point_index = meta.next_spawn_point_index as usize;
+        self.intermission_until = meta.intermission_until;
+        self.reset_at_tick = delta
+            .match_restart_ticks_remaining
+            .map(|remaining| delta.tick.wrapping_add(remaining));
+        self.navmesh_dirty = true;
+        self.pending_commands.clear();
+        self.heroes.clear();
+        self.move_queues.clear();
+        self.enemies.clear();
+        self.towers.clear();
+        self.node_occupancy.clear();
+        populate_from_delta(self, delta);
     }
 
     fn match_restart_ticks_remaining(&self) -> Option<u32> {
@@ -1469,6 +1545,93 @@ impl Simulation {
             .as_ref()
             .cloned()
             .unwrap_or_else(|| build_navigation_mesh(&self.towers))
+    }
+}
+
+fn populate_from_delta(sim: &mut Simulation, delta: &WorldDelta) {
+    for hero_snap in &delta.heroes {
+        sim.heroes.insert(
+            hero_snap.client_id,
+            HeroState {
+                pos: hero_snap.pos,
+                move_dir: [0.0, 0.0],
+                facing: hero_snap.facing,
+                lock_mode_active: hero_snap.lock_mode_active,
+                lock_target_id: hero_snap.lock_target_id,
+                regular_attack: hero_snap.regular_attack,
+                regular_attack_profile: HERO_REGULAR_ATTACK,
+                charge_profile: hero_snap.charge_profile,
+                power_decay_profile: hero_snap.power_decay_profile,
+                powered_modifiers: hero_snap.powered_modifiers,
+                charge_state: hero_snap.charge_state,
+                hp: hero_snap.hp,
+                mana: hero_snap.mana,
+                gold: hero_snap.gold,
+                ability_cooldown_ticks: hero_snap.ability_cooldown_ticks,
+                last_processed_seq: None,
+            },
+        );
+        sim.move_queues.insert(hero_snap.client_id, VecDeque::new());
+    }
+
+    for enemy_snap in &delta.enemies {
+        let radius = enemy_collider_radius(enemy_snap.enemy_type);
+        let (speed, reward) = enemy_stats_from_snapshot(enemy_snap);
+        sim.enemies.insert(
+            enemy_snap.id,
+            EnemyState {
+                id: enemy_snap.id,
+                lane: enemy_snap.lane,
+                pos: enemy_snap.pos,
+                vel: enemy_snap.vel,
+                hp: enemy_snap.hp,
+                max_hp: enemy_snap.max_hp,
+                speed,
+                reward,
+                enemy_type: enemy_snap.enemy_type,
+                radius,
+                facing: enemy_snap.facing,
+                regular_attack: enemy_snap.regular_attack,
+                regular_attack_profile: ENEMY_REGULAR_ATTACK,
+                lock_target: EnemyLockTarget::Base,
+                target_pos: BASE_POSITION,
+                waypoint: enemy_snap.pos,
+                repath_cooldown: 0,
+            },
+        );
+    }
+
+    for tower_snap in &delta.towers {
+        sim.towers.insert(
+            tower_snap.id,
+            TowerState {
+                id: tower_snap.id,
+                owner: tower_snap.owner,
+                lane: tower_snap.lane,
+                node_id: tower_snap.node_id,
+                pos: tower_snap.pos,
+                reload_ticks: tower_snap.reload_ticks_remaining,
+            },
+        );
+        sim.node_occupancy.insert(tower_snap.node_id, tower_snap.id);
+    }
+}
+
+/// Back-derive speed and reward from the enemy snapshot's max_hp and type.
+fn enemy_stats_from_snapshot(snap: &EnemySnapshot) -> (f32, u32) {
+    let spawn_wave = match snap.enemy_type {
+        EnemyType::Grunt => ((snap.max_hp - 34.0) / 9.0).round().max(1.0) as u32,
+        EnemyType::Tank => ((snap.max_hp - 84.0) / 18.0).round().max(1.0) as u32,
+    };
+    match snap.enemy_type {
+        EnemyType::Grunt => (
+            2.0 + spawn_wave as f32 * 0.055,
+            14 + spawn_wave * 2,
+        ),
+        EnemyType::Tank => (
+            1.45 + spawn_wave as f32 * 0.045,
+            28 + spawn_wave * 3,
+        ),
     }
 }
 

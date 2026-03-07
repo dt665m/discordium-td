@@ -414,6 +414,15 @@ pub struct ObjectiveSnapshot {
     pub max_hp: f32,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct SimMeta {
+    pub next_entity_id: u64,
+    pub wave_remaining: u32,
+    pub next_spawn_tick: u32,
+    pub next_spawn_point_index: u8,
+    pub intermission_until: u32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WorldDelta {
     pub tick: u32,
@@ -426,6 +435,7 @@ pub struct WorldDelta {
     pub enemies: Vec<EnemySnapshot>,
     pub towers: Vec<TowerSnapshot>,
     pub your_last_input_seq: Option<u32>,
+    pub sim_meta: Option<SimMeta>,
 }
 
 /// Client-to-server: bundled recent movement inputs for redundancy.
@@ -472,6 +482,7 @@ pub struct WorldPatch {
     pub enemy_patches: Vec<EnemySnapshot>,
     pub tower_patches: Vec<TowerSnapshot>,
     pub removed_ids: Vec<u64>,
+    pub sim_meta: Option<SimMeta>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

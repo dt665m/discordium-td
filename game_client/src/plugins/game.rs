@@ -24,12 +24,13 @@ use game_shared::{
     AbilityId, AttackPhase, BASE_POSITION, BUILD_COMMAND_MAX_DISTANCE, BUILD_NODES, BuildNodeDef,
     ChargePhase, ClientCommand, ClientMoveBundle, DirectionalAttackStateComponent,
     ENEMY_REGULAR_ATTACK, EnemySnapshot, FIXED_DT_SECONDS,
-    HERO_COLLIDER_RADIUS, HERO_MAX_HP, HERO_MAX_MANA, HERO_REGULAR_ATTACK, HERO_SPEED,
+    HERO_MAX_HP, HERO_MAX_MANA, HERO_REGULAR_ATTACK,
     HeroSnapshot, JoinSnapshot, MatchPhase, ObjectiveSnapshot, PROTOCOL_ID, ReliableGameEvent,
-    ReliableServerMessage, ServerWorldMessage, TOWER_COLLIDER_RADIUS, TowerSnapshot, TowerType,
-    WorldDelta, WorldPatch, clamp_to_world, distance_sq, encode, enemy_collider_radius,
+    ReliableServerMessage, ServerWorldMessage, SimMeta, TowerSnapshot,
+    TowerType, WorldDelta, WorldPatch, clamp_to_world, distance_sq, encode,
     is_newer_input_seq, normalize_or_zero,
 };
+use game_sim::Simulation;
 use renet::{DefaultChannel, RenetClient};
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen_futures::spawn_local;
@@ -57,11 +58,8 @@ const ENEMY_HIT_REACTION_DURATION_SECONDS: f32 = 0.16;
 const TOWER_FIRE_REACTION_DURATION_SECONDS: f32 = 0.14;
 const ENEMY_RENDER_SMOOTH_RATE: f32 = 18.0;
 const LOCAL_HERO_CORRECTION_DECAY: f32 = 15.0;
-const LOCAL_HERO_OVERSTEP_SCALE: f32 = 0.7;
 const LOCAL_HERO_RENDER_SMOOTH_RATE: f32 = 30.0;
 const LOCAL_HERO_SNAP_DISTANCE_SQ: f32 = 9.0;
-const LOCAL_HERO_COLLISION_MAX_CORRECTION_PER_STEP: f32 = HERO_SPEED * FIXED_DT_SECONDS * 0.65;
-const LOCAL_HERO_COLLISION_MAX_TOTAL_CORRECTION: f32 = HERO_SPEED * FIXED_DT_SECONDS * 1.05;
 const RENDER_SNAP_DISTANCE_SQ: f32 = 20.0;
 const UNIT_BAR_WIDTH: f32 = 0.9;
 const UNIT_BAR_HEIGHT: f32 = 0.14;
@@ -426,22 +424,43 @@ fn lerp_pos(a: [f32; 2], b: [f32; 2], t: f32) -> [f32; 2] {
     [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]
 }
 
+/// Smoothing offsets from server reconciliation. Applied to predicted positions
+/// to avoid visual teleporting when the server corrects mispredictions.
 #[derive(Resource, Default)]
-struct LocalHeroSmoothing {
-    /// Accumulated visual offset from server corrections. Decays to zero.
-    /// When a server state causes the raw prediction to jump, the jump is absorbed
-    /// here so the visual position doesn't teleport.
-    visual_offset: [f32; 2],
+struct ReconciliationSmoothing {
+    hero_offset: [f32; 2],
+    enemy_offsets: HashMap<u64, [f32; 2]>,
     render_pos: Option<[f32; 2]>,
-    /// Whether prediction was active last frame. Used to detect transitions
-    /// between predicting (movement allowed) and not-predicting (attack/charge lock)
-    /// so we can absorb the prediction delta into visual_offset for continuity.
-    prediction_active: bool,
-    /// Set when client sends a movement-locking command (BasicAttack, SetCharging active).
-    /// Prevents new moves from being predicted and freezes visual offset until the server
-    /// confirms the hero is back to Ready+Idle.
-    local_input_lock: bool,
 }
+
+/// Client-side simulation for full prediction with server reconciliation.
+#[derive(Resource)]
+struct LocalSimulation {
+    sim: Simulation,
+    predicted_tick: u32,
+    input_buffer: VecDeque<InputEntry>,
+    initialized: bool,
+}
+
+impl Default for LocalSimulation {
+    fn default() -> Self {
+        Self {
+            sim: Simulation::new(),
+            predicted_tick: 0,
+            input_buffer: VecDeque::new(),
+            initialized: false,
+        }
+    }
+}
+
+struct InputEntry {
+    seq: u32,
+    commands: Vec<ClientCommand>,
+}
+
+/// Action commands detected in Update, consumed in the next FixedUpdate tick.
+#[derive(Resource, Default)]
+struct PendingActions(Vec<ClientCommand>);
 
 #[derive(Resource)]
 struct UnitBarCameraCache {
@@ -882,7 +901,9 @@ impl Plugin for GameClientPlugin {
         app.insert_resource(InputState::default())
             .insert_resource(NetStats::default())
             .insert_resource(SnapshotBuffer::default())
-            .insert_resource(LocalHeroSmoothing::default())
+            .insert_resource(ReconciliationSmoothing::default())
+            .insert_resource(LocalSimulation::default())
+            .insert_resource(PendingActions::default())
             .insert_resource(UnitBarCameraCache::default())
             .insert_resource(HudState::default())
             .insert_resource(DebugOverlayState::default())
@@ -982,7 +1003,7 @@ impl Plugin for GameClientPlugin {
                 graceful_disconnect_on_app_exit.in_set(ClientUpdateSet::Shutdown),
             )
             .add_observer(apply_unit_bar_camera_update)
-            .add_systems(FixedUpdate, send_movement_commands);
+            .add_systems(FixedUpdate, advance_local_simulation);
 
         app.add_plugins(FpsOverlayPlugin {
             config: FpsOverlayConfig {
@@ -1838,25 +1859,23 @@ fn capture_input(keyboard: Res<ButtonInput<KeyCode>>, mut input_state: ResMut<In
     input_state.dir = normalize_or_zero([-input[0], input[1]]);
 }
 
-fn send_movement_commands(
+fn advance_local_simulation(
     time: Res<Time>,
     input_state: Res<InputState>,
     runtime: Option<NonSendMut<NetworkRuntime>>,
+    mut local_sim: ResMut<LocalSimulation>,
+    mut pending_actions: ResMut<PendingActions>,
     mut net_stats: ResMut<NetStats>,
-    local_smoothing: Res<LocalHeroSmoothing>,
 ) {
-    if local_smoothing.local_input_lock {
-        return;
-    }
-
     let Some(mut runtime) = runtime else {
         return;
     };
 
-    if !runtime.renet.is_connected() {
+    if !runtime.renet.is_connected() || !local_sim.initialized {
         return;
     }
 
+    let my_id = runtime.client_id;
     let seq = runtime.next_command_seq();
 
     // Record send time for RTT measurement
@@ -1866,7 +1885,32 @@ fn send_movement_commands(
         net_stats.last_seq_send_times.pop_front();
     }
 
-    // Build a move bundle: include all pending unacked moves + the new one
+    // Collect all commands for this tick: actions first, then move
+    let mut commands: Vec<ClientCommand> = pending_actions.0.drain(..).collect();
+    let move_cmd = ClientCommand::Move {
+        seq,
+        dir: input_state.dir,
+    };
+    commands.push(move_cmd);
+
+    // Apply all commands to local sim
+    for cmd in &commands {
+        local_sim.sim.queue_command(my_id, *cmd);
+    }
+    let _tick_output = local_sim.sim.step();
+
+    // Store in input buffer for reconciliation replay
+    local_sim.input_buffer.push_back(InputEntry {
+        seq,
+        commands,
+    });
+    // Prevent unbounded buffer growth
+    while local_sim.input_buffer.len() > 256 {
+        local_sim.input_buffer.pop_front();
+    }
+    local_sim.predicted_tick += 1;
+
+    // Send move to server via unreliable channel (redundant bundle for packet loss)
     runtime.pending_moves.push_back(PendingMove {
         seq,
         dir: input_state.dir,
@@ -1899,7 +1943,7 @@ fn send_action_commands(
     world: Res<WorldView>,
     towers: Query<&TowerBuildNode, With<TowerActor>>,
     mut hud_state: ResMut<HudState>,
-    mut local_smoothing: ResMut<LocalHeroSmoothing>,
+    mut pending_actions: ResMut<PendingActions>,
 ) {
     let Some(mut runtime) = runtime else {
         return;
@@ -1908,6 +1952,14 @@ fn send_action_commands(
     if !runtime.renet.is_connected() {
         return;
     }
+
+    // Helper: send action to server AND queue for local sim
+    let mut send_and_queue = |runtime: &mut NetworkRuntime, cmd: ClientCommand| {
+        runtime
+            .renet
+            .send_message(DefaultChannel::ReliableOrdered, encode(&cmd));
+        pending_actions.0.push(cmd);
+    };
 
     if keyboard.just_pressed(KeyCode::KeyQ) {
         let Some(hero) = world.heroes.get(&runtime.client_id) else {
@@ -1922,13 +1974,11 @@ fn send_action_commands(
 
         if let Some(target_id) = next_target {
             let seq = runtime.next_command_seq();
-            runtime.renet.send_message(
-                DefaultChannel::ReliableOrdered,
-                encode(&ClientCommand::SetLockTarget {
-                    seq,
-                    target_id: Some(target_id),
-                }),
-            );
+            let cmd = ClientCommand::SetLockTarget {
+                seq,
+                target_id: Some(target_id),
+            };
+            send_and_queue(&mut runtime, cmd);
             hud_state.last_event = format!("Locked enemy {target_id}");
         } else if hero.lock_mode_active {
             hud_state.last_event = "Lock mode active (no targets)".to_owned();
@@ -1939,52 +1989,40 @@ fn send_action_commands(
 
     if keyboard.just_pressed(KeyCode::KeyE) {
         let seq = runtime.next_command_seq();
-        runtime.renet.send_message(
-            DefaultChannel::ReliableOrdered,
-            encode(&ClientCommand::SetLockTarget {
-                seq,
-                target_id: None,
-            }),
-        );
+        let cmd = ClientCommand::SetLockTarget {
+            seq,
+            target_id: None,
+        };
+        send_and_queue(&mut runtime, cmd);
         hud_state.last_event = "Lock cleared".to_owned();
     }
 
     if mouse.just_pressed(MouseButton::Left) || keyboard.just_pressed(KeyCode::KeyJ) {
         let seq = runtime.next_command_seq();
-        runtime.renet.send_message(
-            DefaultChannel::ReliableOrdered,
-            encode(&ClientCommand::BasicAttack { seq }),
-        );
-        local_smoothing.local_input_lock = true;
+        let cmd = ClientCommand::BasicAttack { seq };
+        send_and_queue(&mut runtime, cmd);
     }
 
     if keyboard.just_pressed(KeyCode::KeyK) {
         let seq = runtime.next_command_seq();
-        runtime.renet.send_message(
-            DefaultChannel::ReliableOrdered,
-            encode(&ClientCommand::CastAbility {
-                seq,
-                ability: AbilityId::ArcBurst,
-            }),
-        );
+        let cmd = ClientCommand::CastAbility {
+            seq,
+            ability: AbilityId::ArcBurst,
+        };
+        send_and_queue(&mut runtime, cmd);
     }
 
     if keyboard.just_pressed(KeyCode::Space) {
         let seq = runtime.next_command_seq();
-        runtime.renet.send_message(
-            DefaultChannel::ReliableOrdered,
-            encode(&ClientCommand::SetCharging { seq, active: true }),
-        );
-        local_smoothing.local_input_lock = true;
+        let cmd = ClientCommand::SetCharging { seq, active: true };
+        send_and_queue(&mut runtime, cmd);
         hud_state.last_event = "Charge started".to_owned();
     }
 
     if keyboard.just_released(KeyCode::Space) {
         let seq = runtime.next_command_seq();
-        runtime.renet.send_message(
-            DefaultChannel::ReliableOrdered,
-            encode(&ClientCommand::SetCharging { seq, active: false }),
-        );
+        let cmd = ClientCommand::SetCharging { seq, active: false };
+        send_and_queue(&mut runtime, cmd);
         hud_state.last_event = "Charge released".to_owned();
     }
 
@@ -1996,14 +2034,12 @@ fn send_action_commands(
         };
 
         let seq = runtime.next_command_seq();
-        runtime.renet.send_message(
-            DefaultChannel::ReliableOrdered,
-            encode(&ClientCommand::BuildTower {
-                seq,
-                node_id,
-                tower_type: TowerType::Arrow,
-            }),
-        );
+        let cmd = ClientCommand::BuildTower {
+            seq,
+            node_id,
+            tower_type: TowerType::Arrow,
+        };
+        send_and_queue(&mut runtime, cmd);
     }
 }
 
@@ -2013,7 +2049,8 @@ fn network_update(
     mut world: ResMut<WorldView>,
     mut net_stats: ResMut<NetStats>,
     mut snapshot_buffer: ResMut<SnapshotBuffer>,
-    mut local_smoothing: ResMut<LocalHeroSmoothing>,
+    mut local_sim: ResMut<LocalSimulation>,
+    mut smoothing: ResMut<ReconciliationSmoothing>,
     mut hud_state: ResMut<HudState>,
     mut debug_overlay: ResMut<DebugOverlayState>,
     render_index: Res<RenderIndex>,
@@ -2048,8 +2085,18 @@ fn network_update(
                 );
                 runtime_inner.client_id = snapshot.you;
                 snapshot_buffer.clear();
-                local_smoothing.visual_offset = [0.0, 0.0];
-                local_smoothing.render_pos = None;
+                smoothing.hero_offset = [0.0, 0.0];
+                smoothing.enemy_offsets.clear();
+                smoothing.render_pos = None;
+
+                // Initialize local simulation from join snapshot
+                if let Some(meta) = snapshot.world.sim_meta {
+                    local_sim.sim = Simulation::from_snapshot(&snapshot.world, &meta);
+                    local_sim.predicted_tick = snapshot.world.tick;
+                    local_sim.input_buffer.clear();
+                    local_sim.initialized = true;
+                }
+
                 world.apply_join(snapshot);
                 hud_state.last_event = "Joined authoritative match".to_owned();
             }
@@ -2075,18 +2122,6 @@ fn network_update(
     }
 
     let wall_time = time.elapsed_secs();
-
-    // Save raw hero position before delta loop for locked-mode offset absorption
-    let pre_hero_pos = world
-        .you
-        .and_then(|cid| world.heroes.get(&cid))
-        .map(|h| h.pos);
-
-    // Pre-loop prediction for batched correction (normal unlocked mode)
-    let pre_loop_prediction = world
-        .you
-        .and_then(|cid| world.heroes.get(&cid))
-        .map(|hero| predict_local_position(hero.pos, &runtime_inner.pending_moves, &world));
 
     while let Some(bytes) = runtime_inner
         .renet
@@ -2186,7 +2221,6 @@ fn network_update(
                         if rtt_sample > 0.0 && rtt_sample < 2.0 {
                             net_stats.update_rtt_sample(rtt_sample);
                         }
-                        // Remove all entries up to and including this one
                         net_stats.last_seq_send_times.drain(..=idx);
                     }
                 }
@@ -2196,7 +2230,7 @@ fn network_update(
                     delta.your_last_input_seq,
                 );
 
-                // Push into snapshot buffer for interpolation
+                // Push into snapshot buffer for remote hero interpolation
                 snapshot_buffer.push(TimestampedSnapshot {
                     server_tick: delta.tick,
                     receive_time: wall_time,
@@ -2205,7 +2239,20 @@ fn network_update(
                 snapshot_buffer.update_interpolation_delay(&net_stats);
                 snapshot_buffer.sync_render_clock();
 
-                // Apply to world view for HUD scalars, local hero, etc.
+                // --- Server reconciliation ---
+                if local_sim.initialized {
+                    if let Some(meta) = delta.sim_meta {
+                        reconcile_local_sim(
+                            &mut local_sim,
+                            &mut smoothing,
+                            &delta,
+                            &meta,
+                            runtime_inner.client_id,
+                        );
+                    }
+                }
+
+                // Apply to world view for HUD scalars
                 world.apply_delta(delta);
             }
             Err(err) => {
@@ -2214,52 +2261,7 @@ fn network_update(
         }
     }
 
-    // Dual-mode correction: locked mode absorbs raw pos changes, unlocked mode
-    // absorbs prediction changes.
-    let locked = local_smoothing.local_input_lock
-        || world
-            .you
-            .and_then(|cid| world.heroes.get(&cid))
-            .map(|hero| {
-                hero.regular_attack.phase != AttackPhase::Ready
-                    || hero.charge_state.phase != ChargePhase::Idle
-            })
-            .unwrap_or(true);
-
-    if locked {
-        // Absorb raw hero.pos changes so visual stays frozen
-        if let Some(pre_pos) = pre_hero_pos {
-            if let Some(hero) = world.you.and_then(|cid| world.heroes.get(&cid)) {
-                local_smoothing.visual_offset[0] -= hero.pos[0] - pre_pos[0];
-                local_smoothing.visual_offset[1] -= hero.pos[1] - pre_pos[1];
-            }
-        }
-    } else if let Some(pre_pred) = pre_loop_prediction {
-        // Normal prediction-based correction
-        if let Some(hero) = world.you.and_then(|cid| world.heroes.get(&cid)) {
-            let post_pred =
-                predict_local_position(hero.pos, &runtime_inner.pending_moves, &world);
-            local_smoothing.visual_offset[0] -= post_pred[0] - pre_pred[0];
-            local_smoothing.visual_offset[1] -= post_pred[1] - pre_pred[1];
-        }
-    }
-
-    // Clear local input lock when server confirms hero is back to Ready+Idle
-    if local_smoothing.local_input_lock {
-        if world
-            .you
-            .and_then(|cid| world.heroes.get(&cid))
-            .map(|hero| {
-                hero.regular_attack.phase == AttackPhase::Ready
-                    && hero.charge_state.phase == ChargePhase::Idle
-            })
-            .unwrap_or(false)
-        {
-            local_smoothing.local_input_lock = false;
-        }
-    }
-
-    // Send client ack for the latest received tick (piggy-backed on next unreliable send)
+    // Send client ack for the latest received tick
     if let Some(latest) = snapshot_buffer.snapshots.back() {
         let ack = game_shared::ClientAck {
             tick: latest.server_tick,
@@ -2272,6 +2274,73 @@ fn network_update(
     if let Err(err) = runtime_inner.transport_send_packets() {
         log::warn!("client send_packets error: {err}");
     }
+}
+
+/// Rollback the local simulation to server-confirmed state and replay unacknowledged inputs.
+fn reconcile_local_sim(
+    local_sim: &mut LocalSimulation,
+    smoothing: &mut ReconciliationSmoothing,
+    delta: &WorldDelta,
+    meta: &SimMeta,
+    my_id: u64,
+) {
+    let ack_seq = delta.your_last_input_seq;
+
+    // Discard acknowledged input entries
+    if let Some(ack) = ack_seq {
+        while let Some(front) = local_sim.input_buffer.front() {
+            if front.seq == ack || !is_newer_input_seq(front.seq, ack) {
+                local_sim.input_buffer.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    // Save pre-reconciliation positions for visual smoothing
+    let old_hero_delta = local_sim.sim.world_delta_for(my_id);
+    let old_hero_pos = old_hero_delta
+        .heroes
+        .iter()
+        .find(|h| h.client_id == my_id)
+        .map(|h| h.pos);
+    let mut old_enemy_positions: HashMap<u64, [f32; 2]> = HashMap::new();
+    for enemy in &old_hero_delta.enemies {
+        old_enemy_positions.insert(enemy.id, enemy.pos);
+    }
+
+    // Reset sim to server-confirmed state
+    local_sim.sim.apply_snapshot(delta, meta);
+
+    // Replay unacknowledged inputs
+    for entry in &local_sim.input_buffer {
+        for cmd in &entry.commands {
+            local_sim.sim.queue_command(my_id, *cmd);
+        }
+        local_sim.sim.step();
+    }
+    local_sim.predicted_tick = local_sim.sim.tick();
+
+    // Compute smoothing offsets (old predicted - new predicted)
+    let new_hero_delta = local_sim.sim.world_delta_for(my_id);
+    if let Some(old_pos) = old_hero_pos {
+        if let Some(new_hero) = new_hero_delta.heroes.iter().find(|h| h.client_id == my_id) {
+            smoothing.hero_offset[0] += old_pos[0] - new_hero.pos[0];
+            smoothing.hero_offset[1] += old_pos[1] - new_hero.pos[1];
+        }
+    }
+
+    // Update enemy smoothing offsets
+    for enemy in &new_hero_delta.enemies {
+        if let Some(old_pos) = old_enemy_positions.get(&enemy.id) {
+            let offset = smoothing.enemy_offsets.entry(enemy.id).or_insert([0.0, 0.0]);
+            offset[0] += old_pos[0] - enemy.pos[0];
+            offset[1] += old_pos[1] - enemy.pos[1];
+        }
+    }
+    // Remove offsets for enemies no longer in sim
+    let new_enemy_ids: HashSet<u64> = new_hero_delta.enemies.iter().map(|e| e.id).collect();
+    smoothing.enemy_offsets.retain(|id, _| new_enemy_ids.contains(id));
 }
 
 /// Reconstruct a full WorldDelta from a patch and its baseline in the snapshot buffer.
@@ -2357,6 +2426,7 @@ fn reconstruct_from_patch(buffer: &SnapshotBuffer, patch: WorldPatch) -> Option<
         enemies,
         towers,
         your_last_input_seq: patch.your_last_input_seq,
+        sim_meta: patch.sim_meta,
     })
 }
 
@@ -2980,9 +3050,9 @@ fn update_local_hero_power_flicker(
 fn sync_dynamic_actors(
     mut commands: Commands,
     time: Res<Time>,
-    fixed_time: Res<Time<Fixed>>,
     input_state: Res<InputState>,
-    mut local_smoothing: ResMut<LocalHeroSmoothing>,
+    local_sim: Res<LocalSimulation>,
+    mut smoothing: ResMut<ReconciliationSmoothing>,
     world: Res<WorldView>,
     net_stats: Res<NetStats>,
     snapshot_buffer: Res<SnapshotBuffer>,
@@ -3005,17 +3075,35 @@ fn sync_dynamic_actors(
 ) {
     let dt = time.delta_secs();
     let local_client_id = runtime.as_ref().map(|runtime| runtime.client_id);
-    let has_local_hero = local_client_id
-        .and_then(|client_id| world.heroes.get(&client_id))
-        .is_some();
-    if !has_local_hero {
-        local_smoothing.visual_offset = [0.0, 0.0];
-        local_smoothing.render_pos = None;
-        local_smoothing.prediction_active = false;
-        local_smoothing.local_input_lock = false;
+
+    // Decay reconciliation smoothing offsets
+    let decay_alpha: f32 = 1.0 - (-LOCAL_HERO_CORRECTION_DECAY * dt).exp();
+    smoothing.hero_offset[0] *= 1.0 - decay_alpha;
+    smoothing.hero_offset[1] *= 1.0 - decay_alpha;
+    // Snap tiny residual
+    let hero_offset_sq = smoothing.hero_offset[0] * smoothing.hero_offset[0]
+        + smoothing.hero_offset[1] * smoothing.hero_offset[1];
+    if hero_offset_sq < 0.0001 {
+        smoothing.hero_offset = [0.0, 0.0];
+    }
+    for offset in smoothing.enemy_offsets.values_mut() {
+        offset[0] *= 1.0 - decay_alpha;
+        offset[1] *= 1.0 - decay_alpha;
+        let sq = offset[0] * offset[0] + offset[1] * offset[1];
+        if sq < 0.0001 {
+            *offset = [0.0, 0.0];
+        }
     }
 
-    // Sample interpolated positions from the snapshot buffer
+    // Get predicted state from local sim (if initialized), otherwise use server state
+    let sim_delta = if local_sim.initialized {
+        let my_id = local_client_id.unwrap_or(0);
+        Some(local_sim.sim.world_delta_for(my_id))
+    } else {
+        None
+    };
+
+    // Sample interpolated positions from the snapshot buffer for remote heroes
     let interpolated = if snapshot_buffer.has_enough_data() {
         Some(snapshot_buffer.sample(snapshot_buffer.render_time, net_stats.enemy_render_lead()))
     } else {
@@ -3023,76 +3111,84 @@ fn sync_dynamic_actors(
     };
 
     let mut desired = HashMap::new();
-    for hero in world.heroes.values() {
-        let local = Some(hero.client_id) == local_client_id;
-        let movement_allowed = hero.regular_attack.phase == AttackPhase::Ready
-            && hero.charge_state.phase == ChargePhase::Idle
-            && !local_smoothing.local_input_lock;
-        let pos = if local {
-            // Always compute the full prediction so we can handle transitions
-            let full_prediction = runtime
-                .as_ref()
-                .map(|runtime| predict_local_position(hero.pos, &runtime.pending_moves, &world))
-                .unwrap_or(hero.pos);
-            let pred_delta = [
-                full_prediction[0] - hero.pos[0],
-                full_prediction[1] - hero.pos[1],
-            ];
 
-            let predicted = if movement_allowed {
-                // Transition: locked → unlocked — subtract prediction from offset
-                // so the visual doesn't jump forward when prediction resumes.
-                if !local_smoothing.prediction_active {
-                    local_smoothing.visual_offset[0] -= pred_delta[0];
-                    local_smoothing.visual_offset[1] -= pred_delta[1];
-                }
-                full_prediction
-            } else {
-                // Transition: unlocked → locked — absorb the dropped prediction
-                // into visual_offset so the visual doesn't jump backward.
-                if local_smoothing.prediction_active {
-                    local_smoothing.visual_offset[0] += pred_delta[0];
-                    local_smoothing.visual_offset[1] += pred_delta[1];
-                }
-                hero.pos
-            };
-            local_smoothing.prediction_active = movement_allowed;
-            update_local_hero_smoothing(
-                &mut local_smoothing,
-                predicted,
-                if movement_allowed {
-                    input_state.dir
-                } else {
-                    [0.0, 0.0]
-                },
-                fixed_time.overstep_fraction(),
-                dt,
-                &world,
-                hero.client_id,
-                !movement_allowed,
-            )
+    // Heroes: local hero from sim, remote heroes from interpolation
+    let empty_heroes = Vec::new();
+    let hero_source = sim_delta.as_ref().map(|d| &d.heroes).unwrap_or(&empty_heroes);
+    // Build lookup from WorldView heroes for remote hero data
+    let world_heroes: &HashMap<u64, HeroSnapshot> = &world.heroes;
+    // Merge: for local hero use sim, for remote heroes use world/interpolation
+    let mut all_hero_ids: HashSet<u64> = world_heroes.keys().copied().collect();
+    for h in hero_source {
+        all_hero_ids.insert(h.client_id);
+    }
+    for hero_id in &all_hero_ids {
+        let local = Some(*hero_id) == local_client_id;
+        // Try to get from sim first (for local hero), then WorldView
+        let sim_hero = hero_source.iter().find(|h| h.client_id == *hero_id);
+        let world_hero = world_heroes.get(hero_id);
+        let hero = if local {
+            sim_hero.or(world_hero)
         } else {
-            // Remote hero: use interpolated position if available
+            world_hero.or(sim_hero)
+        };
+        let Some(hero) = hero else { continue };
+
+        let pos = if local {
+            // Local hero: use sim position + smoothing offset
+            let sim_pos = sim_hero.map(|h| h.pos).unwrap_or(hero.pos);
+            let render_target = [
+                sim_pos[0] + smoothing.hero_offset[0],
+                sim_pos[1] + smoothing.hero_offset[1],
+            ];
+            // Light render smoothing
+            let render = match smoothing.render_pos {
+                Some(current) => {
+                    if distance_sq(current, render_target) > LOCAL_HERO_SNAP_DISTANCE_SQ {
+                        render_target
+                    } else {
+                        let alpha: f32 =
+                            1.0 - (-LOCAL_HERO_RENDER_SMOOTH_RATE * dt).exp();
+                        [
+                            current[0] + (render_target[0] - current[0]) * alpha.clamp(0.0, 1.0),
+                            current[1] + (render_target[1] - current[1]) * alpha.clamp(0.0, 1.0),
+                        ]
+                    }
+                }
+                None => render_target,
+            };
+            smoothing.render_pos = Some(render);
+            render
+        } else {
+            // Remote hero: use interpolated position
             interpolated
                 .as_ref()
-                .and_then(|interp| interp.heroes.get(&hero.client_id).copied())
+                .and_then(|interp| interp.heroes.get(hero_id).copied())
                 .unwrap_or(hero.pos)
         };
         let visual_facing = if local {
-            if hero.lock_mode_active {
-                let lock_target_pos = hero
+            let sim_h = sim_hero.unwrap_or(hero);
+            if sim_h.lock_mode_active {
+                // Use sim enemies for lock target lookup
+                let sim_enemies = sim_delta.as_ref().map(|d| &d.enemies);
+                let lock_target_pos = sim_h
                     .lock_target_id
-                    .and_then(|target_id| world.enemies.get(&target_id).map(|enemy| enemy.pos))
+                    .and_then(|target_id| {
+                        sim_enemies
+                            .and_then(|enemies| enemies.iter().find(|e| e.id == target_id))
+                            .map(|e| e.pos)
+                    })
                     .or_else(|| {
-                        world
-                            .enemies
-                            .values()
-                            .min_by(|a, b| {
-                                distance_sq(pos, a.pos)
-                                    .total_cmp(&distance_sq(pos, b.pos))
-                                    .then_with(|| a.id.cmp(&b.id))
-                            })
-                            .map(|enemy| enemy.pos)
+                        sim_enemies.and_then(|enemies| {
+                            enemies
+                                .iter()
+                                .min_by(|a, b| {
+                                    distance_sq(pos, a.pos)
+                                        .total_cmp(&distance_sq(pos, b.pos))
+                                        .then_with(|| a.id.cmp(&b.id))
+                                })
+                                .map(|enemy| enemy.pos)
+                        })
                     });
                 if let Some(target_pos) = lock_target_pos {
                     let to_target =
@@ -3100,17 +3196,17 @@ fn sync_dynamic_actors(
                     if to_target != [0.0, 0.0] {
                         to_target
                     } else {
-                        hero.facing.dir
+                        sim_h.facing.dir
                     }
                 } else if input_state.dir != [0.0, 0.0] {
                     input_state.dir
                 } else {
-                    hero.facing.dir
+                    sim_h.facing.dir
                 }
-            } else if movement_allowed && input_state.dir != [0.0, 0.0] {
+            } else if input_state.dir != [0.0, 0.0] {
                 input_state.dir
             } else {
-                hero.facing.dir
+                sim_h.facing.dir
             }
         } else {
             hero.facing.dir
@@ -3140,50 +3236,111 @@ fn sync_dynamic_actors(
         );
     }
 
-    for enemy in world.enemies.values() {
-        // Use interpolated position if available, otherwise fall back to prediction
-        let pos = interpolated
-            .as_ref()
-            .and_then(|interp| interp.enemies.get(&enemy.id).map(|(p, _)| *p))
-            .unwrap_or_else(|| predict_enemy_position(enemy, net_stats.enemy_render_lead()));
-        desired.insert(
-            enemy.id,
-            DesiredActor {
-                pos,
-                kind: ActorKind::Enemy,
-                facing: Some(FacingStat {
-                    dir: enemy.facing.dir,
-                }),
-                regular_attack: Some(attack_state_component_to_stat(enemy.regular_attack)),
-                health: Some(HealthStat {
-                    current: enemy.hp,
-                    max: enemy.max_hp,
-                }),
-                mana: None,
-                power: None,
-                charge_state: None,
-                tower_node: None,
-            },
-        );
+    // Enemies: from local sim (predicted) with smoothing offsets
+    let empty_enemies = Vec::new();
+    let enemy_source = if let Some(ref delta) = sim_delta {
+        &delta.enemies
+    } else {
+        &empty_enemies
+    };
+    // Use sim enemies if available, otherwise world enemies
+    if local_sim.initialized && sim_delta.is_some() {
+        for enemy in enemy_source {
+            let offset = smoothing.enemy_offsets.get(&enemy.id).copied().unwrap_or([0.0, 0.0]);
+            let pos = [enemy.pos[0] + offset[0], enemy.pos[1] + offset[1]];
+            desired.insert(
+                enemy.id,
+                DesiredActor {
+                    pos,
+                    kind: ActorKind::Enemy,
+                    facing: Some(FacingStat {
+                        dir: enemy.facing.dir,
+                    }),
+                    regular_attack: Some(attack_state_component_to_stat(enemy.regular_attack)),
+                    health: Some(HealthStat {
+                        current: enemy.hp,
+                        max: enemy.max_hp,
+                    }),
+                    mana: None,
+                    power: None,
+                    charge_state: None,
+                    tower_node: None,
+                },
+            );
+        }
+    } else {
+        for enemy in world.enemies.values() {
+            let pos = interpolated
+                .as_ref()
+                .and_then(|interp| interp.enemies.get(&enemy.id).map(|(p, _)| *p))
+                .unwrap_or_else(|| predict_enemy_position(enemy, net_stats.enemy_render_lead()));
+            desired.insert(
+                enemy.id,
+                DesiredActor {
+                    pos,
+                    kind: ActorKind::Enemy,
+                    facing: Some(FacingStat {
+                        dir: enemy.facing.dir,
+                    }),
+                    regular_attack: Some(attack_state_component_to_stat(enemy.regular_attack)),
+                    health: Some(HealthStat {
+                        current: enemy.hp,
+                        max: enemy.max_hp,
+                    }),
+                    mana: None,
+                    power: None,
+                    charge_state: None,
+                    tower_node: None,
+                },
+            );
+        }
     }
 
-    for tower in world.towers.values() {
-        desired.insert(
-            tower.id,
-            DesiredActor {
-                pos: tower.pos,
-                kind: ActorKind::Tower,
-                facing: None,
-                regular_attack: None,
-                health: None,
-                mana: None,
-                power: None,
-                charge_state: None,
-                tower_node: Some(TowerBuildNode {
-                    node_id: tower.node_id,
-                }),
-            },
-        );
+    // Towers: from local sim if available
+    let empty_towers = Vec::new();
+    let tower_source = if let Some(ref delta) = sim_delta {
+        &delta.towers
+    } else {
+        &empty_towers
+    };
+    if local_sim.initialized && sim_delta.is_some() {
+        for tower in tower_source {
+            desired.insert(
+                tower.id,
+                DesiredActor {
+                    pos: tower.pos,
+                    kind: ActorKind::Tower,
+                    facing: None,
+                    regular_attack: None,
+                    health: None,
+                    mana: None,
+                    power: None,
+                    charge_state: None,
+                    tower_node: Some(TowerBuildNode {
+                        node_id: tower.node_id,
+                    }),
+                },
+            );
+        }
+    } else {
+        for tower in world.towers.values() {
+            desired.insert(
+                tower.id,
+                DesiredActor {
+                    pos: tower.pos,
+                    kind: ActorKind::Tower,
+                    facing: None,
+                    regular_attack: None,
+                    health: None,
+                    mana: None,
+                    power: None,
+                    charge_state: None,
+                    tower_node: Some(TowerBuildNode {
+                        node_id: tower.node_id,
+                    }),
+                },
+            );
+        }
     }
 
     for (id, actor) in &desired {
@@ -3445,8 +3602,8 @@ fn update_debug_overlay(
     state: Res<DebugOverlayState>,
     net_stats: Res<NetStats>,
     snapshot_buffer: Res<SnapshotBuffer>,
-    runtime: Option<NonSend<NetworkRuntime>>,
-    local_smoothing: Res<LocalHeroSmoothing>,
+    smoothing: Res<ReconciliationSmoothing>,
+    local_sim: Res<LocalSimulation>,
     world: Res<WorldView>,
     mut query: Query<&mut Text, With<DebugOverlayText>>,
 ) {
@@ -3457,12 +3614,9 @@ fn update_debug_overlay(
     let jitter_ms = net_stats.jitter_ema * 1000.0;
     let snap_count = snapshot_buffer.snapshots.len();
     let interp_ms = snapshot_buffer.interpolation_delay * 1000.0;
-    let pending = runtime
-        .as_ref()
-        .map(|r| r.pending_moves.len())
-        .unwrap_or(0);
-    let offset_mag = (local_smoothing.visual_offset[0] * local_smoothing.visual_offset[0]
-        + local_smoothing.visual_offset[1] * local_smoothing.visual_offset[1])
+    let input_buf = local_sim.input_buffer.len();
+    let offset_mag = (smoothing.hero_offset[0] * smoothing.hero_offset[0]
+        + smoothing.hero_offset[1] * smoothing.hero_offset[1])
     .sqrt();
     let msgs: String = state
         .recent_msg_types
@@ -3474,9 +3628,9 @@ fn update_debug_overlay(
         text.0 = format!(
             "rtt: {rtt_ms:.0}ms  jitter: {jitter_ms:.0}ms\n\
              snaps: {snap_count}  interp: {interp_ms:.0}ms\n\
-             pending: {pending}  offset: {offset_mag:.3}\n\
-             tick: {}  msgs: {msgs}",
-            world.tick
+             buf: {input_buf}  offset: {offset_mag:.3}\n\
+             stk: {}  ptk: {}  msgs: {msgs}",
+            world.tick, local_sim.predicted_tick
         );
     }
 }
@@ -4320,196 +4474,6 @@ fn pick_nearest_build_node(
     }
 
     best.map(|(node_id, _)| node_id)
-}
-
-fn predict_local_position(
-    base: [f32; 2],
-    pending_moves: &VecDeque<PendingMove>,
-    world: &WorldView,
-) -> [f32; 2] {
-    let mut pos = base;
-    for pending in pending_moves {
-        pos = clamp_to_world([
-            pos[0] + pending.dir[0] * HERO_SPEED * FIXED_DT_SECONDS,
-            pos[1] + pending.dir[1] * HERO_SPEED * FIXED_DT_SECONDS,
-        ]);
-        // Resolve tower collisions to match server behavior.
-        // Only towers (static, always known) — enemy/hero collisions are dynamic
-        // and not worth predicting.
-        for tower in world.towers.values() {
-            pos = push_out_of_collider(
-                pos,
-                tower.pos,
-                HERO_COLLIDER_RADIUS + TOWER_COLLIDER_RADIUS,
-                HERO_SPEED * FIXED_DT_SECONDS,
-            );
-        }
-    }
-    pos
-}
-
-fn predict_local_overstep_position(
-    base: [f32; 2],
-    input_dir: [f32; 2],
-    overstep_fraction: f32,
-) -> [f32; 2] {
-    let overstep = overstep_fraction.clamp(0.0, 1.0);
-    if overstep <= f32::EPSILON {
-        return base;
-    }
-
-    let dir = normalize_or_zero(input_dir);
-    clamp_to_world([
-        base[0] + dir[0] * HERO_SPEED * FIXED_DT_SECONDS * overstep,
-        base[1] + dir[1] * HERO_SPEED * FIXED_DT_SECONDS * overstep,
-    ])
-}
-
-fn update_local_hero_smoothing(
-    smoothing: &mut LocalHeroSmoothing,
-    raw_prediction: [f32; 2],
-    input_dir: [f32; 2],
-    overstep_fraction: f32,
-    dt: f32,
-    world: &WorldView,
-    local_client_id: u64,
-    locked: bool,
-) -> [f32; 2] {
-    // Single fast decay: ~63% of correction absorbed per server tick (33ms)
-    // Skip decay during lock so the visual stays frozen in place.
-    if !locked {
-        let alpha: f32 = 1.0 - (-LOCAL_HERO_CORRECTION_DECAY * dt).exp();
-        smoothing.visual_offset[0] *= 1.0 - alpha;
-        smoothing.visual_offset[1] *= 1.0 - alpha;
-    }
-
-    // Snap tiny residual offsets to zero
-    let offset_sq = smoothing.visual_offset[0] * smoothing.visual_offset[0]
-        + smoothing.visual_offset[1] * smoothing.visual_offset[1];
-    if offset_sq < 0.0001 {
-        smoothing.visual_offset = [0.0, 0.0];
-    }
-
-    // Visual position = raw prediction + correction offset
-    let corrected = [
-        raw_prediction[0] + smoothing.visual_offset[0],
-        raw_prediction[1] + smoothing.visual_offset[1],
-    ];
-    let corrected = resolve_local_hero_collisions(corrected, world, local_client_id);
-
-    // Add scaled overstep extrapolation for sub-tick smoothness
-    let render_target = predict_local_overstep_position(
-        corrected, input_dir, overstep_fraction * LOCAL_HERO_OVERSTEP_SCALE,
-    );
-    let render_target = resolve_local_hero_collisions(render_target, world, local_client_id);
-
-    // Light render smoothing for visual polish (very fast — barely noticeable)
-    let render = match smoothing.render_pos {
-        Some(current) => {
-            if distance_sq(current, render_target) > LOCAL_HERO_SNAP_DISTANCE_SQ {
-                render_target
-            } else {
-                let render_alpha: f32 = 1.0 - (-LOCAL_HERO_RENDER_SMOOTH_RATE * dt).exp();
-                [
-                    current[0]
-                        + (render_target[0] - current[0]) * render_alpha.clamp(0.0, 1.0),
-                    current[1]
-                        + (render_target[1] - current[1]) * render_alpha.clamp(0.0, 1.0),
-                ]
-            }
-        }
-        None => render_target,
-    };
-    smoothing.render_pos = Some(render);
-    render
-}
-
-fn resolve_local_hero_collisions(
-    mut pos: [f32; 2],
-    world: &WorldView,
-    local_client_id: u64,
-) -> [f32; 2] {
-    let start = pos;
-
-    for tower in world.towers.values() {
-        pos = push_out_of_collider(
-            pos,
-            tower.pos,
-            HERO_COLLIDER_RADIUS + TOWER_COLLIDER_RADIUS,
-            LOCAL_HERO_COLLISION_MAX_CORRECTION_PER_STEP,
-        );
-    }
-
-    for enemy in world.enemies.values() {
-        pos = push_out_of_collider(
-            pos,
-            enemy.pos,
-            HERO_COLLIDER_RADIUS + enemy_collider_radius(enemy.enemy_type),
-            LOCAL_HERO_COLLISION_MAX_CORRECTION_PER_STEP,
-        );
-    }
-
-    for hero in world.heroes.values() {
-        if hero.client_id == local_client_id {
-            continue;
-        }
-        pos = push_out_of_collider(
-            pos,
-            hero.pos,
-            HERO_COLLIDER_RADIUS * 2.0,
-            LOCAL_HERO_COLLISION_MAX_CORRECTION_PER_STEP,
-        );
-    }
-
-    let limited_total = clamp_delta_length(
-        [pos[0] - start[0], pos[1] - start[1]],
-        LOCAL_HERO_COLLISION_MAX_TOTAL_CORRECTION,
-    );
-    clamp_to_world([start[0] + limited_total[0], start[1] + limited_total[1]])
-}
-
-fn push_out_of_collider(
-    point: [f32; 2],
-    center: [f32; 2],
-    min_distance: f32,
-    max_correction: f32,
-) -> [f32; 2] {
-    let mut delta = [point[0] - center[0], point[1] - center[1]];
-    let mut dist_sq = delta[0] * delta[0] + delta[1] * delta[1];
-    let min_distance_sq = min_distance * min_distance;
-
-    if dist_sq >= min_distance_sq {
-        return point;
-    }
-
-    if dist_sq <= f32::EPSILON {
-        delta = [1.0, 0.0];
-        dist_sq = 1.0;
-    }
-
-    let inv_dist = dist_sq.sqrt().recip();
-    let target = [
-        center[0] + delta[0] * inv_dist * min_distance,
-        center[1] + delta[1] * inv_dist * min_distance,
-    ];
-    let correction = [target[0] - point[0], target[1] - point[1]];
-    let limited = clamp_delta_length(correction, max_correction);
-    [point[0] + limited[0], point[1] + limited[1]]
-}
-
-fn clamp_delta_length(delta: [f32; 2], max_length: f32) -> [f32; 2] {
-    let len_sq = delta[0] * delta[0] + delta[1] * delta[1];
-    let max_sq = max_length * max_length;
-    if len_sq <= max_sq {
-        return delta;
-    }
-
-    if len_sq <= f32::EPSILON {
-        return [0.0, 0.0];
-    }
-
-    let scale = (max_sq / len_sq).sqrt();
-    [delta[0] * scale, delta[1] * scale]
 }
 
 fn acknowledge_pending_moves(pending_moves: &mut VecDeque<PendingMove>, ack: Option<u32>) {

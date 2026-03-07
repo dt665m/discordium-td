@@ -6,12 +6,17 @@ edition.workspace = true
 [dependencies]
 axum = "0.8.8"
 axum-server = { version = "0.7.2", features = ["tls-rustls"] }
+bevy = { version = "0.18.0", default-features = false, features = ["std"] }
 clap.workspace = true
 env_logger.workspace = true
 game_shared = { path = "../game_shared" }
+game_sim = { path = "../game_sim", features = ["bevy"] }
 log.workspace = true
 renet.workspace = true
 renet-cross = { workspace = true, features = ["axum"] }
 tokio.workspace = true
 tower-http = { version = "0.6.6", features = ["cors"] }
-vleue_navigator = "0.15.0"
+
+[features]
+default = []
+ui = ["bevy/default", "bevy/bevy_dev_tools"]

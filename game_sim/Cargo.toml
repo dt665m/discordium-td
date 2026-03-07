@@ -1,0 +1,19 @@
+[package]
+name = "game_sim"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+game_shared = { path = "../game_shared" }
+log.workspace = true
+vleue_navigator = "0.15.0"
+
+[features]
+default = []
+bevy = ["dep:bevy"]
+
+[dependencies.bevy]
+version = "0.18.0"
+default-features = false
+features = ["std"]
+optional = true

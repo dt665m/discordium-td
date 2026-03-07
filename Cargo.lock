@@ -3009,6 +3009,7 @@ dependencies = [
  "clap",
  "game_server",
  "game_shared",
+ "game_sim",
  "getrandom 0.2.17",
  "log",
  "renet",
@@ -3023,15 +3024,16 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "axum-server",
+ "bevy",
  "clap",
  "env_logger",
  "game_shared",
+ "game_sim",
  "log",
  "renet",
  "renet-cross",
  "tokio",
  "tower-http",
- "vleue_navigator",
 ]
 
 [[package]]
@@ -3040,6 +3042,16 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "serde",
+]
+
+[[package]]
+name = "game_sim"
+version = "0.1.0"
+dependencies = [
+ "bevy",
+ "game_shared",
+ "log",
+ "vleue_navigator",
 ]
 
 [[package]]

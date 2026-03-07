@@ -5,23 +5,26 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     path::PathBuf,
     sync::{Arc, Mutex},
-    thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
+
+use bevy::app::ScheduleRunnerPlugin;
+use bevy::prelude::*;
 
 use crate::{
     http_api::{self, HttpTlsConfig},
-    simulation::Simulation,
+    net::{NetRuntime, SharedNet},
 };
+use game_sim::Simulation;
 use axum::http::HeaderValue;
 use clap::Parser;
 use game_shared::{
-    ClientAck, ClientCommand, ClientMoveBundle, FIXED_DT_SECONDS, PROTOCOL_ID,
-    ReliableServerMessage, ServerWorldMessage, WorldDelta, WorldPatch, encode,
+    ClientAck, ClientCommand, ClientMoveBundle, PROTOCOL_ID, ReliableServerMessage,
+    SERVER_TICK_HZ, ServerWorldMessage, WorldDelta, WorldPatch, encode,
 };
 use renet::{ConnectionConfig, DefaultChannel, RenetServer, ServerEvent};
 use renet_cross::{
-    BootstrapConfig, BootstrapService, MixedServerTransport, MixedTransportBuilder,
+    BootstrapConfig, BootstrapService, MixedTransportBuilder,
     MonotonicClientIdAllocator, ServerAuthentication, UnsecureDevAuthPolicy,
 };
 
@@ -46,7 +49,21 @@ pub struct ServerArgs {
     public_http_base: Option<String>,
     #[arg(long, env = "TD_CORS_ALLOWED_ORIGINS")]
     cors_allowed_origins: Option<String>,
+    #[arg(long, default_value_t = false)]
+    pub ui: bool,
 }
+
+#[allow(dead_code)]
+enum ServerMode {
+    Headless,
+    Ui,
+}
+
+#[derive(Resource, Default)]
+struct ClientNetStates(HashMap<u64, ClientNetState>);
+
+#[derive(Resource, Default)]
+struct PendingJoinSnapshots(VecDeque<u64>);
 
 fn default_http_bind(tls_enabled: bool) -> SocketAddr {
     if tls_enabled {
@@ -118,6 +135,21 @@ fn cors_origins_label(origins: Option<&[HeaderValue]>) -> String {
 }
 
 pub fn run(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let mode = if args.ui {
+        #[cfg(not(feature = "ui"))]
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "--ui requires the 'ui' feature: cargo run --features ui",
+            )
+            .into());
+        }
+        #[cfg(feature = "ui")]
+        ServerMode::Ui
+    } else {
+        ServerMode::Headless
+    };
+
     let ServerArgs {
         http_bind,
         http_tls_cert,
@@ -128,6 +160,7 @@ pub fn run(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
         public_webrtc_addr,
         public_http_base,
         cors_allowed_origins,
+        ui: _,
     } = args;
 
     let http_tls = match (http_tls_cert, http_tls_key) {
@@ -173,7 +206,7 @@ pub fn run(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
         cors_origins
     );
 
-    let server = RenetServer::new(ConnectionConfig::default());
+    let server = Arc::new(Mutex::new(RenetServer::new(ConnectionConfig::default())));
     let shared_transport = Arc::new(Mutex::new(
         MixedTransportBuilder::new(PROTOCOL_ID)
             .udp_bind(udp_bind)
@@ -205,56 +238,89 @@ pub fn run(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
         cors_allowed_origins,
     );
 
-    run_game_loop(server, shared_transport, bootstrap)
+    let shared_net = SharedNet {
+        server,
+        transport: shared_transport,
+        bootstrap,
+    };
+
+    build_and_run_app(mode, shared_net);
+    Ok(())
 }
 
-/// Per-client net state for delta compression.
-struct ClientNetState {
-    /// The tick the client last confirmed receiving.
-    last_acked_tick: Option<u32>,
-    /// The snapshot that the client confirmed receiving (set when ack matches sent_history).
-    /// Only this snapshot is used as a baseline for patches — never an unconfirmed one.
-    confirmed_baseline: Option<WorldDelta>,
-    /// Ring buffer of recently sent snapshots so we can look up the one matching an ack.
-    sent_history: VecDeque<(u32, WorldDelta)>,
+fn build_and_run_app(mode: ServerMode, shared_net: SharedNet) {
+    let mut app = App::new();
+
+    match mode {
+        ServerMode::Headless => {
+            app.add_plugins(
+                MinimalPlugins
+                    .set(ScheduleRunnerPlugin::run_loop(Duration::from_millis(1))),
+            );
+        }
+        ServerMode::Ui => {
+            #[cfg(feature = "ui")]
+            {
+                app.add_plugins(
+                    DefaultPlugins
+                        .set(WindowPlugin {
+                            primary_window: Some(Window {
+                                title: "Discordium TD Server".into(),
+                                resolution: (640, 360).into(),
+                                ..default()
+                            }),
+                            ..default()
+                        })
+                        .disable::<bevy::log::LogPlugin>(),
+                );
+                app.add_systems(Startup, crate::ui::setup_ui_scene)
+                    .add_systems(Update, crate::ui::update_network_panel);
+            }
+        }
+    }
+
+    app.insert_resource(Time::<Fixed>::from_hz(SERVER_TICK_HZ as f64))
+        .insert_resource(NetRuntime { shared: shared_net })
+        .insert_resource(Simulation::new())
+        .insert_resource(ClientNetStates::default())
+        .insert_resource(PendingJoinSnapshots::default())
+        .add_systems(Update, network_transport_update)
+        .add_systems(FixedUpdate, fixed_server_tick)
+        .add_systems(PostUpdate, flush_transport_packets)
+        .run();
 }
 
-fn run_game_loop(
-    mut server: RenetServer,
-    shared_transport: Arc<Mutex<MixedServerTransport>>,
-    bootstrap: Arc<BootstrapService<MonotonicClientIdAllocator, UnsecureDevAuthPolicy>>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mut sim = Simulation::new();
-    let mut pending_join_snapshots = VecDeque::new();
-    let mut client_net_states: HashMap<u64, ClientNetState> = HashMap::new();
+// ---------------------------------------------------------------------------
+// Bevy systems
+// ---------------------------------------------------------------------------
 
-    let tick_dt = Duration::from_secs_f32(FIXED_DT_SECONDS);
-    let mut previous = Instant::now();
-    let mut accumulator = Duration::ZERO;
+fn network_transport_update(
+    time: Res<Time>,
+    net: Res<NetRuntime>,
+    mut sim: ResMut<Simulation>,
+    mut client_states: ResMut<ClientNetStates>,
+    mut pending_joins: ResMut<PendingJoinSnapshots>,
+) {
+    let frame_dt = time.delta();
+    let shared = &net.shared;
+    let bootstrap = Arc::clone(&shared.bootstrap);
 
-    loop {
-        let now = Instant::now();
-        let frame_dt = now.saturating_duration_since(previous);
-        previous = now;
-
+    shared.with_server_and_transport(|server, transport| {
         server.update(frame_dt);
 
-        {
-            let mut transport = lock_transport(&shared_transport)?;
-            let update_result =
-                catch_unwind(AssertUnwindSafe(|| transport.update(frame_dt, &mut server)));
-            match update_result {
-                Ok(Ok(())) => {}
-                Ok(Err(err)) => {
-                    log::warn!("transport update error: {err}");
-                }
-                Err(payload) => {
-                    log::error!(
-                        "transport update panicked: {}; disconnecting all clients",
-                        panic_payload_to_string(payload.as_ref())
-                    );
-                    transport.disconnect_all(&mut server);
-                }
+        let update_result =
+            catch_unwind(AssertUnwindSafe(|| transport.update(frame_dt, server)));
+        match update_result {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                log::warn!("transport update error: {err}");
+            }
+            Err(payload) => {
+                log::error!(
+                    "transport update panicked: {}; disconnecting all clients",
+                    panic_payload_to_string(payload.as_ref())
+                );
+                transport.disconnect_all(server);
             }
         }
 
@@ -264,8 +330,8 @@ fn run_game_loop(
                     match bootstrap.on_client_connected(client_id) {
                         Ok(()) => {
                             sim.add_player(client_id);
-                            pending_join_snapshots.push_back(client_id);
-                            client_net_states.insert(
+                            pending_joins.0.push_back(client_id);
+                            client_states.0.insert(
                                 client_id,
                                 ClientNetState {
                                     last_acked_tick: None,
@@ -276,7 +342,9 @@ fn run_game_loop(
                             log::info!("client connected: {client_id}");
                         }
                         Err(err) => {
-                            log::warn!("disconnecting unauthorized client {client_id}: {err}");
+                            log::warn!(
+                                "disconnecting unauthorized client {client_id}: {err}"
+                            );
                             server.disconnect(client_id);
                         }
                     }
@@ -284,63 +352,73 @@ fn run_game_loop(
                 ServerEvent::ClientDisconnected { client_id, reason } => {
                     bootstrap.on_client_disconnected(client_id);
                     sim.remove_player(client_id);
-                    pending_join_snapshots.retain(|id| *id != client_id);
-                    client_net_states.remove(&client_id);
+                    pending_joins.0.retain(|id| *id != client_id);
+                    client_states.0.remove(&client_id);
                     log::info!("client disconnected: {client_id} ({reason})");
                 }
             }
         }
 
-        receive_client_commands(&mut server, &mut sim, &mut client_net_states);
-
-        accumulator += frame_dt;
-        while accumulator >= tick_dt {
-            send_pending_joins(&mut server, &sim, &mut pending_join_snapshots);
-
-            if sim.has_players() {
-                let tick_output = sim.step();
-                for event in tick_output.reliable_events {
-                    let payload = encode(&ReliableServerMessage::Event(event));
-                    server.broadcast_message(DefaultChannel::ReliableOrdered, payload);
-                }
-
-                broadcast_world_deltas(&mut server, &sim, &mut client_net_states);
-
-                if sim.tick().is_multiple_of(120) {
-                    log::debug!(
-                        "authoritative tick={} clients={}",
-                        sim.tick(),
-                        server.clients_id().len()
-                    );
-                }
-            }
-
-            accumulator -= tick_dt;
-        }
-
-        {
-            let mut transport = lock_transport(&shared_transport)?;
-            let send_result =
-                catch_unwind(AssertUnwindSafe(|| transport.send_packets(&mut server)));
-            if let Err(payload) = send_result {
-                log::error!(
-                    "transport send_packets panicked: {}; disconnecting all clients",
-                    panic_payload_to_string(payload.as_ref())
-                );
-                transport.disconnect_all(&mut server);
-            }
-        }
-
-        thread::sleep(Duration::from_millis(1));
-    }
+        receive_client_commands(server, &mut sim, &mut client_states.0);
+    });
 }
 
-fn lock_transport(
-    shared_transport: &Arc<Mutex<MixedServerTransport>>,
-) -> Result<std::sync::MutexGuard<'_, MixedServerTransport>, Box<dyn std::error::Error>> {
-    shared_transport
-        .lock()
-        .map_err(|_| std::io::Error::other("transport mutex poisoned").into())
+fn fixed_server_tick(
+    net: Res<NetRuntime>,
+    mut sim: ResMut<Simulation>,
+    mut client_states: ResMut<ClientNetStates>,
+    mut pending_joins: ResMut<PendingJoinSnapshots>,
+) {
+    net.shared.with_server(|server| {
+        send_pending_joins(server, &sim, &mut pending_joins.0);
+
+        if sim.has_players() {
+            let tick_output = sim.step();
+            for event in tick_output.reliable_events {
+                let payload = encode(&ReliableServerMessage::Event(event));
+                server.broadcast_message(DefaultChannel::ReliableOrdered, payload);
+            }
+
+            broadcast_world_deltas(server, &sim, &mut client_states.0);
+
+            if sim.tick().is_multiple_of(120) {
+                log::debug!(
+                    "authoritative tick={} clients={}",
+                    sim.tick(),
+                    server.clients_id().len()
+                );
+            }
+        }
+    });
+}
+
+fn flush_transport_packets(net: Res<NetRuntime>) {
+    net.shared.with_server_and_transport(|server, transport| {
+        let send_result =
+            catch_unwind(AssertUnwindSafe(|| transport.send_packets(server)));
+        if let Err(payload) = send_result {
+            log::error!(
+                "transport send_packets panicked: {}; disconnecting all clients",
+                panic_payload_to_string(payload.as_ref())
+            );
+            transport.disconnect_all(server);
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Free functions (unchanged internals)
+// ---------------------------------------------------------------------------
+
+/// Per-client net state for delta compression.
+struct ClientNetState {
+    /// The tick the client last confirmed receiving.
+    last_acked_tick: Option<u32>,
+    /// The snapshot that the client confirmed receiving (set when ack matches sent_history).
+    /// Only this snapshot is used as a baseline for patches — never an unconfirmed one.
+    confirmed_baseline: Option<WorldDelta>,
+    /// Ring buffer of recently sent snapshots so we can look up the one matching an ack.
+    sent_history: VecDeque<(u32, WorldDelta)>,
 }
 
 fn panic_payload_to_string(payload: &(dyn Any + Send)) -> String {
@@ -549,5 +627,6 @@ fn build_world_patch(current: &WorldDelta, baseline: &WorldDelta) -> WorldPatch 
         enemy_patches,
         tower_patches,
         removed_ids,
+        sim_meta: current.sim_meta,
     }
 }

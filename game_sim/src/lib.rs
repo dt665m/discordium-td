@@ -476,6 +476,11 @@ impl Simulation {
                         .is_some_and(|(last_q, _)| !is_newer_input_seq(seq, *last_q));
                     if !dominated_by_queue {
                         queue.push_back((seq, normalize_or_zero(dir)));
+                        // Cap queue to prevent unbounded growth under extreme jitter.
+                        // Drop oldest moves — they're the most stale.
+                        while queue.len() > 10 {
+                            queue.pop_front();
+                        }
                     }
                 }
                 ClientCommand::SetLockTarget { target_id, .. } => {
@@ -504,43 +509,24 @@ impl Simulation {
     fn consume_move_queues(&mut self) {
         let client_ids: Vec<u64> = self.move_queues.keys().copied().collect();
         for client_id in client_ids {
-            // Pop consumed moves from queue first (separate borrow from heroes)
+            // Pop exactly one move per tick (separate borrow from heroes)
             let consumed = {
                 let Some(queue) = self.move_queues.get_mut(&client_id) else {
                     continue;
                 };
-                let first = queue.pop_front();
-                // Anti-buildup: if queue is growing (sustained jitter), drain an extra
-                // move to prevent ever-increasing input lag
-                let extra = if queue.len() > 4 {
-                    queue.pop_front()
-                } else {
-                    None
-                };
-                (first, extra)
+                queue.pop_front()
             };
 
             let Some(hero) = self.heroes.get_mut(&client_id) else {
                 continue;
             };
 
-            if let Some((seq, dir)) = consumed.0 {
+            if let Some((seq, dir)) = consumed {
                 hero.move_dir = dir;
                 hero.last_processed_seq = Some(seq);
             } else {
                 // No input this tick — stop (don't replay stale direction)
                 hero.move_dir = [0.0, 0.0];
-            }
-
-            if let Some((seq, dir)) = consumed.1 {
-                // Apply first move's displacement, then set second move's direction.
-                // advance_heroes will apply the second move's displacement normally.
-                hero.pos = clamp_to_world([
-                    hero.pos[0] + hero.move_dir[0] * HERO_SPEED * FIXED_DT_SECONDS,
-                    hero.pos[1] + hero.move_dir[1] * HERO_SPEED * FIXED_DT_SECONDS,
-                ]);
-                hero.move_dir = dir;
-                hero.last_processed_seq = Some(seq);
             }
         }
     }

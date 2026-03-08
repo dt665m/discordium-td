@@ -1923,7 +1923,7 @@ fn advance_local_simulation(
         .pending_moves
         .iter()
         .rev()
-        .take(8)
+        .take(16)
         .map(|pm| (pm.seq, pm.dir))
         .collect::<Vec<_>>()
         .into_iter()

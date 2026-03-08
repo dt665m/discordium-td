@@ -457,6 +457,7 @@ impl Simulation {
             match &command {
                 ClientCommand::Move { .. } => {}
                 _ => {
+                    self.flush_move_queue_up_to(client_id, seq);
                     if let Some(hero_mut) = self.heroes.get_mut(&client_id) {
                         hero_mut.last_processed_seq = Some(seq);
                     }
@@ -541,6 +542,48 @@ impl Simulation {
                 hero.move_dir = dir;
                 hero.last_processed_seq = Some(seq);
             }
+        }
+    }
+
+    /// Flush all queued moves for `client_id` whose seq is strictly less than
+    /// `action_seq`, applying their displacements. This ensures the hero's
+    /// position matches where the client was when the action was issued.
+    fn flush_move_queue_up_to(&mut self, client_id: u64, action_seq: u32) {
+        let moves_to_apply: Vec<(u32, [f32; 2])> = {
+            let Some(queue) = self.move_queues.get_mut(&client_id) else {
+                return;
+            };
+            let mut moves = Vec::new();
+            while let Some(&(move_seq, dir)) = queue.front() {
+                if !is_newer_input_seq(action_seq, move_seq) {
+                    break; // move_seq >= action_seq
+                }
+                queue.pop_front();
+                moves.push((move_seq, dir));
+            }
+            moves
+        };
+
+        if moves_to_apply.is_empty() {
+            return;
+        }
+
+        let Some(hero) = self.heroes.get_mut(&client_id) else {
+            return;
+        };
+
+        let attack_locked = is_attack_locked(hero.regular_attack);
+        let charge_locked = is_charge_locked(hero.charge_state);
+
+        for (seq, dir) in moves_to_apply {
+            if !attack_locked && !charge_locked {
+                hero.pos = clamp_to_world([
+                    hero.pos[0] + dir[0] * HERO_SPEED * FIXED_DT_SECONDS,
+                    hero.pos[1] + dir[1] * HERO_SPEED * FIXED_DT_SECONDS,
+                ]);
+            }
+            hero.move_dir = dir;
+            hero.last_processed_seq = Some(seq);
         }
     }
 

@@ -492,6 +492,122 @@ pub struct JoinSnapshot {
     pub world: WorldDelta,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum DebugWorldMessageKind {
+    Full,
+    Patch,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum DebugRenderActorKind {
+    LocalHero,
+    RemoteHero,
+    Enemy,
+    Tower,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DebugRenderActor {
+    pub id: u64,
+    pub kind: DebugRenderActorKind,
+    pub pos: [f32; 2],
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ClientInterpolationDebug {
+    pub snapshot_ticks: Vec<u32>,
+    pub render_time: f32,
+    pub interpolation_delay: f32,
+    pub enemy_render_lead: f32,
+    pub older_tick: Option<u32>,
+    pub newer_tick: Option<u32>,
+    pub factor: Option<f32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ClientDebugFrame {
+    pub frame_index: u64,
+    pub client_id: Option<u64>,
+    pub connected: bool,
+    pub menu_visible: bool,
+    pub menu_status: String,
+    pub phase: MatchPhase,
+    pub wave: u32,
+    pub team_life: i32,
+    pub objectives: Vec<ObjectiveSnapshot>,
+    pub applied_world_tick: u32,
+    pub latest_server_tick: Option<u32>,
+    pub latest_server_message: Option<DebugWorldMessageKind>,
+    pub latest_acked_input_seq: Option<u32>,
+    pub latest_sim_meta: Option<SimMeta>,
+    pub predicted_tick: Option<u32>,
+    pub input_dir: [f32; 2],
+    pub pending_action_count: usize,
+    pub pending_move_count: usize,
+    pub rtt_ema: f32,
+    pub jitter_ema: f32,
+    pub reconciliation_offset: [f32; 2],
+    pub authoritative_heroes: Vec<HeroSnapshot>,
+    pub authoritative_enemies: Vec<EnemySnapshot>,
+    pub authoritative_towers: Vec<TowerSnapshot>,
+    pub predicted_heroes: Vec<HeroSnapshot>,
+    pub predicted_enemies: Vec<EnemySnapshot>,
+    pub predicted_towers: Vec<TowerSnapshot>,
+    pub rendered_actors: Vec<DebugRenderActor>,
+    pub interpolation: ClientInterpolationDebug,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ClientDebugBridgeExport {
+    pub enabled: bool,
+    pub latest: Option<ClientDebugFrame>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum DebugClientPlatform {
+    Native,
+    Wasm,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ClientDebugUploadBatch {
+    pub instance_id: String,
+    pub source: DebugClientPlatform,
+    pub upload_seq: u64,
+    pub frames: Vec<ClientDebugFrame>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ServerDebugClientFrame {
+    pub client_id: u64,
+    pub last_acked_tick: Option<u32>,
+    pub confirmed_baseline_tick: Option<u32>,
+    pub sent_history_len: usize,
+    pub world: WorldDelta,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ServerDebugFrame {
+    pub tick: u32,
+    pub clients: Vec<ServerDebugClientFrame>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ServerDebugBridgeExport {
+    pub enabled: bool,
+    pub latest: Option<ServerDebugFrame>,
+    pub frames: Vec<ServerDebugFrame>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DebugRecorderInfo {
+    pub enabled: bool,
+    pub run_id: Option<String>,
+    pub run_dir: Option<String>,
+    pub server_frames_path: Option<String>,
+    pub client_frames_path: Option<String>,
+}
+
 pub fn clamp_to_world(pos: [f32; 2]) -> [f32; 2] {
     [
         pos[0].clamp(-WORLD_HALF_WIDTH, WORLD_HALF_WIDTH),

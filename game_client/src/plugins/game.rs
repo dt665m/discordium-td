@@ -1,3 +1,8 @@
+#[cfg(target_arch = "wasm32")]
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     time::Duration,
@@ -5,7 +10,9 @@ use std::{
 #[cfg(not(target_arch = "wasm32"))]
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
+    sync::mpsc::{self, Sender},
     thread,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use bevy::dev_tools::fps_overlay::{FpsOverlayConfig, FpsOverlayPlugin, FrameTimeGraphConfig};
@@ -22,18 +29,21 @@ use clap::Parser;
 use game_server::{ServerArgs, run as run_server};
 use game_shared::{
     AbilityId, AttackPhase, BASE_POSITION, BUILD_COMMAND_MAX_DISTANCE, BUILD_NODES, BuildNodeDef,
-    ChargePhase, ClientCommand, ClientMoveBundle, DirectionalAttackStateComponent,
-    ENEMY_REGULAR_ATTACK, EnemySnapshot, FIXED_DT_SECONDS,
-    HERO_MAX_HP, HERO_MAX_MANA, HERO_REGULAR_ATTACK,
-    HeroSnapshot, JoinSnapshot, MatchPhase, ObjectiveSnapshot, PROTOCOL_ID, ReliableGameEvent,
-    ReliableServerMessage, ServerWorldMessage, SimMeta, TowerSnapshot,
-    TowerType, WorldDelta, WorldPatch, clamp_to_world, distance_sq, encode,
-    is_newer_input_seq, normalize_or_zero,
+    ChargePhase, ClientCommand, ClientDebugFrame, ClientDebugUploadBatch, ClientMoveBundle,
+    DebugClientPlatform, DirectionalAttackStateComponent, ENEMY_REGULAR_ATTACK, EnemySnapshot,
+    FIXED_DT_SECONDS, HERO_MAX_HP, HERO_MAX_MANA, HERO_REGULAR_ATTACK, HeroSnapshot, JoinSnapshot,
+    MatchPhase, ObjectiveSnapshot, PROTOCOL_ID, ReliableGameEvent, ReliableServerMessage,
+    ServerWorldMessage, SimMeta, TowerSnapshot, TowerType, WorldDelta, WorldPatch, clamp_to_world,
+    distance_sq, encode, is_newer_input_seq, normalize_or_zero,
 };
 use game_sim::Simulation;
+#[cfg(target_arch = "wasm32")]
+use js_sys::{JSON, Reflect};
 use renet::{DefaultChannel, RenetClient};
 #[cfg(target_arch = "wasm32")]
-use wasm_bindgen_futures::spawn_local;
+use wasm_bindgen::{JsCast, JsValue};
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen_futures::{JsFuture, spawn_local};
 
 use super::lock_on::{LockOnPlugin, select_next_lock_target};
 
@@ -124,6 +134,12 @@ const MATCH_END_OVERLAY_BG: Color = Color::srgba(0.04, 0.07, 0.1, 0.74);
 const MATCH_END_OVERLAY_BORDER: Color = Color::srgba(0.53, 0.65, 0.76, 0.84);
 const MATCH_END_OVERLAY_TITLE: Color = Color::srgb(0.94, 0.97, 1.0);
 const MATCH_END_OVERLAY_DEFEAT_TITLE: Color = Color::srgb(1.0, 0.78, 0.72);
+const DEBUG_RECORDER_FLUSH_INTERVAL_SECONDS: f32 = 0.5;
+const DEBUG_RECORDER_MAX_BATCH_SIZE: usize = 16;
+#[cfg(target_arch = "wasm32")]
+const DEBUG_RECORDER_MAX_BATCH_BYTES: usize = 48 * 1024;
+#[cfg(target_arch = "wasm32")]
+const DEBUG_RECORDER_MAX_RETRY_PAYLOADS: usize = 32;
 
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone, Resource, Parser)]
@@ -131,12 +147,18 @@ const MATCH_END_OVERLAY_DEFEAT_TITLE: Color = Color::srgb(1.0, 0.78, 0.72);
 pub struct ClientArgs {
     #[arg(long, env = "TD_HTTP_BASE", default_value = "http://127.0.0.1:8080")]
     http_base: String,
+    #[arg(long, default_value_t = false)]
+    debug_bridge: bool,
+    #[arg(long, default_value_t = false)]
+    debug_recorder: bool,
 }
 
 #[cfg(target_arch = "wasm32")]
 #[derive(Debug, Clone, Resource)]
 pub struct ClientArgs {
     http_base: String,
+    debug_bridge: bool,
+    debug_recorder: bool,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -144,6 +166,8 @@ impl Default for ClientArgs {
     fn default() -> Self {
         Self {
             http_base: default_http_base(),
+            debug_bridge: default_debug_bridge_enabled() || default_debug_recorder_enabled(),
+            debug_recorder: default_debug_recorder_enabled(),
         }
     }
 }
@@ -152,6 +176,198 @@ impl Default for ClientArgs {
 struct PendingMove {
     seq: u32,
     dir: [f32; 2],
+}
+
+#[derive(Resource, Default)]
+struct ClientDebugBridgeState {
+    enabled: bool,
+    frame_index: u64,
+    latest: Option<ClientDebugFrame>,
+    latest_server_message: Option<game_shared::DebugWorldMessageKind>,
+    latest_acked_input_seq: Option<u32>,
+    latest_sim_meta: Option<SimMeta>,
+}
+
+impl ClientDebugBridgeState {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            ..Default::default()
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn export(&self) -> game_shared::ClientDebugBridgeExport {
+        game_shared::ClientDebugBridgeExport {
+            enabled: self.enabled,
+            latest: self.latest.clone(),
+        }
+    }
+}
+
+#[derive(Resource)]
+struct ClientDebugRecorderState {
+    enabled: bool,
+    #[cfg(target_arch = "wasm32")]
+    endpoint: String,
+    instance_id: String,
+    upload_seq: u64,
+    pending_frames: VecDeque<ClientDebugFrame>,
+    last_flush_secs: f32,
+    flush_interval_secs: f32,
+    max_batch_size: usize,
+    #[cfg(target_arch = "wasm32")]
+    max_batch_bytes: usize,
+    #[cfg(not(target_arch = "wasm32"))]
+    native_sender: Option<Sender<String>>,
+    #[cfg(target_arch = "wasm32")]
+    upload_in_flight: Arc<AtomicBool>,
+    #[cfg(target_arch = "wasm32")]
+    retry_payloads: Arc<Mutex<VecDeque<String>>>,
+    #[cfg(target_arch = "wasm32")]
+    max_retry_payloads: usize,
+}
+
+impl ClientDebugRecorderState {
+    fn disabled() -> Self {
+        Self {
+            enabled: false,
+            #[cfg(target_arch = "wasm32")]
+            endpoint: String::new(),
+            instance_id: String::new(),
+            upload_seq: 0,
+            pending_frames: VecDeque::new(),
+            last_flush_secs: 0.0,
+            flush_interval_secs: DEBUG_RECORDER_FLUSH_INTERVAL_SECONDS,
+            max_batch_size: DEBUG_RECORDER_MAX_BATCH_SIZE,
+            #[cfg(target_arch = "wasm32")]
+            max_batch_bytes: DEBUG_RECORDER_MAX_BATCH_BYTES,
+            #[cfg(not(target_arch = "wasm32"))]
+            native_sender: None,
+            #[cfg(target_arch = "wasm32")]
+            upload_in_flight: Arc::new(AtomicBool::new(false)),
+            #[cfg(target_arch = "wasm32")]
+            retry_payloads: Arc::new(Mutex::new(VecDeque::new())),
+            #[cfg(target_arch = "wasm32")]
+            max_retry_payloads: DEBUG_RECORDER_MAX_RETRY_PAYLOADS,
+        }
+    }
+
+    fn new(enabled: bool, http_base: &str) -> Self {
+        if !enabled {
+            return Self::disabled();
+        }
+
+        let endpoint = format!("{}/debug/client-frames", http_base.trim_end_matches('/'));
+        Self {
+            enabled: true,
+            #[cfg(target_arch = "wasm32")]
+            endpoint: endpoint.clone(),
+            instance_id: client_debug_instance_id(),
+            upload_seq: 0,
+            pending_frames: VecDeque::new(),
+            last_flush_secs: 0.0,
+            flush_interval_secs: DEBUG_RECORDER_FLUSH_INTERVAL_SECONDS,
+            max_batch_size: DEBUG_RECORDER_MAX_BATCH_SIZE,
+            #[cfg(target_arch = "wasm32")]
+            max_batch_bytes: DEBUG_RECORDER_MAX_BATCH_BYTES,
+            #[cfg(not(target_arch = "wasm32"))]
+            native_sender: Some(spawn_native_debug_upload_thread(endpoint)),
+            #[cfg(target_arch = "wasm32")]
+            upload_in_flight: Arc::new(AtomicBool::new(false)),
+            #[cfg(target_arch = "wasm32")]
+            retry_payloads: Arc::new(Mutex::new(VecDeque::new())),
+            #[cfg(target_arch = "wasm32")]
+            max_retry_payloads: DEBUG_RECORDER_MAX_RETRY_PAYLOADS,
+        }
+    }
+
+    fn record_frame(&mut self, frame: ClientDebugFrame) {
+        if !self.enabled {
+            return;
+        }
+
+        self.pending_frames.push_back(frame);
+        while self.pending_frames.len() > self.max_batch_size * 8 {
+            self.pending_frames.pop_front();
+        }
+    }
+
+    fn should_flush(&self, elapsed_secs: f32) -> bool {
+        self.enabled
+            && !self.pending_frames.is_empty()
+            && (self.pending_frames.len() >= self.max_batch_size
+                || elapsed_secs - self.last_flush_secs >= self.flush_interval_secs)
+    }
+
+    fn take_batch(
+        &mut self,
+        elapsed_secs: f32,
+        max_payload_bytes: usize,
+    ) -> Option<ClientDebugUploadBatch> {
+        if !self.enabled || self.pending_frames.is_empty() {
+            return None;
+        }
+
+        let next_upload_seq = self.upload_seq.wrapping_add(1);
+        let take_limit = self.pending_frames.len().min(self.max_batch_size);
+        let mut selected_len = 0;
+        let mut frames = Vec::with_capacity(take_limit);
+
+        for frame in self.pending_frames.iter().take(take_limit) {
+            frames.push(frame.clone());
+            let candidate = ClientDebugUploadBatch {
+                instance_id: self.instance_id.clone(),
+                source: client_debug_platform(),
+                upload_seq: next_upload_seq,
+                frames: frames.clone(),
+            };
+            let Ok(payload) = serde_json::to_vec(&candidate) else {
+                log::warn!("failed to size client debug upload batch");
+                return None;
+            };
+
+            if payload.len() <= max_payload_bytes || frames.len() == 1 {
+                selected_len = frames.len();
+                if payload.len() > max_payload_bytes {
+                    break;
+                }
+                continue;
+            }
+
+            frames.pop();
+            break;
+        }
+
+        if selected_len == 0 {
+            return None;
+        }
+
+        frames.truncate(selected_len);
+        self.pending_frames.drain(..selected_len);
+        self.upload_seq = next_upload_seq;
+        self.last_flush_secs = elapsed_secs;
+        Some(ClientDebugUploadBatch {
+            instance_id: self.instance_id.clone(),
+            source: client_debug_platform(),
+            upload_seq: self.upload_seq,
+            frames,
+        })
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn upload_in_flight(&self) -> bool {
+        self.upload_in_flight.load(Ordering::SeqCst)
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn pop_retry_payload(&self) -> Option<String> {
+        let Ok(mut retry_payloads) = self.retry_payloads.lock() else {
+            log::warn!("failed to lock wasm debug recorder retry queue");
+            return None;
+        };
+        retry_payloads.pop_front()
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -340,12 +556,7 @@ impl SnapshotBuffer {
 
         // Interpolate enemies
         for enemy_new in &newer.world.enemies {
-            if let Some(enemy_old) = older
-                .world
-                .enemies
-                .iter()
-                .find(|e| e.id == enemy_new.id)
-            {
+            if let Some(enemy_old) = older.world.enemies.iter().find(|e| e.id == enemy_new.id) {
                 let pos = lerp_pos(enemy_old.pos, enemy_new.pos, t);
                 // Apply extrapolation lead on top of interpolated position
                 let led_pos = clamp_to_world([
@@ -365,7 +576,10 @@ impl SnapshotBuffer {
         InterpolatedPositions { heroes, enemies }
     }
 
-    fn find_bracketing(&self, render_time: f32) -> (&TimestampedSnapshot, &TimestampedSnapshot, f32) {
+    fn find_bracketing(
+        &self,
+        render_time: f32,
+    ) -> (&TimestampedSnapshot, &TimestampedSnapshot, f32) {
         let len = self.snapshots.len();
         if len < 2 {
             let snap = &self.snapshots[0];
@@ -898,6 +1112,18 @@ pub struct GameClientPlugin;
 
 impl Plugin for GameClientPlugin {
     fn build(&self, app: &mut App) {
+        let (http_base, debug_bridge_enabled, debug_recorder_enabled) = app
+            .world()
+            .get_resource::<ClientArgs>()
+            .map(|args| {
+                (
+                    args.http_base.clone(),
+                    args.debug_bridge || args.debug_recorder,
+                    args.debug_recorder,
+                )
+            })
+            .unwrap_or_else(|| ("http://127.0.0.1:8080".to_owned(), false, false));
+
         app.insert_resource(InputState::default())
             .insert_resource(NetStats::default())
             .insert_resource(SnapshotBuffer::default())
@@ -913,6 +1139,11 @@ impl Plugin for GameClientPlugin {
             .insert_resource(MainMenuState::default())
             .insert_resource(WorldView::default())
             .insert_resource(RenderIndex::default())
+            .insert_resource(ClientDebugBridgeState::new(debug_bridge_enabled))
+            .insert_resource(ClientDebugRecorderState::new(
+                debug_recorder_enabled,
+                &http_base,
+            ))
             .insert_resource(Time::<Fixed>::from_hz(game_shared::SERVER_TICK_HZ as f64))
             .insert_resource(ClearColor(Color::srgb(0.05, 0.06, 0.07)))
             .add_plugins(DefaultPlugins.set(WindowPlugin {
@@ -985,6 +1216,10 @@ impl Plugin for GameClientPlugin {
             .add_systems(
                 Update,
                 (
+                    capture_client_debug_bridge_frame,
+                    flush_client_debug_recorder,
+                    #[cfg(target_arch = "wasm32")]
+                    publish_client_debug_bridge,
                     update_hud,
                     update_gold_hud.run_if(resource_changed::<WorldView>),
                     update_gold_spend_popups,
@@ -1021,6 +1256,15 @@ impl Plugin for GameClientPlugin {
                 },
             },
         });
+
+        #[cfg(target_arch = "wasm32")]
+        app.add_systems(
+            Update,
+            poll_client_debug_bridge_commands
+                .after(handle_menu_buttons)
+                .before(process_menu_actions)
+                .in_set(ClientUpdateSet::Input),
+        );
     }
 }
 
@@ -1570,6 +1814,46 @@ fn sync_menu_button_visual_state(
     }
 }
 
+#[cfg(target_arch = "wasm32")]
+fn poll_client_debug_bridge_commands(
+    debug_bridge: Res<ClientDebugBridgeState>,
+    mut menu_state: ResMut<MainMenuState>,
+) {
+    if !debug_bridge.enabled {
+        return;
+    }
+
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+
+    let Ok(command) = Reflect::get(
+        window.as_ref(),
+        &JsValue::from_str("__discordiumDebugBridgeCommand"),
+    ) else {
+        return;
+    };
+    let Some(command) = command.as_string() else {
+        return;
+    };
+
+    let _ = Reflect::set(
+        window.as_ref(),
+        &JsValue::from_str("__discordiumDebugBridgeCommand"),
+        &JsValue::UNDEFINED,
+    );
+
+    match command.as_str() {
+        "connect_dev" => {
+            menu_state.pending_action = Some(MenuAction::ConnectDev);
+            menu_state.connect_request_in_flight = true;
+        }
+        _ => {
+            log::warn!("ignoring unknown debug bridge command: {command}");
+        }
+    }
+}
+
 fn process_menu_actions(world: &mut World) {
     let action = {
         let mut menu_state = world.resource_mut::<MainMenuState>();
@@ -1619,7 +1903,10 @@ fn ensure_local_server_running(world: &mut World) -> Option<(String, String)> {
     let local_http_base = format!("http://127.0.0.1:{LOCAL_HOST_HTTP_PORT}");
     let public_http_base = format!("http://{host_ip}:{LOCAL_HOST_HTTP_PORT}");
 
-    let server_args = ServerArgs::parse_from([
+    let client_args = world.resource::<ClientArgs>();
+    let debug_bridge_enabled = client_args.debug_bridge;
+    let debug_recorder_enabled = client_args.debug_recorder;
+    let mut server_args = vec![
         "embedded-server".to_owned(),
         "--http-bind".to_owned(),
         format!("0.0.0.0:{LOCAL_HOST_HTTP_PORT}"),
@@ -1633,7 +1920,14 @@ fn ensure_local_server_running(world: &mut World) -> Option<(String, String)> {
         format!("{host_ip}:{LOCAL_HOST_UDP_PORT}"),
         "--public-webrtc-addr".to_owned(),
         format!("{host_ip}:{LOCAL_HOST_WEBRTC_PORT}"),
-    ]);
+    ];
+    if debug_bridge_enabled {
+        server_args.push("--debug-bridge".to_owned());
+    }
+    if debug_recorder_enabled {
+        server_args.push("--debug-recorder".to_owned());
+    }
+    let server_args = ServerArgs::parse_from(server_args);
 
     if let Err(err) = thread::Builder::new()
         .name("discordium-local-server".to_owned())
@@ -1820,6 +2114,164 @@ fn default_http_base() -> String {
         .unwrap_or_else(|| "http://127.0.0.1:8080".to_owned())
 }
 
+#[cfg(target_arch = "wasm32")]
+fn default_debug_bridge_enabled() -> bool {
+    web_sys::window()
+        .and_then(|window| window.location().search().ok())
+        .map(|search| query_param_truthy(&search, "debug_bridge"))
+        .unwrap_or(false)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn default_debug_recorder_enabled() -> bool {
+    web_sys::window()
+        .and_then(|window| window.location().search().ok())
+        .map(|search| query_param_truthy(&search, "debug_recorder"))
+        .unwrap_or(false)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn query_param_truthy(search: &str, key: &str) -> bool {
+    search
+        .trim_start_matches('?')
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .filter_map(|pair| {
+            let mut parts = pair.splitn(2, '=');
+            let current_key = parts.next()?;
+            let value = parts.next().unwrap_or("1");
+            Some((current_key, value))
+        })
+        .find_map(|(current_key, value)| {
+            if current_key != key {
+                return None;
+            }
+
+            Some(matches!(
+                value,
+                "1" | "true" | "TRUE" | "True" | "yes" | "YES" | "on" | "ON"
+            ))
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn client_debug_instance_id() -> String {
+    format!("native-{}-{}", unix_time_ms(), std::process::id())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn client_debug_instance_id() -> String {
+    format!("wasm-{:.0}", js_sys::Date::now())
+}
+
+fn client_debug_platform() -> DebugClientPlatform {
+    #[cfg(target_arch = "wasm32")]
+    {
+        DebugClientPlatform::Wasm
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        DebugClientPlatform::Native
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn spawn_native_debug_upload_thread(endpoint: String) -> Sender<String> {
+    let (sender, receiver) = mpsc::channel::<String>();
+    thread::Builder::new()
+        .name("discordium-debug-upload".to_owned())
+        .spawn(move || {
+            for payload in receiver {
+                let response = ureq::post(&endpoint)
+                    .set("Content-Type", "application/json")
+                    .send_string(&payload);
+                if let Err(err) = response {
+                    log::warn!("failed to upload client debug batch to {endpoint}: {err}");
+                }
+            }
+        })
+        .expect("failed to spawn client debug upload thread");
+    sender
+}
+
+#[cfg(target_arch = "wasm32")]
+fn push_wasm_retry_payload(
+    retry_payloads: &Arc<Mutex<VecDeque<String>>>,
+    max_retry_payloads: usize,
+    payload: String,
+) {
+    let Ok(mut retry_payloads) = retry_payloads.lock() else {
+        log::warn!("failed to lock wasm debug recorder retry queue");
+        return;
+    };
+
+    if retry_payloads.len() >= max_retry_payloads {
+        retry_payloads.pop_front();
+        log::warn!("dropping oldest wasm debug recorder payload after retry queue filled");
+    }
+    retry_payloads.push_back(payload);
+}
+
+#[cfg(target_arch = "wasm32")]
+fn spawn_wasm_debug_upload(
+    endpoint: String,
+    payload: String,
+    upload_in_flight: Arc<AtomicBool>,
+    retry_payloads: Arc<Mutex<VecDeque<String>>>,
+    max_retry_payloads: usize,
+) {
+    let Some(window) = web_sys::window() else {
+        push_wasm_retry_payload(&retry_payloads, max_retry_payloads, payload);
+        return;
+    };
+
+    upload_in_flight.store(true, Ordering::SeqCst);
+    spawn_local(async move {
+        let request_init = web_sys::RequestInit::new();
+        request_init.set_method("POST");
+        request_init.set_body(&JsValue::from_str(&payload));
+
+        let should_retry =
+            match JsFuture::from(window.fetch_with_str_and_init(&endpoint, &request_init)).await {
+                Ok(response_value) => match response_value.dyn_into::<web_sys::Response>() {
+                    Ok(response) => {
+                        if response.ok() {
+                            false
+                        } else {
+                            log::warn!(
+                                "wasm debug recorder upload failed with status {}",
+                                response.status()
+                            );
+                            true
+                        }
+                    }
+                    Err(err) => {
+                        log::warn!("failed to decode wasm debug recorder response: {err:?}");
+                        true
+                    }
+                },
+                Err(err) => {
+                    log::warn!("failed to upload wasm debug recorder batch to {endpoint}: {err:?}");
+                    true
+                }
+            };
+
+        if should_retry {
+            push_wasm_retry_payload(&retry_payloads, max_retry_payloads, payload);
+        }
+        upload_in_flight.store(false, Ordering::SeqCst);
+    });
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn unix_time_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default()
+}
+
 fn sync_main_menu_state(
     runtime: Option<NonSend<NetworkRuntime>>,
     menu_state: Res<MainMenuState>,
@@ -1900,10 +2352,9 @@ fn advance_local_simulation(
     let _tick_output = local_sim.sim.step();
 
     // Store in input buffer for reconciliation replay
-    local_sim.input_buffer.push_back(InputEntry {
-        seq,
-        commands,
-    });
+    local_sim
+        .input_buffer
+        .push_back(InputEntry { seq, commands });
     // Prevent unbounded buffer growth
     while local_sim.input_buffer.len() > 256 {
         local_sim.input_buffer.pop_front();
@@ -1930,7 +2381,9 @@ fn advance_local_simulation(
         .rev()
         .collect();
 
-    let bundle = ClientMoveBundle { moves: bundle_moves };
+    let bundle = ClientMoveBundle {
+        moves: bundle_moves,
+    };
     runtime
         .renet
         .send_message(DefaultChannel::Unreliable, encode(&bundle));
@@ -2053,6 +2506,7 @@ fn network_update(
     mut smoothing: ResMut<ReconciliationSmoothing>,
     mut hud_state: ResMut<HudState>,
     mut debug_overlay: ResMut<DebugOverlayState>,
+    mut debug_bridge: ResMut<ClientDebugBridgeState>,
     render_index: Res<RenderIndex>,
     mut commands: Commands,
     scene_assets: Res<SceneAssets>,
@@ -2131,6 +2585,11 @@ fn network_update(
             Ok(msg) => {
                 // Track message type for debug overlay
                 let is_full = matches!(&msg, ServerWorldMessage::Full(_));
+                debug_bridge.latest_server_message = Some(if is_full {
+                    game_shared::DebugWorldMessageKind::Full
+                } else {
+                    game_shared::DebugWorldMessageKind::Patch
+                });
                 if debug_overlay.recent_msg_types.len() >= 32 {
                     debug_overlay.recent_msg_types.pop_front();
                 }
@@ -2229,6 +2688,8 @@ fn network_update(
                     &mut runtime_inner.pending_moves,
                     delta.your_last_input_seq,
                 );
+                debug_bridge.latest_acked_input_seq = delta.your_last_input_seq;
+                debug_bridge.latest_sim_meta = delta.sim_meta;
 
                 // Push into snapshot buffer for remote hero interpolation
                 snapshot_buffer.push(TimestampedSnapshot {
@@ -2333,14 +2794,19 @@ fn reconcile_local_sim(
     // Update enemy smoothing offsets
     for enemy in &new_hero_delta.enemies {
         if let Some(old_pos) = old_enemy_positions.get(&enemy.id) {
-            let offset = smoothing.enemy_offsets.entry(enemy.id).or_insert([0.0, 0.0]);
+            let offset = smoothing
+                .enemy_offsets
+                .entry(enemy.id)
+                .or_insert([0.0, 0.0]);
             offset[0] += old_pos[0] - enemy.pos[0];
             offset[1] += old_pos[1] - enemy.pos[1];
         }
     }
     // Remove offsets for enemies no longer in sim
     let new_enemy_ids: HashSet<u64> = new_hero_delta.enemies.iter().map(|e| e.id).collect();
-    smoothing.enemy_offsets.retain(|id, _| new_enemy_ids.contains(id));
+    smoothing
+        .enemy_offsets
+        .retain(|id, _| new_enemy_ids.contains(id));
 }
 
 /// Reconstruct a full WorldDelta from a patch and its baseline in the snapshot buffer.
@@ -2372,11 +2838,7 @@ fn reconstruct_from_patch(buffer: &SnapshotBuffer, patch: WorldPatch) -> Option<
     }
     // Add new heroes (in patch but not in baseline)
     for patched in &patch.hero_patches {
-        if !base
-            .heroes
-            .iter()
-            .any(|h| h.client_id == patched.client_id)
-        {
+        if !base.heroes.iter().any(|h| h.client_id == patched.client_id) {
             heroes.push(*patched);
         }
     }
@@ -3114,7 +3576,10 @@ fn sync_dynamic_actors(
 
     // Heroes: local hero from sim, remote heroes from interpolation
     let empty_heroes = Vec::new();
-    let hero_source = sim_delta.as_ref().map(|d| &d.heroes).unwrap_or(&empty_heroes);
+    let hero_source = sim_delta
+        .as_ref()
+        .map(|d| &d.heroes)
+        .unwrap_or(&empty_heroes);
     // Build lookup from WorldView heroes for remote hero data
     let world_heroes: &HashMap<u64, HeroSnapshot> = &world.heroes;
     // Merge: for local hero use sim, for remote heroes use world/interpolation
@@ -3147,8 +3612,7 @@ fn sync_dynamic_actors(
                     if distance_sq(current, render_target) > LOCAL_HERO_SNAP_DISTANCE_SQ {
                         render_target
                     } else {
-                        let alpha: f32 =
-                            1.0 - (-LOCAL_HERO_RENDER_SMOOTH_RATE * dt).exp();
+                        let alpha: f32 = 1.0 - (-LOCAL_HERO_RENDER_SMOOTH_RATE * dt).exp();
                         [
                             current[0] + (render_target[0] - current[0]) * alpha.clamp(0.0, 1.0),
                             current[1] + (render_target[1] - current[1]) * alpha.clamp(0.0, 1.0),
@@ -3246,7 +3710,11 @@ fn sync_dynamic_actors(
     // Use sim enemies if available, otherwise world enemies
     if local_sim.initialized && sim_delta.is_some() {
         for enemy in enemy_source {
-            let offset = smoothing.enemy_offsets.get(&enemy.id).copied().unwrap_or([0.0, 0.0]);
+            let offset = smoothing
+                .enemy_offsets
+                .get(&enemy.id)
+                .copied()
+                .unwrap_or([0.0, 0.0]);
             let pos = [enemy.pos[0] + offset[0], enemy.pos[1] + offset[1]];
             desired.insert(
                 enemy.id,
@@ -3617,7 +4085,7 @@ fn update_debug_overlay(
     let input_buf = local_sim.input_buffer.len();
     let offset_mag = (smoothing.hero_offset[0] * smoothing.hero_offset[0]
         + smoothing.hero_offset[1] * smoothing.hero_offset[1])
-    .sqrt();
+        .sqrt();
     let msgs: String = state
         .recent_msg_types
         .iter()
@@ -3633,6 +4101,272 @@ fn update_debug_overlay(
             world.tick, local_sim.predicted_tick
         );
     }
+}
+
+fn capture_client_debug_bridge_frame(
+    runtime: Option<NonSend<NetworkRuntime>>,
+    input_state: Res<InputState>,
+    pending_actions: Res<PendingActions>,
+    local_sim: Res<LocalSimulation>,
+    smoothing: Res<ReconciliationSmoothing>,
+    world: Res<WorldView>,
+    net_stats: Res<NetStats>,
+    snapshot_buffer: Res<SnapshotBuffer>,
+    menu_root: Single<&Node, With<MainMenuRoot>>,
+    menu_state: Res<MainMenuState>,
+    render_index: Res<RenderIndex>,
+    mut debug_bridge: ResMut<ClientDebugBridgeState>,
+    mut debug_recorder: ResMut<ClientDebugRecorderState>,
+    actor_query: Query<
+        (
+            &Transform,
+            Option<&LocalHeroActor>,
+            Option<&HeroActor>,
+            Option<&EnemyActor>,
+            Option<&TowerActor>,
+        ),
+        With<DynamicActor>,
+    >,
+) {
+    if !debug_bridge.enabled {
+        return;
+    }
+
+    let runtime = runtime.as_deref();
+    let client_id = runtime.map(|runtime| runtime.client_id).or(world.you);
+
+    let mut authoritative_heroes: Vec<HeroSnapshot> = world.heroes.values().copied().collect();
+    let mut authoritative_enemies: Vec<EnemySnapshot> = world.enemies.values().copied().collect();
+    let mut authoritative_towers: Vec<TowerSnapshot> = world.towers.values().copied().collect();
+    sort_debug_snapshots(
+        &mut authoritative_heroes,
+        &mut authoritative_enemies,
+        &mut authoritative_towers,
+    );
+
+    let (predicted_tick, predicted_heroes, predicted_enemies, predicted_towers) =
+        if local_sim.initialized {
+            if let Some(client_id) = client_id {
+                let mut predicted = local_sim.sim.world_delta_for(client_id);
+                sort_world_delta_snapshot(&mut predicted);
+                (
+                    Some(local_sim.predicted_tick),
+                    predicted.heroes,
+                    predicted.enemies,
+                    predicted.towers,
+                )
+            } else {
+                (
+                    Some(local_sim.predicted_tick),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                )
+            }
+        } else {
+            (None, Vec::new(), Vec::new(), Vec::new())
+        };
+
+    let mut render_ids: Vec<u64> = render_index.by_id.keys().copied().collect();
+    render_ids.sort_unstable();
+    let mut rendered_actors = Vec::with_capacity(render_ids.len());
+    for id in render_ids {
+        let Some(entity) = render_index.by_id.get(&id) else {
+            continue;
+        };
+        let Ok((transform, local_hero, hero, enemy, tower)) = actor_query.get(*entity) else {
+            continue;
+        };
+        let kind = if local_hero.is_some() {
+            game_shared::DebugRenderActorKind::LocalHero
+        } else if hero.is_some() {
+            game_shared::DebugRenderActorKind::RemoteHero
+        } else if enemy.is_some() {
+            game_shared::DebugRenderActorKind::Enemy
+        } else if tower.is_some() {
+            game_shared::DebugRenderActorKind::Tower
+        } else {
+            continue;
+        };
+        rendered_actors.push(game_shared::DebugRenderActor {
+            id,
+            kind,
+            pos: [transform.translation.x, transform.translation.z],
+        });
+    }
+
+    debug_bridge.frame_index = debug_bridge.frame_index.wrapping_add(1);
+    debug_bridge.latest = Some(ClientDebugFrame {
+        frame_index: debug_bridge.frame_index,
+        client_id,
+        connected: runtime.is_some_and(|runtime| runtime.renet.is_connected()),
+        menu_visible: menu_root.display != Display::None,
+        menu_status: menu_state.status.clone(),
+        phase: world.phase,
+        wave: world.wave,
+        team_life: world.team_life,
+        objectives: world.objectives.clone(),
+        applied_world_tick: world.tick,
+        latest_server_tick: snapshot_buffer
+            .snapshots
+            .back()
+            .map(|snapshot| snapshot.server_tick),
+        latest_server_message: debug_bridge.latest_server_message,
+        latest_acked_input_seq: debug_bridge.latest_acked_input_seq,
+        latest_sim_meta: debug_bridge.latest_sim_meta,
+        predicted_tick,
+        input_dir: input_state.dir,
+        pending_action_count: pending_actions.0.len(),
+        pending_move_count: runtime.map_or(0, |runtime| runtime.pending_moves.len()),
+        rtt_ema: net_stats.rtt_ema,
+        jitter_ema: net_stats.jitter_ema,
+        reconciliation_offset: smoothing.hero_offset,
+        authoritative_heroes,
+        authoritative_enemies,
+        authoritative_towers,
+        predicted_heroes,
+        predicted_enemies,
+        predicted_towers,
+        rendered_actors,
+        interpolation: snapshot_buffer_debug(
+            snapshot_buffer.as_ref(),
+            net_stats.enemy_render_lead(),
+        ),
+    });
+    if let Some(frame) = debug_bridge.latest.clone() {
+        debug_recorder.record_frame(frame);
+    }
+}
+
+fn flush_client_debug_recorder(
+    time: Res<Time>,
+    mut debug_recorder: ResMut<ClientDebugRecorderState>,
+) {
+    let elapsed_secs = time.elapsed_secs();
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        if debug_recorder.upload_in_flight() {
+            return;
+        }
+
+        if let Some(payload) = debug_recorder.pop_retry_payload() {
+            spawn_wasm_debug_upload(
+                debug_recorder.endpoint.clone(),
+                payload,
+                Arc::clone(&debug_recorder.upload_in_flight),
+                Arc::clone(&debug_recorder.retry_payloads),
+                debug_recorder.max_retry_payloads,
+            );
+            return;
+        }
+    }
+
+    if !debug_recorder.should_flush(elapsed_secs) {
+        return;
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    let max_payload_bytes = usize::MAX;
+    #[cfg(target_arch = "wasm32")]
+    let max_payload_bytes = debug_recorder.max_batch_bytes;
+
+    let Some(batch) = debug_recorder.take_batch(elapsed_secs, max_payload_bytes) else {
+        return;
+    };
+    let Ok(payload) = serde_json::to_string(&batch) else {
+        log::warn!("failed to serialize client debug upload batch");
+        return;
+    };
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        if let Some(sender) = &debug_recorder.native_sender {
+            if let Err(err) = sender.send(payload) {
+                log::warn!("failed to queue native client debug upload: {err}");
+            }
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        spawn_wasm_debug_upload(
+            debug_recorder.endpoint.clone(),
+            payload,
+            Arc::clone(&debug_recorder.upload_in_flight),
+            Arc::clone(&debug_recorder.retry_payloads),
+            debug_recorder.max_retry_payloads,
+        );
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn publish_client_debug_bridge(debug_bridge: Res<ClientDebugBridgeState>) {
+    if !debug_bridge.enabled || !debug_bridge.is_changed() {
+        return;
+    }
+
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+
+    let Ok(export_json) = serde_json::to_string(&debug_bridge.export()) else {
+        log::warn!("failed to serialize client debug bridge export");
+        return;
+    };
+    let Ok(export_value) = JSON::parse(&export_json) else {
+        log::warn!("failed to parse client debug bridge JSON for window export");
+        return;
+    };
+    if let Err(err) = Reflect::set(
+        window.as_ref(),
+        &JsValue::from_str("__discordiumDebugBridge"),
+        &export_value,
+    ) {
+        log::warn!("failed to publish client debug bridge to window: {err:?}");
+    }
+}
+
+fn snapshot_buffer_debug(
+    snapshot_buffer: &SnapshotBuffer,
+    enemy_render_lead: f32,
+) -> game_shared::ClientInterpolationDebug {
+    let snapshot_ticks = snapshot_buffer
+        .snapshots
+        .iter()
+        .map(|snapshot| snapshot.server_tick)
+        .collect::<Vec<_>>();
+    let (older_tick, newer_tick, factor) = if snapshot_buffer.snapshots.is_empty() {
+        (None, None, None)
+    } else {
+        let (older, newer, t) = snapshot_buffer.find_bracketing(snapshot_buffer.render_time);
+        (Some(older.server_tick), Some(newer.server_tick), Some(t))
+    };
+
+    game_shared::ClientInterpolationDebug {
+        snapshot_ticks,
+        render_time: snapshot_buffer.render_time,
+        interpolation_delay: snapshot_buffer.interpolation_delay,
+        enemy_render_lead,
+        older_tick,
+        newer_tick,
+        factor,
+    }
+}
+
+fn sort_world_delta_snapshot(world: &mut WorldDelta) {
+    sort_debug_snapshots(&mut world.heroes, &mut world.enemies, &mut world.towers);
+    world.objectives.sort_by_key(|objective| objective.lane);
+}
+
+fn sort_debug_snapshots(
+    heroes: &mut Vec<HeroSnapshot>,
+    enemies: &mut Vec<EnemySnapshot>,
+    towers: &mut Vec<TowerSnapshot>,
+) {
+    heroes.sort_by_key(|hero| hero.client_id);
+    enemies.sort_by_key(|enemy| enemy.id);
+    towers.sort_by_key(|tower| tower.id);
 }
 
 fn update_match_end_overlay(

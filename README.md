@@ -54,6 +54,107 @@ Build release wasm bundle:
 just web-build
 ```
 
+## Debug Bridge and Recorder
+
+For network, interpolation, reconciliation, and long-session desync debugging, both the server and client can expose a structured debug bridge. The optional recorder extends that bridge with durable NDJSON logs so a long lifecycle does not overwrite the important frames in memory.
+
+Enable the server bridge:
+
+```bash
+cargo run -p game_server -- --debug-bridge
+```
+
+Enable the server recorder as well:
+
+```bash
+cargo run -p game_server -- --debug-recorder
+```
+
+Recorder mode also enables the bridge automatically and writes each run into its own dated directory under `target/debug-recorder/YYYY-MM-DD/<run_id>/` by default. Override the base log directory with:
+
+```bash
+cargo run -p game_server -- --debug-recorder --debug-log-dir /tmp/discordium-debug
+```
+
+Server debug HTTP routes:
+
+- `http://127.0.0.1:8080/debug/bridge`
+- `http://127.0.0.1:8080/debug/recorder`
+- `POST http://127.0.0.1:8080/debug/client-frames`
+
+Enable the native client bridge:
+
+```bash
+cargo run -p game_client -- --debug-bridge
+```
+
+Enable the native client recorder:
+
+```bash
+cargo run -p game_client -- --debug-recorder
+```
+
+When recorder mode is enabled, the native client batches `ClientDebugFrame` uploads to the server's `/debug/client-frames` endpoint in a background thread. If you use the in-client embedded server flow, `--debug-recorder` is forwarded to that embedded server automatically.
+
+For the wasm client, the same bridge is enabled with a query parameter because runtime clap parsing is not available in the browser:
+
+- `http://127.0.0.1:1420/?debug_bridge=1`
+
+Enable the wasm recorder with:
+
+- `http://127.0.0.1:1420/?debug_recorder=1`
+
+`debug_recorder=1` also enables the browser bridge and uploads chunked frame batches to `/debug/client-frames` with retry-aware `fetch` POSTs.
+
+When enabled in the browser, the latest client frame is published to:
+
+- `window.__discordiumDebugBridge`
+
+The browser bridge also accepts a simple command channel for automation:
+
+- `window.__discordiumDebugBridgeCommand = "connect_dev"`
+
+The client bridge includes:
+
+- latest authoritative world tick and message type
+- local predicted tick and reconciliation offset
+- rendered actor positions after interpolation/smoothing
+- authoritative and predicted hero/enemy/tower snapshots
+
+The server bridge includes:
+
+- authoritative per-client world snapshots
+- last acked tick, confirmed patch baseline tick, and sent-history depth
+
+Recorder output inside each run directory:
+
+- `server.ndjson`: one authoritative server frame per fixed tick
+- `client.ndjson`: uploaded client frame batches with source platform, instance id, and upload sequence
+
+The `/debug/recorder` endpoint returns the active run id, run directory, and concrete output paths for the current server process.
+
+## Netcode Verifier
+
+With the debug bridge enabled on the server and the wasm client served on `127.0.0.1:1420`, run:
+
+```bash
+node ./scripts/netcode-verify.mjs
+```
+
+The verifier will:
+
+- open the browser in headed mode
+- connect through the debug bridge command channel
+- drive a short movement/combat scenario
+- compare client authoritative snapshots against matching server authoritative frames
+- write a JSON report to `target/netcode-verifier/YYYY-MM-DD/<run_id>/report.json`
+
+The script resolves Playwright from the shared Codex runtime at `~/.codex/playwright-runtime`, so the repo no longer needs a local `package.json` or `node_modules/` for browser verification.
+
+Headless Chromium is not reliable for this Bevy wasm client in the current setup because WebGL surface creation can fail there.
+
+For recorder-backed verification, start the server with `--debug-recorder`, run the wasm client with `?debug_recorder=1`, then run the verifier. That gives you a live mismatch report plus durable client/server traces for later inspection.
+
 ## Cloudflare End-to-End TLS (HTTP Handshake)
 
 The server supports TLS for the HTTP bootstrap/signaling endpoint used during connect/handshake.

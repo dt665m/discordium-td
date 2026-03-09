@@ -12,20 +12,22 @@ use bevy::app::ScheduleRunnerPlugin;
 use bevy::prelude::*;
 
 use crate::{
+    debug_bridge::ServerDebugBridgeHandle,
+    debug_recorder::DebugRecorderHandle,
     http_api::{self, HttpTlsConfig},
     net::{NetRuntime, SharedNet},
 };
-use game_sim::Simulation;
 use axum::http::HeaderValue;
 use clap::Parser;
 use game_shared::{
-    ClientAck, ClientCommand, ClientMoveBundle, PROTOCOL_ID, ReliableServerMessage,
-    SERVER_TICK_HZ, ServerWorldMessage, WorldDelta, WorldPatch, encode,
+    ClientAck, ClientCommand, ClientMoveBundle, PROTOCOL_ID, ReliableServerMessage, SERVER_TICK_HZ,
+    ServerDebugClientFrame, ServerDebugFrame, ServerWorldMessage, WorldDelta, WorldPatch, encode,
 };
+use game_sim::Simulation;
 use renet::{ConnectionConfig, DefaultChannel, RenetServer, ServerEvent};
 use renet_cross::{
-    BootstrapConfig, BootstrapService, MixedTransportBuilder,
-    MonotonicClientIdAllocator, ServerAuthentication, UnsecureDevAuthPolicy,
+    BootstrapConfig, BootstrapService, MixedTransportBuilder, MonotonicClientIdAllocator,
+    ServerAuthentication, UnsecureDevAuthPolicy,
 };
 
 #[derive(Debug, Clone, Parser)]
@@ -51,6 +53,12 @@ pub struct ServerArgs {
     cors_allowed_origins: Option<String>,
     #[arg(long, default_value_t = false)]
     pub ui: bool,
+    #[arg(long, default_value_t = false)]
+    pub debug_bridge: bool,
+    #[arg(long, default_value_t = false)]
+    pub debug_recorder: bool,
+    #[arg(long, env = "TD_DEBUG_LOG_DIR")]
+    pub debug_log_dir: Option<PathBuf>,
 }
 
 #[allow(dead_code)]
@@ -64,6 +72,15 @@ struct ClientNetStates(HashMap<u64, ClientNetState>);
 
 #[derive(Resource, Default)]
 struct PendingJoinSnapshots(VecDeque<u64>);
+
+#[derive(Resource, Clone, Default)]
+struct DebugBridgeResource(Option<ServerDebugBridgeHandle>);
+
+#[derive(Resource, Clone, Default)]
+struct DebugRecorderResource(Option<DebugRecorderHandle>);
+
+const DEBUG_BRIDGE_HISTORY_LIMIT: usize = 240;
+const DEFAULT_DEBUG_LOG_DIR: &str = "target/debug-recorder";
 
 fn default_http_bind(tls_enabled: bool) -> SocketAddr {
     if tls_enabled {
@@ -161,6 +178,9 @@ pub fn run(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
         public_http_base,
         cors_allowed_origins,
         ui: _,
+        debug_bridge,
+        debug_recorder,
+        debug_log_dir,
     } = args;
 
     let http_tls = match (http_tls_cert, http_tls_key) {
@@ -193,9 +213,18 @@ pub fn run(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
     let cors_allowed_origins = parse_cors_allowed_origins(cors_allowed_origins)?;
     let cors_origins = cors_origins_label(cors_allowed_origins.as_deref());
+    let debug_bridge_enabled = debug_bridge || debug_recorder;
+    let debug_bridge =
+        debug_bridge_enabled.then(|| ServerDebugBridgeHandle::new(DEBUG_BRIDGE_HISTORY_LIMIT));
+    let debug_recorder = if debug_recorder {
+        let log_dir = debug_log_dir.unwrap_or_else(|| PathBuf::from(DEFAULT_DEBUG_LOG_DIR));
+        Some(DebugRecorderHandle::new(log_dir)?)
+    } else {
+        None
+    };
 
     log::info!(
-        "starting server: http_bind={} http_tls={} udp_bind={} webrtc_bind={} public_http_base={} public_udp_addr={} public_webrtc_addr={} cors_allowed_origins={}",
+        "starting server: http_bind={} http_tls={} udp_bind={} webrtc_bind={} public_http_base={} public_udp_addr={} public_webrtc_addr={} cors_allowed_origins={} debug_bridge={} debug_recorder={}",
         http_bind,
         http_tls.is_some(),
         udp_bind,
@@ -203,7 +232,9 @@ pub fn run(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
         public_http_base,
         public_udp_addr,
         public_webrtc_addr,
-        cors_origins
+        cors_origins,
+        debug_bridge.is_some(),
+        debug_recorder.is_some()
     );
 
     let server = Arc::new(Mutex::new(RenetServer::new(ConnectionConfig::default())));
@@ -236,6 +267,8 @@ pub fn run(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
         public_webrtc_addr,
         http_tls,
         cors_allowed_origins,
+        debug_bridge.clone(),
+        debug_recorder.clone(),
     );
 
     let shared_net = SharedNet {
@@ -244,18 +277,22 @@ pub fn run(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
         bootstrap,
     };
 
-    build_and_run_app(mode, shared_net);
+    build_and_run_app(mode, shared_net, debug_bridge, debug_recorder);
     Ok(())
 }
 
-fn build_and_run_app(mode: ServerMode, shared_net: SharedNet) {
+fn build_and_run_app(
+    mode: ServerMode,
+    shared_net: SharedNet,
+    debug_bridge: Option<ServerDebugBridgeHandle>,
+    debug_recorder: Option<DebugRecorderHandle>,
+) {
     let mut app = App::new();
 
     match mode {
         ServerMode::Headless => {
             app.add_plugins(
-                MinimalPlugins
-                    .set(ScheduleRunnerPlugin::run_loop(Duration::from_millis(1))),
+                MinimalPlugins.set(ScheduleRunnerPlugin::run_loop(Duration::from_millis(1))),
             );
         }
         ServerMode::Ui => {
@@ -284,6 +321,8 @@ fn build_and_run_app(mode: ServerMode, shared_net: SharedNet) {
         .insert_resource(Simulation::new())
         .insert_resource(ClientNetStates::default())
         .insert_resource(PendingJoinSnapshots::default())
+        .insert_resource(DebugBridgeResource(debug_bridge))
+        .insert_resource(DebugRecorderResource(debug_recorder))
         .add_systems(Update, network_transport_update)
         .add_systems(FixedUpdate, fixed_server_tick)
         .add_systems(PostUpdate, flush_transport_packets)
@@ -308,8 +347,7 @@ fn network_transport_update(
     shared.with_server_and_transport(|server, transport| {
         server.update(frame_dt);
 
-        let update_result =
-            catch_unwind(AssertUnwindSafe(|| transport.update(frame_dt, server)));
+        let update_result = catch_unwind(AssertUnwindSafe(|| transport.update(frame_dt, server)));
         match update_result {
             Ok(Ok(())) => {}
             Ok(Err(err)) => {
@@ -342,9 +380,7 @@ fn network_transport_update(
                             log::info!("client connected: {client_id}");
                         }
                         Err(err) => {
-                            log::warn!(
-                                "disconnecting unauthorized client {client_id}: {err}"
-                            );
+                            log::warn!("disconnecting unauthorized client {client_id}: {err}");
                             server.disconnect(client_id);
                         }
                     }
@@ -368,6 +404,8 @@ fn fixed_server_tick(
     mut sim: ResMut<Simulation>,
     mut client_states: ResMut<ClientNetStates>,
     mut pending_joins: ResMut<PendingJoinSnapshots>,
+    debug_bridge: Res<DebugBridgeResource>,
+    debug_recorder: Res<DebugRecorderResource>,
 ) {
     net.shared.with_server(|server| {
         send_pending_joins(server, &sim, &mut pending_joins.0);
@@ -380,6 +418,15 @@ fn fixed_server_tick(
             }
 
             broadcast_world_deltas(server, &sim, &mut client_states.0);
+            if debug_bridge.0.is_some() || debug_recorder.0.is_some() {
+                let frame = build_server_debug_frame(server, &sim, &client_states.0);
+                if let Some(debug_bridge) = &debug_bridge.0 {
+                    debug_bridge.push_frame(frame.clone());
+                }
+                if let Some(debug_recorder) = &debug_recorder.0 {
+                    debug_recorder.record_server_frame(frame);
+                }
+            }
 
             if sim.tick().is_multiple_of(120) {
                 log::debug!(
@@ -394,8 +441,7 @@ fn fixed_server_tick(
 
 fn flush_transport_packets(net: Res<NetRuntime>) {
     net.shared.with_server_and_transport(|server, transport| {
-        let send_result =
-            catch_unwind(AssertUnwindSafe(|| transport.send_packets(server)));
+        let send_result = catch_unwind(AssertUnwindSafe(|| transport.send_packets(server)));
         if let Err(payload) = send_result {
             log::error!(
                 "transport send_packets panicked: {}; disconnecting all clients",
@@ -419,6 +465,45 @@ struct ClientNetState {
     confirmed_baseline: Option<WorldDelta>,
     /// Ring buffer of recently sent snapshots so we can look up the one matching an ack.
     sent_history: VecDeque<(u32, WorldDelta)>,
+}
+
+fn build_server_debug_frame(
+    server: &RenetServer,
+    sim: &Simulation,
+    client_net_states: &HashMap<u64, ClientNetState>,
+) -> ServerDebugFrame {
+    let mut client_ids = server.clients_id();
+    client_ids.sort_unstable();
+
+    let clients = client_ids
+        .into_iter()
+        .map(|client_id| {
+            let state = client_net_states.get(&client_id);
+            let mut world = sim.world_delta_for(client_id);
+            sort_world_delta(&mut world);
+            ServerDebugClientFrame {
+                client_id,
+                last_acked_tick: state.and_then(|state| state.last_acked_tick),
+                confirmed_baseline_tick: state
+                    .and_then(|state| state.confirmed_baseline.as_ref())
+                    .map(|baseline| baseline.tick),
+                sent_history_len: state.map_or(0, |state| state.sent_history.len()),
+                world,
+            }
+        })
+        .collect();
+
+    ServerDebugFrame {
+        tick: sim.tick(),
+        clients,
+    }
+}
+
+fn sort_world_delta(world: &mut WorldDelta) {
+    world.heroes.sort_by_key(|hero| hero.client_id);
+    world.enemies.sort_by_key(|enemy| enemy.id);
+    world.towers.sort_by_key(|tower| tower.id);
+    world.objectives.sort_by_key(|objective| objective.lane);
 }
 
 fn panic_payload_to_string(payload: &(dyn Any + Send)) -> String {
@@ -447,9 +532,7 @@ fn receive_client_commands(
                     sim.queue_command(client_id, command);
                 }
                 Err(err) => {
-                    log::debug!(
-                        "dropping invalid reliable command from client {client_id}: {err}"
-                    );
+                    log::debug!("dropping invalid reliable command from client {client_id}: {err}");
                 }
             }
         }
@@ -472,13 +555,10 @@ fn receive_client_commands(
                     if should_update {
                         state.last_acked_tick = Some(ack.tick);
                         // Promote the acked snapshot from sent_history to confirmed_baseline
-                        if let Some(pos) = state
-                            .sent_history
-                            .iter()
-                            .position(|(t, _)| *t == ack.tick)
+                        if let Some(pos) =
+                            state.sent_history.iter().position(|(t, _)| *t == ack.tick)
                         {
-                            state.confirmed_baseline =
-                                Some(state.sent_history[pos].1.clone());
+                            state.confirmed_baseline = Some(state.sent_history[pos].1.clone());
                             // Drop everything older — we'll never need it
                             state.sent_history.drain(..pos);
                         }
@@ -595,11 +675,7 @@ fn build_world_patch(current: &WorldDelta, baseline: &WorldDelta) -> WorldPatch 
 
     // Find removed entities (in baseline but not in current)
     for hero in &baseline.heroes {
-        if !current
-            .heroes
-            .iter()
-            .any(|c| c.client_id == hero.client_id)
-        {
+        if !current.heroes.iter().any(|c| c.client_id == hero.client_id) {
             removed_ids.push(hero.client_id);
         }
     }

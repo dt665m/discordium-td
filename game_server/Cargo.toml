@@ -14,6 +14,9 @@ game_sim = { path = "../game_sim", features = ["bevy"] }
 log.workspace = true
 renet.workspace = true
 renet-cross = { workspace = true, features = ["axum"] }
+serde.workspace = true
+serde_json.workspace = true
+time = { version = "0.3.36", features = ["formatting", "macros"] }
 tokio.workspace = true
 tower-http = { version = "0.6.6", features = ["cors"] }
 

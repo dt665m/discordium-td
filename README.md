@@ -138,7 +138,7 @@ The `/debug/recorder` endpoint returns the active run id, run directory, and con
 With the debug bridge enabled on the server and the wasm client served on `127.0.0.1:1420`, run:
 
 ```bash
-node ./scripts/netcode-verify.mjs
+./scripts/run-netcode-verify.sh
 ```
 
 The verifier will:
@@ -149,7 +149,7 @@ The verifier will:
 - compare client authoritative snapshots against matching server authoritative frames
 - write a JSON report to `target/netcode-verifier/YYYY-MM-DD/<run_id>/report.json`
 
-The script resolves Playwright from the shared Codex runtime at `~/.codex/playwright-runtime`, so the repo no longer needs a local `package.json` or `node_modules/` for browser verification.
+The wrapper prepares Playwright in an OS-temporary runtime, so the repo does not need a local `package.json` or `node_modules/` for browser verification. Set `PLAYWRIGHT_RUNTIME_DIR` to override that location.
 
 Headless Chromium is not reliable for this Bevy wasm client in the current setup because WebGL surface creation can fail there.
 

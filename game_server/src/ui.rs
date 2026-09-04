@@ -1,9 +1,9 @@
 #![cfg(feature = "ui")]
 
 use bevy::prelude::*;
+use game_sim::Simulation;
 
 use crate::net::NetRuntime;
-use crate::simulation::Simulation;
 
 #[derive(Component)]
 pub(crate) struct NetworkPanelText;

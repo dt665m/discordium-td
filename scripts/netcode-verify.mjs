@@ -19,10 +19,11 @@ const DEFAULTS = {
 const FLOAT_EPSILON = 0.001;
 const WARN_TICK_LAG = 6;
 const WARN_RENDER_DELTA = 0.75;
-const SHARED_PLAYWRIGHT_PACKAGE = path.join(
-  os.homedir(),
-  ".codex",
-  "playwright-runtime",
+const PLAYWRIGHT_RUNTIME_DIR =
+  process.env.PLAYWRIGHT_RUNTIME_DIR ??
+  path.join(os.tmpdir(), "discordium-td-playwright-runtime");
+const FALLBACK_PLAYWRIGHT_PACKAGE = path.join(
+  PLAYWRIGHT_RUNTIME_DIR,
   "package.json",
 );
 const { chromium } = await loadPlaywright();
@@ -136,11 +137,11 @@ async function loadPlaywright() {
     return await import("playwright");
   } catch (localError) {
     try {
-      const sharedRequire = createRequire(SHARED_PLAYWRIGHT_PACKAGE);
-      return sharedRequire("playwright");
-    } catch (sharedError) {
+      const fallbackRequire = createRequire(FALLBACK_PLAYWRIGHT_PACKAGE);
+      return fallbackRequire("playwright");
+    } catch (fallbackError) {
       throw new Error(
-        `Could not load Playwright from the current Node module resolution path or the shared Codex runtime at ${SHARED_PLAYWRIGHT_PACKAGE}. Local error: ${localError}. Shared error: ${sharedError}`,
+        `Could not load Playwright from the current Node module resolution path or the temporary runtime at ${FALLBACK_PLAYWRIGHT_PACKAGE}. Run ./scripts/run-netcode-verify.sh to prepare it. Local error: ${localError}. Fallback error: ${fallbackError}`,
       );
     }
   }

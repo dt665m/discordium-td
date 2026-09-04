@@ -52,12 +52,12 @@ Wasm client:
 4. Run automated verification for the wasm client when appropriate.
 
 ```bash
-node ./scripts/netcode-verify.mjs
+./scripts/run-netcode-verify.sh
 ```
 
 Use headed Chromium. Headless Chromium is not reliable for this Bevy wasm client because WebGL surface creation may fail.
 
-The verifier resolves Playwright from the shared Codex runtime used by [$playwright-interactive](/Users/dt665m/.codex/skills/playwright-interactive/SKILL.md), so this repository does not need its own `package.json` or `node_modules/`.
+The wrapper prepares Playwright in an OS-temporary runtime, so this repository does not need its own `package.json` or `node_modules/`. Set `PLAYWRIGHT_RUNTIME_DIR` to override that location.
 
 ## What gets recorded
 

@@ -82,10 +82,7 @@ When unsure, search these topics in Bevy 0.18 docs/examples:
 
 ## Validation Before Finishing
 
-- Run:
-  - `cargo fmt --all`
-  - `cargo check --workspace --all-targets`
-  - `cargo test --workspace`
-- If a recipe exists, also run:
-  - `just check`
+- For Rust changes, run formatting and the checks/tests covering the affected crates and behavior. Use `just check` when it covers the needed checks; do not duplicate equivalent commands.
+- Broaden to workspace checks/tests for cross-crate contracts or merge/release validation. Documentation-only edits need relevant link/example validation rather than a game build.
+- Fix failures caused by this change and rerun affected checks before finishing.
 

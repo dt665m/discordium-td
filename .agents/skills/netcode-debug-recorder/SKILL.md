@@ -73,9 +73,27 @@ Client NDJSON:
 - client instance id and upload sequence
 - authoritative, predicted, interpolation, and rendered-actor data
 
+## Capture identity and health
+
+- Set `TD_REALM_ID`, `TD_INSTANCE_ID`, and `TD_BUILD_REVISION` for realm instances.
+- Read `metadata.json` and `health.json` before drawing conclusions from incomplete captures.
+- Schema version 2 adds server process identity, client session IDs, capture timing, transport metrics,
+  replication counters, and recorder drop/failure counters. `events.ndjson` captures server lifecycle events.
+- Client F3 displays metrics; F4 marks the next sampled frame. Capture rate is 10 Hz.
+- F6 toggles the renet-cross conditioner panel; hiding it does not disable impairment.
+- For a 300 ms experiment, connect with conditioning Off, allow baseline RTT to settle, then select ~300 ms RTT. Verify observed `network.rtt_ms`, not just the preset.
+- Client frame `conditioner` records settings, baseline, queues, and distinct simulated/overflow/outage/transition drops. Older captures may omit this optional field.
+- Server-side alternative: `cargo run -p game_server -- --net-delay-ms 150 --debug-recorder` adds 150 ms each way to every UDP/WebRTC client. Keep client conditioning Off. `--net-jitter-ms` and `--net-loss-percent` add jitter/loss; the optional server UI has runtime controls.
+- Server frame `conditioner` and `server_conditioner_startup`/`server_conditioner_changed` events identify artificial conditions. Server presets are added RTT, not baseline-adjusted targets.
+- Use Off after an experiment. Browser conditioning does not cover ICE/DTLS/SCTP establishment.
+- Client uploads are best effort, size-bounded and timeout-limited; failures are counted, not retried indefinitely.
+- The server defaults to 256 MiB of NDJSON per run; override with `TD_DEBUG_MAX_BYTES`.
+- A successful upload means queued; inspect write failures and `limit_reached` in recorder health.
+- Keep these opt-in debug endpoints on internal/admin routes.
+
 ## How to compare traces
 
-- Match frames by authoritative tick first
+- Match frames by authoritative tick first, scoped to the server process session; distinguish client reconnects by client `session_id`
 - For server-side per-client data, also match by `client_id`
 - Compare:
   - server authoritative world delta
@@ -97,8 +115,8 @@ Client NDJSON:
 Before finishing code changes in this area, run:
 
 ```bash
-cargo check --workspace --all-targets
-cargo check -p game_client --target wasm32-unknown-unknown
-cargo test --workspace
 just check
+cargo check --locked -p game_client --target wasm32-unknown-unknown
+just test
+node --test scripts/netcode-analysis.test.mjs
 ```

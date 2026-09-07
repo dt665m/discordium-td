@@ -10,6 +10,7 @@ game_sim = { path = "../game_sim", features = ["bevy"] }
 log.workspace = true
 renet.workspace = true
 renet-cross.workspace = true
+bevy-net-debug.workspace = true
 serde_json.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
@@ -22,4 +23,4 @@ getrandom = { version = "0.2.17", features = ["js"] }
 js-sys = "0.3.82"
 wasm-bindgen = "0.2.105"
 wasm-bindgen-futures = "0.4.55"
-web-sys = { version = "0.3.82", features = ["Window", "Location", "RequestInit", "Response"] }
+web-sys = { version = "0.3.82", features = ["Window", "Location", "RequestInit", "Response", "AbortController", "AbortSignal"] }

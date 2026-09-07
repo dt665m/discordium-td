@@ -12,7 +12,8 @@ clap = { version = "4.5.53", features = ["derive", "env"] }
 env_logger = "0.11.8"
 log = "0.4.22"
 renet = "2.0.0"
-renet-cross = "0.3.0"
+renet-cross = "0.6"
+bevy-net-debug = "0.1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 tokio = { version = "1.49.0", features = [
@@ -21,6 +22,18 @@ tokio = { version = "1.49.0", features = [
   "time",
   "net",
 ] }
+
+# Browser iteration: optimized dependencies, incremental game code, no whole-program LTO.
+[profile.web-dev]
+inherits = "dev"
+opt-level = 1
+debug = 0
+incremental = true
+lto = false
+codegen-units = 256
+
+[profile.web-dev.package."*"]
+opt-level = 3
 
 [profile.web-release]
 inherits = "release"

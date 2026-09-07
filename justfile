@@ -50,6 +50,14 @@ web-client http_base="http://127.0.0.1:8080" address="127.0.0.1" port="1420":
       TD_WEB_HTTP_BASE="{{http_base}}" \
       trunk serve --release --cargo-profile web-release --config Trunk.toml --address {{address}} --port {{port}}
 
+# Incremental browser iteration; keep deployment output and optimizations separate.
+web-dev http_base="http://127.0.0.1:8080" address="127.0.0.1" port="1420":
+    cd "{{WEB_CLIENT}}" && \
+      NO_COLOR=false \
+      TD_WEB_HTTP_BASE="{{http_base}}" \
+      trunk serve --release=false --cargo-profile web-dev --config Trunk.toml \
+        --dist "{{ROOT}}/target/web-dev/dist" --address {{address}} --port {{port}}
+
 web-deploy:
     npx wrangler pages deploy /Users/dt665m/Projects/games/discordium-td/game_client/dist --project-name=discordium-td
 

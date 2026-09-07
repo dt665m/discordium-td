@@ -51,11 +51,13 @@
         font-size: clamp(12px, 1.5vw, 14px);
       }
 
+      .game-viewport {
+        width: min(96vw, 1180px);
+        height: max(320px, calc(100svh - 130px));
+      }
+
       canvas {
         display: block;
-        width: min(96vw, 1180px);
-        max-height: calc(100svh - 130px);
-        height: auto;
         border-radius: 14px;
         border: 1px solid rgba(74, 94, 122, 0.3);
         box-shadow: 0 16px 40px rgba(15, 23, 42, 0.2);
@@ -75,5 +77,6 @@
       <h1>Discordium TD</h1>
       <p>Web client hosted by Trunk. Start the game server separately, then connect from menu.</p>
     </section>
+    <div class="game-viewport"><canvas id="game-canvas"></canvas></div>
   </body>
 </html>

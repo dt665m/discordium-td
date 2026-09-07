@@ -1,8 +1,27 @@
-#[cfg(target_arch = "wasm32")]
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
-};
+#[path = "game/simulation_presentations.rs"]
+mod simulation_presentations;
+use simulation_presentations::*;
+#[path = "game/snapshots.rs"]
+mod snapshots;
+use snapshots::*;
+#[path = "game/input.rs"]
+mod input;
+use input::*;
+#[path = "game/prediction.rs"]
+mod prediction;
+#[path = "game/presentation.rs"]
+mod presentation;
+use prediction::*;
+use presentation::*;
+#[path = "game/receive.rs"]
+mod receive;
+use receive::*;
+#[path = "game/outbound.rs"]
+mod outbound;
+use super::debug_panel::{DebugMetric, DebugPanel, HudMetric};
+use bevy_net_debug::{ConditionerDebug, ConditionerDebugPlugin};
+use outbound::*;
+use renet_cross::conditioner::ConditionerHandle;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     time::Duration,
@@ -10,9 +29,7 @@ use std::{
 #[cfg(not(target_arch = "wasm32"))]
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
-    sync::mpsc::{self, Sender},
     thread,
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use bevy::dev_tools::fps_overlay::{FpsOverlayConfig, FpsOverlayPlugin, FrameTimeGraphConfig};
@@ -29,25 +46,25 @@ use clap::Parser;
 use game_server::{ServerArgs, run as run_server};
 use game_shared::{
     AbilityId, AttackPhase, BASE_POSITION, BUILD_COMMAND_MAX_DISTANCE, BUILD_NODES, BuildNodeDef,
-    ChargePhase, ClientCommand, ClientDebugFrame, ClientDebugUploadBatch, ClientMoveBundle,
-    DebugClientPlatform, DirectionalAttackStateComponent, ENEMY_REGULAR_ATTACK, EnemySnapshot,
-    FIXED_DT_SECONDS, HERO_MAX_HP, HERO_MAX_MANA, HERO_REGULAR_ATTACK, HeroSnapshot, JoinSnapshot,
-    MatchPhase, ObjectiveSnapshot, PROTOCOL_ID, ReliableGameEvent, ReliableServerMessage,
-    ServerWorldMessage, SimMeta, TowerSnapshot, TowerType, WorldDelta, WorldPatch, clamp_to_world,
-    distance_sq, encode, is_newer_input_seq, normalize_or_zero,
+    ChargePhase, ClientCommand, ClientDebugFrame, ClientMoveBundle,
+    DirectionalAttackStateComponent, ENEMY_REGULAR_ATTACK, EnemySnapshot, FIXED_DT_SECONDS,
+    HERO_MAX_HP, HERO_MAX_MANA, HERO_REGULAR_ATTACK, HeroSnapshot, JoinSnapshot, MatchPhase,
+    ObjectiveSnapshot, PROTOCOL_ID, ReliableGameEvent, ReliableServerMessage, ServerWorldMessage,
+    SimMeta, TowerSnapshot, TowerType, WorldDelta, WorldPatch, clamp_to_world, distance_sq, encode,
+    is_newer_input_seq, normalize_or_zero,
 };
 use game_sim::Simulation;
 #[cfg(target_arch = "wasm32")]
 use js_sys::{JSON, Reflect};
 use renet::{DefaultChannel, RenetClient};
 #[cfg(target_arch = "wasm32")]
-use wasm_bindgen::{JsCast, JsValue};
+use wasm_bindgen::JsValue;
 #[cfg(target_arch = "wasm32")]
-use wasm_bindgen_futures::{JsFuture, spawn_local};
+use wasm_bindgen_futures::spawn_local;
 
+use super::debug_recorder::{ClientDebugRecorderState, flush_client_debug_recorder};
 use super::lock_on::{LockOnPlugin, select_next_lock_target};
 
-const ABILITY_EFFECT_DURATION_SECONDS: f32 = 0.55;
 const ABILITY_EFFECT_START_RADIUS: f32 = 0.8;
 const HIT_EFFECT_DURATION_SECONDS: f32 = 0.22;
 const HIT_EFFECT_START_SCALE: f32 = 0.25;
@@ -134,13 +151,6 @@ const MATCH_END_OVERLAY_BG: Color = Color::srgba(0.04, 0.07, 0.1, 0.74);
 const MATCH_END_OVERLAY_BORDER: Color = Color::srgba(0.53, 0.65, 0.76, 0.84);
 const MATCH_END_OVERLAY_TITLE: Color = Color::srgb(0.94, 0.97, 1.0);
 const MATCH_END_OVERLAY_DEFEAT_TITLE: Color = Color::srgb(1.0, 0.78, 0.72);
-const DEBUG_RECORDER_FLUSH_INTERVAL_SECONDS: f32 = 0.5;
-const DEBUG_RECORDER_MAX_BATCH_SIZE: usize = 16;
-#[cfg(target_arch = "wasm32")]
-const DEBUG_RECORDER_MAX_BATCH_BYTES: usize = 48 * 1024;
-#[cfg(target_arch = "wasm32")]
-const DEBUG_RECORDER_MAX_RETRY_PAYLOADS: usize = 32;
-
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone, Resource, Parser)]
 #[command(name = "game_client")]
@@ -180,6 +190,8 @@ struct PendingMove {
 
 #[derive(Resource, Default)]
 struct ClientDebugBridgeState {
+    pending_marker: bool,
+    replication: game_shared::DebugReplicationHealth,
     enabled: bool,
     frame_index: u64,
     latest: Option<ClientDebugFrame>,
@@ -205,192 +217,35 @@ impl ClientDebugBridgeState {
     }
 }
 
-#[derive(Resource)]
-struct ClientDebugRecorderState {
-    enabled: bool,
-    #[cfg(target_arch = "wasm32")]
-    endpoint: String,
-    instance_id: String,
-    upload_seq: u64,
-    pending_frames: VecDeque<ClientDebugFrame>,
-    last_flush_secs: f32,
-    flush_interval_secs: f32,
-    max_batch_size: usize,
-    #[cfg(target_arch = "wasm32")]
-    max_batch_bytes: usize,
-    #[cfg(not(target_arch = "wasm32"))]
-    native_sender: Option<Sender<String>>,
-    #[cfg(target_arch = "wasm32")]
-    upload_in_flight: Arc<AtomicBool>,
-    #[cfg(target_arch = "wasm32")]
-    retry_payloads: Arc<Mutex<VecDeque<String>>>,
-    #[cfg(target_arch = "wasm32")]
-    max_retry_payloads: usize,
-}
-
-impl ClientDebugRecorderState {
-    fn disabled() -> Self {
-        Self {
-            enabled: false,
-            #[cfg(target_arch = "wasm32")]
-            endpoint: String::new(),
-            instance_id: String::new(),
-            upload_seq: 0,
-            pending_frames: VecDeque::new(),
-            last_flush_secs: 0.0,
-            flush_interval_secs: DEBUG_RECORDER_FLUSH_INTERVAL_SECONDS,
-            max_batch_size: DEBUG_RECORDER_MAX_BATCH_SIZE,
-            #[cfg(target_arch = "wasm32")]
-            max_batch_bytes: DEBUG_RECORDER_MAX_BATCH_BYTES,
-            #[cfg(not(target_arch = "wasm32"))]
-            native_sender: None,
-            #[cfg(target_arch = "wasm32")]
-            upload_in_flight: Arc::new(AtomicBool::new(false)),
-            #[cfg(target_arch = "wasm32")]
-            retry_payloads: Arc::new(Mutex::new(VecDeque::new())),
-            #[cfg(target_arch = "wasm32")]
-            max_retry_payloads: DEBUG_RECORDER_MAX_RETRY_PAYLOADS,
-        }
-    }
-
-    fn new(enabled: bool, http_base: &str) -> Self {
-        if !enabled {
-            return Self::disabled();
-        }
-
-        let endpoint = format!("{}/debug/client-frames", http_base.trim_end_matches('/'));
-        Self {
-            enabled: true,
-            #[cfg(target_arch = "wasm32")]
-            endpoint: endpoint.clone(),
-            instance_id: client_debug_instance_id(),
-            upload_seq: 0,
-            pending_frames: VecDeque::new(),
-            last_flush_secs: 0.0,
-            flush_interval_secs: DEBUG_RECORDER_FLUSH_INTERVAL_SECONDS,
-            max_batch_size: DEBUG_RECORDER_MAX_BATCH_SIZE,
-            #[cfg(target_arch = "wasm32")]
-            max_batch_bytes: DEBUG_RECORDER_MAX_BATCH_BYTES,
-            #[cfg(not(target_arch = "wasm32"))]
-            native_sender: Some(spawn_native_debug_upload_thread(endpoint)),
-            #[cfg(target_arch = "wasm32")]
-            upload_in_flight: Arc::new(AtomicBool::new(false)),
-            #[cfg(target_arch = "wasm32")]
-            retry_payloads: Arc::new(Mutex::new(VecDeque::new())),
-            #[cfg(target_arch = "wasm32")]
-            max_retry_payloads: DEBUG_RECORDER_MAX_RETRY_PAYLOADS,
-        }
-    }
-
-    fn record_frame(&mut self, frame: ClientDebugFrame) {
-        if !self.enabled {
-            return;
-        }
-
-        self.pending_frames.push_back(frame);
-        while self.pending_frames.len() > self.max_batch_size * 8 {
-            self.pending_frames.pop_front();
-        }
-    }
-
-    fn should_flush(&self, elapsed_secs: f32) -> bool {
-        self.enabled
-            && !self.pending_frames.is_empty()
-            && (self.pending_frames.len() >= self.max_batch_size
-                || elapsed_secs - self.last_flush_secs >= self.flush_interval_secs)
-    }
-
-    fn take_batch(
-        &mut self,
-        elapsed_secs: f32,
-        max_payload_bytes: usize,
-    ) -> Option<ClientDebugUploadBatch> {
-        if !self.enabled || self.pending_frames.is_empty() {
-            return None;
-        }
-
-        let next_upload_seq = self.upload_seq.wrapping_add(1);
-        let take_limit = self.pending_frames.len().min(self.max_batch_size);
-        let mut selected_len = 0;
-        let mut frames = Vec::with_capacity(take_limit);
-
-        for frame in self.pending_frames.iter().take(take_limit) {
-            frames.push(frame.clone());
-            let candidate = ClientDebugUploadBatch {
-                instance_id: self.instance_id.clone(),
-                source: client_debug_platform(),
-                upload_seq: next_upload_seq,
-                frames: frames.clone(),
-            };
-            let Ok(payload) = serde_json::to_vec(&candidate) else {
-                log::warn!("failed to size client debug upload batch");
-                return None;
-            };
-
-            if payload.len() <= max_payload_bytes || frames.len() == 1 {
-                selected_len = frames.len();
-                if payload.len() > max_payload_bytes {
-                    break;
-                }
-                continue;
-            }
-
-            frames.pop();
-            break;
-        }
-
-        if selected_len == 0 {
-            return None;
-        }
-
-        frames.truncate(selected_len);
-        self.pending_frames.drain(..selected_len);
-        self.upload_seq = next_upload_seq;
-        self.last_flush_secs = elapsed_secs;
-        Some(ClientDebugUploadBatch {
-            instance_id: self.instance_id.clone(),
-            source: client_debug_platform(),
-            upload_seq: self.upload_seq,
-            frames,
-        })
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    fn upload_in_flight(&self) -> bool {
-        self.upload_in_flight.load(Ordering::SeqCst)
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    fn pop_retry_payload(&self) -> Option<String> {
-        let Ok(mut retry_payloads) = self.retry_payloads.lock() else {
-            log::warn!("failed to lock wasm debug recorder retry queue");
-            return None;
-        };
-        retry_payloads.pop_front()
-    }
-}
-
 #[cfg(not(target_arch = "wasm32"))]
 type ClientTransport = renet_cross::UdpNetcodeClientTransport;
 #[cfg(target_arch = "wasm32")]
 type ClientTransport = renet_cross::WebRtcNetcodeClientTransport;
 
 struct NetworkRuntime {
+    match_epoch: u32,
     client_id: u64,
     next_seq: u32,
+    last_generated_move: Option<u32>,
+    unacked_actions: VecDeque<game_shared::ClientAction>,
     pending_moves: VecDeque<PendingMove>,
     renet: RenetClient,
     transport: ClientTransport,
+    send_cadence: SendCadence,
 }
 
 impl NetworkRuntime {
     fn new(client_id: u64, renet: RenetClient, transport: ClientTransport) -> Self {
         Self {
             client_id,
+            match_epoch: 0,
             next_seq: 0,
+            last_generated_move: None,
+            unacked_actions: VecDeque::new(),
             pending_moves: VecDeque::new(),
             renet,
             transport,
+            send_cadence: SendCadence::default(),
         }
     }
 
@@ -429,6 +284,8 @@ struct NetStats {
     rtt_ema: f32,
     jitter_ema: f32,
     last_seq_send_times: VecDeque<(u32, f32)>,
+    last_snapshot_received_secs: Option<f64>,
+    last_rtt_sample_secs: Option<f64>,
 }
 
 impl Default for NetStats {
@@ -437,6 +294,8 @@ impl Default for NetStats {
             rtt_ema: 0.1,
             jitter_ema: 0.02,
             last_seq_send_times: VecDeque::new(),
+            last_snapshot_received_secs: None,
+            last_rtt_sample_secs: None,
         }
     }
 }
@@ -455,189 +314,6 @@ impl NetStats {
     }
 }
 
-#[derive(Clone)]
-struct TimestampedSnapshot {
-    server_tick: u32,
-    receive_time: f32,
-    world: WorldDelta,
-}
-
-#[derive(Resource)]
-struct SnapshotBuffer {
-    snapshots: VecDeque<TimestampedSnapshot>,
-    interpolation_delay: f32,
-    render_time: f32,
-}
-
-impl Default for SnapshotBuffer {
-    fn default() -> Self {
-        Self {
-            snapshots: VecDeque::with_capacity(12),
-            interpolation_delay: FIXED_DT_SECONDS * 2.0,
-            render_time: 0.0,
-        }
-    }
-}
-
-/// Positions interpolated from the snapshot buffer for remote entities.
-struct InterpolatedPositions {
-    heroes: HashMap<u64, [f32; 2]>,
-    enemies: HashMap<u64, ([f32; 2], [f32; 2])>, // (pos, vel)
-}
-
-impl SnapshotBuffer {
-    fn push(&mut self, snapshot: TimestampedSnapshot) {
-        // Discard out-of-order snapshots
-        if let Some(last) = self.snapshots.back() {
-            if !game_shared::is_newer_input_seq(snapshot.server_tick, last.server_tick)
-                && snapshot.server_tick != last.server_tick
-            {
-                return;
-            }
-        }
-        self.snapshots.push_back(snapshot);
-        while self.snapshots.len() > 12 {
-            self.snapshots.pop_front();
-        }
-    }
-
-    fn update_interpolation_delay(&mut self, net_stats: &NetStats) {
-        let target = (net_stats.rtt_ema * 0.5 + net_stats.jitter_ema * 3.0)
-            .max(FIXED_DT_SECONDS * 2.0)
-            .min(0.2);
-        const DELAY_ALPHA: f32 = 0.05;
-        self.interpolation_delay += DELAY_ALPHA * (target - self.interpolation_delay);
-    }
-
-    fn advance_render_time(&mut self, dt: f32) {
-        self.render_time += dt;
-    }
-
-    /// Sync render_time to latest snapshot receive_time minus interpolation_delay.
-    /// Called when a new snapshot arrives to keep the clock on track.
-    fn sync_render_clock(&mut self) {
-        if let Some(latest) = self.snapshots.back() {
-            let target_render_time = latest.receive_time - self.interpolation_delay;
-            // Softly chase the target to avoid jumps
-            let diff = target_render_time - self.render_time;
-            if diff.abs() > 0.5 {
-                // Too far off — snap
-                self.render_time = target_render_time;
-            }
-            // Otherwise render_time advances naturally via advance_render_time
-        }
-    }
-
-    fn sample(&self, render_time: f32, enemy_lead: f32) -> InterpolatedPositions {
-        let mut heroes = HashMap::new();
-        let mut enemies = HashMap::new();
-
-        if self.snapshots.is_empty() {
-            return InterpolatedPositions { heroes, enemies };
-        }
-
-        // Find bracketing snapshots
-        let (older, newer, t) = self.find_bracketing(render_time);
-
-        // Interpolate heroes
-        for hero_new in &newer.world.heroes {
-            if let Some(hero_old) = older
-                .world
-                .heroes
-                .iter()
-                .find(|h| h.client_id == hero_new.client_id)
-            {
-                let pos = lerp_pos(hero_old.pos, hero_new.pos, t);
-                heroes.insert(hero_new.client_id, pos);
-            } else {
-                heroes.insert(hero_new.client_id, hero_new.pos);
-            }
-        }
-
-        // Interpolate enemies
-        for enemy_new in &newer.world.enemies {
-            if let Some(enemy_old) = older.world.enemies.iter().find(|e| e.id == enemy_new.id) {
-                let pos = lerp_pos(enemy_old.pos, enemy_new.pos, t);
-                // Apply extrapolation lead on top of interpolated position
-                let led_pos = clamp_to_world([
-                    pos[0] + enemy_new.vel[0] * enemy_lead,
-                    pos[1] + enemy_new.vel[1] * enemy_lead,
-                ]);
-                enemies.insert(enemy_new.id, (led_pos, enemy_new.vel));
-            } else {
-                let led_pos = clamp_to_world([
-                    enemy_new.pos[0] + enemy_new.vel[0] * enemy_lead,
-                    enemy_new.pos[1] + enemy_new.vel[1] * enemy_lead,
-                ]);
-                enemies.insert(enemy_new.id, (led_pos, enemy_new.vel));
-            }
-        }
-
-        InterpolatedPositions { heroes, enemies }
-    }
-
-    fn find_bracketing(
-        &self,
-        render_time: f32,
-    ) -> (&TimestampedSnapshot, &TimestampedSnapshot, f32) {
-        let len = self.snapshots.len();
-        if len < 2 {
-            let snap = &self.snapshots[0];
-            return (snap, snap, 1.0);
-        }
-
-        // Find the newest snapshot with receive_time <= render_time
-        let mut older_idx = 0;
-        for i in 0..len {
-            if self.snapshots[i].receive_time <= render_time {
-                older_idx = i;
-            } else {
-                break;
-            }
-        }
-        let newer_idx = (older_idx + 1).min(len - 1);
-        if older_idx == newer_idx {
-            // render_time is past all snapshots — use last two and extrapolate (clamp t to 1.0)
-            if len >= 2 {
-                let older = &self.snapshots[len - 2];
-                let newer = &self.snapshots[len - 1];
-                return (older, newer, 1.0);
-            }
-            let snap = &self.snapshots[0];
-            return (snap, snap, 1.0);
-        }
-
-        let older = &self.snapshots[older_idx];
-        let newer = &self.snapshots[newer_idx];
-        let span = newer.receive_time - older.receive_time;
-        let t = if span > f32::EPSILON {
-            ((render_time - older.receive_time) / span).clamp(0.0, 1.0)
-        } else {
-            1.0
-        };
-        (older, newer, t)
-    }
-
-    fn has_enough_data(&self) -> bool {
-        self.snapshots.len() >= 2
-    }
-
-    fn clear(&mut self) {
-        self.snapshots.clear();
-        self.render_time = 0.0;
-        self.interpolation_delay = FIXED_DT_SECONDS * 2.0;
-    }
-
-    /// Find a snapshot by tick for delta reconstruction.
-    fn find_by_tick(&self, tick: u32) -> Option<&TimestampedSnapshot> {
-        self.snapshots.iter().find(|s| s.server_tick == tick)
-    }
-}
-
-fn lerp_pos(a: [f32; 2], b: [f32; 2], t: f32) -> [f32; 2] {
-    [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]
-}
-
 /// Smoothing offsets from server reconciliation. Applied to predicted positions
 /// to avoid visual teleporting when the server corrects mispredictions.
 #[derive(Resource, Default)]
@@ -650,6 +326,8 @@ struct ReconciliationSmoothing {
 /// Client-side simulation for full prediction with server reconciliation.
 #[derive(Resource)]
 struct LocalSimulation {
+    last_attack_effect_seq: Option<u32>,
+    enemy_hit_feedback: EnemyHitFeedback,
     sim: Simulation,
     predicted_tick: u32,
     input_buffer: VecDeque<InputEntry>,
@@ -659,6 +337,8 @@ struct LocalSimulation {
 impl Default for LocalSimulation {
     fn default() -> Self {
         Self {
+            last_attack_effect_seq: None,
+            enemy_hit_feedback: EnemyHitFeedback::default(),
             sim: Simulation::new(),
             predicted_tick: 0,
             input_buffer: VecDeque::new(),
@@ -668,7 +348,6 @@ impl Default for LocalSimulation {
 }
 
 struct InputEntry {
-    seq: u32,
     commands: Vec<ClientCommand>,
 }
 
@@ -712,9 +391,6 @@ impl Default for DebugOverlayState {
         }
     }
 }
-
-#[derive(Component)]
-struct DebugOverlayText;
 
 #[derive(Clone, Copy)]
 enum MenuAction {
@@ -809,9 +485,15 @@ struct SceneAssets {
     power_bar_material: Handle<StandardMaterial>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum ActorKey {
+    Hero(u64),
+    World(u64),
+}
+
 #[derive(Resource, Default)]
 struct RenderIndex {
-    by_id: HashMap<u64, Entity>,
+    by_id: HashMap<ActorKey, Entity>,
 }
 
 #[derive(Resource, Default)]
@@ -891,9 +573,6 @@ struct BuildNodeMarker {
 struct ObjectiveMarker;
 
 #[derive(Component)]
-struct HudText;
-
-#[derive(Component)]
 struct SpecialSkillIcon;
 
 #[derive(Component)]
@@ -943,14 +622,6 @@ struct UnitBarCamera;
 #[derive(Event, Clone, Copy)]
 struct UnitBarCameraChanged {
     world_rotation: Quat,
-}
-
-#[derive(Component)]
-struct AbilityEffectVisual {
-    age_seconds: f32,
-    duration_seconds: f32,
-    max_radius: f32,
-    material: Handle<StandardMaterial>,
 }
 
 #[derive(Component)]
@@ -1133,6 +804,7 @@ impl Plugin for GameClientPlugin {
             .insert_resource(UnitBarCameraCache::default())
             .insert_resource(HudState::default())
             .insert_resource(DebugOverlayState::default())
+            .init_resource::<super::debug_panel::DiagnosticHistory>()
             .insert_resource(SpecialSkillCooldownUiState::default())
             .insert_resource(PowerPieUiState::default())
             .insert_resource(GoldHudState::default())
@@ -1150,11 +822,16 @@ impl Plugin for GameClientPlugin {
                 primary_window: Some(Window {
                     title: "Discordium TD MVP Client".to_string(),
                     resolution: (1400_u32, 900_u32).into(),
+                    #[cfg(target_arch = "wasm32")]
+                    canvas: Some("#game-canvas".into()),
+                    #[cfg(target_arch = "wasm32")]
+                    fit_canvas_to_parent: true,
                     ..Default::default()
                 }),
                 ..Default::default()
             }))
             .add_plugins(LockOnPlugin)
+            .add_plugins(ConditionerDebugPlugin::new(ConditionerHandle::default()))
             .add_systems(Startup, (setup_scene, setup_main_menu))
             .configure_sets(
                 Update,
@@ -1176,7 +853,12 @@ impl Plugin for GameClientPlugin {
                     .in_set(ClientUpdateSet::Input),
             )
             .add_systems(Update, capture_input.in_set(ClientUpdateSet::Input))
-            .add_systems(Update, toggle_debug_overlay.in_set(ClientUpdateSet::Input))
+            .add_systems(
+                Update,
+                (toggle_debug_overlay, super::debug_panel::scroll)
+                    .chain()
+                    .in_set(ClientUpdateSet::Input),
+            )
             .add_systems(
                 Update,
                 (
@@ -1184,6 +866,8 @@ impl Plugin for GameClientPlugin {
                     #[cfg(target_arch = "wasm32")]
                     poll_web_bootstrap,
                     network_update,
+                    network_send,
+                    report_conditioner_rtt,
                 )
                     .chain()
                     .in_set(ClientUpdateSet::Network),
@@ -1191,7 +875,7 @@ impl Plugin for GameClientPlugin {
             .add_systems(
                 Update,
                 (
-                    update_ability_effects,
+                    sync_simulation_presentations,
                     update_hit_effects,
                     update_tower_shot_effects,
                     update_regular_attack_effects,
@@ -1202,7 +886,8 @@ impl Plugin for GameClientPlugin {
                     update_hero_hit_reactions,
                     update_enemy_hit_reactions,
                     update_tower_fire_reactions,
-                    update_unit_bars.run_if(resource_changed::<WorldView>),
+                    update_predicted_enemy_deaths,
+                    update_unit_bars,
                     update_unit_bar_background_scales.run_if(resource_changed::<WorldView>),
                     update_unit_bar_visibility.run_if(resource_changed::<WorldView>),
                     publish_unit_bar_camera_updates,
@@ -1223,11 +908,13 @@ impl Plugin for GameClientPlugin {
                     update_hud,
                     update_gold_hud.run_if(resource_changed::<WorldView>),
                     update_gold_spend_popups,
-                    update_special_skill_hud.run_if(resource_changed::<WorldView>),
+                    update_special_skill_hud,
                     update_power_pie_hud,
                     update_match_end_overlay.run_if(resource_changed::<WorldView>),
                     sync_menu_button_visual_state,
                     sync_main_menu_state,
+                    sample_diagnostic_history,
+                    super::debug_panel::update_graphs,
                     update_debug_overlay,
                 )
                     .chain()
@@ -1239,6 +926,8 @@ impl Plugin for GameClientPlugin {
             )
             .add_observer(apply_unit_bar_camera_update)
             .add_systems(FixedUpdate, advance_local_simulation);
+
+        app.world_mut().resource_mut::<ConditionerDebug>().visible = false;
 
         app.add_plugins(FpsOverlayPlugin {
             config: FpsOverlayConfig {
@@ -1457,34 +1146,9 @@ fn setup_scene(
     });
     commands.insert_resource(power_pie_raster_cache);
 
-    commands.spawn((
-        Node {
-            position_type: PositionType::Absolute,
-            top: Val::Px(12.0),
-            left: Val::Px(12.0),
-            ..Default::default()
-        },
-        Text::new("connecting..."),
-        TextColor(Color::WHITE),
-        HudText,
-    ));
+    super::debug_panel::spawn_hud(&mut commands);
 
-    commands.spawn((
-        Node {
-            position_type: PositionType::Absolute,
-            top: Val::Px(12.0),
-            right: Val::Px(12.0),
-            ..Default::default()
-        },
-        Text::new(""),
-        TextFont {
-            font_size: 13.0,
-            ..Default::default()
-        },
-        TextColor(Color::srgba(0.7, 0.9, 1.0, 0.85)),
-        Visibility::Hidden,
-        DebugOverlayText,
-    ));
+    super::debug_panel::spawn(&mut commands);
 
     commands
         .spawn((
@@ -1952,6 +1616,12 @@ fn ensure_local_server_running(world: &mut World) -> Option<(String, String)> {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn connect_to_bootstrap(world: &mut World, http_base: &str, attempts: u32) {
+    world
+        .resource_mut::<ClientDebugRecorderState>()
+        .begin_session(http_base);
+    world.resource_mut::<ClientDebugBridgeState>().replication = Default::default();
+    world.resource_mut::<NetStats>().last_snapshot_received_secs = None;
+    world.resource_mut::<NetStats>().last_rtt_sample_secs = None;
     if let Some(mut existing) = world.remove_non_send_resource::<NetworkRuntime>() {
         graceful_disconnect_runtime(&mut existing, "reconnect");
     }
@@ -1961,7 +1631,12 @@ fn connect_to_bootstrap(world: &mut World, http_base: &str, attempts: u32) {
         match renet_cross::connect_via_session_http_blocking(
             http_base,
             PROTOCOL_ID,
-            renet_cross::NativeConnectOptions::default(),
+            renet_cross::NativeConnectOptions {
+                transport: renet_cross::ClientTransportConfig {
+                    conditioner: Some(world.resource::<ConditionerDebug>().handle().clone()),
+                },
+                ..Default::default()
+            },
         ) {
             Ok((renet, transport, client_id)) => {
                 on_bootstrap_connected(world, http_base, client_id, renet, transport);
@@ -1985,6 +1660,12 @@ fn connect_to_bootstrap(world: &mut World, http_base: &str, attempts: u32) {
 
 #[cfg(target_arch = "wasm32")]
 fn connect_to_bootstrap(world: &mut World, http_base: &str, _attempts: u32) {
+    world
+        .resource_mut::<ClientDebugRecorderState>()
+        .begin_session(http_base);
+    world.resource_mut::<ClientDebugBridgeState>().replication = Default::default();
+    world.resource_mut::<NetStats>().last_snapshot_received_secs = None;
+    world.resource_mut::<NetStats>().last_rtt_sample_secs = None;
     if let Some(mut existing) = world.remove_non_send_resource::<NetworkRuntime>() {
         graceful_disconnect_runtime(&mut existing, "reconnect");
     }
@@ -1994,10 +1675,17 @@ fn connect_to_bootstrap(world: &mut World, http_base: &str, _attempts: u32) {
     let slot = std::rc::Rc::new(std::cell::RefCell::new(None));
     let slot_clone = std::rc::Rc::clone(&slot);
     let request_base = http_base.clone();
+    let options = renet_cross::WebRtcConnectOptions {
+        transport: renet_cross::ClientTransportConfig {
+            conditioner: Some(world.resource::<ConditionerDebug>().handle().clone()),
+        },
+        ..Default::default()
+    };
     spawn_local(async move {
-        let result = renet_cross::connect_via_sdp_http(&request_base, PROTOCOL_ID)
-            .await
-            .map_err(|err| err.to_string());
+        let result =
+            renet_cross::connect_via_sdp_http_with_options(&request_base, PROTOCOL_ID, options)
+                .await
+                .map_err(|err| err.to_string());
         *slot_clone.borrow_mut() = Some(result);
     });
     world.insert_non_send_resource(PendingWebBootstrap { slot });
@@ -2014,7 +1702,24 @@ fn on_bootstrap_connected(
     renet: RenetClient,
     transport: ClientTransport,
 ) {
+    // Drop the old transport before attaching shared controls to its replacement.
+    world.remove_non_send_resource::<NetworkRuntime>();
+    let mut debug = world.resource_mut::<ConditionerDebug>();
+    debug.report_rtt(None);
     world.insert_non_send_resource(NetworkRuntime::new(client_id, renet, transport));
+    *world.resource_mut::<WorldView>() = WorldView::default();
+    *world.resource_mut::<LocalSimulation>() = LocalSimulation::default();
+    *world.resource_mut::<NetStats>() = NetStats::default();
+    world.resource_mut::<SnapshotBuffer>().clear();
+    *world.resource_mut::<ReconciliationSmoothing>() = ReconciliationSmoothing::default();
+    world.resource_mut::<PendingActions>().0.clear();
+    *world.resource_mut::<super::debug_panel::DiagnosticHistory>() = default();
+    let bridge_enabled = world.resource::<ClientDebugBridgeState>().enabled;
+    *world.resource_mut::<ClientDebugBridgeState>() = ClientDebugBridgeState::new(bridge_enabled);
+    world
+        .resource_mut::<DebugOverlayState>()
+        .recent_msg_types
+        .clear();
     world.resource_mut::<WorldView>().you = Some(client_id);
     world
         .resource_mut::<MainMenuState>()
@@ -2155,123 +1860,6 @@ fn query_param_truthy(search: &str, key: &str) -> bool {
         .unwrap_or(false)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-fn client_debug_instance_id() -> String {
-    format!("native-{}-{}", unix_time_ms(), std::process::id())
-}
-
-#[cfg(target_arch = "wasm32")]
-fn client_debug_instance_id() -> String {
-    format!("wasm-{:.0}", js_sys::Date::now())
-}
-
-fn client_debug_platform() -> DebugClientPlatform {
-    #[cfg(target_arch = "wasm32")]
-    {
-        DebugClientPlatform::Wasm
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        DebugClientPlatform::Native
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn spawn_native_debug_upload_thread(endpoint: String) -> Sender<String> {
-    let (sender, receiver) = mpsc::channel::<String>();
-    thread::Builder::new()
-        .name("discordium-debug-upload".to_owned())
-        .spawn(move || {
-            for payload in receiver {
-                let response = ureq::post(&endpoint)
-                    .set("Content-Type", "application/json")
-                    .send_string(&payload);
-                if let Err(err) = response {
-                    log::warn!("failed to upload client debug batch to {endpoint}: {err}");
-                }
-            }
-        })
-        .expect("failed to spawn client debug upload thread");
-    sender
-}
-
-#[cfg(target_arch = "wasm32")]
-fn push_wasm_retry_payload(
-    retry_payloads: &Arc<Mutex<VecDeque<String>>>,
-    max_retry_payloads: usize,
-    payload: String,
-) {
-    let Ok(mut retry_payloads) = retry_payloads.lock() else {
-        log::warn!("failed to lock wasm debug recorder retry queue");
-        return;
-    };
-
-    if retry_payloads.len() >= max_retry_payloads {
-        retry_payloads.pop_front();
-        log::warn!("dropping oldest wasm debug recorder payload after retry queue filled");
-    }
-    retry_payloads.push_back(payload);
-}
-
-#[cfg(target_arch = "wasm32")]
-fn spawn_wasm_debug_upload(
-    endpoint: String,
-    payload: String,
-    upload_in_flight: Arc<AtomicBool>,
-    retry_payloads: Arc<Mutex<VecDeque<String>>>,
-    max_retry_payloads: usize,
-) {
-    let Some(window) = web_sys::window() else {
-        push_wasm_retry_payload(&retry_payloads, max_retry_payloads, payload);
-        return;
-    };
-
-    upload_in_flight.store(true, Ordering::SeqCst);
-    spawn_local(async move {
-        let request_init = web_sys::RequestInit::new();
-        request_init.set_method("POST");
-        request_init.set_body(&JsValue::from_str(&payload));
-
-        let should_retry =
-            match JsFuture::from(window.fetch_with_str_and_init(&endpoint, &request_init)).await {
-                Ok(response_value) => match response_value.dyn_into::<web_sys::Response>() {
-                    Ok(response) => {
-                        if response.ok() {
-                            false
-                        } else {
-                            log::warn!(
-                                "wasm debug recorder upload failed with status {}",
-                                response.status()
-                            );
-                            true
-                        }
-                    }
-                    Err(err) => {
-                        log::warn!("failed to decode wasm debug recorder response: {err:?}");
-                        true
-                    }
-                },
-                Err(err) => {
-                    log::warn!("failed to upload wasm debug recorder batch to {endpoint}: {err:?}");
-                    true
-                }
-            };
-
-        if should_retry {
-            push_wasm_retry_payload(&retry_payloads, max_retry_payloads, payload);
-        }
-        upload_in_flight.store(false, Ordering::SeqCst);
-    });
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn unix_time_ms() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis())
-        .unwrap_or_default()
-}
-
 fn sync_main_menu_state(
     runtime: Option<NonSend<NetworkRuntime>>,
     menu_state: Res<MainMenuState>,
@@ -2289,640 +1877,6 @@ fn sync_main_menu_state(
         Display::Flex
     };
     status_text.0 = menu_state.status.clone();
-}
-
-fn capture_input(keyboard: Res<ButtonInput<KeyCode>>, mut input_state: ResMut<InputState>) {
-    let mut input = [0.0, 0.0];
-    if keyboard.pressed(KeyCode::KeyW) {
-        input[1] += 1.0;
-    }
-    if keyboard.pressed(KeyCode::KeyS) {
-        input[1] -= 1.0;
-    }
-    if keyboard.pressed(KeyCode::KeyA) {
-        input[0] -= 1.0;
-    }
-    if keyboard.pressed(KeyCode::KeyD) {
-        input[0] += 1.0;
-    }
-
-    // Top-down camera view is currently mirrored on screen X relative to world X.
-    // Flip horizontal input so `A` is screen-left and `D` is screen-right.
-    input_state.dir = normalize_or_zero([-input[0], input[1]]);
-}
-
-fn advance_local_simulation(
-    time: Res<Time>,
-    input_state: Res<InputState>,
-    runtime: Option<NonSendMut<NetworkRuntime>>,
-    mut local_sim: ResMut<LocalSimulation>,
-    mut pending_actions: ResMut<PendingActions>,
-    mut net_stats: ResMut<NetStats>,
-) {
-    let Some(mut runtime) = runtime else {
-        return;
-    };
-
-    if !runtime.renet.is_connected() || !local_sim.initialized {
-        return;
-    }
-
-    let my_id = runtime.client_id;
-    let seq = runtime.next_command_seq();
-
-    // Record send time for RTT measurement
-    let wall_time = time.elapsed_secs();
-    net_stats.last_seq_send_times.push_back((seq, wall_time));
-    while net_stats.last_seq_send_times.len() > 256 {
-        net_stats.last_seq_send_times.pop_front();
-    }
-
-    // Collect all commands for this tick: actions first, then move
-    let mut commands: Vec<ClientCommand> = pending_actions.0.drain(..).collect();
-    let move_cmd = ClientCommand::Move {
-        seq,
-        dir: input_state.dir,
-    };
-    commands.push(move_cmd);
-
-    // Apply all commands to local sim
-    for cmd in &commands {
-        local_sim.sim.queue_command(my_id, *cmd);
-    }
-    let _tick_output = local_sim.sim.step();
-
-    // Store in input buffer for reconciliation replay
-    local_sim
-        .input_buffer
-        .push_back(InputEntry { seq, commands });
-    // Prevent unbounded buffer growth
-    while local_sim.input_buffer.len() > 256 {
-        local_sim.input_buffer.pop_front();
-    }
-    local_sim.predicted_tick += 1;
-
-    // Send move to server via unreliable channel (redundant bundle for packet loss)
-    runtime.pending_moves.push_back(PendingMove {
-        seq,
-        dir: input_state.dir,
-    });
-    while runtime.pending_moves.len() > 256 {
-        runtime.pending_moves.pop_front();
-    }
-
-    let bundle_moves: Vec<(u32, [f32; 2])> = runtime
-        .pending_moves
-        .iter()
-        .rev()
-        .take(16)
-        .map(|pm| (pm.seq, pm.dir))
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-
-    let bundle = ClientMoveBundle {
-        moves: bundle_moves,
-    };
-    runtime
-        .renet
-        .send_message(DefaultChannel::Unreliable, encode(&bundle));
-}
-
-fn send_action_commands(
-    keyboard: Res<ButtonInput<KeyCode>>,
-    mouse: Res<ButtonInput<MouseButton>>,
-    runtime: Option<NonSendMut<NetworkRuntime>>,
-    world: Res<WorldView>,
-    towers: Query<&TowerBuildNode, With<TowerActor>>,
-    mut hud_state: ResMut<HudState>,
-    mut pending_actions: ResMut<PendingActions>,
-) {
-    let Some(mut runtime) = runtime else {
-        return;
-    };
-
-    if !runtime.renet.is_connected() {
-        return;
-    }
-
-    // Helper: send action to server AND queue for local sim
-    let mut send_and_queue = |runtime: &mut NetworkRuntime, cmd: ClientCommand| {
-        runtime
-            .renet
-            .send_message(DefaultChannel::ReliableOrdered, encode(&cmd));
-        pending_actions.0.push(cmd);
-    };
-
-    if keyboard.just_pressed(KeyCode::KeyQ) {
-        let Some(hero) = world.heroes.get(&runtime.client_id) else {
-            return;
-        };
-
-        let next_target = select_next_lock_target(
-            hero.lock_target_id,
-            hero.pos,
-            world.enemies.values().map(|enemy| (enemy.id, enemy.pos)),
-        );
-
-        if let Some(target_id) = next_target {
-            let seq = runtime.next_command_seq();
-            let cmd = ClientCommand::SetLockTarget {
-                seq,
-                target_id: Some(target_id),
-            };
-            send_and_queue(&mut runtime, cmd);
-            hud_state.last_event = format!("Locked enemy {target_id}");
-        } else if hero.lock_mode_active {
-            hud_state.last_event = "Lock mode active (no targets)".to_owned();
-        } else {
-            hud_state.last_event = "No valid lock target".to_owned();
-        }
-    }
-
-    if keyboard.just_pressed(KeyCode::KeyE) {
-        let seq = runtime.next_command_seq();
-        let cmd = ClientCommand::SetLockTarget {
-            seq,
-            target_id: None,
-        };
-        send_and_queue(&mut runtime, cmd);
-        hud_state.last_event = "Lock cleared".to_owned();
-    }
-
-    if mouse.just_pressed(MouseButton::Left) || keyboard.just_pressed(KeyCode::KeyJ) {
-        let seq = runtime.next_command_seq();
-        let cmd = ClientCommand::BasicAttack { seq };
-        send_and_queue(&mut runtime, cmd);
-    }
-
-    if keyboard.just_pressed(KeyCode::KeyK) {
-        let seq = runtime.next_command_seq();
-        let cmd = ClientCommand::CastAbility {
-            seq,
-            ability: AbilityId::ArcBurst,
-        };
-        send_and_queue(&mut runtime, cmd);
-    }
-
-    if keyboard.just_pressed(KeyCode::Space) {
-        let seq = runtime.next_command_seq();
-        let cmd = ClientCommand::SetCharging { seq, active: true };
-        send_and_queue(&mut runtime, cmd);
-        hud_state.last_event = "Charge started".to_owned();
-    }
-
-    if keyboard.just_released(KeyCode::Space) {
-        let seq = runtime.next_command_seq();
-        let cmd = ClientCommand::SetCharging { seq, active: false };
-        send_and_queue(&mut runtime, cmd);
-        hud_state.last_event = "Charge released".to_owned();
-    }
-
-    if keyboard.just_pressed(KeyCode::KeyB) {
-        let Some(node_id) = pick_nearest_build_node(&world, runtime.client_id, &towers) else {
-            hud_state.last_event =
-                "No available build node in range. Move closer to a green node.".to_owned();
-            return;
-        };
-
-        let seq = runtime.next_command_seq();
-        let cmd = ClientCommand::BuildTower {
-            seq,
-            node_id,
-            tower_type: TowerType::Arrow,
-        };
-        send_and_queue(&mut runtime, cmd);
-    }
-}
-
-fn network_update(
-    time: Res<Time>,
-    runtime: Option<NonSendMut<NetworkRuntime>>,
-    mut world: ResMut<WorldView>,
-    mut net_stats: ResMut<NetStats>,
-    mut snapshot_buffer: ResMut<SnapshotBuffer>,
-    mut local_sim: ResMut<LocalSimulation>,
-    mut smoothing: ResMut<ReconciliationSmoothing>,
-    mut hud_state: ResMut<HudState>,
-    mut debug_overlay: ResMut<DebugOverlayState>,
-    mut debug_bridge: ResMut<ClientDebugBridgeState>,
-    render_index: Res<RenderIndex>,
-    mut commands: Commands,
-    scene_assets: Res<SceneAssets>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-) {
-    let Some(mut runtime) = runtime else {
-        return;
-    };
-    let runtime_inner: &mut NetworkRuntime = &mut runtime;
-
-    let dt_secs = time.delta_secs().clamp(0.0, 0.1);
-    let dt = Duration::from_secs_f32(dt_secs);
-    runtime_inner.renet.update(dt);
-    if let Err(err) = runtime_inner.transport_update(dt) {
-        log::warn!("client transport update failed: {err}");
-    }
-
-    // Advance the interpolation render clock
-    snapshot_buffer.advance_render_time(dt_secs);
-
-    while let Some(bytes) = runtime_inner
-        .renet
-        .receive_message(DefaultChannel::ReliableOrdered)
-    {
-        match game_shared::decode::<ReliableServerMessage>(&bytes) {
-            Ok(ReliableServerMessage::JoinSnapshot(snapshot)) => {
-                acknowledge_pending_moves(
-                    &mut runtime_inner.pending_moves,
-                    snapshot.world.your_last_input_seq,
-                );
-                runtime_inner.client_id = snapshot.you;
-                snapshot_buffer.clear();
-                smoothing.hero_offset = [0.0, 0.0];
-                smoothing.enemy_offsets.clear();
-                smoothing.render_pos = None;
-
-                // Initialize local simulation from join snapshot
-                if let Some(meta) = snapshot.world.sim_meta {
-                    local_sim.sim = Simulation::from_snapshot(&snapshot.world, &meta);
-                    local_sim.predicted_tick = snapshot.world.tick;
-                    local_sim.input_buffer.clear();
-                    local_sim.initialized = true;
-                }
-
-                world.apply_join(snapshot);
-                hud_state.last_event = "Joined authoritative match".to_owned();
-            }
-            Ok(ReliableServerMessage::Event(event)) => {
-                match &event {
-                    ReliableGameEvent::AbilityCast { pos, radius, .. } => {
-                        spawn_ability_effect(
-                            &mut commands,
-                            &mut materials,
-                            &scene_assets,
-                            *pos,
-                            *radius,
-                        );
-                    }
-                    _ => {}
-                }
-                hud_state.last_event = describe_event(event, runtime_inner.client_id);
-            }
-            Err(err) => {
-                log::warn!("failed to decode reliable message: {err}");
-            }
-        }
-    }
-
-    let wall_time = time.elapsed_secs();
-
-    while let Some(bytes) = runtime_inner
-        .renet
-        .receive_message(DefaultChannel::Unreliable)
-    {
-        match game_shared::decode::<ServerWorldMessage>(&bytes) {
-            Ok(msg) => {
-                // Track message type for debug overlay
-                let is_full = matches!(&msg, ServerWorldMessage::Full(_));
-                debug_bridge.latest_server_message = Some(if is_full {
-                    game_shared::DebugWorldMessageKind::Full
-                } else {
-                    game_shared::DebugWorldMessageKind::Patch
-                });
-                if debug_overlay.recent_msg_types.len() >= 32 {
-                    debug_overlay.recent_msg_types.pop_front();
-                }
-                debug_overlay.recent_msg_types.push_back(is_full);
-
-                let delta = match msg {
-                    ServerWorldMessage::Full(d) => d,
-                    ServerWorldMessage::Patch(patch) => {
-                        match reconstruct_from_patch(&snapshot_buffer, patch) {
-                            Some(d) => d,
-                            None => continue, // baseline not found, skip
-                        }
-                    }
-                };
-
-                let hit_enemy_ids = detect_hit_enemy_ids(&world.enemies, &delta);
-                let hit_hero_ids = detect_hit_hero_ids(&world.heroes, &delta);
-                let fired_tower_ids = detect_fired_tower_ids(&world.towers, &delta);
-                let attack_starts = detect_regular_attack_starts(&world, &delta);
-
-                for attack in attack_starts {
-                    spawn_regular_attack_effect(
-                        &mut commands,
-                        &mut materials,
-                        &scene_assets,
-                        attack.pos,
-                        attack.facing,
-                        attack.range,
-                        attack.enemy,
-                    );
-                }
-
-                for enemy in &delta.enemies {
-                    if !hit_enemy_ids.contains(&enemy.id) {
-                        continue;
-                    }
-
-                    spawn_hit_effect(&mut commands, &mut materials, &scene_assets, enemy.pos);
-                    if let Some(entity) = render_index.by_id.get(&enemy.id) {
-                        commands.entity(*entity).insert(EnemyHitReaction::default());
-                    }
-                }
-
-                for hero in &delta.heroes {
-                    if !hit_hero_ids.contains(&hero.client_id) {
-                        continue;
-                    }
-
-                    spawn_hit_effect(&mut commands, &mut materials, &scene_assets, hero.pos);
-                    if let Some(entity) = render_index.by_id.get(&hero.client_id) {
-                        commands.entity(*entity).insert(HeroHitReaction::default());
-                    }
-                }
-
-                for tower in &delta.towers {
-                    if !fired_tower_ids.contains(&tower.id) {
-                        continue;
-                    }
-
-                    if let Some(entity) = render_index.by_id.get(&tower.id) {
-                        commands
-                            .entity(*entity)
-                            .insert(TowerFireReaction::default());
-                    }
-
-                    if let Some(target_pos) =
-                        pick_tower_shot_target(tower, &delta.enemies, &hit_enemy_ids)
-                    {
-                        spawn_tower_shot_effect(
-                            &mut commands,
-                            &mut materials,
-                            &scene_assets,
-                            tower.pos,
-                            target_pos,
-                        );
-                    }
-                }
-
-                // RTT measurement: match your_last_input_seq to recorded send times
-                if let Some(ack_seq) = delta.your_last_input_seq {
-                    if let Some(idx) = net_stats
-                        .last_seq_send_times
-                        .iter()
-                        .position(|(seq, _)| *seq == ack_seq)
-                    {
-                        let (_, send_time) = net_stats.last_seq_send_times[idx];
-                        let rtt_sample = wall_time - send_time;
-                        if rtt_sample > 0.0 && rtt_sample < 2.0 {
-                            net_stats.update_rtt_sample(rtt_sample);
-                        }
-                        net_stats.last_seq_send_times.drain(..=idx);
-                    }
-                }
-
-                acknowledge_pending_moves(
-                    &mut runtime_inner.pending_moves,
-                    delta.your_last_input_seq,
-                );
-                debug_bridge.latest_acked_input_seq = delta.your_last_input_seq;
-                debug_bridge.latest_sim_meta = delta.sim_meta;
-
-                // Push into snapshot buffer for remote hero interpolation
-                snapshot_buffer.push(TimestampedSnapshot {
-                    server_tick: delta.tick,
-                    receive_time: wall_time,
-                    world: delta.clone(),
-                });
-                snapshot_buffer.update_interpolation_delay(&net_stats);
-                snapshot_buffer.sync_render_clock();
-
-                // --- Server reconciliation ---
-                if local_sim.initialized {
-                    if let Some(meta) = delta.sim_meta {
-                        reconcile_local_sim(
-                            &mut local_sim,
-                            &mut smoothing,
-                            &delta,
-                            &meta,
-                            runtime_inner.client_id,
-                        );
-                    }
-                }
-
-                // Apply to world view for HUD scalars
-                world.apply_delta(delta);
-            }
-            Err(err) => {
-                log::warn!("failed to decode ServerWorldMessage: {err}");
-            }
-        }
-    }
-
-    // Send client ack for the latest received tick
-    if let Some(latest) = snapshot_buffer.snapshots.back() {
-        let ack = game_shared::ClientAck {
-            tick: latest.server_tick,
-        };
-        runtime_inner
-            .renet
-            .send_message(DefaultChannel::Unreliable, encode(&ack));
-    }
-
-    if let Err(err) = runtime_inner.transport_send_packets() {
-        log::warn!("client send_packets error: {err}");
-    }
-}
-
-/// Rollback the local simulation to server-confirmed state and replay unacknowledged inputs.
-fn reconcile_local_sim(
-    local_sim: &mut LocalSimulation,
-    smoothing: &mut ReconciliationSmoothing,
-    delta: &WorldDelta,
-    meta: &SimMeta,
-    my_id: u64,
-) {
-    let ack_seq = delta.your_last_input_seq;
-
-    // Discard acknowledged input entries
-    if let Some(ack) = ack_seq {
-        while let Some(front) = local_sim.input_buffer.front() {
-            if front.seq == ack || !is_newer_input_seq(front.seq, ack) {
-                local_sim.input_buffer.pop_front();
-            } else {
-                break;
-            }
-        }
-    }
-
-    // Save pre-reconciliation positions for visual smoothing
-    let old_hero_delta = local_sim.sim.world_delta_for(my_id);
-    let old_hero_pos = old_hero_delta
-        .heroes
-        .iter()
-        .find(|h| h.client_id == my_id)
-        .map(|h| h.pos);
-    let mut old_enemy_positions: HashMap<u64, [f32; 2]> = HashMap::new();
-    for enemy in &old_hero_delta.enemies {
-        old_enemy_positions.insert(enemy.id, enemy.pos);
-    }
-
-    // Reset sim to server-confirmed state
-    local_sim.sim.apply_snapshot(delta, meta);
-
-    // Replay unacknowledged inputs
-    for entry in &local_sim.input_buffer {
-        for cmd in &entry.commands {
-            local_sim.sim.queue_command(my_id, *cmd);
-        }
-        local_sim.sim.step();
-    }
-    local_sim.predicted_tick = local_sim.sim.tick();
-
-    // Compute smoothing offsets (old predicted - new predicted)
-    let new_hero_delta = local_sim.sim.world_delta_for(my_id);
-    if let Some(old_pos) = old_hero_pos {
-        if let Some(new_hero) = new_hero_delta.heroes.iter().find(|h| h.client_id == my_id) {
-            smoothing.hero_offset[0] += old_pos[0] - new_hero.pos[0];
-            smoothing.hero_offset[1] += old_pos[1] - new_hero.pos[1];
-        }
-    }
-
-    // Update enemy smoothing offsets
-    for enemy in &new_hero_delta.enemies {
-        if let Some(old_pos) = old_enemy_positions.get(&enemy.id) {
-            let offset = smoothing
-                .enemy_offsets
-                .entry(enemy.id)
-                .or_insert([0.0, 0.0]);
-            offset[0] += old_pos[0] - enemy.pos[0];
-            offset[1] += old_pos[1] - enemy.pos[1];
-        }
-    }
-    // Remove offsets for enemies no longer in sim
-    let new_enemy_ids: HashSet<u64> = new_hero_delta.enemies.iter().map(|e| e.id).collect();
-    smoothing
-        .enemy_offsets
-        .retain(|id, _| new_enemy_ids.contains(id));
-}
-
-/// Reconstruct a full WorldDelta from a patch and its baseline in the snapshot buffer.
-fn reconstruct_from_patch(buffer: &SnapshotBuffer, patch: WorldPatch) -> Option<WorldDelta> {
-    let baseline = buffer.find_by_tick(patch.baseline_tick)?;
-    let base = &baseline.world;
-
-    // Start with baseline entity lists
-    let mut heroes: Vec<HeroSnapshot> = Vec::new();
-    let mut enemies: Vec<EnemySnapshot> = Vec::new();
-    let mut towers: Vec<TowerSnapshot> = Vec::new();
-
-    let removed: HashSet<u64> = patch.removed_ids.into_iter().collect();
-
-    // Heroes: start from baseline, apply patches
-    for hero in &base.heroes {
-        if removed.contains(&hero.client_id) {
-            continue;
-        }
-        if let Some(patched) = patch
-            .hero_patches
-            .iter()
-            .find(|h| h.client_id == hero.client_id)
-        {
-            heroes.push(*patched);
-        } else {
-            heroes.push(*hero);
-        }
-    }
-    // Add new heroes (in patch but not in baseline)
-    for patched in &patch.hero_patches {
-        if !base.heroes.iter().any(|h| h.client_id == patched.client_id) {
-            heroes.push(*patched);
-        }
-    }
-
-    // Enemies: start from baseline, apply patches
-    for enemy in &base.enemies {
-        if removed.contains(&enemy.id) {
-            continue;
-        }
-        if let Some(patched) = patch.enemy_patches.iter().find(|e| e.id == enemy.id) {
-            enemies.push(*patched);
-        } else {
-            enemies.push(*enemy);
-        }
-    }
-    for patched in &patch.enemy_patches {
-        if !base.enemies.iter().any(|e| e.id == patched.id) {
-            enemies.push(*patched);
-        }
-    }
-
-    // Towers: start from baseline, apply patches
-    for tower in &base.towers {
-        if removed.contains(&tower.id) {
-            continue;
-        }
-        if let Some(patched) = patch.tower_patches.iter().find(|t| t.id == tower.id) {
-            towers.push(*patched);
-        } else {
-            towers.push(*tower);
-        }
-    }
-    for patched in &patch.tower_patches {
-        if !base.towers.iter().any(|t| t.id == patched.id) {
-            towers.push(*patched);
-        }
-    }
-
-    Some(WorldDelta {
-        tick: patch.tick,
-        phase: patch.phase,
-        match_restart_ticks_remaining: patch.match_restart_ticks_remaining,
-        wave: patch.wave,
-        team_life: patch.team_life,
-        objectives: patch.objectives,
-        heroes,
-        enemies,
-        towers,
-        your_last_input_seq: patch.your_last_input_seq,
-        sim_meta: patch.sim_meta,
-    })
-}
-
-fn spawn_ability_effect(
-    commands: &mut Commands,
-    materials: &mut Assets<StandardMaterial>,
-    scene_assets: &SceneAssets,
-    pos: [f32; 2],
-    radius: f32,
-) {
-    let material = materials.add(StandardMaterial {
-        base_color: Color::srgba(0.25, 0.88, 1.0, 0.46),
-        emissive: LinearRgba::new(0.08, 0.4, 0.6, 0.0),
-        alpha_mode: AlphaMode::Blend,
-        unlit: true,
-        cull_mode: None,
-        ..Default::default()
-    });
-
-    commands.spawn((
-        Mesh3d(scene_assets.ability_effect_mesh.clone()),
-        MeshMaterial3d(material.clone()),
-        Transform::from_translation(world_to_translation(pos, 0.12)).with_scale(Vec3::new(
-            ABILITY_EFFECT_START_RADIUS,
-            1.0,
-            ABILITY_EFFECT_START_RADIUS,
-        )),
-        AbilityEffectVisual {
-            age_seconds: 0.0,
-            duration_seconds: ABILITY_EFFECT_DURATION_SECONDS,
-            max_radius: radius.max(0.0),
-            material,
-        },
-    ));
 }
 
 fn spawn_hit_effect(
@@ -3096,10 +2050,17 @@ fn detect_hit_hero_ids(
     hit_hero_ids
 }
 
-fn detect_regular_attack_starts(world: &WorldView, delta: &WorldDelta) -> Vec<RegularAttackStart> {
+fn detect_regular_attack_starts(
+    world: &WorldView,
+    delta: &WorldDelta,
+    local_id: u64,
+) -> Vec<RegularAttackStart> {
     let mut starts = Vec::new();
 
     for hero in &delta.heroes {
+        if hero.client_id == local_id {
+            continue;
+        }
         let previous_phase = world
             .heroes
             .get(&hero.client_id)
@@ -3237,37 +2198,6 @@ fn spawn_tower_shot_effect(
     ));
 }
 
-fn update_ability_effects(
-    mut commands: Commands,
-    time: Res<Time>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-    mut effects: Query<(Entity, &mut AbilityEffectVisual, &mut Transform)>,
-) {
-    let dt = time.delta_secs();
-
-    for (entity, mut effect, mut transform) in &mut effects {
-        effect.age_seconds += dt;
-        let t = (effect.age_seconds / effect.duration_seconds).clamp(0.0, 1.0);
-
-        let radius =
-            ABILITY_EFFECT_START_RADIUS + (effect.max_radius - ABILITY_EFFECT_START_RADIUS) * t;
-        transform.scale.x = radius;
-        transform.scale.z = radius;
-        transform.translation.y = 0.12 + 0.12 * t;
-
-        if let Some(material) = materials.get_mut(&effect.material) {
-            let alpha = 0.46 * (1.0 - t);
-            material.base_color = Color::srgba(0.25, 0.88, 1.0, alpha);
-            material.emissive =
-                LinearRgba::new(0.08 * (1.0 - t), 0.4 * (1.0 - t), 0.6 * (1.0 - t), 0.0);
-        }
-
-        if effect.age_seconds >= effect.duration_seconds {
-            commands.entity(entity).despawn();
-        }
-    }
-}
-
 fn update_hit_effects(
     mut commands: Commands,
     time: Res<Time>,
@@ -3390,7 +2320,8 @@ fn update_enemy_hit_reactions(
     for (entity, mut reaction, mut transform) in &mut enemies {
         reaction.age_seconds += dt;
         let t = (reaction.age_seconds / ENEMY_HIT_REACTION_DURATION_SECONDS).clamp(0.0, 1.0);
-        let pulse = 1.0 - (2.0 * t - 1.0).abs();
+        // Contact should read immediately, then settle back to the base pose.
+        let pulse = (1.0 - t).powi(2);
         let stretch = 1.0 + 0.32 * pulse;
         let squash = 1.0 - 0.18 * pulse;
 
@@ -3521,6 +2452,7 @@ fn sync_dynamic_actors(
     mut render_index: ResMut<RenderIndex>,
     assets: Res<SceneAssets>,
     runtime: Option<NonSend<NetworkRuntime>>,
+    dying: Query<(), With<PredictedEnemyDeath>>,
     mut actors: Query<
         (
             &mut Transform,
@@ -3676,7 +2608,7 @@ fn sync_dynamic_actors(
             hero.facing.dir
         };
         desired.insert(
-            hero.client_id,
+            ActorKey::Hero(hero.client_id),
             DesiredActor {
                 pos,
                 kind: ActorKind::Hero { local },
@@ -3717,7 +2649,7 @@ fn sync_dynamic_actors(
                 .unwrap_or([0.0, 0.0]);
             let pos = [enemy.pos[0] + offset[0], enemy.pos[1] + offset[1]];
             desired.insert(
-                enemy.id,
+                ActorKey::World(enemy.id),
                 DesiredActor {
                     pos,
                     kind: ActorKind::Enemy,
@@ -3743,7 +2675,7 @@ fn sync_dynamic_actors(
                 .and_then(|interp| interp.enemies.get(&enemy.id).map(|(p, _)| *p))
                 .unwrap_or_else(|| predict_enemy_position(enemy, net_stats.enemy_render_lead()));
             desired.insert(
-                enemy.id,
+                ActorKey::World(enemy.id),
                 DesiredActor {
                     pos,
                     kind: ActorKind::Enemy,
@@ -3774,7 +2706,7 @@ fn sync_dynamic_actors(
     if local_sim.initialized && sim_delta.is_some() {
         for tower in tower_source {
             desired.insert(
-                tower.id,
+                ActorKey::World(tower.id),
                 DesiredActor {
                     pos: tower.pos,
                     kind: ActorKind::Tower,
@@ -3793,7 +2725,7 @@ fn sync_dynamic_actors(
     } else {
         for tower in world.towers.values() {
             desired.insert(
-                tower.id,
+                ActorKey::World(tower.id),
                 DesiredActor {
                     pos: tower.pos,
                     kind: ActorKind::Tower,
@@ -3824,6 +2756,15 @@ fn sync_dynamic_actors(
                 tower_node,
             )) = actors.get_mut(existing_entity)
             {
+                if dying.contains(existing_entity) {
+                    // Reconciliation rejected the predicted removal: restore this
+                    // same entity rather than respawning a fresh visual.
+                    commands
+                        .entity(existing_entity)
+                        .remove::<PredictedEnemyDeath>()
+                        .insert(Visibility::Inherited);
+                    // Normal visual sync blends the pose back after rejection.
+                }
                 let target_translation = world_to_translation(actor.pos, actor_y(actor.kind));
                 if let Some(smooth_rate) = actor_smoothing_rate(actor.kind) {
                     if transform.translation.distance_squared(target_translation)
@@ -3862,7 +2803,7 @@ fn sync_dynamic_actors(
         render_index.by_id.insert(*id, entity);
     }
 
-    let stale_ids: Vec<u64> = render_index
+    let stale_ids: Vec<ActorKey> = render_index
         .by_id
         .keys()
         .filter(|id| !desired.contains_key(id))
@@ -3870,6 +2811,24 @@ fn sync_dynamic_actors(
         .collect();
 
     for stale_id in stale_ids {
+        // Prediction can remove an enemy before a snapshot confirms the kill.
+        // Animate its retained visual until authority removes it, avoiding
+        // a frozen pose while waiting for confirmation.
+        if let ActorKey::World(id) = stale_id {
+            if world.enemies.contains_key(&id) {
+                if let Some(entity) = render_index.by_id.get(&stale_id) {
+                    if !dying.contains(*entity) {
+                        commands
+                            .entity(*entity)
+                            .insert(PredictedEnemyDeath::default());
+                    }
+                    if let Ok((_, Some(mut health), ..)) = actors.get_mut(*entity) {
+                        health.current = 0.0;
+                    }
+                }
+                continue;
+            }
+        }
         if let Some(entity) = render_index.by_id.remove(&stale_id) {
             commands.entity(entity).despawn();
         }
@@ -3886,7 +2845,7 @@ fn local_locked_target_entity(
         return None;
     }
     let target_id = hero.lock_target_id?;
-    render_index.by_id.get(&target_id).copied()
+    render_index.by_id.get(&ActorKey::World(target_id)).copied()
 }
 
 fn health_bar_width_multiplier(
@@ -4049,13 +3008,72 @@ fn update_objective_markers(
     }
 }
 
+fn conditioner_snapshot(debug: &ConditionerDebug) -> game_shared::DebugConditioner {
+    let config = debug.handle().config();
+    let stats = debug.handle().stats();
+    let direction =
+        |s: renet_cross::conditioner::DirectionStats| game_shared::DebugConditionerDirection {
+            queued_packets: s.queued_packets,
+            queued_bytes: s.queued_bytes,
+            simulated_loss_drops: s.simulated_loss_drops,
+            outage_drops: s.outage_drops,
+            overflow_drops: s.overflow_drops,
+            transition_drops: s.transition_drops,
+        };
+    game_shared::DebugConditioner {
+        enabled: config.enabled,
+        delay_each_way_ms: config.latency.as_secs_f64() * 1000.0,
+        jitter_ms: config.jitter.as_secs_f64() * 1000.0,
+        packet_loss: config.packet_loss,
+        baseline_rtt_ms: debug.baseline_rtt().map(|rtt| rtt.as_secs_f64() * 1000.0),
+        outage_active: stats.outage_active,
+        incoming: direction(stats.incoming),
+        outgoing: direction(stats.outgoing),
+    }
+}
+
+fn report_conditioner_rtt(
+    runtime: Option<NonSend<NetworkRuntime>>,
+    mut debug: ResMut<ConditionerDebug>,
+) {
+    let rtt = runtime
+        .as_ref()
+        .filter(|runtime| runtime.renet.is_connected())
+        .map(|runtime| Duration::from_secs_f64(runtime.renet.rtt()));
+    debug.report_rtt(rtt);
+}
+
 fn toggle_debug_overlay(
+    mut conditioner: ResMut<ConditionerDebug>,
+    mut bridge: ResMut<ClientDebugBridgeState>,
     keyboard: Res<ButtonInput<KeyCode>>,
     mut state: ResMut<DebugOverlayState>,
-    mut query: Query<&mut Visibility, With<DebugOverlayText>>,
+    mut query: Query<&mut Visibility, With<DebugPanel>>,
+    mut hud: Query<&mut Visibility, (With<super::debug_panel::HudRoot>, Without<DebugPanel>)>,
 ) {
+    if keyboard.just_pressed(KeyCode::F6) {
+        conditioner.visible = !conditioner.visible;
+        if conditioner.visible {
+            state.visible = false;
+        }
+    }
+    if keyboard.just_pressed(KeyCode::F4) {
+        bridge.pending_marker = true;
+    }
     if keyboard.just_pressed(KeyCode::F3) {
         state.visible = !state.visible;
+        if state.visible {
+            conditioner.visible = false;
+        }
+    }
+    if keyboard.just_pressed(KeyCode::F3) || keyboard.just_pressed(KeyCode::F6) {
+        for mut vis in &mut hud {
+            *vis = if state.visible {
+                Visibility::Hidden
+            } else {
+                Visibility::Inherited
+            };
+        }
         for mut vis in &mut query {
             *vis = if state.visible {
                 Visibility::Inherited
@@ -4066,44 +3084,202 @@ fn toggle_debug_overlay(
     }
 }
 
+fn client_network_health(runtime: &NetworkRuntime) -> game_shared::DebugNetworkHealth {
+    let client = &runtime.renet;
+    #[cfg(target_arch = "wasm32")]
+    let browser_drops = {
+        let stats = runtime.transport.stats();
+        Some(game_shared::DebugBrowserDrops {
+            send_backpressure: stats.send_backpressure_drops,
+            receive_overflow: stats.receive_overflow_drops,
+            invalid_size: stats.receive_invalid_size_drops,
+        })
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    let browser_drops = None;
+    game_shared::DebugNetworkHealth {
+        browser_drops,
+        transport: if cfg!(target_arch = "wasm32") {
+            "webrtc"
+        } else {
+            "udp"
+        }
+        .to_owned(),
+        rtt_ms: client.rtt() * 1000.0,
+        packet_loss: client.packet_loss(),
+        sent_bytes_per_second: client.bytes_sent_per_sec(),
+        received_bytes_per_second: client.bytes_received_per_sec(),
+    }
+}
+
+fn sample_diagnostic_history(
+    time: Res<Time<Real>>,
+    runtime: Option<NonSend<NetworkRuntime>>,
+    stats: Res<NetStats>,
+    mut history: ResMut<super::debug_panel::DiagnosticHistory>,
+) {
+    let now = time.elapsed_secs_f64();
+    let network = runtime
+        .as_ref()
+        .filter(|r| r.renet.is_connected())
+        .filter(|_| {
+            stats
+                .last_snapshot_received_secs
+                .is_some_and(|t| now - t < 1.5)
+        })
+        .map(|r| client_network_health(r));
+    let values = network.map_or([None; 5], |n| {
+        [
+            Some(n.rtt_ms as f32),
+            stats
+                .last_rtt_sample_secs
+                .filter(|t| now - t < 1.5)
+                .map(|_| stats.jitter_ema * 1000.0),
+            Some((n.packet_loss * 100.0) as f32),
+            Some((n.received_bytes_per_second / 1024.0) as f32),
+            Some((n.sent_bytes_per_second / 1024.0) as f32),
+        ]
+    });
+    history.record(now, values);
+}
+
 fn update_debug_overlay(
+    conditioner: Res<ConditionerDebug>,
+    bridge: Res<ClientDebugBridgeState>,
+    time: Res<Time<Real>>,
+    runtime: Option<NonSend<NetworkRuntime>>,
     state: Res<DebugOverlayState>,
     net_stats: Res<NetStats>,
     snapshot_buffer: Res<SnapshotBuffer>,
     smoothing: Res<ReconciliationSmoothing>,
     local_sim: Res<LocalSimulation>,
-    world: Res<WorldView>,
-    mut query: Query<&mut Text, With<DebugOverlayText>>,
+    mut query: Query<(&DebugMetric, &mut Text, &mut TextColor)>,
 ) {
     if !state.visible {
         return;
     }
-    let rtt_ms = net_stats.rtt_ema * 1000.0;
-    let jitter_ms = net_stats.jitter_ema * 1000.0;
-    let snap_count = snapshot_buffer.snapshots.len();
-    let interp_ms = snapshot_buffer.interpolation_delay * 1000.0;
-    let input_buf = local_sim.input_buffer.len();
-    let offset_mag = (smoothing.hero_offset[0] * smoothing.hero_offset[0]
-        + smoothing.hero_offset[1] * smoothing.hero_offset[1])
-        .sqrt();
-    let msgs: String = state
-        .recent_msg_types
-        .iter()
-        .map(|&full| if full { 'F' } else { 'P' })
-        .collect();
-
-    for mut text in &mut query {
-        text.0 = format!(
-            "rtt: {rtt_ms:.0}ms  jitter: {jitter_ms:.0}ms\n\
-             snaps: {snap_count}  interp: {interp_ms:.0}ms\n\
-             buf: {input_buf}  offset: {offset_mag:.3}\n\
-             stk: {}  ptk: {}  msgs: {msgs}",
-            world.tick, local_sim.predicted_tick
-        );
+    let network = runtime.as_ref().map(|r| client_network_health(r));
+    let fresh_network = network.as_ref().filter(|_| {
+        runtime.as_ref().is_some_and(|r| r.renet.is_connected())
+            && net_stats
+                .last_snapshot_received_secs
+                .is_some_and(|t| time.elapsed_secs_f64() - t < 1.5)
+    });
+    let age = |sample: Option<f64>| {
+        sample.map_or("--".into(), |t| {
+            format!("{:.0} ms", (time.elapsed_secs_f64() - t).max(0.0) * 1000.0)
+        })
+    };
+    for (field, mut text, mut color) in &mut query {
+        let mut warning = false;
+        let value = match field {
+            DebugMetric::Connection => network.as_ref().map_or("Offline".into(), |n| {
+                format!(
+                    "{} / {}",
+                    n.transport,
+                    if runtime.as_ref().is_some_and(|r| r.renet.is_connected()) {
+                        "connected"
+                    } else {
+                        "connecting / disconnected"
+                    }
+                )
+            }),
+            DebugMetric::Conditioning => {
+                warning = conditioner.handle().is_active();
+                if warning { "ACTIVE / F6" } else { "Off" }.into()
+            }
+            DebugMetric::Rtt => fresh_network.map_or("--".into(), |n| {
+                warning = n.rtt_ms > 200.0;
+                format!("{:.0} ms", n.rtt_ms)
+            }),
+            DebugMetric::Loss => fresh_network.map_or("--".into(), |n| {
+                warning = n.packet_loss > 0.01;
+                format!("{:.1}%", n.packet_loss * 100.0)
+            }),
+            DebugMetric::Sent => fresh_network.map_or("--".into(), |n| {
+                format!("{:.1} KiB/s", n.sent_bytes_per_second / 1024.0)
+            }),
+            DebugMetric::Received => fresh_network.map_or("--".into(), |n| {
+                format!("{:.1} KiB/s", n.received_bytes_per_second / 1024.0)
+            }),
+            DebugMetric::SnapshotAge => {
+                warning = net_stats
+                    .last_snapshot_received_secs
+                    .is_some_and(|t| time.elapsed_secs_f64() - t > 1.5);
+                age(net_stats.last_snapshot_received_secs)
+            }
+            DebugMetric::BaselineMisses => {
+                warning = bridge.replication.baseline_misses > 0;
+                bridge.replication.baseline_misses.to_string()
+            }
+            DebugMetric::DecodeErrors => {
+                warning = bridge.replication.decode_errors > 0;
+                bridge.replication.decode_errors.to_string()
+            }
+            DebugMetric::TransportErrors => {
+                warning = bridge.replication.transport_errors > 0;
+                bridge.replication.transport_errors.to_string()
+            }
+            DebugMetric::BrowserDrops => network
+                .as_ref()
+                .and_then(|n| n.browser_drops.as_ref())
+                .map_or("--".into(), |d| {
+                    warning = d.send_backpressure + d.receive_overflow + d.invalid_size > 0;
+                    format!(
+                        "{} / {} / {}",
+                        d.send_backpressure, d.receive_overflow, d.invalid_size
+                    )
+                }),
+            DebugMetric::Messages => {
+                let full = state.recent_msg_types.iter().filter(|full| **full).count();
+                format!(
+                    "{full} full / {} patches",
+                    state.recent_msg_types.len() - full
+                )
+            }
+            DebugMetric::InputAck => {
+                if net_stats
+                    .last_rtt_sample_secs
+                    .is_some_and(|t| time.elapsed_secs_f64() - t < 1.5)
+                {
+                    format!("{:.0} ms", net_stats.rtt_ema * 1000.0)
+                } else {
+                    "--".into()
+                }
+            }
+            DebugMetric::AckJitter => {
+                if net_stats
+                    .last_rtt_sample_secs
+                    .is_some_and(|t| time.elapsed_secs_f64() - t < 1.5)
+                {
+                    format!("{:.0} ms", net_stats.jitter_ema * 1000.0)
+                } else {
+                    "--".into()
+                }
+            }
+            DebugMetric::Interpolation => {
+                format!("{:.0} ms", snapshot_buffer.interpolation_delay * 1000.0)
+            }
+            DebugMetric::InputBuffer => local_sim.input_buffer.len().to_string(),
+            DebugMetric::Correction => format!(
+                "{:.3} units",
+                smoothing.hero_offset[0].hypot(smoothing.hero_offset[1])
+            ),
+        };
+        if text.0 != value {
+            text.0 = value;
+        }
+        color.0 = if warning {
+            Color::srgb(1.0, 0.71, 0.35)
+        } else {
+            Color::srgb(0.89, 0.94, 1.0)
+        };
     }
 }
 
 fn capture_client_debug_bridge_frame(
+    conditioner: Res<ConditionerDebug>,
+    (real_time, mut last_capture): (Res<Time<Real>>, Local<f64>),
     runtime: Option<NonSend<NetworkRuntime>>,
     input_state: Res<InputState>,
     pending_actions: Res<PendingActions>,
@@ -4128,14 +3304,15 @@ fn capture_client_debug_bridge_frame(
         With<DynamicActor>,
     >,
 ) {
-    if !debug_bridge.enabled {
+    if !debug_bridge.enabled || real_time.elapsed_secs_f64() - *last_capture < 0.1 {
         return;
     }
+    *last_capture = real_time.elapsed_secs_f64();
 
     let runtime = runtime.as_deref();
     let client_id = runtime.map(|runtime| runtime.client_id).or(world.you);
 
-    let mut authoritative_heroes: Vec<HeroSnapshot> = world.heroes.values().copied().collect();
+    let mut authoritative_heroes: Vec<HeroSnapshot> = world.heroes.values().cloned().collect();
     let mut authoritative_enemies: Vec<EnemySnapshot> = world.enemies.values().copied().collect();
     let mut authoritative_towers: Vec<TowerSnapshot> = world.towers.values().copied().collect();
     sort_debug_snapshots(
@@ -4167,7 +3344,7 @@ fn capture_client_debug_bridge_frame(
             (None, Vec::new(), Vec::new(), Vec::new())
         };
 
-    let mut render_ids: Vec<u64> = render_index.by_id.keys().copied().collect();
+    let mut render_ids: Vec<ActorKey> = render_index.by_id.keys().copied().collect();
     render_ids.sort_unstable();
     let mut rendered_actors = Vec::with_capacity(render_ids.len());
     for id in render_ids {
@@ -4189,7 +3366,9 @@ fn capture_client_debug_bridge_frame(
             continue;
         };
         rendered_actors.push(game_shared::DebugRenderActor {
-            id,
+            id: match id {
+                ActorKey::Hero(id) | ActorKey::World(id) => id,
+            },
             kind,
             pos: [transform.translation.x, transform.translation.z],
         });
@@ -4197,6 +3376,24 @@ fn capture_client_debug_bridge_frame(
 
     debug_bridge.frame_index = debug_bridge.frame_index.wrapping_add(1);
     debug_bridge.latest = Some(ClientDebugFrame {
+        conditioner: Some(conditioner_snapshot(&conditioner)),
+        marker: std::mem::take(&mut debug_bridge.pending_marker),
+        replication: debug_bridge.replication.clone(),
+        schema_version: game_shared::DEBUG_SCHEMA_VERSION,
+        session_id: debug_recorder.session_id.clone(),
+        capture_elapsed_ms: real_time.elapsed_secs_f64() * 1000.0,
+        frame_duration_ms: real_time.delta_secs_f64() * 1000.0,
+        snapshot_age_ms: net_stats
+            .last_snapshot_received_secs
+            .map(|received| (real_time.elapsed_secs_f64() - received).max(0.0) * 1000.0),
+        input_ack_age_ms: net_stats
+            .last_rtt_sample_secs
+            .map(|received| (real_time.elapsed_secs_f64() - received).max(0.0) * 1000.0),
+        disconnect_reason: runtime
+            .and_then(|r| r.renet.disconnect_reason())
+            .map(|r| format!("{r:?}")),
+        network: runtime.map(|r| client_network_health(r)),
+        recorder: debug_recorder.health(),
         frame_index: debug_bridge.frame_index,
         client_id,
         connected: runtime.is_some_and(|runtime| runtime.renet.is_connected()),
@@ -4235,68 +3432,6 @@ fn capture_client_debug_bridge_frame(
     });
     if let Some(frame) = debug_bridge.latest.clone() {
         debug_recorder.record_frame(frame);
-    }
-}
-
-fn flush_client_debug_recorder(
-    time: Res<Time>,
-    mut debug_recorder: ResMut<ClientDebugRecorderState>,
-) {
-    let elapsed_secs = time.elapsed_secs();
-
-    #[cfg(target_arch = "wasm32")]
-    {
-        if debug_recorder.upload_in_flight() {
-            return;
-        }
-
-        if let Some(payload) = debug_recorder.pop_retry_payload() {
-            spawn_wasm_debug_upload(
-                debug_recorder.endpoint.clone(),
-                payload,
-                Arc::clone(&debug_recorder.upload_in_flight),
-                Arc::clone(&debug_recorder.retry_payloads),
-                debug_recorder.max_retry_payloads,
-            );
-            return;
-        }
-    }
-
-    if !debug_recorder.should_flush(elapsed_secs) {
-        return;
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    let max_payload_bytes = usize::MAX;
-    #[cfg(target_arch = "wasm32")]
-    let max_payload_bytes = debug_recorder.max_batch_bytes;
-
-    let Some(batch) = debug_recorder.take_batch(elapsed_secs, max_payload_bytes) else {
-        return;
-    };
-    let Ok(payload) = serde_json::to_string(&batch) else {
-        log::warn!("failed to serialize client debug upload batch");
-        return;
-    };
-
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        if let Some(sender) = &debug_recorder.native_sender {
-            if let Err(err) = sender.send(payload) {
-                log::warn!("failed to queue native client debug upload: {err}");
-            }
-        }
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    {
-        spawn_wasm_debug_upload(
-            debug_recorder.endpoint.clone(),
-            payload,
-            Arc::clone(&debug_recorder.upload_in_flight),
-            Arc::clone(&debug_recorder.retry_payloads),
-            debug_recorder.max_retry_payloads,
-        );
     }
 }
 
@@ -4395,34 +3530,52 @@ fn update_match_end_overlay(
 }
 
 fn update_hud(
+    conditioner: Res<ConditionerDebug>,
     world: Res<WorldView>,
     runtime: Option<NonSend<NetworkRuntime>>,
-    hud_state: Res<HudState>,
-    mut hud_text: Single<&mut Text, With<HudText>>,
+    mut hud_text: Query<(&HudMetric, &mut Text, &mut Node)>,
 ) {
-    let status = runtime
-        .as_ref()
-        .map(|runtime| {
-            if runtime.renet.is_connected() {
-                "connected"
-            } else if runtime.renet.is_connecting() {
-                "connecting"
-            } else {
-                "disconnected"
-            }
-        })
-        .unwrap_or("offline");
-
-    let restart_line = match (world.phase, world.match_restart_ticks_remaining) {
-        (MatchPhase::InProgress, _) => "restart: --".to_owned(),
-        (_, Some(ticks)) => format!("restart: {:.1}s", ticks as f32 * FIXED_DT_SECONDS),
-        (_, None) => "restart: pending".to_owned(),
-    };
-
-    hud_text.0 = format!(
-        "Discordium TD MVP\nstatus: {status}\nphase: {:?}\nwave: {}\nteam life: {}\n{restart_line}\ncontrols: WASD move, Left Click/J regular attack, K special attack, Space hold charge, Q lock/cycle, E clear lock\n{}",
-        world.phase, world.wave, world.team_life, hud_state.last_event
-    );
+    let connected = runtime.as_ref().is_some_and(|r| r.renet.is_connected());
+    let status = runtime.as_ref().map_or("Offline", |r| {
+        if r.renet.is_connecting() {
+            "Connecting..."
+        } else {
+            "Disconnected"
+        }
+    });
+    for (field, mut text, mut node) in &mut hud_text {
+        let (visible, value) = match field {
+            HudMetric::Simulation => (
+                conditioner.handle().is_active(),
+                "Lag simulation active  /  F6".into(),
+            ),
+            HudMetric::Status => (!connected, status.into()),
+            HudMetric::Wave => (
+                true,
+                if connected {
+                    world.wave.to_string()
+                } else {
+                    "--".into()
+                },
+            ),
+            HudMetric::TeamLife => (
+                true,
+                if connected {
+                    world.team_life.to_string()
+                } else {
+                    "--".into()
+                },
+            ),
+        };
+        node.display = if visible {
+            Display::Flex
+        } else {
+            Display::None
+        };
+        if text.0 != value {
+            text.0 = value;
+        }
+    }
 }
 
 fn update_gold_hud(
@@ -4489,6 +3642,7 @@ fn update_gold_spend_popups(
 
 fn update_special_skill_hud(
     world: Res<WorldView>,
+    local_sim: Res<LocalSimulation>,
     runtime: Option<NonSend<NetworkRuntime>>,
     mut cooldown_ui_state: ResMut<SpecialSkillCooldownUiState>,
     mut icon_color: Single<&mut BackgroundColor, With<SpecialSkillIcon>>,
@@ -4497,9 +3651,7 @@ fn update_special_skill_hud(
 ) {
     let (mut overlay_node, mut overlay_visibility) = overlay.into_inner();
 
-    let local_hero = runtime
-        .as_ref()
-        .and_then(|runtime| world.heroes.get(&runtime.client_id));
+    let local_hero = presentation_hero(&local_sim, &world, runtime.as_ref().map(|r| r.client_id));
     let Some(local_hero) = local_hero else {
         cooldown_ui_state.last_ticks_remaining = 0;
         cooldown_ui_state.max_ticks_remaining = 0;
@@ -4538,6 +3690,7 @@ fn update_special_skill_hud(
 fn update_power_pie_hud(
     time: Res<Time>,
     world: Res<WorldView>,
+    local_sim: Res<LocalSimulation>,
     runtime: Option<NonSend<NetworkRuntime>>,
     power_pie_texture: Option<Res<PowerPieUiTexture>>,
     power_pie_raster_cache: Option<Res<PowerPieRasterCache>>,
@@ -4556,18 +3709,8 @@ fn update_power_pie_hud(
         return;
     };
 
-    let local_hero = runtime
-        .as_ref()
-        .and_then(|runtime| world.heroes.get(&runtime.client_id));
-    let (ratio, power_active) = local_hero
-        .map(|hero| {
-            let max = hero.charge_profile.power_meter_max.max(f32::EPSILON);
-            (
-                (hero.charge_state.power_meter / max).clamp(0.0, 1.0),
-                hero.charge_state.power_active,
-            )
-        })
-        .unwrap_or((0.0, false));
+    let local_hero = presentation_hero(&local_sim, &world, runtime.as_ref().map(|r| r.client_id));
+    let (ratio, power_active) = charge_presentation(local_hero.as_ref());
 
     let flash = if power_active {
         let phase = time.elapsed_secs() * POWER_PIE_FLASH_HZ * std::f32::consts::TAU;
@@ -5269,5 +4412,155 @@ fn describe_event(event: ReliableGameEvent, local_client_id: u64) -> String {
         }
         ReliableGameEvent::Victory => "Victory".to_owned(),
         ReliableGameEvent::Defeat => "Defeat".to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod conditioner_tests {
+    use super::*;
+
+    #[test]
+    fn target_rtt_and_disconnect_are_reflected_in_capture() {
+        let handle = ConditionerHandle::default();
+        let mut debug = ConditionerDebug::new(handle.clone());
+        assert!(!debug.target_rtt(Duration::from_millis(300)));
+        debug.report_rtt(Some(Duration::from_millis(20)));
+        assert!(debug.target_rtt(Duration::from_millis(300)));
+        let snapshot = conditioner_snapshot(&debug);
+        assert!(snapshot.enabled);
+        assert_eq!(snapshot.delay_each_way_ms, 140.0);
+        assert_eq!(snapshot.baseline_rtt_ms, Some(20.0));
+        debug.report_rtt(Some(Duration::from_millis(300)));
+        assert_eq!(conditioner_snapshot(&debug).baseline_rtt_ms, Some(20.0));
+        debug.report_rtt(None);
+        assert_eq!(conditioner_snapshot(&debug).baseline_rtt_ms, None);
+        debug.disable();
+        assert!(!conditioner_snapshot(&debug).enabled);
+    }
+}
+
+#[cfg(test)]
+mod protocol_regressions {
+    use super::*;
+
+    fn snapshot(tick: u32) -> TimestampedSnapshot {
+        let mut world = Simulation::new().world_delta_for(1);
+        world.tick = tick;
+        TimestampedSnapshot {
+            server_tick: tick,
+            receive_time: tick as f32,
+            world,
+        }
+    }
+
+    #[test]
+    fn snapshots_reject_stale_and_duplicate_ticks_across_wrap() {
+        let mut buffer = SnapshotBuffer::default();
+        assert!(buffer.push(snapshot(u32::MAX - 1)));
+        assert!(buffer.push(snapshot(0)));
+        assert!(!buffer.push(snapshot(u32::MAX)));
+        assert!(!buffer.push(snapshot(0)));
+        assert_eq!(buffer.snapshots.len(), 2);
+        assert_eq!(buffer.snapshots.back().unwrap().server_tick, 0);
+    }
+
+    #[test]
+    fn usable_server_baseline_survives_more_than_twelve_updates() {
+        let mut buffer = SnapshotBuffer::default();
+        for tick in 1..=61 {
+            assert!(buffer.push(snapshot(tick)));
+        }
+        assert!(buffer.find_by_tick(1).is_some());
+        for tick in 62..=100 {
+            buffer.push(snapshot(tick));
+        }
+        assert_eq!(buffer.snapshots.len(), 64);
+    }
+
+    #[test]
+    fn removing_world_entity_does_not_remove_hero_with_same_numeric_id() {
+        let mut sim = Simulation::new();
+        sim.add_player(1_000_000);
+        for _ in 0..=game_shared::WAVE_PREP_TICKS {
+            sim.step();
+        }
+        let base = sim.world_delta_for(1_000_000);
+        assert!(base.enemies.iter().any(|e| e.id == 1_000_000));
+        let patch = WorldPatch {
+            presentations: Vec::new(),
+            tick: base.tick + 1,
+            baseline_tick: base.tick,
+            phase: base.phase,
+            match_restart_ticks_remaining: base.match_restart_ticks_remaining,
+            wave: base.wave,
+            team_life: base.team_life,
+            objectives: base.objectives.clone(),
+            your_last_input_seq: base.your_last_input_seq,
+            hero_patches: vec![],
+            enemy_patches: vec![],
+            tower_patches: vec![],
+            removed_ids: vec![1_000_000],
+            removed_hero_ids: vec![],
+            sim_meta: base.sim_meta,
+        };
+        let mut buffer = SnapshotBuffer::default();
+        buffer.push(TimestampedSnapshot {
+            server_tick: base.tick,
+            receive_time: 0.0,
+            world: base,
+        });
+        let rebuilt = reconstruct_from_patch(&buffer, patch).unwrap();
+        assert!(rebuilt.heroes.iter().any(|h| h.client_id == 1_000_000));
+        assert!(!rebuilt.enemies.iter().any(|e| e.id == 1_000_000));
+    }
+
+    #[test]
+    fn movement_ack_does_not_discard_or_reapply_reliable_action() {
+        let mut server = Simulation::new();
+        server.add_player(1);
+        server.queue_command(
+            1,
+            ClientCommand::Move {
+                seq: 2,
+                dir: [0.0, 0.0],
+            },
+        );
+        server.step();
+        let action = ClientCommand::BasicAttack { seq: 1 };
+        let mut local = LocalSimulation::default();
+        local.input_buffer.push_back(InputEntry {
+            commands: vec![
+                action,
+                ClientCommand::Move {
+                    seq: 2,
+                    dir: [0.0, 0.0],
+                },
+            ],
+        });
+        let delta = server.world_delta_for(1);
+        reconcile_local_sim(
+            &mut local,
+            &mut ReconciliationSmoothing::default(),
+            &delta,
+            &server.sim_meta(),
+            1,
+        );
+        assert_eq!(local.input_buffer.front().unwrap().commands, vec![action]);
+        assert_eq!(
+            local.sim.world_delta_for(1).heroes[0].regular_attack.phase,
+            AttackPhase::Windup
+        );
+        server.queue_command(1, action);
+        server.step();
+        let delta = server.world_delta_for(1);
+        reconcile_local_sim(
+            &mut local,
+            &mut ReconciliationSmoothing::default(),
+            &delta,
+            &server.sim_meta(),
+            1,
+        );
+        assert!(local.input_buffer.is_empty());
+        assert_eq!(local.sim.world_delta_for(1), delta);
     }
 }

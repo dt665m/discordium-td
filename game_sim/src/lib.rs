@@ -1,5 +1,6 @@
+mod input;
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, VecDeque},
     f32::consts::TAU,
 };
 
@@ -8,17 +9,17 @@ use game_shared::{
     BUILD_NODES, BuildRejectReason, ChargePhase, ChargeProfileComponent, ChargeStateComponent,
     ClientCommand, DirectionalAttackComponent, DirectionalAttackStateComponent,
     ENEMY_OBJECTIVE_DAMAGE, ENEMY_REGULAR_ATTACK, ENEMY_SPAWN_POINTS, EXTRA_ENEMIES_PER_WAVE,
-    EnemySnapshot, EnemyType, FIXED_DT_SECONDS, FacingComponent, HERO_ABILITY_COOLDOWN_TICKS,
-    HERO_ABILITY_DAMAGE, HERO_ABILITY_MANA_COST, HERO_ABILITY_RADIUS, HERO_CHARGE_PROFILE,
-    HERO_COLLIDER_RADIUS, HERO_MANA_REGEN_PER_TICK, HERO_MAX_HP, HERO_MAX_MANA,
-    HERO_POWER_DECAY_PROFILE, HERO_POWERED_MODIFIERS, HERO_REGULAR_ATTACK, HERO_SPEED,
-    INITIAL_GOLD, INITIAL_TEAM_LIFE, JoinSnapshot, MATCH_RESET_TICKS, MAX_WAVES, MatchPhase,
-    OBJECTIVE_COLLIDER_RADIUS, OBJECTIVE_MAX_HP, ObjectiveSnapshot, PowerDecayProfileComponent,
-    PoweredUpModifiersComponent, ReliableGameEvent, SimMeta, TOWER_BUILD_COST, TOWER_COLLIDER_RADIUS,
-    TOWER_DAMAGE, TOWER_RANGE, TOWER_RELOAD_TICKS, TowerSnapshot, TowerType, WAVE_PREP_TICKS,
-    WAVE_SPAWN_INTERVAL_TICKS, WORLD_HALF_HEIGHT, WORLD_HALF_WIDTH, WorldDelta, cardinalize_dir_or,
-    clamp_to_world, directional_attack_can_hit, distance_sq, enemy_collider_radius,
-    is_newer_input_seq, normalize_or_zero,
+    EnemyLockTarget, EnemySnapshot, EnemyType, FIXED_DT_SECONDS, FacingComponent,
+    HERO_ABILITY_COOLDOWN_TICKS, HERO_ABILITY_DAMAGE, HERO_ABILITY_MANA_COST, HERO_ABILITY_RADIUS,
+    HERO_CHARGE_PROFILE, HERO_COLLIDER_RADIUS, HERO_MANA_REGEN_PER_TICK, HERO_MAX_HP,
+    HERO_MAX_MANA, HERO_POWER_DECAY_PROFILE, HERO_POWERED_MODIFIERS, HERO_REGULAR_ATTACK,
+    HERO_SPEED, INITIAL_GOLD, INITIAL_TEAM_LIFE, JoinSnapshot, MATCH_RESET_TICKS, MAX_WAVES,
+    MatchPhase, OBJECTIVE_COLLIDER_RADIUS, OBJECTIVE_MAX_HP, ObjectiveSnapshot,
+    PowerDecayProfileComponent, PoweredUpModifiersComponent, ReliableGameEvent, SimMeta,
+    TOWER_BUILD_COST, TOWER_COLLIDER_RADIUS, TOWER_DAMAGE, TOWER_RANGE, TOWER_RELOAD_TICKS,
+    TowerSnapshot, TowerType, WAVE_PREP_TICKS, WAVE_SPAWN_INTERVAL_TICKS, WORLD_HALF_HEIGHT,
+    WORLD_HALF_WIDTH, WorldDelta, cardinalize_dir_or, clamp_to_world, directional_attack_can_hit,
+    distance_sq, enemy_collider_radius, is_newer_input_seq, normalize_or_zero,
 };
 use vleue_navigator::NavMesh;
 
@@ -41,7 +42,7 @@ const TOWER_NAV_BLOCK_VERTICES: usize = 8;
 const NAVMESH_SEARCH_DELTA: f32 = 0.015;
 const NAVMESH_SEARCH_STEPS: u32 = 220;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct HeroState {
     pos: [f32; 2],
     move_dir: [f32; 2],
@@ -59,6 +60,9 @@ struct HeroState {
     gold: u32,
     ability_cooldown_ticks: u32,
     last_processed_seq: Option<u32>,
+    last_action_seq: Option<u32>,
+    last_attack_seq: Option<u32>,
+    pending_actions: VecDeque<game_shared::ClientAction>,
 }
 
 #[derive(Debug, Clone)]
@@ -80,12 +84,6 @@ struct EnemyState {
     target_pos: [f32; 2],
     waypoint: [f32; 2],
     repath_cooldown: u32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EnemyLockTarget {
-    Hero(u64),
-    Base,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -126,19 +124,22 @@ pub struct TickOutput {
 #[derive(Debug)]
 #[cfg_attr(feature = "bevy", derive(bevy::prelude::Resource))]
 pub struct Simulation {
+    historical_targets: BTreeMap<(u64, u32), Vec<(u64, [f32; 2])>>,
+    presentations: Vec<game_shared::PresentationInstance>,
+    match_epoch: u32,
     tick: u32,
     phase: MatchPhase,
     team_life: i32,
     wave: u32,
     objective_hp: f32,
-    heroes: HashMap<u64, HeroState>,
-    enemies: HashMap<u64, EnemyState>,
-    towers: HashMap<u64, TowerState>,
-    node_occupancy: HashMap<u32, u64>,
+    heroes: BTreeMap<u64, HeroState>,
+    enemies: BTreeMap<u64, EnemyState>,
+    towers: BTreeMap<u64, TowerState>,
+    node_occupancy: BTreeMap<u32, u64>,
     navmesh_cache: Option<NavMesh>,
     navmesh_dirty: bool,
     pending_commands: Vec<(u64, ClientCommand)>,
-    move_queues: HashMap<u64, VecDeque<(u32, [f32; 2])>>,
+    move_queues: BTreeMap<u64, VecDeque<(u32, [f32; 2])>>,
     next_entity_id: u64,
     wave_remaining: u32,
     next_spawn_tick: u32,
@@ -156,19 +157,22 @@ impl Default for Simulation {
 impl Simulation {
     pub fn new() -> Self {
         Self {
+            historical_targets: BTreeMap::new(),
+            presentations: Vec::new(),
+            match_epoch: 0,
             tick: 0,
             phase: MatchPhase::InProgress,
             team_life: INITIAL_TEAM_LIFE,
             wave: 0,
             objective_hp: OBJECTIVE_MAX_HP,
-            heroes: HashMap::new(),
-            enemies: HashMap::new(),
-            towers: HashMap::new(),
-            node_occupancy: HashMap::new(),
+            heroes: BTreeMap::new(),
+            enemies: BTreeMap::new(),
+            towers: BTreeMap::new(),
+            node_occupancy: BTreeMap::new(),
             navmesh_cache: None,
             navmesh_dirty: true,
             pending_commands: Vec::new(),
-            move_queues: HashMap::new(),
+            move_queues: BTreeMap::new(),
             next_entity_id: 1_000_000,
             wave_remaining: 0,
             next_spawn_tick: 0,
@@ -202,6 +206,9 @@ impl Simulation {
                 gold: INITIAL_GOLD,
                 ability_cooldown_ticks: 0,
                 last_processed_seq: None,
+                last_action_seq: None,
+                last_attack_seq: None,
+                pending_actions: VecDeque::new(),
             },
         );
         self.move_queues.insert(client_id, VecDeque::new());
@@ -210,6 +217,7 @@ impl Simulation {
     pub fn remove_player(&mut self, client_id: u64) {
         self.heroes.remove(&client_id);
         self.move_queues.remove(&client_id);
+        self.pending_commands.retain(|(id, _)| *id != client_id);
 
         let owned_towers: Vec<u64> = self
             .towers
@@ -232,10 +240,6 @@ impl Simulation {
 
     pub fn has_players(&self) -> bool {
         !self.heroes.is_empty()
-    }
-
-    pub fn queue_command(&mut self, client_id: u64, command: ClientCommand) {
-        self.pending_commands.push((client_id, command));
     }
 
     pub fn tick(&self) -> u32 {
@@ -268,6 +272,15 @@ impl Simulation {
                 mana: hero.mana,
                 gold: hero.gold,
                 ability_cooldown_ticks: hero.ability_cooldown_ticks,
+                move_dir: hero.move_dir,
+                pending_moves: self
+                    .move_queues
+                    .get(id)
+                    .map_or_else(Vec::new, |q| q.iter().copied().collect()),
+                last_move_seq: hero.last_processed_seq,
+                last_action_seq: hero.last_action_seq,
+                last_attack_seq: hero.last_attack_seq,
+                pending_actions: hero.pending_actions.iter().copied().collect(),
             });
         }
         heroes.sort_unstable_by_key(|hero| hero.client_id);
@@ -284,6 +297,12 @@ impl Simulation {
                 hp: enemy.hp.max(0.0),
                 max_hp: enemy.max_hp,
                 enemy_type: enemy.enemy_type,
+                speed: enemy.speed,
+                reward: enemy.reward,
+                lock_target: enemy.lock_target,
+                target_pos: enemy.target_pos,
+                waypoint: enemy.waypoint,
+                repath_cooldown: enemy.repath_cooldown,
             });
         }
         enemies.sort_unstable_by_key(|enemy| enemy.id);
@@ -313,6 +332,7 @@ impl Simulation {
             .and_then(|hero| hero.last_processed_seq);
 
         WorldDelta {
+            presentations: self.presentations.clone(),
             tick: self.tick,
             phase: self.phase,
             match_restart_ticks_remaining: self.match_restart_ticks_remaining(),
@@ -329,6 +349,7 @@ impl Simulation {
 
     pub fn sim_meta(&self) -> SimMeta {
         SimMeta {
+            match_epoch: self.match_epoch,
             next_entity_id: self.next_entity_id,
             wave_remaining: self.wave_remaining,
             next_spawn_tick: self.next_spawn_tick,
@@ -337,12 +358,19 @@ impl Simulation {
         }
     }
 
+    pub fn presentations(&self) -> &[game_shared::PresentationInstance] {
+        &self.presentations
+    }
+
     pub fn set_tick(&mut self, tick: u32) {
         self.tick = tick;
     }
 
     pub fn from_snapshot(delta: &WorldDelta, meta: &SimMeta) -> Self {
         let mut sim = Self {
+            historical_targets: BTreeMap::new(),
+            presentations: delta.presentations.clone(),
+            match_epoch: meta.match_epoch,
             tick: delta.tick,
             phase: delta.phase,
             team_life: delta.team_life,
@@ -352,14 +380,14 @@ impl Simulation {
                 .first()
                 .map(|o| o.hp)
                 .unwrap_or(OBJECTIVE_MAX_HP),
-            heroes: HashMap::new(),
-            enemies: HashMap::new(),
-            towers: HashMap::new(),
-            node_occupancy: HashMap::new(),
+            heroes: BTreeMap::new(),
+            enemies: BTreeMap::new(),
+            towers: BTreeMap::new(),
+            node_occupancy: BTreeMap::new(),
             navmesh_cache: None,
             navmesh_dirty: true,
             pending_commands: Vec::new(),
-            move_queues: HashMap::new(),
+            move_queues: BTreeMap::new(),
             next_entity_id: meta.next_entity_id,
             wave_remaining: meta.wave_remaining,
             next_spawn_tick: meta.next_spawn_tick,
@@ -374,6 +402,9 @@ impl Simulation {
     }
 
     pub fn apply_snapshot(&mut self, delta: &WorldDelta, meta: &SimMeta) {
+        self.historical_targets.clear();
+        self.presentations.clone_from(&delta.presentations);
+        self.match_epoch = meta.match_epoch;
         self.tick = delta.tick;
         self.phase = delta.phase;
         self.team_life = delta.team_life;
@@ -402,12 +433,22 @@ impl Simulation {
     }
 
     fn match_restart_ticks_remaining(&self) -> Option<u32> {
-        self.reset_at_tick
-            .map(|reset_at_tick| reset_at_tick.saturating_sub(self.tick))
+        self.reset_at_tick.map(|reset_at_tick| {
+            if is_newer_input_seq(reset_at_tick, self.tick) {
+                reset_at_tick.wrapping_sub(self.tick)
+            } else {
+                0
+            }
+        })
     }
 
     pub fn step(&mut self) -> TickOutput {
         self.tick = self.tick.wrapping_add(1);
+        for instance in &mut self.presentations {
+            instance.age_ticks += 1;
+        }
+        self.presentations
+            .retain(|instance| instance.age_ticks < instance.duration_ticks);
 
         let mut reliable_events = Vec::new();
         if self.phase != MatchPhase::InProgress {
@@ -415,6 +456,7 @@ impl Simulation {
             return TickOutput { reliable_events };
         }
 
+        self.release_ready_actions();
         self.apply_pending_commands(&mut reliable_events);
         self.consume_move_queues();
         self.advance_enemies(&mut reliable_events);
@@ -428,155 +470,15 @@ impl Simulation {
             reliable_events.push(ReliableGameEvent::Defeat);
         }
 
+        self.historical_targets.clear();
         TickOutput { reliable_events }
-    }
-
-    fn apply_pending_commands(&mut self, reliable_events: &mut Vec<ReliableGameEvent>) {
-        let commands: Vec<(u64, ClientCommand)> = self.pending_commands.drain(..).collect();
-        for (client_id, command) in commands {
-            if !self.heroes.contains_key(&client_id) {
-                continue;
-            }
-
-            let seq = command.seq();
-            let Some(hero) = self.heroes.get(&client_id) else {
-                continue;
-            };
-
-            let accept_seq = hero
-                .last_processed_seq
-                .is_none_or(|last_seq| is_newer_input_seq(seq, last_seq));
-            if !accept_seq {
-                continue;
-            }
-
-            // For Move commands, queue them for 1:1 tick consumption instead of
-            // applying immediately. Don't update last_processed_seq here — let
-            // consume_move_queues handle it when the move is actually consumed.
-            // For all other commands, update last_processed_seq and process immediately.
-            match &command {
-                ClientCommand::Move { .. } => {}
-                _ => {
-                    self.flush_move_queue_up_to(client_id, seq);
-                    if let Some(hero_mut) = self.heroes.get_mut(&client_id) {
-                        hero_mut.last_processed_seq = Some(seq);
-                    }
-                }
-            }
-
-            match command {
-                ClientCommand::Move { dir, .. } => {
-                    let queue = self.move_queues.entry(client_id).or_default();
-                    // Also reject moves already queued but not yet consumed.
-                    // The client re-sends unacked moves in every bundle for
-                    // packet-loss resilience; without this check, duplicates
-                    // pile up and the queue grows unboundedly.
-                    let dominated_by_queue = queue
-                        .back()
-                        .is_some_and(|(last_q, _)| !is_newer_input_seq(seq, *last_q));
-                    if !dominated_by_queue {
-                        queue.push_back((seq, normalize_or_zero(dir)));
-                        // Cap queue to prevent unbounded growth under extreme jitter.
-                        // Drop oldest moves — they're the most stale.
-                        while queue.len() > 10 {
-                            queue.pop_front();
-                        }
-                    }
-                }
-                ClientCommand::SetLockTarget { target_id, .. } => {
-                    self.try_set_lock_target(client_id, target_id);
-                }
-                ClientCommand::SetCharging { active, .. } => {
-                    self.try_set_charging(client_id, active);
-                }
-                ClientCommand::BasicAttack { .. } => {
-                    self.try_start_regular_attack(client_id);
-                }
-                ClientCommand::CastAbility { ability, .. } => {
-                    self.try_cast_ability(client_id, ability, reliable_events);
-                }
-                ClientCommand::BuildTower {
-                    node_id,
-                    tower_type,
-                    ..
-                } => {
-                    self.try_build_tower(client_id, node_id, tower_type, reliable_events);
-                }
-            }
-        }
-    }
-
-    fn consume_move_queues(&mut self) {
-        let client_ids: Vec<u64> = self.move_queues.keys().copied().collect();
-        for client_id in client_ids {
-            // Pop exactly one move per tick (separate borrow from heroes)
-            let consumed = {
-                let Some(queue) = self.move_queues.get_mut(&client_id) else {
-                    continue;
-                };
-                queue.pop_front()
-            };
-
-            let Some(hero) = self.heroes.get_mut(&client_id) else {
-                continue;
-            };
-
-            if let Some((seq, dir)) = consumed {
-                hero.move_dir = dir;
-                hero.last_processed_seq = Some(seq);
-            } else {
-                // No input this tick — stop (don't replay stale direction)
-                hero.move_dir = [0.0, 0.0];
-            }
-        }
-    }
-
-    /// Flush all queued moves for `client_id` whose seq is strictly less than
-    /// `action_seq`, applying their displacements. This ensures the hero's
-    /// position matches where the client was when the action was issued.
-    fn flush_move_queue_up_to(&mut self, client_id: u64, action_seq: u32) {
-        let moves_to_apply: Vec<(u32, [f32; 2])> = {
-            let Some(queue) = self.move_queues.get_mut(&client_id) else {
-                return;
-            };
-            let mut moves = Vec::new();
-            while let Some(&(move_seq, dir)) = queue.front() {
-                if !is_newer_input_seq(action_seq, move_seq) {
-                    break; // move_seq >= action_seq
-                }
-                queue.pop_front();
-                moves.push((move_seq, dir));
-            }
-            moves
-        };
-
-        if moves_to_apply.is_empty() {
-            return;
-        }
-
-        let Some(hero) = self.heroes.get_mut(&client_id) else {
-            return;
-        };
-
-        let attack_locked = is_attack_locked(hero.regular_attack);
-        let charge_locked = is_charge_locked(hero.charge_state);
-
-        for (seq, dir) in moves_to_apply {
-            if !attack_locked && !charge_locked {
-                hero.pos = clamp_to_world([
-                    hero.pos[0] + dir[0] * HERO_SPEED * FIXED_DT_SECONDS,
-                    hero.pos[1] + dir[1] * HERO_SPEED * FIXED_DT_SECONDS,
-                ]);
-            }
-            hero.move_dir = dir;
-            hero.last_processed_seq = Some(seq);
-        }
     }
 
     fn try_cast_ability(
         &mut self,
         client_id: u64,
         ability: AbilityId,
+        action_seq: u32,
         reliable_events: &mut Vec<ReliableGameEvent>,
     ) {
         if ability != AbilityId::ArcBurst {
@@ -601,6 +503,20 @@ impl Simulation {
         let ability_radius = hero_ability_radius(hero);
         let damage_multiplier = hero_attack_damage_multiplier(hero);
 
+        self.presentations.push(game_shared::PresentationInstance {
+            id: game_shared::PresentationId {
+                match_epoch: self.match_epoch,
+                owner: client_id,
+                action_seq,
+                slot: 0,
+            },
+            kind: game_shared::PresentationKind::ArcBurst,
+            pos: cast_origin,
+            radius: ability_radius,
+            age_ticks: 0,
+            duration_ticks: 17,
+        });
+
         reliable_events.push(ReliableGameEvent::AbilityCast {
             owner: client_id,
             pos: cast_origin,
@@ -609,9 +525,19 @@ impl Simulation {
 
         let mut targets = Vec::new();
         let radius_sq = ability_radius * ability_radius;
-        for enemy in self.enemies.values() {
-            if distance_sq(enemy.pos, cast_origin) <= radius_sq {
-                targets.push(enemy.id);
+        if let Some(history) = self.historical_targets.remove(&(client_id, action_seq)) {
+            for (id, pos) in history {
+                // Historical geometry cannot resurrect a removed enemy or award
+                // a second kill. All damage still applies to current state.
+                if self.enemies.contains_key(&id) && distance_sq(pos, cast_origin) <= radius_sq {
+                    targets.push(id);
+                }
+            }
+        } else {
+            for enemy in self.enemies.values() {
+                if distance_sq(enemy.pos, cast_origin) <= radius_sq {
+                    targets.push(enemy.id);
+                }
             }
         }
 
@@ -687,7 +613,7 @@ impl Simulation {
             return;
         }
 
-        let Some(hero) = self.heroes.get(&client_id).copied() else {
+        let Some(hero) = self.heroes.get(&client_id).cloned() else {
             return;
         };
 
@@ -738,7 +664,7 @@ impl Simulation {
 
     fn advance_heroes(&mut self, reliable_events: &mut Vec<ReliableGameEvent>) {
         let hero_ids: Vec<u64> = self.heroes.keys().copied().collect();
-        let enemy_positions: HashMap<u64, [f32; 2]> = self
+        let enemy_positions: BTreeMap<u64, [f32; 2]> = self
             .enemies
             .iter()
             .map(|(id, enemy)| (*id, enemy.pos))
@@ -811,7 +737,7 @@ impl Simulation {
         self.resolve_hero_collisions();
 
         for attacker_id in triggered_attackers {
-            let Some(hero) = self.heroes.get(&attacker_id).copied() else {
+            let Some(hero) = self.heroes.get(&attacker_id).cloned() else {
                 continue;
             };
             let regular_attack_profile = hero_regular_attack_profile(&hero);
@@ -882,7 +808,7 @@ impl Simulation {
             })
             .collect();
 
-        let mut displacements: HashMap<u64, [f32; 2]> = HashMap::new();
+        let mut displacements: BTreeMap<u64, [f32; 2]> = BTreeMap::new();
 
         for i in 0..hero_snapshots.len() {
             for j in (i + 1)..hero_snapshots.len() {
@@ -1217,7 +1143,7 @@ impl Simulation {
         let collision_cells =
             build_spatial_cells(&snapshots, collision_cell_size, |snapshot| snapshot.pos);
 
-        let mut displacements: HashMap<u64, [f32; 2]> = HashMap::new();
+        let mut displacements: BTreeMap<u64, [f32; 2]> = BTreeMap::new();
 
         for i in 0..snapshots.len() {
             let a = snapshots[i];
@@ -1403,7 +1329,7 @@ impl Simulation {
     }
 
     fn spawn_wave_units(&mut self, reliable_events: &mut Vec<ReliableGameEvent>) {
-        if self.tick < self.intermission_until {
+        if is_newer_input_seq(self.intermission_until, self.tick) {
             return;
         }
 
@@ -1428,7 +1354,7 @@ impl Simulation {
             reliable_events.push(ReliableGameEvent::WaveStarted { wave: self.wave });
         }
 
-        if self.tick < self.next_spawn_tick {
+        if is_newer_input_seq(self.next_spawn_tick, self.tick) {
             return;
         }
 
@@ -1444,10 +1370,10 @@ impl Simulation {
             self.next_spawn_point_index = self.next_spawn_point_index.wrapping_add(1);
         }
 
-        self.next_spawn_tick = self.tick + WAVE_SPAWN_INTERVAL_TICKS;
+        self.next_spawn_tick = self.tick.wrapping_add(WAVE_SPAWN_INTERVAL_TICKS);
 
         if self.wave_remaining == 0 {
-            self.intermission_until = self.tick + WAVE_PREP_TICKS;
+            self.intermission_until = self.tick.wrapping_add(WAVE_PREP_TICKS);
         }
     }
 
@@ -1516,20 +1442,23 @@ impl Simulation {
         if self.reset_at_tick.is_some() {
             return;
         }
-        self.reset_at_tick = Some(self.tick.saturating_add(MATCH_RESET_TICKS));
+        self.reset_at_tick = Some(self.tick.wrapping_add(MATCH_RESET_TICKS));
     }
 
     fn maybe_reset_match(&mut self) {
         let Some(reset_at_tick) = self.reset_at_tick else {
             return;
         };
-        if self.tick < reset_at_tick {
+        if is_newer_input_seq(reset_at_tick, self.tick) {
             return;
         }
         self.reset_match_state();
     }
 
     fn reset_match_state(&mut self) {
+        self.historical_targets.clear();
+        self.presentations.clear();
+        self.match_epoch = self.match_epoch.wrapping_add(1);
         self.phase = MatchPhase::InProgress;
         self.team_life = INITIAL_TEAM_LIFE;
         self.wave = 0;
@@ -1539,10 +1468,16 @@ impl Simulation {
         self.node_occupancy.clear();
         self.navmesh_dirty = true;
         self.pending_commands.clear();
+        for hero in self.heroes.values_mut() {
+            hero.pending_actions.clear();
+        }
+        for queue in self.move_queues.values_mut() {
+            queue.clear();
+        }
         self.wave_remaining = 0;
         self.next_spawn_tick = 0;
         self.next_spawn_point_index = 0;
-        self.intermission_until = self.tick + WAVE_PREP_TICKS;
+        self.intermission_until = self.tick.wrapping_add(WAVE_PREP_TICKS);
         self.reset_at_tick = None;
 
         for (client_id, hero) in &mut self.heroes {
@@ -1583,7 +1518,7 @@ fn populate_from_delta(sim: &mut Simulation, delta: &WorldDelta) {
             hero_snap.client_id,
             HeroState {
                 pos: hero_snap.pos,
-                move_dir: [0.0, 0.0],
+                move_dir: hero_snap.move_dir,
                 facing: hero_snap.facing,
                 lock_mode_active: hero_snap.lock_mode_active,
                 lock_target_id: hero_snap.lock_target_id,
@@ -1597,15 +1532,21 @@ fn populate_from_delta(sim: &mut Simulation, delta: &WorldDelta) {
                 mana: hero_snap.mana,
                 gold: hero_snap.gold,
                 ability_cooldown_ticks: hero_snap.ability_cooldown_ticks,
-                last_processed_seq: None,
+                last_processed_seq: hero_snap.last_move_seq,
+                last_action_seq: hero_snap.last_action_seq,
+                last_attack_seq: hero_snap.last_attack_seq,
+                pending_actions: hero_snap.pending_actions.iter().copied().collect(),
             },
         );
-        sim.move_queues.insert(hero_snap.client_id, VecDeque::new());
+        sim.move_queues.insert(
+            hero_snap.client_id,
+            hero_snap.pending_moves.iter().copied().collect(),
+        );
     }
 
     for enemy_snap in &delta.enemies {
         let radius = enemy_collider_radius(enemy_snap.enemy_type);
-        let (speed, reward) = enemy_stats_from_snapshot(enemy_snap);
+
         sim.enemies.insert(
             enemy_snap.id,
             EnemyState {
@@ -1615,17 +1556,17 @@ fn populate_from_delta(sim: &mut Simulation, delta: &WorldDelta) {
                 vel: enemy_snap.vel,
                 hp: enemy_snap.hp,
                 max_hp: enemy_snap.max_hp,
-                speed,
-                reward,
+                speed: enemy_snap.speed,
+                reward: enemy_snap.reward,
                 enemy_type: enemy_snap.enemy_type,
                 radius,
                 facing: enemy_snap.facing,
                 regular_attack: enemy_snap.regular_attack,
                 regular_attack_profile: ENEMY_REGULAR_ATTACK,
-                lock_target: EnemyLockTarget::Base,
-                target_pos: BASE_POSITION,
-                waypoint: enemy_snap.pos,
-                repath_cooldown: 0,
+                lock_target: enemy_snap.lock_target,
+                target_pos: enemy_snap.target_pos,
+                waypoint: enemy_snap.waypoint,
+                repath_cooldown: enemy_snap.repath_cooldown,
             },
         );
     }
@@ -1643,24 +1584,6 @@ fn populate_from_delta(sim: &mut Simulation, delta: &WorldDelta) {
             },
         );
         sim.node_occupancy.insert(tower_snap.node_id, tower_snap.id);
-    }
-}
-
-/// Back-derive speed and reward from the enemy snapshot's max_hp and type.
-fn enemy_stats_from_snapshot(snap: &EnemySnapshot) -> (f32, u32) {
-    let spawn_wave = match snap.enemy_type {
-        EnemyType::Grunt => ((snap.max_hp - 34.0) / 9.0).round().max(1.0) as u32,
-        EnemyType::Tank => ((snap.max_hp - 84.0) / 18.0).round().max(1.0) as u32,
-    };
-    match snap.enemy_type {
-        EnemyType::Grunt => (
-            2.0 + spawn_wave as f32 * 0.055,
-            14 + spawn_wave * 2,
-        ),
-        EnemyType::Tank => (
-            1.45 + spawn_wave as f32 * 0.045,
-            28 + spawn_wave * 3,
-        ),
     }
 }
 
@@ -1749,7 +1672,7 @@ fn enemy_separation_direction(
     enemy_pos: [f32; 2],
     enemy_radius: f32,
     snapshots: &[EnemyMotionSnapshot],
-    separation_cells: &HashMap<(i32, i32), Vec<usize>>,
+    separation_cells: &BTreeMap<(i32, i32), Vec<usize>>,
     separation_cell_size: f32,
 ) -> [f32; 2] {
     let mut separation = [0.0, 0.0];
@@ -1808,8 +1731,8 @@ fn build_spatial_cells<T>(
     values: &[T],
     cell_size: f32,
     pos_of: impl Fn(&T) -> [f32; 2],
-) -> HashMap<(i32, i32), Vec<usize>> {
-    let mut cells: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
+) -> BTreeMap<(i32, i32), Vec<usize>> {
+    let mut cells: BTreeMap<(i32, i32), Vec<usize>> = BTreeMap::new();
     for (index, value) in values.iter().enumerate() {
         let cell = spatial_cell_key(pos_of(value), cell_size);
         cells.entry(cell).or_default().push(index);
@@ -1818,7 +1741,7 @@ fn build_spatial_cells<T>(
 }
 
 fn for_each_spatial_neighbor(
-    cells: &HashMap<(i32, i32), Vec<usize>>,
+    cells: &BTreeMap<(i32, i32), Vec<usize>>,
     cell_size: f32,
     pos: [f32; 2],
     mut f: impl FnMut(usize),
@@ -2129,7 +2052,7 @@ fn find_next_waypoint(
     Some(goal)
 }
 
-fn build_navigation_mesh(towers: &HashMap<u64, TowerState>) -> NavMesh {
+fn build_navigation_mesh(towers: &BTreeMap<u64, TowerState>) -> NavMesh {
     let half_width = WORLD_HALF_WIDTH - NAVMESH_MARGIN;
     let half_height = WORLD_HALF_HEIGHT - NAVMESH_MARGIN;
 
@@ -2216,13 +2139,13 @@ fn project_to_walkable(
     None
 }
 
-fn add_displacement(map: &mut HashMap<u64, [f32; 2]>, id: u64, delta: [f32; 2]) {
+fn add_displacement(map: &mut BTreeMap<u64, [f32; 2]>, id: u64, delta: [f32; 2]) {
     let entry = map.entry(id).or_insert([0.0, 0.0]);
     entry[0] += delta[0];
     entry[1] += delta[1];
 }
 
-fn nearest_enemy_id(hero_pos: [f32; 2], enemies: &HashMap<u64, [f32; 2]>) -> Option<u64> {
+fn nearest_enemy_id(hero_pos: [f32; 2], enemies: &BTreeMap<u64, [f32; 2]>) -> Option<u64> {
     let mut best: Option<(u64, f32)> = None;
     for (enemy_id, enemy_pos) in enemies {
         let dist_sq = distance_sq(hero_pos, *enemy_pos);
@@ -2662,7 +2585,7 @@ mod tests {
             },
         );
         sim.step();
-        let first = sim.heroes.get(&1).copied().expect("hero should exist");
+        let first = sim.heroes.get(&1).cloned().expect("hero should exist");
         assert!(first.mana > 0.0);
         assert!((first.hp - 60.0).abs() < 0.0001);
 
@@ -2681,7 +2604,7 @@ mod tests {
             .map(|hero| hero.charge_state.power_meter)
             .unwrap_or(0.0);
         sim.step();
-        let post_mana = sim.heroes.get(&1).copied().expect("hero should exist");
+        let post_mana = sim.heroes.get(&1).cloned().expect("hero should exist");
         assert!((post_mana.hp - mana_full_hp).abs() < 0.0001);
         assert!(post_mana.charge_state.power_meter > mana_full_power);
 
@@ -2693,13 +2616,13 @@ mod tests {
             hero.charge_state.power_meter = 95.0;
         }
         sim.step();
-        let after_full_power = sim.heroes.get(&1).copied().expect("hero should exist");
+        let after_full_power = sim.heroes.get(&1).cloned().expect("hero should exist");
         assert!(after_full_power.charge_state.power_active);
         assert_eq!(after_full_power.charge_state.phase, ChargePhase::Charging);
         assert!(after_full_power.hp > 80.0);
 
         sim.step();
-        let charged = sim.heroes.get(&1).copied().expect("hero should exist");
+        let charged = sim.heroes.get(&1).cloned().expect("hero should exist");
         assert!((charged.hp - HERO_MAX_HP).abs() < 0.001);
         assert!(
             charged.charge_state.phase == ChargePhase::Recovery
@@ -2731,7 +2654,7 @@ mod tests {
         );
         sim.step();
 
-        let hero = sim.heroes.get(&1).copied().expect("hero should exist");
+        let hero = sim.heroes.get(&1).cloned().expect("hero should exist");
         assert_eq!(hero.charge_state.phase, ChargePhase::Idle);
         assert!(!hero.charge_state.input_held);
         assert!(hero.charge_state.power_active);
@@ -2902,7 +2825,7 @@ mod tests {
         );
         sim.step();
 
-        let partial = sim.heroes.get(&1).copied().expect("hero should exist");
+        let partial = sim.heroes.get(&1).cloned().expect("hero should exist");
         assert!(partial.charge_state.power_meter > 0.0);
         assert!(partial.charge_state.power_meter < partial.charge_profile.power_meter_max);
         assert!(!partial.charge_state.power_active);
@@ -2910,7 +2833,7 @@ mod tests {
         let mut last_power_meter = partial.charge_state.power_meter;
         for _ in 0..4 {
             sim.step();
-            let hero = sim.heroes.get(&1).copied().expect("hero should exist");
+            let hero = sim.heroes.get(&1).cloned().expect("hero should exist");
             assert!(!hero.charge_state.power_active);
             assert!(hero.charge_state.power_meter <= last_power_meter + 0.0001);
             last_power_meter = hero.charge_state.power_meter;
@@ -2943,7 +2866,7 @@ mod tests {
         );
         sim.step();
 
-        let hero = sim.heroes.get(&1).copied().expect("hero should exist");
+        let hero = sim.heroes.get(&1).cloned().expect("hero should exist");
         let expected_mana = HERO_ABILITY_MANA_COST * 0.5 + HERO_MANA_REGEN_PER_TICK;
         assert!((hero.mana - expected_mana).abs() < 0.001);
         assert_eq!(
@@ -3035,5 +2958,476 @@ mod tests {
 
         let retargeted = choose_enemy_target([12.0, 0.0], EnemyLockTarget::Hero(1), &heroes);
         assert_eq!(retargeted, EnemyLockTarget::Hero(2));
+    }
+}
+
+#[cfg(test)]
+mod netcode_regressions {
+    use super::*;
+
+    #[test]
+    fn delayed_reliable_action_survives_newer_movement() {
+        let mut sim = Simulation::new();
+        sim.add_player(1);
+        sim.queue_command(
+            1,
+            ClientCommand::Move {
+                seq: 101,
+                dir: [0.0, 0.0],
+            },
+        );
+        sim.step();
+        sim.queue_command(1, ClientCommand::BasicAttack { seq: 100 });
+        sim.step();
+        assert_eq!(sim.heroes[&1].regular_attack.phase, AttackPhase::Windup);
+    }
+
+    #[test]
+    fn actions_cannot_fast_forward_queued_movement() {
+        let mut sim = Simulation::new();
+        sim.add_player(1);
+        let start = sim.heroes[&1].pos;
+        for seq in 1..=10 {
+            sim.queue_command(
+                1,
+                ClientCommand::Move {
+                    seq,
+                    dir: [1.0, 0.0],
+                },
+            );
+        }
+        sim.queue_command(
+            1,
+            ClientCommand::SetLockTarget {
+                seq: 11,
+                target_id: None,
+            },
+        );
+        sim.step();
+        assert!(sim.heroes[&1].pos[0] - start[0] <= HERO_SPEED * FIXED_DT_SECONDS + 0.00001);
+    }
+
+    #[test]
+    fn restored_world_replays_identically_with_movement_backlog() {
+        let mut original = Simulation::new();
+        original.add_player(1);
+        original.add_player(2);
+        original.heroes.get_mut(&1).unwrap().pos = [0.0, 3.0];
+        original.heroes.get_mut(&2).unwrap().pos = [1.0, 3.0];
+        for i in 0..8 {
+            original.spawn_enemy(i % ENEMY_SPAWN_POINTS.len(), 1);
+        }
+        for (i, enemy) in original.enemies.values_mut().enumerate() {
+            enemy.pos = [i as f32 * 0.35, 3.5];
+        }
+        for seq in 1..=5 {
+            original.queue_command(
+                1,
+                ClientCommand::Move {
+                    seq,
+                    dir: [1.0, 0.0],
+                },
+            );
+            original.queue_command(
+                2,
+                ClientCommand::Move {
+                    seq,
+                    dir: [-1.0, 0.0],
+                },
+            );
+        }
+        original.step();
+        let delta = original.world_delta_for(1);
+        let mut restored = Simulation::from_snapshot(&delta, &original.sim_meta());
+        assert_eq!(delta, restored.world_delta_for(1));
+        for tick in 0..30 {
+            let a = original.step();
+            let b = restored.step();
+            assert_eq!(
+                a.reliable_events, b.reliable_events,
+                "events at replay {tick}"
+            );
+            assert_eq!(
+                original.world_delta_for(1),
+                restored.world_delta_for(1),
+                "replay {tick}"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_restores_enemy_decision_state() {
+        let mut sim = Simulation::new();
+        sim.add_player(1);
+        sim.spawn_enemy(0, 1);
+        let enemy = sim.enemies.values_mut().next().unwrap();
+        enemy.lock_target = EnemyLockTarget::Hero(1);
+        enemy.target_pos = [3.0, 4.0];
+        enemy.waypoint = [2.0, 3.0];
+        enemy.repath_cooldown = 5;
+        let delta = sim.world_delta_for(1);
+        let restored = Simulation::from_snapshot(&delta, &sim.sim_meta());
+        let a = sim.enemies.values().next().unwrap();
+        let b = restored.enemies.values().next().unwrap();
+        assert_eq!(a.lock_target, b.lock_target);
+        assert_eq!(a.target_pos, b.target_pos);
+        assert_eq!(a.waypoint, b.waypoint);
+        assert_eq!(a.repath_cooldown, b.repath_cooldown);
+    }
+}
+
+#[cfg(test)]
+mod protocol_edge_tests {
+    use super::*;
+
+    #[test]
+    fn duplicate_and_reordered_redundant_moves_are_consumed_once() {
+        let mut sim = Simulation::new();
+        sim.add_player(1);
+        let start = sim.heroes[&1].pos;
+        for seq in [u32::MAX, 0, 1, u32::MAX, 0, 1] {
+            sim.queue_command(
+                1,
+                ClientCommand::Move {
+                    seq,
+                    dir: [1.0, 0.0],
+                },
+            );
+        }
+        for _ in 0..4 {
+            sim.step();
+        }
+        assert_eq!(sim.heroes[&1].last_processed_seq, Some(1));
+        assert!(
+            (sim.heroes[&1].pos[0] - start[0] - 3.0 * HERO_SPEED * FIXED_DT_SECONDS).abs()
+                < 0.00001
+        );
+        sim.queue_command(
+            1,
+            ClientCommand::Move {
+                seq: 0,
+                dir: [1.0, 0.0],
+            },
+        );
+        sim.step();
+        assert_eq!(sim.heroes[&1].last_processed_seq, Some(1));
+    }
+
+    #[test]
+    fn nonfinite_input_and_disconnect_cannot_leak_into_new_session() {
+        let mut sim = Simulation::new();
+        sim.add_player(1);
+        sim.queue_command(
+            1,
+            ClientCommand::Move {
+                seq: 100,
+                dir: [f32::NAN, 0.0],
+            },
+        );
+        sim.queue_command(1, ClientCommand::BasicAttack { seq: 101 });
+        sim.remove_player(1);
+        sim.add_player(1);
+        sim.step();
+        assert_eq!(sim.heroes[&1].last_action_seq, None);
+        assert_eq!(sim.heroes[&1].last_processed_seq, None);
+        assert!(sim.heroes[&1].pos.iter().all(|x| x.is_finite()));
+    }
+
+    #[test]
+    fn duplicate_actions_do_not_restart_after_cooldown() {
+        let mut sim = Simulation::new();
+        sim.add_player(1);
+        sim.queue_command(1, ClientCommand::BasicAttack { seq: u32::MAX });
+        sim.step();
+        for _ in 0..60 {
+            sim.step();
+        }
+        sim.queue_command(1, ClientCommand::BasicAttack { seq: u32::MAX });
+        sim.step();
+        assert_eq!(sim.heroes[&1].regular_attack.phase, AttackPhase::Ready);
+        sim.queue_command(1, ClientCommand::BasicAttack { seq: 0 });
+        sim.step();
+        assert_eq!(sim.heroes[&1].regular_attack.phase, AttackPhase::Windup);
+    }
+
+    #[test]
+    fn match_reset_waits_through_tick_wrap_and_discards_old_moves() {
+        let mut sim = Simulation::new();
+        sim.add_player(1);
+        sim.set_tick(u32::MAX - 2);
+        sim.phase = MatchPhase::Defeat;
+        sim.move_queues
+            .get_mut(&1)
+            .unwrap()
+            .push_back((5, [1.0, 0.0]));
+        sim.schedule_match_reset();
+        assert_eq!(sim.match_restart_ticks_remaining(), Some(MATCH_RESET_TICKS));
+        for _ in 0..MATCH_RESET_TICKS - 1 {
+            sim.step();
+        }
+        assert_eq!(sim.phase, MatchPhase::Defeat);
+        sim.step();
+        assert_eq!(sim.phase, MatchPhase::InProgress);
+        assert!(sim.move_queues[&1].is_empty());
+        assert_eq!(
+            sim.intermission_until,
+            sim.tick.wrapping_add(WAVE_PREP_TICKS)
+        );
+    }
+}
+
+#[cfg(test)]
+mod action_timeline_tests {
+    use super::*;
+    use game_shared::ClientAction;
+
+    #[test]
+    fn early_attack_waits_for_walk_and_snapshot_restore_keeps_boundary() {
+        let mut server = Simulation::new();
+        server.add_player(1);
+        let start = server.heroes[&1].pos;
+        let action = ClientAction {
+            view_tick: None,
+            match_epoch: 0,
+            command: ClientCommand::BasicAttack { seq: 6 },
+            after_move_seq: Some(5),
+        };
+        server.queue_action(1, action); // reliable channel wins the race
+        server.step();
+        assert_eq!(server.heroes[&1].regular_attack.phase, AttackPhase::Ready);
+        for seq in 1..=5 {
+            server.queue_command(
+                1,
+                ClientCommand::Move {
+                    seq,
+                    dir: [1.0, 0.0],
+                },
+            );
+        }
+        for _ in 0..2 {
+            server.step();
+        }
+        let snapshot = server.world_delta_for(1);
+        let mut restored = Simulation::from_snapshot(&snapshot, &server.sim_meta());
+        for _ in 0..3 {
+            server.queue_action(1, action); // repeated in movement packets
+            restored.queue_action(1, action);
+            server.step();
+            restored.step();
+            assert_eq!(server.world_delta_for(1), restored.world_delta_for(1));
+            assert_eq!(server.heroes[&1].regular_attack.phase, AttackPhase::Ready);
+        }
+        let stop = server.heroes[&1].pos;
+        assert!((stop[0] - start[0] - 5.0 * HERO_SPEED * FIXED_DT_SECONDS).abs() < 0.0001);
+        server.queue_command(
+            1,
+            ClientCommand::Move {
+                seq: 7,
+                dir: [1.0, 0.0],
+            },
+        );
+        server.step();
+        assert_eq!(server.heroes[&1].pos, stop);
+        assert_eq!(server.heroes[&1].regular_attack.phase, AttackPhase::Windup);
+        assert_eq!(server.heroes[&1].last_action_seq, Some(6));
+        assert!(server.heroes[&1].pending_actions.is_empty());
+    }
+
+    #[test]
+    fn boundary_wrap_and_invalid_dependency_are_handled() {
+        let mut sim = Simulation::new();
+        sim.add_player(1);
+        sim.queue_command(
+            1,
+            ClientCommand::Move {
+                seq: u32::MAX,
+                dir: [0.0, 0.0],
+            },
+        );
+        sim.step();
+        sim.queue_action(
+            1,
+            ClientAction {
+                view_tick: None,
+                match_epoch: 0,
+                command: ClientCommand::BasicAttack { seq: 0 },
+                after_move_seq: Some(u32::MAX),
+            },
+        );
+        sim.step();
+        assert_eq!(sim.heroes[&1].last_action_seq, Some(0));
+        sim.queue_action(
+            1,
+            ClientAction {
+                view_tick: None,
+                match_epoch: 0,
+                command: ClientCommand::BasicAttack { seq: 1 },
+                after_move_seq: Some(2),
+            },
+        );
+        assert!(sim.heroes[&1].pending_actions.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod round_input_tests {
+    use super::*;
+    #[test]
+    fn old_round_actions_cannot_execute_after_reset() {
+        let mut sim = Simulation::new();
+        sim.add_player(1);
+        let action = game_shared::ClientAction {
+            view_tick: None,
+            match_epoch: 0,
+            command: ClientCommand::BasicAttack { seq: 2 },
+            after_move_seq: Some(1),
+        };
+        sim.queue_action(1, action);
+        sim.reset_match_state();
+        sim.queue_action(1, action);
+        assert!(sim.heroes[&1].pending_actions.is_empty());
+        assert_eq!(sim.sim_meta().match_epoch, 1);
+        sim.queue_action(
+            1,
+            game_shared::ClientAction {
+                view_tick: None,
+                match_epoch: 1,
+                after_move_seq: None,
+                ..action
+            },
+        );
+        sim.step();
+        assert_eq!(sim.heroes[&1].last_attack_seq, Some(2));
+    }
+    #[test]
+    fn deferred_actions_are_bounded_and_removed_with_player() {
+        let mut sim = Simulation::new();
+        sim.add_player(1);
+        for seq in 2..200 {
+            sim.queue_action(
+                1,
+                game_shared::ClientAction {
+                    view_tick: None,
+                    match_epoch: 0,
+                    command: ClientCommand::BasicAttack { seq },
+                    after_move_seq: Some(1),
+                },
+            );
+        }
+        assert_eq!(sim.heroes[&1].pending_actions.len(), 64);
+        sim.remove_player(1);
+        sim.add_player(1);
+        assert!(sim.heroes[&1].pending_actions.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod presentation_contract_tests {
+    use super::*;
+    #[test]
+    fn ability_state_survives_restore_and_replay_without_duplicate_identity() {
+        let mut sim = Simulation::new();
+        sim.add_player(1);
+        let before = sim.world_delta_for(1);
+        let command = ClientCommand::CastAbility {
+            seq: 7,
+            ability: AbilityId::ArcBurst,
+        };
+        sim.queue_command(1, command);
+        sim.step();
+        let predicted = sim.world_delta_for(1);
+        assert_eq!(predicted.presentations.len(), 1);
+        let instance = predicted.presentations[0];
+        assert_eq!(instance.id.action_seq, 7);
+        assert_eq!(instance.age_ticks, 0);
+        let mut replay = Simulation::from_snapshot(&before, &before.sim_meta.unwrap());
+        replay.queue_command(1, command);
+        replay.step();
+        assert_eq!(
+            replay.world_delta_for(1).presentations,
+            predicted.presentations
+        );
+        let mut confirmed = Simulation::from_snapshot(&predicted, &predicted.sim_meta.unwrap());
+        confirmed.queue_command(1, command);
+        confirmed.step();
+        let state = confirmed.world_delta_for(1);
+        assert_eq!(state.presentations.len(), 1);
+        assert_eq!(state.presentations[0].id, instance.id);
+        assert_eq!(state.presentations[0].age_ticks, 1);
+        for _ in 0..instance.duration_ticks {
+            confirmed.step();
+        }
+        assert!(confirmed.world_delta_for(1).presentations.is_empty());
+        sim.reset_match_state();
+        assert!(sim.world_delta_for(1).presentations.is_empty());
+    }
+
+    #[test]
+    fn rejected_ability_does_not_create_presentation_state() {
+        let mut sim = Simulation::new();
+        sim.add_player(1);
+        sim.heroes.get_mut(&1).unwrap().mana = 0.0;
+        sim.queue_command(
+            1,
+            ClientCommand::CastAbility {
+                seq: 1,
+                ability: AbilityId::ArcBurst,
+            },
+        );
+        sim.step();
+        assert!(sim.world_delta_for(1).presentations.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod historical_ability_tests {
+    use super::*;
+    #[test]
+    fn history_changes_hit_geometry_but_not_origin_or_ability_validation() {
+        let mut sim = Simulation::new();
+        sim.add_player(1);
+        // Let the real spawner create an enemy, then put it beyond current range.
+        for _ in 0..1000 {
+            sim.step();
+            if !sim.enemies.is_empty() {
+                break;
+            }
+        }
+        let id = *sim.enemies.keys().next().unwrap();
+        let origin = sim.heroes[&1].pos;
+        sim.enemies.get_mut(&id).unwrap().pos = [origin[0] + 20.0, origin[1]];
+        sim.enemies.get_mut(&id).unwrap().hp = 1000.0;
+        sim.set_historical_targets(1, 1, vec![(id, origin)]);
+        sim.queue_command(
+            1,
+            ClientCommand::CastAbility {
+                seq: 1,
+                ability: AbilityId::ArcBurst,
+            },
+        );
+        sim.step();
+        assert_eq!(sim.enemies[&id].hp, 1000.0 - HERO_ABILITY_DAMAGE);
+        let hp = sim.enemies[&id].hp;
+        sim.set_historical_targets(1, 1, vec![(id, origin)]);
+        sim.queue_command(
+            1,
+            ClientCommand::CastAbility {
+                seq: 1,
+                ability: AbilityId::ArcBurst,
+            },
+        );
+        sim.step();
+        assert_eq!(sim.enemies[&id].hp, hp); // duplicate cannot damage twice
+        sim.set_historical_targets(1, 2, vec![(id, origin)]);
+        sim.queue_command(
+            1,
+            ClientCommand::CastAbility {
+                seq: 2,
+                ability: AbilityId::ArcBurst,
+            },
+        );
+        sim.step();
+        assert_eq!(sim.enemies[&id].hp, hp); // history cannot bypass cooldown
+        assert!(sim.historical_targets.is_empty());
     }
 }

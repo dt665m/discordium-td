@@ -582,6 +582,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "bevy-net-debug"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "528627745506b10b3887dbe07d064d39dd4095e4bc8875849d24e2a809685673"
+dependencies = [
+ "bevy",
+ "renet-cross",
+]
+
+[[package]]
 name = "bevy_a11y"
 version = "0.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1893,7 +1903,7 @@ dependencies = [
  "bitflags 2.13.1",
  "cexpr",
  "clang-sys",
- "itertools 0.13.0",
+ "itertools 0.11.0",
  "proc-macro2",
  "quote",
  "regex",
@@ -3175,6 +3185,7 @@ name = "game_client"
 version = "0.1.0"
 dependencies = [
  "bevy",
+ "bevy-net-debug",
  "clap",
  "game_server",
  "game_shared",
@@ -4048,15 +4059,6 @@ name = "itertools"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b1c173a5686ce8bfa551b3563d0c2170bf24ca44da99c7ca4bfdab5418c3fe57"
-dependencies = [
- "either",
-]
-
-[[package]]
-name = "itertools"
-version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "413ee7dfc52ee1a4949ceeb7dbc8a33f2d6c088194d9f922fb8318faf1f01186"
 dependencies = [
  "either",
 ]
@@ -5634,12 +5636,11 @@ dependencies = [
 
 [[package]]
 name = "renet-cross"
-version = "0.3.0"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5bc027796e74877849fea5d61ed383b08b4393e863b303f82a42be0c55ef4777"
+checksum = "0e7ff19a537a7752ac9c76388a4cf50243ff27cc6f16cc21eebb1527827802b2"
 dependencies = [
  "axum",
- "futures-channel",
  "getrandom 0.2.17",
  "gloo-net",
  "gloo-timers",

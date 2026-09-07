@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-pub const PROTOCOL_ID: u64 = 7;
+pub const PROTOCOL_ID: u64 = 11;
 pub const SERVER_TICK_HZ: u32 = 30;
 pub const FIXED_DT_SECONDS: f32 = 1.0 / SERVER_TICK_HZ as f32;
 
@@ -318,6 +318,16 @@ impl ClientCommand {
     }
 }
 
+/// Reliable action anchored after the last movement generated before the button press.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct ClientAction {
+    /// Predicted target-view tick; untrusted and bounded by server policy.
+    pub view_tick: Option<u32>,
+    pub match_epoch: u32,
+    pub command: ClientCommand,
+    pub after_move_seq: Option<u32>,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum BuildRejectReason {
     InvalidNode,
@@ -366,7 +376,7 @@ pub enum ReliableServerMessage {
     Event(ReliableGameEvent),
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HeroSnapshot {
     pub client_id: u64,
     pub pos: [f32; 2],
@@ -382,6 +392,19 @@ pub struct HeroSnapshot {
     pub mana: f32,
     pub gold: u32,
     pub ability_cooldown_ticks: u32,
+    /// Independent channel watermarks: movement never acknowledges an action.
+    pub move_dir: [f32; 2],
+    pub pending_moves: Vec<(u32, [f32; 2])>,
+    pub pending_actions: Vec<ClientAction>,
+    pub last_move_seq: Option<u32>,
+    pub last_action_seq: Option<u32>,
+    pub last_attack_seq: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum EnemyLockTarget {
+    Hero(u64),
+    Base,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -395,6 +418,12 @@ pub struct EnemySnapshot {
     pub hp: f32,
     pub max_hp: f32,
     pub enemy_type: EnemyType,
+    pub speed: f32,
+    pub reward: u32,
+    pub lock_target: EnemyLockTarget,
+    pub target_pos: [f32; 2],
+    pub waypoint: [f32; 2],
+    pub repath_cooldown: u32,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -416,6 +445,7 @@ pub struct ObjectiveSnapshot {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct SimMeta {
+    pub match_epoch: u32,
     pub next_entity_id: u64,
     pub wave_remaining: u32,
     pub next_spawn_tick: u32,
@@ -423,8 +453,35 @@ pub struct SimMeta {
     pub intermission_until: u32,
 }
 
+/// Stable across prediction, snapshot restore, and replay. Slots distinguish
+/// multiple presentation instances produced by one mechanic action.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct PresentationId {
+    pub match_epoch: u32,
+    pub owner: u64,
+    pub action_seq: u32,
+    pub slot: u16,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub enum PresentationKind {
+    ArcBurst,
+}
+
+/// Simulation-owned lifetime. Renderers consume this state, never network events.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct PresentationInstance {
+    pub id: PresentationId,
+    pub kind: PresentationKind,
+    pub pos: [f32; 2],
+    pub radius: f32,
+    pub age_ticks: u32,
+    pub duration_ticks: u32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WorldDelta {
+    pub presentations: Vec<PresentationInstance>,
     pub tick: u32,
     pub phase: MatchPhase,
     pub match_restart_ticks_remaining: Option<u32>,
@@ -441,6 +498,8 @@ pub struct WorldDelta {
 /// Client-to-server: bundled recent movement inputs for redundancy.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ClientMoveBundle {
+    pub match_epoch: u32,
+    pub actions: Vec<ClientAction>,
     pub moves: Vec<(u32, [f32; 2])>, // (seq, dir) pairs, oldest first
 }
 
@@ -470,6 +529,7 @@ pub enum ServerWorldMessage {
 /// Delta-compressed world update.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WorldPatch {
+    pub presentations: Vec<PresentationInstance>,
     pub tick: u32,
     pub baseline_tick: u32,
     pub phase: MatchPhase,
@@ -482,6 +542,7 @@ pub struct WorldPatch {
     pub enemy_patches: Vec<EnemySnapshot>,
     pub tower_patches: Vec<TowerSnapshot>,
     pub removed_ids: Vec<u64>,
+    pub removed_hero_ids: Vec<u64>,
     pub sim_meta: Option<SimMeta>,
 }
 
@@ -524,8 +585,88 @@ pub struct ClientInterpolationDebug {
     pub factor: Option<f32>,
 }
 
+// Debug JSON is versioned independently of the gameplay wire protocol.
+pub const DEBUG_SCHEMA_VERSION: u32 = 2;
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct DebugNetworkHealth {
+    pub browser_drops: Option<DebugBrowserDrops>,
+    pub transport: String,
+    pub rtt_ms: f64,
+    pub packet_loss: f64,
+    pub sent_bytes_per_second: f64,
+    pub received_bytes_per_second: f64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct DebugBrowserDrops {
+    pub send_backpressure: u64,
+    pub receive_overflow: u64,
+    pub invalid_size: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct DebugReplicationHealth {
+    pub full_snapshots: u64,
+    pub patches: u64,
+    pub baseline_misses: u64,
+    pub decode_errors: u64,
+    pub transport_errors: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct DebugCaptureHealth {
+    pub dropped_frames: u64,
+    pub dropped_batches: u64,
+    pub upload_failures: u64,
+    pub uploaded_batches: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct DebugServerIdentity {
+    pub realm: String,
+    pub instance: String,
+    pub process_session: String,
+    pub build: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DebugConditionerDirection {
+    pub queued_packets: usize,
+    pub queued_bytes: usize,
+    pub simulated_loss_drops: u64,
+    pub outage_drops: u64,
+    pub overflow_drops: u64,
+    pub transition_drops: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DebugConditioner {
+    pub enabled: bool,
+    pub delay_each_way_ms: f64,
+    pub jitter_ms: f64,
+    pub packet_loss: f32,
+    pub baseline_rtt_ms: Option<f64>,
+    pub outage_active: bool,
+    pub incoming: DebugConditionerDirection,
+    pub outgoing: DebugConditionerDirection,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ClientDebugFrame {
+    #[serde(default)]
+    pub conditioner: Option<DebugConditioner>,
+    pub marker: bool,
+    pub replication: DebugReplicationHealth,
+    pub schema_version: u32,
+    pub session_id: String,
+    pub capture_elapsed_ms: f64,
+    pub frame_duration_ms: f64,
+    pub snapshot_age_ms: Option<f64>,
+    pub input_ack_age_ms: Option<f64>,
+    pub disconnect_reason: Option<String>,
+    pub network: Option<DebugNetworkHealth>,
+    pub recorder: DebugCaptureHealth,
     pub frame_index: u64,
     pub client_id: Option<u64>,
     pub connected: bool,
@@ -571,6 +712,9 @@ pub enum DebugClientPlatform {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ClientDebugUploadBatch {
+    pub schema_version: u32,
+    pub session_id: String,
+    pub build: String,
     pub instance_id: String,
     pub source: DebugClientPlatform,
     pub upload_seq: u64,
@@ -579,6 +723,7 @@ pub struct ClientDebugUploadBatch {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ServerDebugClientFrame {
+    pub network: Option<DebugNetworkHealth>,
     pub client_id: u64,
     pub last_acked_tick: Option<u32>,
     pub confirmed_baseline_tick: Option<u32>,
@@ -587,7 +732,22 @@ pub struct ServerDebugClientFrame {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DebugServerConditioner {
+    pub packets: DebugConditioner,
+    pub peers: usize,
+    pub peer_limit_drops: u64,
+    pub expired_peers: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ServerDebugFrame {
+    #[serde(default)]
+    pub conditioner: Option<DebugServerConditioner>,
+    pub schema_version: u32,
+    pub identity: DebugServerIdentity,
+    pub capture_unix_ms: u64,
+    pub capture_elapsed_ms: f64,
+    pub step_duration_ms: f64,
     pub tick: u32,
     pub clients: Vec<ServerDebugClientFrame>,
 }
@@ -601,6 +761,13 @@ pub struct ServerDebugBridgeExport {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DebugRecorderInfo {
+    pub limit_reached: bool,
+    pub max_run_bytes: u64,
+    pub schema_version: u32,
+    pub identity: DebugServerIdentity,
+    pub dropped_records: u64,
+    pub write_failures: u64,
+    pub written_records: u64,
     pub enabled: bool,
     pub run_id: Option<String>,
     pub run_dir: Option<String>,
@@ -616,6 +783,9 @@ pub fn clamp_to_world(pos: [f32; 2]) -> [f32; 2] {
 }
 
 pub fn normalize_or_zero(dir: [f32; 2]) -> [f32; 2] {
+    if !dir[0].is_finite() || !dir[1].is_finite() {
+        return [0.0, 0.0];
+    }
     let length_sq = dir[0] * dir[0] + dir[1] * dir[1];
     if length_sq <= f32::EPSILON {
         return [0.0, 0.0];
@@ -681,7 +851,12 @@ pub fn encode<T: Serialize>(value: &T) -> Vec<u8> {
 }
 
 pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, bincode::Error> {
-    bincode::deserialize(bytes)
+    use bincode::Options;
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .with_limit(1024 * 1024)
+        .reject_trailing_bytes()
+        .deserialize(bytes)
 }
 
 pub fn is_newer_input_seq(new_seq: u32, old_seq: u32) -> bool {
@@ -690,7 +865,7 @@ pub fn is_newer_input_seq(new_seq: u32, old_seq: u32) -> bool {
     }
 
     let diff = new_seq.wrapping_sub(old_seq);
-    diff != 0 && diff < (u32::MAX / 2)
+    diff != 0 && diff < (1_u32 << 31)
 }
 
 #[cfg(test)]
@@ -737,5 +912,32 @@ mod tests {
             [-1.0, 0.0],
             ENEMY_REGULAR_ATTACK
         ));
+    }
+}
+
+#[cfg(test)]
+mod protocol_edge_tests {
+    use super::*;
+
+    #[test]
+    fn decode_rejects_trailing_and_oversized_declared_collections() {
+        let mut payload = encode(&ClientAck { tick: 5 });
+        payload.push(0);
+        assert!(decode::<ClientAck>(&payload).is_err());
+        assert!(decode::<ClientMoveBundle>(&u64::MAX.to_le_bytes()).is_err());
+        assert_eq!(
+            decode::<ClientAck>(&encode(&ClientAck { tick: 5 }))
+                .unwrap()
+                .tick,
+            5
+        );
+    }
+
+    #[test]
+    fn half_range_sequence_boundary_and_nonfinite_vectors() {
+        assert!(is_newer_input_seq(0x7fff_ffff, 0));
+        assert!(!is_newer_input_seq(0x8000_0000, 0));
+        assert_eq!(normalize_or_zero([f32::INFINITY, 0.0]), [0.0, 0.0]);
+        assert_eq!(normalize_or_zero([f32::NAN, 1.0]), [0.0, 0.0]);
     }
 }

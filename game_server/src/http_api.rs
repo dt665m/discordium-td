@@ -167,6 +167,17 @@ async fn ingest_client_debug_frames(
             format!("invalid client debug upload batch: {err}"),
         )
     })?;
-    debug_recorder.record_client_batch(batch);
+    if batch.schema_version != game_shared::DEBUG_SCHEMA_VERSION {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "unsupported debug schema version".into(),
+        ));
+    }
+    if !debug_recorder.record_client_batch(batch) {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "debug recorder queue full or unavailable".into(),
+        ));
+    }
     Ok(StatusCode::ACCEPTED)
 }

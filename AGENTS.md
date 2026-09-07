@@ -86,3 +86,16 @@ When unsure, search these topics in Bevy 0.18 docs/examples:
 - Broaden to workspace checks/tests for cross-crate contracts or merge/release validation. Documentation-only edits need relevant link/example validation rather than a game build.
 - Fix failures caused by this change and rerun affected checks before finishing.
 
+
+## Predicted mechanic presentation
+
+- New transient mechanic visuals must be simulation-owned `PresentationInstance`
+  state (or existing predicted actor components), not spawned from network receive
+  handlers. See `docs/predicted-presentation.md`.
+- Allocate identities from match epoch, actor, input sequence and a stable slot;
+  do not allocate a fresh random ID on replay.
+- The shared simulation owns acceptance, lifetime and gameplay. The client renderer
+  owns meshes, materials and correction blending. Extend the common presentation
+  lifecycle rather than adding mechanic-specific prediction/confirmation paths.
+- Cover local execution, snapshot restore/replay, rejection, expiry and replication
+  in tests when adding a new presentation primitive.

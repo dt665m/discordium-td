@@ -14,16 +14,6 @@ pub struct SharedNet {
 }
 
 impl SharedNet {
-    pub fn with_server<R>(&self, f: impl FnOnce(&mut RenetServer) -> R) -> Option<R> {
-        match self.server.lock() {
-            Ok(mut server) => Some(f(&mut server)),
-            Err(err) => {
-                log::error!("server mutex poisoned: {err}");
-                None
-            }
-        }
-    }
-
     pub fn with_server_and_transport<R>(
         &self,
         f: impl FnOnce(&mut RenetServer, &mut MixedServerTransport) -> R,

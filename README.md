@@ -466,3 +466,8 @@ Snapshots restore deferred actions, movement queues and separate acknowledgment
 watermarks. Local basic-attack effects use attack sequence IDs to avoid duplicates
 when prediction and server confirmation race. Inputs carry a match epoch, preventing
 late packets from a previous round from executing after reset.
+
+## License
+
+Licensed under either the [MIT License](LICENSE-MIT) or the
+[Apache License, Version 2.0](LICENSE-APACHE), at your option.

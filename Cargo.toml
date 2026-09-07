@@ -3,6 +3,7 @@ members = ["game_shared", "game_sim", "game_server", "game_client"]
 resolver = "2"
 
 [workspace.package]
+license = "MIT OR Apache-2.0"
 version = "0.1.0"
 edition = "2024"
 

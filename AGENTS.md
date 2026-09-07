@@ -7,7 +7,10 @@ This file defines project-specific guidance for coding agents working in this re
 - Applies to the entire workspace rooted at `discordium-td/`.
 - Favor consistency and correctness over ad-hoc local fixes.
 
-## Bevy 0.18 Core Conventions
+## Bevy 0.19 Core Conventions
+
+- Keep Bevy's version centralized in `[workspace.dependencies]`; the workspace targets 0.19.1 and Rust 1.95 or newer.
+- Consult the [Bevy 0.19 release blog](https://bevy.org/news/bevy-0-19/) and [0.18 to 0.19 migration guide](https://bevy.org/learn/migration-guides/0-18-to-0-19/) for API and convention changes.
 
 - Coordinate system:
   - `+Y` is up.
@@ -34,6 +37,17 @@ This file defines project-specific guidance for coding agents working in this re
 - Prefer data-driven systems over branching by entity id or player id.
 - Keep rendering-only effects in client-only components/systems.
 - Server remains authoritative for gameplay state transitions.
+- Resources are now components on dedicated entities. Do not derive both `Resource` and `Component`; scope broad entity queries so they do not accidentally include resources. `World::clear_entities` also clears resources.
+- Use `insert_non_send`, `get_non_send_mut`, and `remove_non_send` for non-send data instead of the deprecated `*_non_send_resource` APIs.
+
+## Scene and UI Composition
+
+- Prefer BSN (`bsn!`, `bsn_list!`) scene functions for reusable UI and static hierarchies; use `spawn_scene` or a scene function's `.spawn()` system. The connection menu in `game_client/src/plugins/game/menu.rs` is an example.
+- Keep dynamic simulation/presentation lifecycles in their existing ECS systems; scene composition does not replace simulation ownership.
+- Use `FontSize::Px` for fixed-size text in Rust structs, or `px(...)` in BSN. Use `FontSource` for font selection and the current `TextLayout::justify`, `linebreak`, and `no_wrap` constructors.
+- `Assets::get_mut` returns `AssetMut`; bind it as `mut` and pass `&mut asset` to helpers. Only mutate assets when their values actually change so change detection can avoid unnecessary GPU work.
+- Lights use `shadow_maps_enabled`; contact shadows are a separate opt-in feature. Custom render passes belong in the `Core3d`/`Core2d` schedules using explicit system ordering.
+- When selecting Bevy feature collections, opt into `ui` and `audio` explicitly if using `3d`/`2d` without the default feature set.
 
 ## System Ordering and Dependencies
 
@@ -46,6 +60,7 @@ This file defines project-specific guidance for coding agents working in this re
   - FX / UI updates
 - Fixed-step gameplay commands should run in `FixedUpdate`.
 - Do not rely on incidental ordering from registration order when dependency is real.
+- Window close/exit systems run in `Last` in Bevy 0.19. Run graceful disconnect and other `AppExit` cleanup after `bevy::window::ExitSystems` so it executes in the final frame.
 
 ## Networking and Prediction
 
@@ -67,7 +82,7 @@ This file defines project-specific guidance for coding agents working in this re
 
 ## What to Search First
 
-When unsure, search these topics in Bevy 0.18 docs/examples:
+When unsure, search these topics in Bevy 0.19 docs/examples:
 
 - Transforms and directions:
   - `Transform`, `GlobalTransform`, `forward`, `right`, `looking_at`

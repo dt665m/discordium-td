@@ -4,6 +4,7 @@ use super::*;
 pub(super) fn capture_input(
     keyboard: Res<ButtonInput<KeyCode>>,
     mut input_state: ResMut<InputState>,
+    cameras: Query<&Transform, With<camera::GameCamera>>,
 ) {
     let mut input = [0.0, 0.0];
     if keyboard.pressed(KeyCode::KeyW) {
@@ -19,9 +20,9 @@ pub(super) fn capture_input(
         input[0] += 1.0;
     }
 
-    // Top-down camera view is currently mirrored on screen X relative to world X.
-    // Flip horizontal input so `A` is screen-left and `D` is screen-right.
-    input_state.dir = normalize_or_zero([-input[0], input[1]]);
+    input_state.dir = cameras.single().map_or([0.0, 0.0], |camera| {
+        camera::movement_in_world(input, camera)
+    });
 }
 
 pub(super) fn send_action_commands(

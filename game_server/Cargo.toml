@@ -3,11 +3,12 @@ license.workspace = true
 name = "game_server"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 axum = "0.8.8"
 axum-server = { version = "0.7.2", features = ["tls-rustls"] }
-bevy = { version = "0.18.0", default-features = false, features = ["std"] }
+bevy = { workspace = true, features = ["std"] }
 clap.workspace = true
 env_logger.workspace = true
 game_shared = { path = "../game_shared" }

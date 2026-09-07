@@ -1,5 +1,8 @@
+mod camera;
+mod minimap;
 #[path = "game/simulation_presentations.rs"]
 mod simulation_presentations;
+mod targeting;
 use simulation_presentations::*;
 #[path = "game/snapshots.rs"]
 mod snapshots;
@@ -16,6 +19,11 @@ use presentation::*;
 #[path = "game/receive.rs"]
 mod receive;
 use receive::*;
+#[path = "game/lifecycle.rs"]
+mod lifecycle;
+#[path = "game/menu.rs"]
+mod menu;
+use lifecycle::*;
 #[path = "game/outbound.rs"]
 mod outbound;
 use super::debug_panel::{DebugMetric, DebugPanel, HudMetric};
@@ -392,10 +400,11 @@ impl Default for DebugOverlayState {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 enum MenuAction {
     #[cfg(not(target_arch = "wasm32"))]
     SinglePlayer,
+    #[default]
     ConnectDev,
 }
 
@@ -470,8 +479,7 @@ struct SceneAssets {
     shot_effect_mesh: Handle<Mesh>,
     hero_attack_cone_mesh: Handle<Mesh>,
     enemy_attack_cone_mesh: Handle<Mesh>,
-    hero_local_material: Handle<StandardMaterial>,
-    hero_remote_material: Handle<StandardMaterial>,
+    hero_material: Handle<StandardMaterial>,
     enemy_material: Handle<StandardMaterial>,
     tower_material: Handle<StandardMaterial>,
     node_free_material: Handle<StandardMaterial>,
@@ -601,13 +609,13 @@ struct GoldSpendPopup {
     age_seconds: f32,
 }
 
-#[derive(Component)]
+#[derive(Component, Default, Clone)]
 struct MainMenuRoot;
 
-#[derive(Component)]
+#[derive(Component, Default, Clone)]
 struct MainMenuStatusText;
 
-#[derive(Component, Clone, Copy)]
+#[derive(Component, Clone, Copy, Default)]
 struct MainMenuButton(MenuAction);
 
 #[derive(Component)]
@@ -759,6 +767,7 @@ enum ActorKind {
 
 #[derive(Clone, Copy)]
 struct DesiredActor {
+    player: Option<targeting::PlayerVisual>,
     pos: [f32; 2],
     kind: ActorKind,
     facing: Option<FacingStat>,
@@ -776,7 +785,6 @@ enum ClientUpdateSet {
     Network,
     Visual,
     Ui,
-    Shutdown,
 }
 
 pub struct GameClientPlugin;
@@ -830,9 +838,15 @@ impl Plugin for GameClientPlugin {
                 }),
                 ..Default::default()
             }))
-            .add_plugins(LockOnPlugin)
+            .add_plugins((
+                LockOnPlugin,
+                ClientLifecyclePlugin,
+                camera::GameCameraPlugin,
+                targeting::TargetingPlugin,
+                minimap::MinimapPlugin,
+            ))
             .add_plugins(ConditionerDebugPlugin::new(ConditionerHandle::default()))
-            .add_systems(Startup, (setup_scene, setup_main_menu))
+            .add_systems(Startup, (setup_scene, menu::main_menu.spawn()))
             .configure_sets(
                 Update,
                 (
@@ -840,7 +854,6 @@ impl Plugin for GameClientPlugin {
                     ClientUpdateSet::Network,
                     ClientUpdateSet::Visual,
                     ClientUpdateSet::Ui,
-                    ClientUpdateSet::Shutdown,
                 )
                     .chain(),
             )
@@ -920,10 +933,6 @@ impl Plugin for GameClientPlugin {
                     .chain()
                     .in_set(ClientUpdateSet::Ui),
             )
-            .add_systems(
-                Update,
-                graceful_disconnect_on_app_exit.in_set(ClientUpdateSet::Shutdown),
-            )
             .add_observer(apply_unit_bar_camera_update)
             .add_systems(FixedUpdate, advance_local_simulation);
 
@@ -932,7 +941,7 @@ impl Plugin for GameClientPlugin {
         app.add_plugins(FpsOverlayPlugin {
             config: FpsOverlayConfig {
                 text_config: TextFont {
-                    font_size: 16.0,
+                    font_size: FontSize::Px(16.0),
                     ..Default::default()
                 },
                 text_color: Color::srgb(0.85, 0.95, 0.9),
@@ -984,14 +993,9 @@ fn setup_scene(
         REGULAR_ATTACK_CONE_SEGMENTS,
     ));
 
-    let hero_local_material = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.25, 0.85, 0.9),
+    let hero_material = materials.add(StandardMaterial {
+        base_color: Color::WHITE,
         perceptual_roughness: 0.72,
-        ..Default::default()
-    });
-    let hero_remote_material = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.4, 0.55, 0.8),
-        perceptual_roughness: 0.8,
         ..Default::default()
     });
     let enemy_material = materials.add(StandardMaterial {
@@ -1074,8 +1078,7 @@ fn setup_scene(
         shot_effect_mesh,
         hero_attack_cone_mesh,
         enemy_attack_cone_mesh,
-        hero_local_material,
-        hero_remote_material,
+        hero_material,
         enemy_material,
         tower_material,
         node_free_material: node_free_material.clone(),
@@ -1122,16 +1125,10 @@ fn setup_scene(
     commands.spawn((
         DirectionalLight {
             illuminance: 25_000.0,
-            shadows_enabled: true,
+            shadow_maps_enabled: true,
             ..Default::default()
         },
         Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -1.0, -0.65, 0.0)),
-    ));
-
-    commands.spawn((
-        Camera3d::default(),
-        Transform::from_xyz(0.0, 42.0, 0.01).looking_at(Vec3::new(0.0, 0.0, 0.0), Vec3::Z),
-        UnitBarCamera,
     ));
 
     let power_pie_raster_cache = build_power_pie_raster_cache(POWER_PIE_TEXTURE_SIZE);
@@ -1176,10 +1173,10 @@ fn setup_scene(
                 BackgroundColor(MATCH_END_OVERLAY_BG),
                 Text::new(""),
                 TextFont {
-                    font_size: 30.0,
+                    font_size: FontSize::Px(30.0),
                     ..Default::default()
                 },
-                TextLayout::new_with_justify(Justify::Center),
+                TextLayout::justify(Justify::Center),
                 TextColor(MATCH_END_OVERLAY_TITLE),
                 MatchEndOverlayText,
             ));
@@ -1221,7 +1218,7 @@ fn setup_scene(
             parent.spawn((
                 Text::new("K"),
                 TextFont {
-                    font_size: 34.0,
+                    font_size: FontSize::Px(34.0),
                     ..Default::default()
                 },
                 TextColor(SPECIAL_SKILL_ICON_KEY_COLOR),
@@ -1295,7 +1292,7 @@ fn setup_scene(
             parent.spawn((
                 Text::new("GOLD"),
                 TextFont {
-                    font_size: 13.0,
+                    font_size: FontSize::Px(13.0),
                     ..Default::default()
                 },
                 TextColor(GOLD_HUD_LABEL_COLOR),
@@ -1303,127 +1300,12 @@ fn setup_scene(
             parent.spawn((
                 Text::new("0"),
                 TextFont {
-                    font_size: 30.0,
+                    font_size: FontSize::Px(30.0),
                     ..Default::default()
                 },
                 TextColor(GOLD_HUD_VALUE_COLOR),
                 GoldHudValueText,
             ));
-        });
-}
-
-fn setup_main_menu(mut commands: Commands) {
-    commands
-        .spawn((
-            MainMenuRoot,
-            Node {
-                position_type: PositionType::Absolute,
-                width: Val::Percent(100.0),
-                height: Val::Percent(100.0),
-                justify_content: JustifyContent::Center,
-                align_items: AlignItems::Center,
-                ..Default::default()
-            },
-        ))
-        .with_children(|parent| {
-            parent
-                .spawn((
-                    Node {
-                        width: Val::Px(520.0),
-                        padding: UiRect::all(Val::Px(18.0)),
-                        border_radius: BorderRadius::all(Val::Px(10.0)),
-                        row_gap: Val::Px(10.0),
-                        flex_direction: FlexDirection::Column,
-                        align_items: AlignItems::Stretch,
-                        ..Default::default()
-                    },
-                    BackgroundColor(MENU_PANEL_COLOR),
-                ))
-                .with_children(|panel| {
-                    panel.spawn((
-                        Text::new("Discordium TD"),
-                        TextFont {
-                            font_size: 38.0,
-                            ..Default::default()
-                        },
-                        TextColor(Color::srgb(0.93, 0.96, 0.98)),
-                    ));
-
-                    panel.spawn((
-                        Text::new("Choose a connection mode"),
-                        TextFont {
-                            font_size: 17.0,
-                            ..Default::default()
-                        },
-                        TextColor(Color::srgb(0.7, 0.78, 0.84)),
-                    ));
-
-                    #[cfg(not(target_arch = "wasm32"))]
-                    panel
-                        .spawn((
-                            Button,
-                            MainMenuButton(MenuAction::SinglePlayer),
-                            Node {
-                                width: Val::Percent(100.0),
-                                height: Val::Px(54.0),
-                                border: UiRect::all(Val::Px(1.0)),
-                                border_radius: BorderRadius::all(Val::Px(8.0)),
-                                justify_content: JustifyContent::Center,
-                                align_items: AlignItems::Center,
-                                margin: UiRect::top(Val::Px(8.0)),
-                                ..Default::default()
-                            },
-                            BorderColor::all(Color::srgb(0.36, 0.44, 0.49)),
-                            BackgroundColor(MENU_BUTTON_NORMAL),
-                        ))
-                        .with_children(|button| {
-                            button.spawn((
-                                Text::new("Single Player (Host + Join)"),
-                                TextFont {
-                                    font_size: 21.0,
-                                    ..Default::default()
-                                },
-                                TextColor(Color::srgb(0.95, 0.97, 0.98)),
-                            ));
-                        });
-
-                    panel
-                        .spawn((
-                            Button,
-                            MainMenuButton(MenuAction::ConnectDev),
-                            Node {
-                                width: Val::Percent(100.0),
-                                height: Val::Px(54.0),
-                                border: UiRect::all(Val::Px(1.0)),
-                                border_radius: BorderRadius::all(Val::Px(8.0)),
-                                justify_content: JustifyContent::Center,
-                                align_items: AlignItems::Center,
-                                ..Default::default()
-                            },
-                            BorderColor::all(Color::srgb(0.36, 0.44, 0.49)),
-                            BackgroundColor(MENU_BUTTON_NORMAL),
-                        ))
-                        .with_children(|button| {
-                            button.spawn((
-                                Text::new("Connect to Dev (localhost)"),
-                                TextFont {
-                                    font_size: 21.0,
-                                    ..Default::default()
-                                },
-                                TextColor(Color::srgb(0.95, 0.97, 0.98)),
-                            ));
-                        });
-
-                    panel.spawn((
-                        Text::new("Select a mode to start."),
-                        TextFont {
-                            font_size: 15.0,
-                            ..Default::default()
-                        },
-                        TextColor(Color::srgb(0.75, 0.83, 0.89)),
-                        MainMenuStatusText,
-                    ));
-                });
         });
 }
 
@@ -1622,7 +1504,7 @@ fn connect_to_bootstrap(world: &mut World, http_base: &str, attempts: u32) {
     world.resource_mut::<ClientDebugBridgeState>().replication = Default::default();
     world.resource_mut::<NetStats>().last_snapshot_received_secs = None;
     world.resource_mut::<NetStats>().last_rtt_sample_secs = None;
-    if let Some(mut existing) = world.remove_non_send_resource::<NetworkRuntime>() {
+    if let Some(mut existing) = world.remove_non_send::<NetworkRuntime>() {
         graceful_disconnect_runtime(&mut existing, "reconnect");
     }
 
@@ -1666,10 +1548,10 @@ fn connect_to_bootstrap(world: &mut World, http_base: &str, _attempts: u32) {
     world.resource_mut::<ClientDebugBridgeState>().replication = Default::default();
     world.resource_mut::<NetStats>().last_snapshot_received_secs = None;
     world.resource_mut::<NetStats>().last_rtt_sample_secs = None;
-    if let Some(mut existing) = world.remove_non_send_resource::<NetworkRuntime>() {
+    if let Some(mut existing) = world.remove_non_send::<NetworkRuntime>() {
         graceful_disconnect_runtime(&mut existing, "reconnect");
     }
-    world.remove_non_send_resource::<PendingWebBootstrap>();
+    world.remove_non_send::<PendingWebBootstrap>();
 
     let http_base = http_base.trim_end_matches('/').to_owned();
     let slot = std::rc::Rc::new(std::cell::RefCell::new(None));
@@ -1688,7 +1570,7 @@ fn connect_to_bootstrap(world: &mut World, http_base: &str, _attempts: u32) {
                 .map_err(|err| err.to_string());
         *slot_clone.borrow_mut() = Some(result);
     });
-    world.insert_non_send_resource(PendingWebBootstrap { slot });
+    world.insert_non_send(PendingWebBootstrap { slot });
     set_menu_status(
         world,
         format!("Connecting via {http_base} (WebRTC bootstrap)..."),
@@ -1703,10 +1585,10 @@ fn on_bootstrap_connected(
     transport: ClientTransport,
 ) {
     // Drop the old transport before attaching shared controls to its replacement.
-    world.remove_non_send_resource::<NetworkRuntime>();
+    world.remove_non_send::<NetworkRuntime>();
     let mut debug = world.resource_mut::<ConditionerDebug>();
     debug.report_rtt(None);
-    world.insert_non_send_resource(NetworkRuntime::new(client_id, renet, transport));
+    world.insert_non_send(NetworkRuntime::new(client_id, renet, transport));
     *world.resource_mut::<WorldView>() = WorldView::default();
     *world.resource_mut::<LocalSimulation>() = LocalSimulation::default();
     *world.resource_mut::<NetStats>() = NetStats::default();
@@ -1742,7 +1624,7 @@ fn on_bootstrap_failed(world: &mut World, message: &str) {
 #[cfg(target_arch = "wasm32")]
 fn poll_web_bootstrap(world: &mut World) {
     let result = {
-        let Some(pending) = world.get_non_send_resource_mut::<PendingWebBootstrap>() else {
+        let Some(pending) = world.get_non_send_mut::<PendingWebBootstrap>() else {
             return;
         };
         pending.slot.borrow_mut().take()
@@ -1761,34 +1643,7 @@ fn poll_web_bootstrap(world: &mut World) {
             on_bootstrap_failed(world, &format!("Connect failed via {http_base}: {err}"));
         }
     }
-    world.remove_non_send_resource::<PendingWebBootstrap>();
-}
-
-fn graceful_disconnect_runtime(runtime: &mut NetworkRuntime, reason: &str) {
-    if runtime.renet.disconnect_reason().is_some() {
-        return;
-    }
-
-    runtime.renet.disconnect();
-    if let Err(err) = runtime.transport_update(Duration::ZERO) {
-        log::warn!("failed to send disconnect packet during {reason}: {err}");
-    } else {
-        log::info!("sent graceful disconnect packet during {reason}");
-    }
-}
-
-fn graceful_disconnect_on_app_exit(
-    mut app_exit_reader: MessageReader<AppExit>,
-    runtime: Option<NonSendMut<NetworkRuntime>>,
-) {
-    if app_exit_reader.read().next().is_none() {
-        return;
-    }
-
-    let Some(mut runtime) = runtime else {
-        return;
-    };
-    graceful_disconnect_runtime(&mut runtime, "app exit");
+    world.remove_non_send::<PendingWebBootstrap>();
 }
 
 fn set_menu_status(world: &mut World, status: String) {
@@ -2214,7 +2069,7 @@ fn update_hit_effects(
         transform.scale = Vec3::splat(scale);
         transform.translation.y = 0.52 + 0.18 * t;
 
-        if let Some(material) = materials.get_mut(&effect.material) {
+        if let Some(mut material) = materials.get_mut(&effect.material) {
             let alpha = 0.92 * (1.0 - t);
             material.base_color = Color::srgba(1.0, 0.34, 0.22, alpha);
             material.emissive =
@@ -2242,7 +2097,7 @@ fn update_tower_shot_effects(
         transform.scale.y = 1.0 - 0.45 * t;
         transform.scale.z = 1.0 - 0.45 * t;
 
-        if let Some(material) = materials.get_mut(&effect.material) {
+        if let Some(mut material) = materials.get_mut(&effect.material) {
             let alpha = 0.88 * (1.0 - t);
             material.base_color = Color::srgba(1.0, 0.92, 0.35, alpha);
             material.emissive =
@@ -2269,7 +2124,7 @@ fn update_regular_attack_effects(
 
         transform.translation.y = REGULAR_ATTACK_EFFECT_Y + 0.07 * t;
 
-        if let Some(material) = materials.get_mut(&effect.material) {
+        if let Some(mut material) = materials.get_mut(&effect.material) {
             let alpha = 0.5 * (1.0 - t);
             let base = material.base_color.to_srgba();
             material.base_color = Color::srgba(base.red, base.green, base.blue, alpha);
@@ -2610,6 +2465,10 @@ fn sync_dynamic_actors(
         desired.insert(
             ActorKey::Hero(hero.client_id),
             DesiredActor {
+                player: Some(targeting::PlayerVisual {
+                    id: hero.client_id,
+                    target: hero.lock_target_id.filter(|_| hero.lock_mode_active),
+                }),
                 pos,
                 kind: ActorKind::Hero { local },
                 facing: Some(FacingStat { dir: visual_facing }),
@@ -2651,6 +2510,7 @@ fn sync_dynamic_actors(
             desired.insert(
                 ActorKey::World(enemy.id),
                 DesiredActor {
+                    player: None,
                     pos,
                     kind: ActorKind::Enemy,
                     facing: Some(FacingStat {
@@ -2677,6 +2537,7 @@ fn sync_dynamic_actors(
             desired.insert(
                 ActorKey::World(enemy.id),
                 DesiredActor {
+                    player: None,
                     pos,
                     kind: ActorKind::Enemy,
                     facing: Some(FacingStat {
@@ -2708,6 +2569,7 @@ fn sync_dynamic_actors(
             desired.insert(
                 ActorKey::World(tower.id),
                 DesiredActor {
+                    player: None,
                     pos: tower.pos,
                     kind: ActorKind::Tower,
                     facing: None,
@@ -2727,6 +2589,7 @@ fn sync_dynamic_actors(
             desired.insert(
                 ActorKey::World(tower.id),
                 DesiredActor {
+                    player: None,
                     pos: tower.pos,
                     kind: ActorKind::Tower,
                     facing: None,
@@ -3612,7 +3475,7 @@ fn update_gold_hud(
                     },
                     Text::new(format!("-{spent}")),
                     TextFont {
-                        font_size: 21.0,
+                        font_size: FontSize::Px(21.0),
                         ..Default::default()
                     },
                     TextColor(GOLD_SPEND_TEXT_COLOR),
@@ -3705,7 +3568,7 @@ fn update_power_pie_hud(
         return;
     };
     let (mut circle_node, mut border_color, mut background_color) = circle.into_inner();
-    let Some(image) = images.get_mut(&power_pie_texture.handle) else {
+    let Some(mut image) = images.get_mut(&power_pie_texture.handle) else {
         return;
     };
 
@@ -3763,7 +3626,7 @@ fn update_power_pie_hud(
     background_color.0 = bg_color;
 
     draw_power_pie_image(
-        image,
+        &mut image,
         &power_pie_raster_cache,
         ratio,
         fill_color,
@@ -4075,7 +3938,7 @@ fn spawn_actor_entity(
         ActorKind::Hero { local: true } => commands
             .spawn((
                 Mesh3d(assets.hero_mesh.clone()),
-                MeshMaterial3d(assets.hero_local_material.clone()),
+                MeshMaterial3d(assets.hero_material.clone()),
                 transform,
                 DynamicActor,
                 HeroActor,
@@ -4085,7 +3948,7 @@ fn spawn_actor_entity(
         ActorKind::Hero { local: false } => commands
             .spawn((
                 Mesh3d(assets.hero_mesh.clone()),
-                MeshMaterial3d(assets.hero_remote_material.clone()),
+                MeshMaterial3d(assets.hero_material.clone()),
                 transform,
                 DynamicActor,
                 HeroActor,
@@ -4159,6 +4022,9 @@ fn apply_actor_stats(commands: &mut Commands, entity: Entity, actor: DesiredActo
 }
 
 fn apply_actor_metadata(commands: &mut Commands, entity: Entity, actor: DesiredActor) {
+    if let Some(player) = actor.player {
+        commands.entity(entity).insert(player);
+    }
     let mut entity_commands = commands.entity(entity);
     if let Some(tower_node) = actor.tower_node {
         entity_commands.insert(tower_node);
@@ -4179,6 +4045,9 @@ fn sync_existing_actor_components(
     regular_attack: Option<Mut<RegularAttackStat>>,
     tower_node: Option<Mut<TowerBuildNode>>,
 ) {
+    if let Some(player) = actor.player {
+        commands.entity(entity).insert(player);
+    }
     sync_optional_component(commands, entity, health, actor.health);
     sync_optional_component(commands, entity, mana, actor.mana);
     sync_optional_component(commands, entity, power, actor.power);

@@ -75,7 +75,7 @@ pub(super) fn sync_simulation_presentations(
         transform.scale = Vec3::new(radius, 1.0, radius);
         transform.translation.y = 0.12 + 0.12 * t;
         let correction_fade = (1.0 - visual.absent_seconds / 0.12).clamp(0.0, 1.0);
-        if let Some(material) = materials.get_mut(&effect.material) {
+        if let Some(mut material) = materials.get_mut(&effect.material) {
             material.base_color = Color::srgba(0.25, 0.88, 1.0, 0.46 * (1.0 - t) * correction_fade);
             material.emissive =
                 LinearRgba::new(0.08, 0.4, 0.6, 0.0) * ((1.0 - t) * correction_fade);

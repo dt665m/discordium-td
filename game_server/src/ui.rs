@@ -50,7 +50,7 @@ fn label(parent: &mut ChildSpawnerCommands, text: impl Into<String>, size: f32, 
     parent.spawn((
         Text::new(text),
         TextFont {
-            font_size: size,
+            font_size: FontSize::Px(size),
             ..default()
         },
         TextColor(color),
@@ -92,7 +92,7 @@ fn metric(parent: &mut ChildSpawnerCommands, name: &str, field: Metric) {
                 field,
                 Text::new("--"),
                 TextFont {
-                    font_size: 13.0,
+                    font_size: FontSize::Px(13.0),
                     ..default()
                 },
                 TextColor(INK),
@@ -165,7 +165,7 @@ pub(crate) fn setup_ui_scene(mut commands: Commands) {
                 EmptyClients,
                 Text::new("Waiting for players to connect"),
                 TextFont {
-                    font_size: 13.0,
+                    font_size: FontSize::Px(13.0),
                     ..default()
                 },
                 TextColor(MUTED),
@@ -188,7 +188,7 @@ pub(crate) fn setup_ui_scene(mut commands: Commands) {
                             ClientCell { row, column },
                             Text::new("--"),
                             TextFont {
-                                font_size: 13.0,
+                                font_size: FontSize::Px(13.0),
                                 ..default()
                             },
                             TextColor(INK),
@@ -250,7 +250,7 @@ pub(crate) fn setup_conditioner_ui(mut commands: Commands) {
             for (index,name) in ["Queued packets","Queued bytes","Simulated loss","Outage drops","Queue overflow","Transition drops"].iter().enumerate() {
                 p.spawn(Node {width:Val::Percent(100.0),..default()}).with_children(|p| {
                     p.spawn(Node {width:Val::Percent(52.0),..default()}).with_children(|p|label(p,*name,13.0,MUTED));
-                    for field in [Metric::Incoming(index),Metric::Outgoing(index)] {p.spawn((field,Text::new("0"),TextFont {font_size:13.0,..default()},TextColor(INK),Node {width:Val::Percent(24.0),..default()}));}
+                    for field in [Metric::Incoming(index),Metric::Outgoing(index)] {p.spawn((field,Text::new("0"),TextFont {font_size:FontSize::Px(13.0),..default()},TextColor(INK),Node {width:Val::Percent(24.0),..default()}));}
                 });
             }
             metric(p,"Tracked peers",Metric::Peers);metric(p,"Peer-limit drops",Metric::PeerDrops);metric(p,"Expired peers",Metric::Expired);

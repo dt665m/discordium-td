@@ -52,7 +52,7 @@ pub(super) fn spawn(commands: &mut Commands) {
             p.spawn((
                 Text::new("Network / F3     F4 Mark  /  F6 Lag"),
                 TextFont {
-                    font_size: 11.0,
+                    font_size: FontSize::Px(11.0),
                     ..default()
                 },
                 TextColor(Color::srgb(0.89, 0.94, 1.0)),
@@ -89,7 +89,7 @@ pub(super) fn spawn(commands: &mut Commands) {
                         p.spawn((
                             Text::new(label),
                             TextFont {
-                                font_size: 11.0,
+                                font_size: FontSize::Px(11.0),
                                 ..default()
                             },
                             TextColor(graph_color(series)),
@@ -98,7 +98,7 @@ pub(super) fn spawn(commands: &mut Commands) {
                             metric,
                             Text::new("--"),
                             TextFont {
-                                font_size: 11.0,
+                                font_size: FontSize::Px(11.0),
                                 ..default()
                             },
                             TextColor(Color::WHITE),
@@ -134,7 +134,7 @@ pub(super) fn spawn(commands: &mut Commands) {
                             GraphScale(series),
                             Text::new(""),
                             TextFont {
-                                font_size: 9.0,
+                                font_size: FontSize::Px(9.0),
                                 ..default()
                             },
                             TextColor(Color::srgb(0.72, 0.8, 0.9)),
@@ -175,7 +175,7 @@ pub(super) fn spawn(commands: &mut Commands) {
                         p.spawn((
                             Text::new(label),
                             TextFont {
-                                font_size: 10.0,
+                                font_size: FontSize::Px(10.0),
                                 ..default()
                             },
                             TextColor(Color::srgb(0.65, 0.73, 0.83)),
@@ -184,7 +184,7 @@ pub(super) fn spawn(commands: &mut Commands) {
                             metric,
                             Text::new("--"),
                             TextFont {
-                                font_size: 10.0,
+                                font_size: FontSize::Px(10.0),
                                 ..default()
                             },
                             TextColor(Color::srgb(0.89, 0.94, 1.0)),
@@ -245,7 +245,7 @@ pub(super) fn spawn_hud(commands: &mut Commands) {
                         p.spawn((
                             Text::new(label),
                             TextFont {
-                                font_size: 10.0,
+                                font_size: FontSize::Px(10.0),
                                 ..default()
                             },
                             TextColor(Color::srgb(0.56, 0.65, 0.76)),
@@ -254,7 +254,7 @@ pub(super) fn spawn_hud(commands: &mut Commands) {
                             field,
                             Text::new("--"),
                             TextFont {
-                                font_size: 22.0,
+                                font_size: FontSize::Px(22.0),
                                 ..default()
                             },
                             TextColor(Color::WHITE),
@@ -268,7 +268,7 @@ pub(super) fn spawn_hud(commands: &mut Commands) {
 Debug",
                     ),
                     TextFont {
-                        font_size: 10.0,
+                        font_size: FontSize::Px(10.0),
                         ..default()
                     },
                     TextColor(Color::srgb(0.56, 0.65, 0.76)),
@@ -279,7 +279,7 @@ Debug",
                     field,
                     Text::new(""),
                     TextFont {
-                        font_size: 11.0,
+                        font_size: FontSize::Px(11.0),
                         ..default()
                     },
                     TextColor(Color::srgb(1.0, 0.71, 0.35)),

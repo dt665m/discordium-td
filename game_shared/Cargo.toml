@@ -3,6 +3,7 @@ license.workspace = true
 name = "game_shared"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 bincode.workspace = true

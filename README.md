@@ -1,10 +1,10 @@
 # Discordium TD
 
-Server-authoritative Bevy 0.18 tower defense prototype using `renet-cross` (`~/Projects/games/net`) for mixed native/web transport.
+Server-authoritative Bevy 0.19.1 tower defense prototype using [renet-cross](https://github.com/dt665m/renet-cross) for mixed native/web transport.
 
 ## Prerequisites
 
-- Rust toolchain (`rustup`, `cargo`)
+- Rust 1.95 or newer (`rustup`, `cargo`)
 - [`just`](https://github.com/casey/just)
 - [`trunk`](https://trunkrs.dev/) for web client builds/serving
 - Wasm target for web builds:
@@ -70,9 +70,34 @@ deployment. In one local Chrome test, a game-code edit rebuilt in about 31 secon
 and two clients ran with a median frame duration around 8.6 ms; these are local
 measurements, not performance guarantees for other machines or longer sessions.
 
+## Camera and player indicators
+
+- `Page Up` / `Page Down`: zoom in / out.
+- `[` / `]`: rotate the overhead camera. WASD stays relative to the screen.
+- Smooth player follow is enabled by default. `C` toggles the fixed arena view;
+  `Home` resets zoom and rotation and restores follow.
+- `Q`: select/cycle a lock target; `E`: clear the lock.
+
+Follow uses a small screen-space dead zone, smoothed movement look-ahead, and
+adaptive catch-up for fast movement. An outer boundary keeps the character in
+view during bursts. Rejoins, round changes, and large position jumps reset
+tracking. Zoom and rotation remain manual; dash-specific tuning will follow
+when the dash mechanic exists.
+
+Players have stable colors shared across clients. A solid pointer in the same
+color marks each player's target; pointers sit side by side when targets are
+shared. Local pointers follow predicted lock state and clear when their target
+dies or disappears.
+
+The nearby minimap follows you and rotates with the camera. It shows teammates,
+enemies, towers, and the base within its 24-unit span. Colored edge chevrons point
+toward teammates outside that area; your marker has a white border. The map uses
+reused UI markers updated at 10 Hz, with no additional camera or scene render.
+
 ## Simulating a bad connection
 
-The client uses the Bevy UI from `bevy-net-debug 0.1` with registry `renet-cross 0.6`.
+The client uses the Bevy UI from `bevy-net-debug 0.2` with `renet-cross 0.6`.
+Both dependencies use their published crates.io releases.
 Press **F3** for grouped client diagnostics or **F6** for network simulation controls.
 The compact HUD shows wave and team life; connection warnings and active lag
 simulation appear only when relevant. F3 contains a compact network overlay; detailed events remain in captures.

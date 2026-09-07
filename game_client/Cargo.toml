@@ -6,7 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-bevy = { workspace = true, features = ["default", "bevy_dev_tools"] }
+bevy = { workspace = true, features = ["bevy_dev_tools"] }
 game_shared = { path = "../game_shared" }
 game_sim = { path = "../game_sim", features = ["bevy"] }
 log.workspace = true
@@ -16,11 +16,18 @@ bevy-net-debug.workspace = true
 serde_json.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+bevy = { workspace = true, features = ["default"] }
 clap.workspace = true
 game_server = { path = "../game_server" }
 ureq = "2.12.1"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+# Keep the browser bundle within Pages' per-file limit by enabling only the
+# rendering/UI plugins we use (no audio, glTF loader, or post-processing plugins).
+bevy = { workspace = true, features = [
+  "default_app", "default_platform", "3d_api", "bevy_pbr",
+  "bevy_gizmos_render", "bevy_ui_render", "bevy_scene", "ui_picking",
+] }
 getrandom = { version = "0.2.17", features = ["js"] }
 js-sys = "0.3.82"
 wasm-bindgen = "0.2.105"

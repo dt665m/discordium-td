@@ -338,6 +338,9 @@ For recorder-backed verification, start the server with `--debug-recorder`, run 
 
 ## Cloudflare End-to-End TLS (HTTP Handshake)
 
+For the existing Oracle server and Cloudflare Pages site, see the
+[production deployment guide](docs/deployment.md).
+
 The server supports TLS for the HTTP bootstrap/signaling endpoint used during connect/handshake.
 
 ### Important transport note

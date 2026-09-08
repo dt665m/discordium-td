@@ -1,8 +1,10 @@
 //! Headless and UI configuration for simulated server distance.
+#[cfg(feature = "ui")]
 use bevy::prelude::Resource;
 use clap::Args;
 use renet_cross::server_conditioner::ServerConditionerHandle;
 
+#[cfg(feature = "ui")]
 #[derive(Resource, Clone)]
 pub(crate) struct ServerConditioner(pub ServerConditionerHandle);
 use renet_cross::conditioner::ConditionerConfig;

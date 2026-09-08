@@ -5,6 +5,8 @@ mod debug_context;
 mod debug_recorder;
 mod http_api;
 pub(crate) mod net;
+mod network;
+mod replication;
 #[cfg(feature = "ui")]
 pub(crate) mod ui;
 

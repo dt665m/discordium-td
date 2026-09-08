@@ -30,7 +30,7 @@ pub(super) fn sync_simulation_presentations(
         return;
     };
     let instances = local.sim.presentations();
-    for instance in instances {
+    for instance in &instances {
         if !visuals
             .iter()
             .any(|(_, visual, ..)| visual.id == instance.id)

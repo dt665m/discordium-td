@@ -1,6 +1,23 @@
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize};
+mod packed_patch;
+pub mod replication;
+mod wire;
+pub use replication::{apply_world_patch, build_world_patch};
+pub use wire::{decode, decode_with_limit, encode};
 
-pub const PROTOCOL_ID: u64 = 11;
+pub const PROTOCOL_ID: u64 = 13;
+
+/// Stable actor namespaces used by world-local replication identity indexes.
+/// These distinguish player IDs from server-allocated world IDs.
+pub mod actor_namespace {
+    pub const HERO: u8 = 0;
+    pub const ENEMY: u8 = 1;
+    pub const TOWER: u8 = 2;
+}
+/// At most two waiting movement ticks, plus the tick being executed.
+pub const MAX_MOVEMENT_BACKLOG: usize = 3;
+/// Bound speculative whole-world work during missing authority (500 ms).
+pub const MAX_PREDICTION_TICKS: usize = 15;
 pub const SERVER_TICK_HZ: u32 = 30;
 pub const FIXED_DT_SECONDS: f32 = 1.0 / SERVER_TICK_HZ as f32;
 
@@ -378,6 +395,7 @@ pub enum ReliableServerMessage {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HeroSnapshot {
+    pub respawn_generation: u32,
     pub client_id: u64,
     pub pos: [f32; 2],
     pub facing: FacingComponent,
@@ -407,8 +425,16 @@ pub enum EnemyLockTarget {
     Base,
 }
 
+/// Logical wave spawn, independent of speculative tower/entity allocation order.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct EnemySpawnIdentity {
+    pub wave: u32,
+    pub ordinal: u32,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct EnemySnapshot {
+    pub spawn: EnemySpawnIdentity,
     pub id: u64,
     pub lane: u8,
     pub pos: [f32; 2],
@@ -491,8 +517,16 @@ pub struct WorldDelta {
     pub heroes: Vec<HeroSnapshot>,
     pub enemies: Vec<EnemySnapshot>,
     pub towers: Vec<TowerSnapshot>,
-    pub your_last_input_seq: Option<u32>,
     pub sim_meta: Option<SimMeta>,
+}
+
+impl WorldDelta {
+    pub fn last_move_seq_for(&self, client_id: u64) -> Option<u32> {
+        self.heroes
+            .iter()
+            .find(|hero| hero.client_id == client_id)
+            .and_then(|hero| hero.last_move_seq)
+    }
 }
 
 /// Client-to-server: bundled recent movement inputs for redundancy.
@@ -526,24 +560,43 @@ pub enum ServerWorldMessage {
     Patch(WorldPatch),
 }
 
-/// Delta-compressed world update.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+impl ServerWorldMessage {
+    /// Same Full variant on the wire, without cloning a world just to serialize it.
+    pub fn encode_full(world: &WorldDelta) -> Vec<u8> {
+        #[derive(Serialize)]
+        enum Borrowed<'a> {
+            Full(&'a WorldDelta),
+        }
+        encode(&Borrowed::Full(world))
+    }
+}
+
+/// Current values of changed records over an acknowledged frame range.
+#[derive(Debug, Clone, PartialEq)]
 pub struct WorldPatch {
-    pub presentations: Vec<PresentationInstance>,
     pub tick: u32,
     pub baseline_tick: u32,
-    pub phase: MatchPhase,
-    pub match_restart_ticks_remaining: Option<u32>,
-    pub wave: u32,
-    pub team_life: i32,
-    pub objectives: Vec<ObjectiveSnapshot>,
-    pub your_last_input_seq: Option<u32>,
-    pub hero_patches: Vec<HeroSnapshot>,
-    pub enemy_patches: Vec<EnemySnapshot>,
-    pub tower_patches: Vec<TowerSnapshot>,
-    pub removed_ids: Vec<u64>,
-    pub removed_hero_ids: Vec<u64>,
-    pub sim_meta: Option<SimMeta>,
+    pub records: Vec<RecordPatch>,
+}
+
+/// Stable replication namespaces; one actor's layout never shifts another's.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub enum StateKey {
+    World,
+    Hero(u64),
+    Enemy(u64),
+    Tower(u64),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RecordPatch {
+    pub key: StateKey,
+    /// None removes the record; Some resizes it before applying current values.
+    pub state_len: Option<u32>,
+    /// One bit per byte of the reconstructed record, least-significant bit first.
+    pub mask: Vec<u8>,
+    /// Current values for set bits, in ascending byte-offset order.
+    pub values: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -586,7 +639,7 @@ pub struct ClientInterpolationDebug {
 }
 
 // Debug JSON is versioned independently of the gameplay wire protocol.
-pub const DEBUG_SCHEMA_VERSION: u32 = 2;
+pub const DEBUG_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct DebugNetworkHealth {
@@ -728,6 +781,8 @@ pub struct ServerDebugClientFrame {
     pub last_acked_tick: Option<u32>,
     pub confirmed_baseline_tick: Option<u32>,
     pub sent_history_len: usize,
+    pub snapshot_payload_bytes: Option<usize>,
+    pub snapshot_baseline_tick: Option<u32>,
     pub world: WorldDelta,
 }
 
@@ -844,19 +899,6 @@ pub fn directional_attack_can_hit(
     let to_target_norm = [to_target[0] * inv_len, to_target[1] * inv_len];
     let dot = facing[0] * to_target_norm[0] + facing[1] * to_target_norm[1];
     dot >= profile.arc_dot_threshold
-}
-
-pub fn encode<T: Serialize>(value: &T) -> Vec<u8> {
-    bincode::serialize(value).expect("failed to serialize network payload")
-}
-
-pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, bincode::Error> {
-    use bincode::Options;
-    bincode::DefaultOptions::new()
-        .with_fixint_encoding()
-        .with_limit(1024 * 1024)
-        .reject_trailing_bytes()
-        .deserialize(bytes)
 }
 
 pub fn is_newer_input_seq(new_seq: u32, old_seq: u32) -> bool {

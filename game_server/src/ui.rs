@@ -1,8 +1,7 @@
 #![cfg(feature = "ui")]
 
-use crate::net::NetRuntime;
+use crate::network::NetworkMetrics;
 use bevy::prelude::*;
-use game_sim::Simulation;
 
 const MUTED: Color = Color::srgb(0.56, 0.65, 0.76);
 const INK: Color = Color::srgb(0.89, 0.94, 1.0);
@@ -262,34 +261,16 @@ pub(crate) fn update_network_panel(
     context: Res<crate::debug_context::DebugContext>,
     recorder: Res<crate::app::DebugRecorderResource>,
     conditioner: Res<crate::conditioner::ServerConditioner>,
-    net: Res<NetRuntime>,
-    sim: Res<Simulation>,
+    net: Res<NetworkMetrics>,
     mut fields: Query<(&Metric, &mut Text, &mut TextColor)>,
     mut cells: Query<(&ClientCell, &mut Text, &mut TextColor), Without<Metric>>,
     mut rows: Query<(&ClientRow, &mut Node), Without<EmptyClients>>,
     mut empty: Single<&mut Node, With<EmptyClients>>,
 ) {
-    let peers = net.shared.with_server_and_transport(|server, transport| {
-        let mut ids = server.clients_id();
-        ids.sort_unstable();
-        ids.into_iter()
-            .map(|id| {
-                (
-                    id,
-                    if transport.udp().client_addr(id).is_some() {
-                        "UDP"
-                    } else {
-                        "WebRTC"
-                    },
-                    server.network_info(id).ok(),
-                )
-            })
-            .collect::<Vec<_>>()
-    });
     let health = recorder.0.as_ref().map(|r| r.info());
     let state = crate::conditioner::snapshot(&conditioner.0);
     let p = &state.packets;
-    let peer_slice = peers.as_deref().unwrap_or_default();
+    let peer_slice = net.peers.as_slice();
     let samples: Vec<_> = peer_slice
         .iter()
         .filter_map(|(_, _, n)| n.as_ref())
@@ -311,14 +292,8 @@ pub(crate) fn update_network_panel(
             Metric::Instance => context.identity.instance.clone(),
             Metric::Process => context.identity.process_session.clone(),
             Metric::Build => context.identity.build.clone(),
-            Metric::Tick => sim.tick().to_string(),
-            Metric::Clients => {
-                if peers.is_some() {
-                    peer_slice.len().to_string()
-                } else {
-                    "Unavailable".into()
-                }
-            }
+            Metric::Tick => net.tick.to_string(),
+            Metric::Clients => peer_slice.len().to_string(),
             Metric::Rtt => format!("{} ms", mean(|n| n.rtt * 1000.0)),
             Metric::Loss => format!("{} %", mean(|n| n.packet_loss * 100.0)),
             Metric::Sent => format!(

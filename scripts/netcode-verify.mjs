@@ -10,7 +10,11 @@ const DEFAULTS = {
   pageUrl: "http://127.0.0.1:1420/?debug_bridge=1",
   serverDebugUrl: "http://127.0.0.1:8080/debug/bridge",
   sampleMs: 150,
-  scenarioMs: 5000,
+  scenarioMs: 15000,
+  clients: 2,
+  stress: false,
+  conditionClient: false,
+  deviceScaleFactor: process.platform === "darwin" ? 2 : 1,
   connectTimeoutMs: 30000,
   reportPath: buildDefaultReportPath(),
   headless: false,
@@ -32,32 +36,57 @@ async function main() {
     sampleCount: 0, matchedSamples: 0, missingServerFrameSamples: 0,
     maxServerTickLag: 0, maxLocalRenderPredictionDelta: 0,
   }};
-  let browser, context, sampler;
+  let browser, context;
+  const samplers = [];
   const failure = (error) => result.findings.push({severity: "error", code: "verifier_failure", message: error?.stack ?? String(error)});
   try {
     const { chromium } = await loadPlaywright();
-    browser = await chromium.launch({ headless: options.headless });
-    context = await browser.newContext({ viewport: { width: 1400, height: 900 } });
-    const page = await context.newPage();
-    const log = (kind, message) => {
-      if (result.browserLogs.length >= 200) result.browserLogs.shift();
-      result.browserLogs.push({at: new Date().toISOString(), kind, message});
-    };
-    page.on("console", (message) => log(message.type(), message.text()));
-    page.on("pageerror", (error) => log("pageerror", String(error)));
-    page.on("requestfailed", (request) => log("requestfailed", `${request.url()}: ${request.failure()?.errorText}`));
-    await page.goto(options.pageUrl, { waitUntil: "load" });
-    await page.waitForSelector("canvas", { timeout: options.connectTimeoutMs });
-    await waitForClientBridge(page, options.connectTimeoutMs);
-    await ensureConnected(page, options.connectTimeoutMs);
-    await focusCanvas(page);
-    sampler = collectSamples(page, options, result).catch(failure);
-    await runScenario(page);
-    await sampler;
+    browser = await chromium.launch({ headless: options.headless, args: ["--disable-background-timer-throttling", "--disable-renderer-backgrounding", "--disable-backgrounding-occluded-windows"] });
+    context = await browser.newContext({ viewport: { width: 1400, height: 900 }, deviceScaleFactor: options.deviceScaleFactor });
+    const pages = [];
+    const runs = [];
+    for (let index = 0; index < options.clients; index++) {
+      const page = await context.newPage();
+      const run = { rawSamples: [], findings: [], metrics: { sampleCount: 0, matchedSamples: 0,
+        missingServerFrameSamples: 0, maxServerTickLag: 0, maxLocalRenderPredictionDelta: 0 }};
+      const log = (kind, message) => {
+        if (result.browserLogs.length >= 200) result.browserLogs.shift();
+        result.browserLogs.push({at: new Date().toISOString(), client: index, kind, message});
+      };
+      page.on("console", message => log(message.type(), message.text()));
+      page.on("pageerror", error => log("pageerror", String(error)));
+      await page.goto(options.pageUrl, { waitUntil: "load" });
+      await page.waitForSelector("canvas", { timeout: options.connectTimeoutMs });
+      await waitForClientBridge(page, options.connectTimeoutMs);
+      await ensureConnected(page, options.connectTimeoutMs);
+      await focusCanvas(page);
+      if (options.conditionClient) await page.evaluate(() => { window.__discordiumDebugBridgeCommand = "network_300ms"; });
+      pages.push(page); runs.push(run);
+    }
+    for (let index = 0; index < pages.length; index++) {
+      samplers.push(collectSamples(pages[index], options, runs[index]).catch(failure));
+    }
+    await Promise.all(pages.map((page, index) => runScenario(page, options.scenarioMs, index, options.stress)));
+    await Promise.all(samplers);
+    for (let index = 0; index < runs.length; index++) {
+      const run = runs[index];
+      if (options.clients > 1 && !(run.metrics.remoteMovementSamples > 0)) {
+        run.findings.push({severity: "error", code: "missing_remote_movement_coverage", message: "No moving remote hero was observed"});
+      }
+      const report = finalizeReport(run, options);
+      result.rawSamples.push(...run.rawSamples.map(sample => ({...sample, clientIndex: index})));
+      result.findings.push(...report.findings.map(finding => ({...finding, clientIndex: index})));
+      for (const key of ["sampleCount", "matchedSamples", "missingServerFrameSamples", "clientFrameChanges", "serverTickChanges", "remoteMovementSamples"]) {
+        result.metrics[key] = (result.metrics[key] ?? 0) + (run.metrics[key] ?? 0);
+      }
+      for (const key of ["maxServerTickLag", "maxLocalRenderPredictionDelta", "maxPredictionLeadTicks", "maxInputAckAgeMs", "maxRemoteStep"]) {
+        result.metrics[key] = Math.max(result.metrics[key] ?? 0, run.metrics[key] ?? 0);
+      }
+    }
   } catch (error) { failure(error); }
   finally {
     options.stopSampling = true;
-    await sampler;
+    await Promise.all(samplers);
     delete options.stopSampling;
     await context?.close().catch(() => {});
     await browser?.close().catch(() => {});
@@ -105,6 +134,11 @@ function parseArgs(argv) {
       i += 1;
       continue;
     }
+    if (["--clients", "--device-scale-factor"].includes(arg) && next) {
+      options[arg === "--clients" ? "clients" : "deviceScaleFactor"] = Number(next); i++; continue;
+    }
+    if (arg === "--condition-client") { options.conditionClient = true; continue; }
+    if (arg === "--stress") { options.stress = true; continue; }
     if (arg === "--headless") {
       options.headless = true;
       continue;
@@ -124,6 +158,8 @@ function parseArgs(argv) {
   for (const key of ["sampleMs", "scenarioMs", "connectTimeoutMs"]) {
     if (!Number.isFinite(options[key]) || options[key] <= 0) throw new Error(`${key} must be a positive finite number`);
   }
+  if (!Number.isInteger(options.clients) || options.clients < 1 || options.clients > 8) throw new Error("clients must be 1–8");
+  if (![1, 2].includes(options.deviceScaleFactor)) throw new Error("device-scale-factor must be 1 or 2");
   return options;
 }
 
@@ -137,6 +173,10 @@ Options:
   --scenario-ms N
   --connect-timeout-ms N
   --report PATH
+  --clients N
+  --stress
+  --condition-client
+  --device-scale-factor N
   --headless
   --headed
   --help`);
@@ -164,7 +204,7 @@ function buildDefaultReportPath() {
     .toISOString()
     .replaceAll(":", "-")
     .replaceAll(".", "-")}-${process.pid}`;
-  return path.join("target", "netcode-verifier", dateDir, runId, "report.json");
+  return path.join("target", "reports", "netcode-verifier", dateDir, runId, "report.json");
 }
 
 async function waitForClientBridge(page, timeoutMs) {
@@ -197,15 +237,24 @@ async function focusCanvas(page) {
   await page.mouse.click(box.x + box.width * 0.5, box.y + box.height * 0.5);
 }
 
-async function runScenario(page) {
-  await holdKey(page, "w", 900);
-  await holdKey(page, "d", 700);
-  await page.keyboard.press("j");
-  await holdKey(page, "s", 700);
-  await holdKey(page, " ", 450);
-  await page.keyboard.press("k");
-  await holdKey(page, "a", 700);
-  await page.waitForTimeout(900);
+async function runScenario(page, durationMs, index, stress) {
+  let interrupted = false;
+  const started = Date.now();
+  const keys = index % 2 ? ["d", "s", "a", "w"] : ["w", "d", "s", "a"];
+  while (Date.now() - started < durationMs) {
+    for (const key of keys) {
+      if (Date.now() - started >= durationMs) break;
+      await holdKey(page, key, 900);
+    }
+    if (stress && index === 0 && !interrupted) {
+      interrupted = true;
+      await page.evaluate(() => { window.__discordiumDebugBridgeCommand = "network_outage"; });
+      await holdKey(page, "d", 1200);
+      await page.evaluate(() => { const until = performance.now() + 150; while (performance.now() < until) {} });
+    }
+    await page.keyboard.press("j");
+    await page.keyboard.press("k");
+  }
 }
 
 async function holdKey(page, key, durationMs) {

@@ -26,10 +26,10 @@ from `ReliableGameEvent::AbilityCast`. That event remains for gameplay reporting
 `Simulation::presentations` → full snapshots / patches → snapshot reconstruction
 → `Simulation::apply_snapshot` → input replay → one client renderer.
 
-Active instances are a complete, short-lived list in each patch. This intentionally
-keeps the initial contract simple; it adds bytes while effects are active. The
-simulation advances ages and removes expired instances on both client and server.
-Protocol 11 requires both ends rebuilt.
+Active instances are part of the complete simulation state reconstructed from
+replication patches. The simulation advances ages and removes expired instances
+on both client and server. Protocol 13 requires both ends rebuilt; see the
+[replication contract](netcode.md).
 
 The renderer retains missing instances invisibly for one second to tolerate brief
 reconciliation changes, then releases them. Corrections within an instance's life

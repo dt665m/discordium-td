@@ -42,6 +42,11 @@ export function analyzeSample(clientLatest, serverExport, findings, seen, metric
     pushFinding(findings, seen, {severity: "error", code: "stale_snapshot", message: "Last snapshot is more than 1.5 seconds old", sampleIndex});
   }
 
+  if (clientLatest.replication?.decode_errors > 0) {
+    pushFinding(findings, seen, {severity: "error", code: "replication_decode_errors", message: "Gameplay message decoding failed; check matching client/server builds", sampleIndex});
+  }
+  analyzePresentationContinuity(clientLatest, findings, seen, metrics, sampleIndex);
+
   const serverFrame = findServerClientFrame(
     serverExport.frames ?? [],
     clientLatest.latest_server_tick,
@@ -114,7 +119,7 @@ export function analyzeSample(clientLatest, serverExport, findings, seen, metric
     sampleIndex,
     "acked_input_seq",
     clientLatest.latest_acked_input_seq,
-    serverFrame.world.your_last_input_seq,
+    serverFrame.world.heroes.find(hero => hero.client_id === clientLatest.client_id)?.last_move_seq ?? null,
   );
 
   compareSnapshotList(
@@ -174,6 +179,33 @@ export function analyzeSample(clientLatest, serverExport, findings, seen, metric
       });
     }
   }
+}
+
+function analyzePresentationContinuity(frame, findings, seen, metrics, sampleIndex) {
+  if (frame.predicted_tick != null) {
+    const lead = (frame.predicted_tick - frame.latest_server_tick) >>> 0;
+    metrics.maxPredictionLeadTicks = Math.max(metrics.maxPredictionLeadTicks ?? 0, lead);
+    if (lead > 15) pushFinding(findings, seen, {severity: "error", code: "unbounded_prediction_lead", message: `Prediction leads authority by ${lead} ticks`, sampleIndex});
+  }
+  metrics.maxInputAckAgeMs = Math.max(metrics.maxInputAckAgeMs ?? 0, frame.input_ack_age_ms ?? 0);
+  const previous = metrics.previousPresentation;
+  const current = {time: frame.capture_elapsed_ms, tick: frame.frame_index,
+    epoch: frame.latest_sim_meta?.match_epoch, stale: frame.snapshot_age_ms > 500,
+    actors: frame.rendered_actors.filter(actor => actor.kind === "RemoteHero").map(actor => ({...actor,
+      generation: frame.authoritative_heroes.find(hero => hero.client_id === actor.id)?.respawn_generation}))};
+  if (previous && previous.tick !== current.tick && previous.epoch === current.epoch && !previous.stale && !current.stale) {
+    const dt = (current.time - previous.time) / 1000;
+    if (dt > 0 && dt < 0.5) for (const actor of current.actors) {
+      const old = previous.actors.find(other => other.id === actor.id && other.generation === actor.generation);
+      if (!old) continue;
+      const step = distance(actor.pos, old.pos);
+      metrics.maxRemoteStep = Math.max(metrics.maxRemoteStep ?? 0, step);
+      if (step > 0.01) metrics.remoteMovementSamples = (metrics.remoteMovementSamples ?? 0) + 1;
+      // Hero speed 9.5; allow clock discipline and capture interval skew.
+      if (step > 9.5 * 1.5 * dt + 0.25) pushFinding(findings, seen, {severity: "error", code: "remote_presentation_jump", message: `Remote hero moved ${step.toFixed(3)} units in ${dt.toFixed(3)} seconds`, sampleIndex});
+    }
+  }
+  metrics.previousPresentation = current;
 }
 
 function findServerClientFrame(frames, tick, clientId) {
@@ -306,6 +338,10 @@ export function finalizeReport(result, options) {
       maxLocalRenderPredictionDelta: Number(
         result.metrics.maxLocalRenderPredictionDelta.toFixed(4),
       ),
+      maxPredictionLeadTicks: result.metrics.maxPredictionLeadTicks ?? 0,
+      maxInputAckAgeMs: result.metrics.maxInputAckAgeMs ?? 0,
+      remoteMovementSamples: result.metrics.remoteMovementSamples ?? 0,
+      maxRemoteStep: result.metrics.maxRemoteStep ?? 0,
       errorCount,
       warnCount,
     },

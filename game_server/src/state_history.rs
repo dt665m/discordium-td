@@ -114,7 +114,7 @@ mod tests {
     #[test]
     fn history_is_bounded_and_handles_tick_wrap_and_round_reset() {
         let sim = game_sim::Simulation::new();
-        let mut world = sim.world_delta_for(0);
+        let mut world = sim.world_delta();
         let mut history = StateHistory::default();
         for i in 0..40u32 {
             world.tick = (u32::MAX - 20).wrapping_add(i);

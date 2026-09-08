@@ -62,7 +62,7 @@ pub(super) fn send_action_commands(
         runtime
             .renet
             .send_message(DefaultChannel::ReliableOrdered, encode(&action));
-        pending_actions.0.push(cmd);
+        pending_actions.0.push(action);
     };
 
     if keyboard.just_pressed(KeyCode::KeyQ) {

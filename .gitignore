@@ -6,3 +6,6 @@
 # cargo defaults
 debug/
 target/
+
+# Python eval helper imports
+__pycache__/

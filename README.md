@@ -2,6 +2,22 @@
 
 Server-authoritative Bevy 0.19.1 tower defense prototype using [renet-cross](https://github.com/dt665m/renet-cross) for mixed native/web transport.
 
+See the [networking and prediction contract](docs/netcode.md) for replication history,
+packet recovery, timing, and verification.
+
+## Code layout
+
+- `shared/protocol/` (`game_shared`): wire messages, snapshots, and gameplay definitions.
+- `shared/simulation/` (`game_sim`): ECS gameplay components and plugins shared by the authoritative server and client prediction/replay.
+- `shared/replication/` (`game_replication`): game-independent network identities and world-local entity indexing.
+- `game_server/`: admission, lag compensation, per-client replication policy, and the transport worker.
+- `game_client/`: input capture, prediction orchestration, interpolation, rendering, and UI.
+
+Bevy entity handles are local to each world. Shared `NetId` components identify
+corresponding actors across server, prediction, and rendering worlds. The server
+remains authoritative; prediction uses the shared gameplay plugins without
+requiring cross-platform lockstep determinism.
+
 ## Prerequisites
 
 - Rust 1.95 or newer (`rustup`, `cargo`)

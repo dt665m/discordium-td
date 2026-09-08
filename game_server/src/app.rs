@@ -1,8 +1,18 @@
+#[cfg(test)]
+use crate::network::{Ingress, NetworkMetrics};
+#[cfg(test)]
+use crate::network::{egress::broadcast_world_deltas, worker::PacketSendClock};
+#[cfg(test)]
+use crate::replication::{ClientNetState, ReplicationHistory};
+#[cfg(test)]
+use game_shared::{
+    ClientAck, ClientMoveBundle, ReliableServerMessage, ServerWorldMessage, WorldDelta,
+    build_world_patch, encode,
+};
+#[cfg(test)]
+use std::collections::{HashMap, VecDeque};
 use std::{
-    any::Any,
-    collections::{HashMap, HashSet, VecDeque},
     net::SocketAddr,
-    panic::{AssertUnwindSafe, catch_unwind},
     path::PathBuf,
     sync::{Arc, Mutex},
     time::Duration,
@@ -13,19 +23,26 @@ use bevy::prelude::*;
 
 use crate::{
     debug_bridge::ServerDebugBridgeHandle,
-    debug_context::{DebugContext, unix_ms},
+    debug_context::DebugContext,
     debug_recorder::DebugRecorderHandle,
     http_api::{self, HttpTlsConfig},
-    net::{NetRuntime, SharedNet},
+    net::SharedNet,
+    network::{
+        ServerNetworkPlugin,
+        schedule::{PendingJoinSnapshots, fixed_server_tick, receive_client_commands},
+    },
 };
 use axum::http::HeaderValue;
 use clap::Parser;
-use game_shared::{
-    ClientAck, ClientCommand, ClientMoveBundle, PROTOCOL_ID, ReliableServerMessage, SERVER_TICK_HZ,
-    ServerDebugClientFrame, ServerDebugFrame, ServerWorldMessage, WorldDelta, WorldPatch, encode,
-};
+use game_shared::{PROTOCOL_ID, SERVER_TICK_HZ};
+#[cfg(test)]
 use game_sim::Simulation;
-use renet::{ConnectionConfig, DefaultChannel, RenetServer, ServerEvent};
+#[cfg(test)]
+use game_sim::world as sim;
+#[cfg(test)]
+use renet::ConnectionConfig;
+#[cfg(test)]
+use renet::{DefaultChannel, RenetServer};
 use renet_cross::{
     BootstrapConfig, BootstrapService, MixedTransportBuilder, MonotonicClientIdAllocator,
     ServerAuthentication, UnsecureDevAuthPolicy,
@@ -36,6 +53,9 @@ use renet_cross::{
 pub struct ServerArgs {
     #[command(flatten)]
     pub network_conditioner: crate::conditioner::NetworkConditionerArgs,
+    /// Admission limit; benchmark the chosen player/entity workload before raising it.
+    #[arg(long, env = "TD_MAX_CLIENTS", default_value_t = 8, value_parser = clap::value_parser!(u16).range(1..=1024))]
+    pub max_clients: u16,
     #[arg(long, env = "TD_HTTP_BIND")]
     http_bind: Option<SocketAddr>,
     #[arg(long, env = "TD_HTTP_TLS_CERT")]
@@ -69,15 +89,6 @@ enum ServerMode {
     Headless,
     Ui,
 }
-
-#[derive(Resource, Default)]
-struct ClientNetStates(HashMap<u64, ClientNetState>);
-
-#[derive(Resource, Default)]
-struct PendingJoinSnapshots(VecDeque<u64>);
-
-#[derive(Resource, Clone, Default)]
-struct DebugBridgeResource(Option<ServerDebugBridgeHandle>);
 
 #[derive(Resource, Clone, Default)]
 pub(crate) struct DebugRecorderResource(pub(crate) Option<DebugRecorderHandle>);
@@ -172,6 +183,7 @@ pub fn run(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let ServerArgs {
         network_conditioner,
+        max_clients,
         http_bind,
         http_tls_cert,
         http_tls_key,
@@ -245,11 +257,10 @@ pub fn run(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let conditioner_config = network_conditioner.config();
     log::info!("server network conditioner startup: {conditioner_config:?}");
-    let server = Arc::new(Mutex::new(RenetServer::new(ConnectionConfig::default())));
     let conditioner = renet_cross::server_conditioner::ServerConditionerHandle::new(
         renet_cross::server_conditioner::ServerConditionerConfig {
             packets: conditioner_config,
-            max_peers: 32,
+            max_peers: (usize::from(max_clients) * 2).max(32),
             ..Default::default()
         },
     )?;
@@ -262,7 +273,7 @@ pub fn run(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
             .webrtc_bind(webrtc_bind)
             .public_udp_addr(public_udp_addr)
             .public_webrtc_addr(public_webrtc_addr)
-            .max_clients(8)
+            .max_clients(usize::from(max_clients))
             .authentication(ServerAuthentication::Unsecure)
             .build()?,
     ));
@@ -298,7 +309,7 @@ pub fn run(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let shared_net = SharedNet {
-        server,
+        max_clients: usize::from(max_clients),
         transport: shared_transport,
         bootstrap,
     };
@@ -329,6 +340,19 @@ fn build_and_run_app(
             app.add_plugins(
                 MinimalPlugins.set(ScheduleRunnerPlugin::run_loop(Duration::from_millis(1))),
             );
+            // These frame schedules only coordinate time, messages and export.
+            // Dispatching their tiny systems across the pool at 1 kHz adds work
+            // without parallel gameplay. Simulation queries keep their own pool.
+            let labels = app
+                .world()
+                .resource::<bevy::app::MainScheduleOrder>()
+                .labels
+                .clone();
+            for label in labels {
+                app.edit_schedule(label, |schedule| {
+                    schedule.set_executor(bevy::ecs::schedule::SingleThreadedExecutor::new());
+                });
+            }
         }
         ServerMode::Ui => {
             #[cfg(feature = "ui")]
@@ -361,546 +385,25 @@ fn build_and_run_app(
         }
     }
 
-    app.insert_resource(Time::<Fixed>::from_hz(SERVER_TICK_HZ as f64))
-        .insert_resource(crate::conditioner::ServerConditioner(conditioner))
-        .insert_resource(NetRuntime { shared: shared_net })
-        .insert_resource(Simulation::new())
+    #[cfg(feature = "ui")]
+    app.insert_resource(crate::conditioner::ServerConditioner(conditioner.clone()));
+
+    app.add_plugins(game_sim::SimulationPlugins)
+        .add_plugins(ServerNetworkPlugin {
+            shared: shared_net,
+            context: debug_context.clone(),
+            bridge: debug_bridge.clone(),
+            recorder: debug_recorder.clone(),
+            conditioner: conditioner.clone(),
+        })
+        .insert_resource(Time::<Fixed>::from_hz(SERVER_TICK_HZ as f64))
         .insert_resource(crate::state_history::StateHistory::default())
-        .insert_resource(ClientNetStates::default())
         .insert_resource(PendingJoinSnapshots::default())
-        .insert_resource(DebugBridgeResource(debug_bridge))
         .insert_resource(DebugRecorderResource(debug_recorder))
         .insert_resource(debug_context)
-        .add_systems(Update, network_transport_update)
+        .add_systems(PreUpdate, receive_client_commands)
         .add_systems(FixedUpdate, fixed_server_tick)
-        .add_systems(PostUpdate, flush_transport_packets)
         .run();
-}
-
-// ---------------------------------------------------------------------------
-// Bevy systems
-// ---------------------------------------------------------------------------
-
-fn network_transport_update(
-    recorder: Res<DebugRecorderResource>,
-    time: Res<Time<Real>>,
-    net: Res<NetRuntime>,
-    mut sim: ResMut<Simulation>,
-    mut client_states: ResMut<ClientNetStates>,
-    mut pending_joins: ResMut<PendingJoinSnapshots>,
-) {
-    let frame_dt = time.delta();
-    let shared = &net.shared;
-    let bootstrap = Arc::clone(&shared.bootstrap);
-
-    shared.with_server_and_transport(|server, transport| {
-        server.update(frame_dt);
-
-        let update_result = catch_unwind(AssertUnwindSafe(|| transport.update(frame_dt, server)));
-        match update_result {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => {
-                log::warn!("transport update error: {err}");
-                if let Some(r) = &recorder.0 {
-                    r.event("transport_error", None, Some(sim.tick()), err.to_string());
-                }
-            }
-            Err(payload) => {
-                log::error!(
-                    "transport update panicked: {}; disconnecting all clients",
-                    panic_payload_to_string(payload.as_ref())
-                );
-                transport.disconnect_all(server);
-            }
-        }
-
-        while let Some(event) = server.get_event() {
-            match event {
-                ServerEvent::ClientConnected { client_id } => {
-                    match bootstrap.on_client_connected(client_id) {
-                        Ok(()) => {
-                            sim.add_player(client_id);
-                            pending_joins.0.push_back(client_id);
-                            client_states.0.insert(
-                                client_id,
-                                ClientNetState {
-                                    last_acked_tick: None,
-                                    confirmed_baseline: None,
-                                    sent_history: VecDeque::new(),
-                                },
-                            );
-                            log::info!("client connected: {client_id}");
-                            if let Some(r) = &recorder.0 {
-                                r.event(
-                                    "client_connected",
-                                    Some(client_id),
-                                    Some(sim.tick()),
-                                    String::new(),
-                                );
-                            }
-                        }
-                        Err(err) => {
-                            log::warn!("disconnecting unauthorized client {client_id}: {err}");
-                            server.disconnect(client_id);
-                        }
-                    }
-                }
-                ServerEvent::ClientDisconnected { client_id, reason } => {
-                    bootstrap.on_client_disconnected(client_id);
-                    sim.remove_player(client_id);
-                    pending_joins.0.retain(|id| *id != client_id);
-                    client_states.0.remove(&client_id);
-                    log::info!("client disconnected: {client_id} ({reason})");
-                    if let Some(r) = &recorder.0 {
-                        r.event(
-                            "client_disconnected",
-                            Some(client_id),
-                            Some(sim.tick()),
-                            reason.to_string(),
-                        );
-                    }
-                }
-            }
-        }
-    });
-}
-
-fn fixed_server_tick(
-    conditioner: Res<crate::conditioner::ServerConditioner>,
-    context: Res<DebugContext>,
-    net: Res<NetRuntime>,
-    mut sim: ResMut<Simulation>,
-    mut history: ResMut<crate::state_history::StateHistory>,
-    mut client_states: ResMut<ClientNetStates>,
-    mut pending_joins: ResMut<PendingJoinSnapshots>,
-    debug_bridge: Res<DebugBridgeResource>,
-    debug_recorder: Res<DebugRecorderResource>,
-) {
-    net.shared.with_server_and_transport(|server, transport| {
-        receive_client_commands(server, &mut sim, &mut client_states.0);
-        send_pending_joins(server, &sim, &mut pending_joins.0);
-
-        if sim.has_players() {
-            let step_started = std::time::Instant::now();
-            let current = sim.world_delta_for(0);
-            history.record(&current);
-            for (client, action) in sim.ready_actions() {
-                if !matches!(
-                    action.command,
-                    game_shared::ClientCommand::CastAbility {
-                        ability: game_shared::AbilityId::ArcBurst,
-                        ..
-                    }
-                ) {
-                    continue;
-                }
-                let rtt = server.network_info(client).map(|n| n.rtt).unwrap_or(0.0);
-                let decision =
-                    crate::state_history::validate_view_tick(sim.tick(), action.view_tick, rtt)
-                        .and_then(|tick| {
-                            let origin = current
-                                .heroes
-                                .iter()
-                                .find(|h| h.client_id == client)
-                                .ok_or(crate::state_history::RewindFallback::CasterDiscontinuity)?
-                                .pos;
-                            history.validated_targets(
-                                action.match_epoch,
-                                tick,
-                                sim.tick(),
-                                client,
-                                origin,
-                            )
-                        });
-                let detail = match decision {
-                    Ok(targets) => {
-                        let count = targets.len();
-                        sim.set_historical_targets(client, action.command.seq(), targets);
-                        format!(
-                            "seq={} view_tick={:?} historical_candidates={count}",
-                            action.command.seq(),
-                            action.view_tick
-                        )
-                    }
-                    Err(reason) => format!(
-                        "seq={} view_tick={:?} current_world_fallback={reason:?}",
-                        action.command.seq(),
-                        action.view_tick
-                    ),
-                };
-                log::debug!("lag compensation: {detail}");
-                if let Some(recorder) = &debug_recorder.0 {
-                    recorder.event(
-                        "lag_compensation_query",
-                        Some(client),
-                        Some(sim.tick()),
-                        detail,
-                    );
-                }
-            }
-            let tick_output = sim.step();
-            history.record(&sim.world_delta_for(0));
-            let step_duration_ms = step_started.elapsed().as_secs_f64() * 1000.0;
-            for event in tick_output.reliable_events {
-                let payload = encode(&ReliableServerMessage::Event(event));
-                server.broadcast_message(DefaultChannel::ReliableOrdered, payload);
-            }
-
-            broadcast_world_deltas(server, &sim, &mut client_states.0);
-            if debug_bridge.0.is_some() || debug_recorder.0.is_some() {
-                let frame = build_server_debug_frame(
-                    server,
-                    transport,
-                    &sim,
-                    &client_states.0,
-                    &context,
-                    step_duration_ms,
-                    &conditioner.0,
-                );
-                if let Some(debug_bridge) = &debug_bridge.0 {
-                    debug_bridge.push_frame(frame.clone());
-                }
-                if let Some(debug_recorder) = &debug_recorder.0 {
-                    debug_recorder.record_server_frame(frame);
-                }
-            }
-
-            if sim.tick().is_multiple_of(120) {
-                log::debug!(
-                    "authoritative tick={} clients={}",
-                    sim.tick(),
-                    server.clients_id().len()
-                );
-            }
-        }
-    });
-}
-
-fn flush_transport_packets(net: Res<NetRuntime>) {
-    net.shared.with_server_and_transport(|server, transport| {
-        let send_result = catch_unwind(AssertUnwindSafe(|| transport.send_packets(server)));
-        if let Err(payload) = send_result {
-            log::error!(
-                "transport send_packets panicked: {}; disconnecting all clients",
-                panic_payload_to_string(payload.as_ref())
-            );
-            transport.disconnect_all(server);
-        }
-    });
-}
-
-// ---------------------------------------------------------------------------
-// Free functions (unchanged internals)
-// ---------------------------------------------------------------------------
-
-/// Per-client net state for delta compression.
-struct ClientNetState {
-    /// The tick the client last confirmed receiving.
-    last_acked_tick: Option<u32>,
-    /// The snapshot that the client confirmed receiving (set when ack matches sent_history).
-    /// Only this snapshot is used as a baseline for patches — never an unconfirmed one.
-    confirmed_baseline: Option<WorldDelta>,
-    /// Ring buffer of recently sent snapshots so we can look up the one matching an ack.
-    sent_history: VecDeque<(u32, WorldDelta)>,
-}
-
-impl ClientNetState {
-    fn acknowledge(&mut self, tick: u32) {
-        if self
-            .last_acked_tick
-            .is_some_and(|old| !game_shared::is_newer_input_seq(tick, old))
-        {
-            return;
-        }
-        // Unknown/future ACKs must not poison the watermark or baseline.
-        if let Some(pos) = self.sent_history.iter().position(|(t, _)| *t == tick) {
-            self.last_acked_tick = Some(tick);
-            self.confirmed_baseline = Some(self.sent_history[pos].1.clone());
-            self.sent_history.drain(..pos);
-        }
-    }
-}
-
-fn build_server_debug_frame(
-    server: &RenetServer,
-    transport: &renet_cross::MixedServerTransport,
-    sim: &Simulation,
-    client_net_states: &HashMap<u64, ClientNetState>,
-    context: &DebugContext,
-    step_duration_ms: f64,
-    conditioner: &renet_cross::server_conditioner::ServerConditionerHandle,
-) -> ServerDebugFrame {
-    let mut client_ids = server.clients_id();
-    client_ids.sort_unstable();
-
-    let clients = client_ids
-        .into_iter()
-        .map(|client_id| {
-            let state = client_net_states.get(&client_id);
-            let mut world = sim.world_delta_for(client_id);
-            sort_world_delta(&mut world);
-            ServerDebugClientFrame {
-                network: server.network_info(client_id).ok().map(|n| {
-                    game_shared::DebugNetworkHealth {
-                        browser_drops: None,
-                        transport: if transport.udp().client_addr(client_id).is_some() {
-                            "udp"
-                        } else {
-                            "webrtc"
-                        }
-                        .into(),
-                        rtt_ms: n.rtt * 1000.0,
-                        packet_loss: n.packet_loss,
-                        sent_bytes_per_second: n.bytes_sent_per_second as f64,
-                        received_bytes_per_second: n.bytes_received_per_second as f64,
-                    }
-                }),
-                client_id,
-                last_acked_tick: state.and_then(|state| state.last_acked_tick),
-                confirmed_baseline_tick: state
-                    .and_then(|state| state.confirmed_baseline.as_ref())
-                    .map(|baseline| baseline.tick),
-                sent_history_len: state.map_or(0, |state| state.sent_history.len()),
-                world,
-            }
-        })
-        .collect();
-
-    ServerDebugFrame {
-        conditioner: Some(crate::conditioner::snapshot(conditioner)),
-        schema_version: game_shared::DEBUG_SCHEMA_VERSION,
-        identity: context.identity.clone(),
-        capture_unix_ms: unix_ms(),
-        capture_elapsed_ms: context.elapsed_ms(),
-        step_duration_ms,
-        tick: sim.tick(),
-        clients,
-    }
-}
-
-fn sort_world_delta(world: &mut WorldDelta) {
-    world.heroes.sort_by_key(|hero| hero.client_id);
-    world.enemies.sort_by_key(|enemy| enemy.id);
-    world.towers.sort_by_key(|tower| tower.id);
-    world.objectives.sort_by_key(|objective| objective.lane);
-}
-
-fn panic_payload_to_string(payload: &(dyn Any + Send)) -> String {
-    if let Some(message) = payload.downcast_ref::<&'static str>() {
-        return (*message).to_owned();
-    }
-
-    if let Some(message) = payload.downcast_ref::<String>() {
-        return message.clone();
-    }
-
-    "<non-string panic payload>".to_owned()
-}
-
-fn receive_client_commands(
-    server: &mut RenetServer,
-    sim: &mut Simulation,
-    client_net_states: &mut HashMap<u64, ClientNetState>,
-) {
-    let clients = server.clients_id();
-    for client_id in clients {
-        // Reliable channel: action commands (attacks, abilities, builds, etc.)
-        for _ in 0..16 {
-            let Some(bytes) = server.receive_message(client_id, DefaultChannel::ReliableOrdered)
-            else {
-                break;
-            };
-            if bytes.len() > 64 {
-                server.disconnect(client_id);
-                break;
-            }
-            match game_shared::decode::<game_shared::ClientAction>(&bytes) {
-                Ok(action) if !matches!(action.command, ClientCommand::Move { .. }) => {
-                    sim.queue_action(client_id, action);
-                }
-                Ok(_) => {
-                    server.disconnect(client_id);
-                    break;
-                }
-                Err(err) => {
-                    log::debug!("dropping invalid reliable command from client {client_id}: {err}");
-                }
-            }
-        }
-
-        // Unreliable channel: move bundles and client acks
-        for _ in 0..32 {
-            let Some(bytes) = server.receive_message(client_id, DefaultChannel::Unreliable) else {
-                break;
-            };
-            if bytes.len() > 2048 {
-                continue;
-            }
-            // Try to decode as ClientMoveBundle first
-            if let Ok(bundle) = game_shared::decode::<ClientMoveBundle>(&bytes) {
-                if bundle.match_epoch != sim.sim_meta().match_epoch
-                    || bundle.moves.len() > 16
-                    || bundle.actions.len() > 64
-                {
-                    continue;
-                }
-                for action in bundle.actions {
-                    sim.queue_action(client_id, action);
-                }
-                for (seq, dir) in bundle.moves {
-                    sim.queue_command(client_id, ClientCommand::Move { seq, dir });
-                }
-                continue;
-            }
-            // Try to decode as ClientAck
-            if let Ok(ack) = game_shared::decode::<ClientAck>(&bytes) {
-                if let Some(state) = client_net_states.get_mut(&client_id) {
-                    state.acknowledge(ack.tick);
-                }
-                continue;
-            }
-            log::debug!("dropping unrecognized unreliable message from client {client_id}");
-        }
-    }
-}
-
-fn send_pending_joins(
-    server: &mut RenetServer,
-    sim: &Simulation,
-    pending_joins: &mut VecDeque<u64>,
-) {
-    let connected: HashSet<u64> = server.clients_id().into_iter().collect();
-    while let Some(client_id) = pending_joins.pop_front() {
-        if !connected.contains(&client_id) {
-            continue;
-        }
-
-        let join = sim.join_snapshot(client_id);
-        let payload = encode(&ReliableServerMessage::JoinSnapshot(join));
-        server.send_message(client_id, DefaultChannel::ReliableOrdered, payload);
-    }
-}
-
-/// Max tick age for a baseline to be usable for delta compression.
-const DELTA_BASELINE_MAX_AGE: u32 = 60;
-
-fn broadcast_world_deltas(
-    server: &mut RenetServer,
-    sim: &Simulation,
-    client_net_states: &mut HashMap<u64, ClientNetState>,
-) {
-    let client_ids = server.clients_id();
-    for client_id in client_ids {
-        let delta: WorldDelta = sim.world_delta_for(client_id);
-
-        let state = client_net_states
-            .entry(client_id)
-            .or_insert_with(|| ClientNetState {
-                last_acked_tick: None,
-                confirmed_baseline: None,
-                sent_history: VecDeque::new(),
-            });
-
-        // Only build a patch against a baseline the client has confirmed receiving.
-        let msg = snapshot_message(&delta, state.confirmed_baseline.as_ref());
-
-        server.send_message(client_id, DefaultChannel::Unreliable, encode(&msg));
-
-        // Store in sent_history so we can promote to confirmed_baseline when acked.
-        state.sent_history.push_back((delta.tick, delta));
-        while state.sent_history.len() > 64 {
-            state.sent_history.pop_front();
-        }
-    }
-}
-
-fn snapshot_message(delta: &WorldDelta, baseline: Option<&WorldDelta>) -> ServerWorldMessage {
-    if let Some(baseline) = baseline {
-        let age = delta.tick.wrapping_sub(baseline.tick);
-        if age > 0 && age <= DELTA_BASELINE_MAX_AGE {
-            return ServerWorldMessage::Patch(build_world_patch(delta, baseline));
-        }
-    }
-    ServerWorldMessage::Full(delta.clone())
-}
-
-fn build_world_patch(current: &WorldDelta, baseline: &WorldDelta) -> WorldPatch {
-    let mut hero_patches = Vec::new();
-    let mut enemy_patches = Vec::new();
-    let mut tower_patches = Vec::new();
-    let mut removed_ids = Vec::new();
-    let mut removed_hero_ids = Vec::new();
-
-    // Heroes: find changed and new
-    for hero in &current.heroes {
-        let changed = baseline
-            .heroes
-            .iter()
-            .find(|b| b.client_id == hero.client_id)
-            .is_none_or(|b| b != hero);
-        if changed {
-            hero_patches.push(hero.clone());
-        }
-    }
-
-    // Enemies: find changed and new
-    for enemy in &current.enemies {
-        let changed = baseline
-            .enemies
-            .iter()
-            .find(|b| b.id == enemy.id)
-            .is_none_or(|b| b != enemy);
-        if changed {
-            enemy_patches.push(*enemy);
-        }
-    }
-
-    // Towers: find changed and new
-    for tower in &current.towers {
-        let changed = baseline
-            .towers
-            .iter()
-            .find(|b| b.id == tower.id)
-            .is_none_or(|b| b != tower);
-        if changed {
-            tower_patches.push(*tower);
-        }
-    }
-
-    // Find removed entities (in baseline but not in current)
-    for hero in &baseline.heroes {
-        if !current.heroes.iter().any(|c| c.client_id == hero.client_id) {
-            removed_hero_ids.push(hero.client_id);
-        }
-    }
-    for enemy in &baseline.enemies {
-        if !current.enemies.iter().any(|c| c.id == enemy.id) {
-            removed_ids.push(enemy.id);
-        }
-    }
-    for tower in &baseline.towers {
-        if !current.towers.iter().any(|c| c.id == tower.id) {
-            removed_ids.push(tower.id);
-        }
-    }
-
-    WorldPatch {
-        presentations: current.presentations.clone(),
-        tick: current.tick,
-        baseline_tick: baseline.tick,
-        phase: current.phase,
-        match_restart_ticks_remaining: current.match_restart_ticks_remaining,
-        wave: current.wave,
-        team_life: current.team_life,
-        objectives: current.objectives.clone(),
-        your_last_input_seq: current.your_last_input_seq,
-        hero_patches,
-        enemy_patches,
-        tower_patches,
-        removed_ids,
-        removed_hero_ids,
-        sim_meta: current.sim_meta,
-    }
 }
 
 #[cfg(test)]
@@ -908,52 +411,314 @@ mod protocol_regressions {
     use super::*;
 
     #[test]
-    fn unknown_ack_cannot_poison_baseline_and_old_ack_cannot_regress_it() {
-        let mut delta = Simulation::new().world_delta_for(1);
-        delta.tick = 10;
-        let mut state = ClientNetState {
-            last_acked_tick: None,
-            confirmed_baseline: None,
-            sent_history: VecDeque::from([(10, delta.clone())]),
+    fn preupdate_stages_ordered_ingress_before_shared_ecs_tick() {
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, game_sim::SimulationPlugins));
+        let (worker, output) = crate::network::test_worker(vec![
+            Ingress::Connected(1),
+            Ingress::Disconnected(1),
+            Ingress::Connected(2),
+            Ingress::Moves(
+                2,
+                ClientMoveBundle {
+                    match_epoch: sim::sim_meta(app.world()).match_epoch,
+                    moves: vec![(7, [1.0, 0.0])],
+                    actions: Vec::new(),
+                },
+            ),
+        ]);
+        app.init_resource::<crate::network::PendingOutput>()
+            .add_systems(PostUpdate, crate::network::inbox::publish_output)
+            .insert_resource(worker)
+            .init_resource::<NetworkMetrics>()
+            .init_resource::<PendingJoinSnapshots>()
+            .init_resource::<DebugRecorderResource>()
+            .init_resource::<crate::state_history::StateHistory>()
+            .add_systems(PreUpdate, receive_client_commands)
+            .add_systems(FixedUpdate, fixed_server_tick);
+        // The soft per-pass deadline may split connection setup over frames.
+        for _ in 0..4 {
+            app.world_mut().run_schedule(PreUpdate);
+        }
+        assert_eq!(sim::world_delta(app.world()).tick, 0);
+        assert_eq!(sim::world_delta(app.world()).heroes[0].last_move_seq, None);
+        app.world_mut().run_schedule(FixedUpdate);
+        assert!(output.try_recv().is_err());
+        app.world_mut().run_schedule(PostUpdate);
+        let batch = output.try_recv().unwrap();
+        assert_eq!(batch.messages.len(), 1);
+        let crate::network::Outbound::ToClient(2, ReliableServerMessage::JoinSnapshot(join)) =
+            &batch.messages[0]
+        else {
+            panic!()
         };
-        state.acknowledge(1000);
-        assert_eq!(state.last_acked_tick, None);
-        state.acknowledge(10);
-        state.acknowledge(9);
-        assert_eq!(state.last_acked_tick, Some(10));
-        assert_eq!(state.confirmed_baseline.unwrap(), delta);
+        assert_eq!(join.world.tick, 0);
+        let snapshot = batch.world.unwrap();
+        assert_eq!(snapshot.tick, 1);
+        assert_eq!(snapshot.heroes.len(), 1);
+        assert_eq!(snapshot.heroes[0].client_id, 2);
+        assert_eq!(snapshot.heroes[0].last_move_seq, Some(7));
+        assert_eq!(snapshot, sim::world_delta(app.world()));
     }
 
     #[test]
-    fn baseline_expiry_falls_back_to_full_including_tick_wrap() {
-        let mut baseline = Simulation::new().world_delta_for(1);
-        baseline.tick = u32::MAX - 20;
-        let mut delta = baseline.clone();
-        delta.tick = baseline.tick.wrapping_add(60);
-        assert!(matches!(
-            snapshot_message(&delta, Some(&baseline)),
-            ServerWorldMessage::Patch(_)
-        ));
-        delta.tick = baseline.tick.wrapping_add(61);
-        assert!(matches!(
-            snapshot_message(&delta, Some(&baseline)),
-            ServerWorldMessage::Full(_)
-        ));
-        assert!(matches!(
-            snapshot_message(&delta, None),
-            ServerWorldMessage::Full(_)
-        ));
+    fn staging_bursts_leave_remainder_for_later_frames() {
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, game_sim::SimulationPlugins));
+        let total = crate::network::ingress::MAX_INGRESS_PER_PASS + 10;
+        let (worker, _output) =
+            crate::network::test_worker((0..total).map(|_| Ingress::Metrics(Vec::new())).collect());
+        app.insert_resource(worker)
+            .init_resource::<NetworkMetrics>()
+            .add_systems(PreUpdate, receive_client_commands);
+        app.world_mut().run_schedule(PreUpdate);
+        let metrics = app.world().resource::<NetworkMetrics>();
+        assert!(metrics.ingress_messages > 0);
+        assert!(metrics.ingress_messages <= crate::network::ingress::MAX_INGRESS_PER_PASS as u64);
+        assert_eq!(metrics.ingress_deferred_passes, 1);
+        assert_eq!(metrics.ingress_peak_pending, total);
+        // No fixed tick ran; additional staging never gives the worker a new quota.
+        assert_eq!(app.world().resource::<NetworkMetrics>().tick, 0);
+        for _ in 0..total {
+            app.world_mut().run_schedule(PreUpdate);
+        }
+        assert_eq!(
+            app.world().resource::<NetworkMetrics>().ingress_messages,
+            total as u64
+        );
+    }
+
+    #[test]
+    fn unsent_snapshot_cannot_be_acknowledged_as_baseline() {
+        let mut config = ConnectionConfig::default();
+        for channel in &mut config.server_channels_config {
+            channel.max_memory_usage_bytes = 1;
+        }
+        let mut server = RenetServer::new(config);
+        server.add_connection(1);
+        let mut simulation = Simulation::new();
+        simulation.add_player(1);
+        let snapshot = simulation.world_delta();
+        let mut clients = HashMap::new();
+        let mut history = ReplicationHistory::default();
+        broadcast_world_deltas(&mut server, &snapshot, &mut clients, &mut history);
+        let client = clients.get_mut(&1).unwrap();
+        assert!(client.outstanding.is_empty());
+        client.acknowledge(snapshot.tick);
+        assert!(client.last_acked_tick.is_none());
+    }
+
+    #[test]
+    fn admission_limit_is_configurable_and_rejects_transport_overflow() {
+        assert_eq!(
+            ServerArgs::try_parse_from(["server"]).unwrap().max_clients,
+            8
+        );
+        assert_eq!(
+            ServerArgs::try_parse_from(["server", "--max-clients", "64"])
+                .unwrap()
+                .max_clients,
+            64
+        );
+        for invalid in ["0", "1025"] {
+            assert!(ServerArgs::try_parse_from(["server", "--max-clients", invalid]).is_err());
+        }
+    }
+
+    #[test]
+    fn packet_generation_is_bounded_under_fast_app_polling() {
+        let mut last = PacketSendClock::default();
+        let sends = (0..1000)
+            .filter(|ms| last.should_flush(Duration::from_millis(*ms), false))
+            .count();
+        assert!(sends <= 31 && sends >= 29);
+        assert!(last.should_flush(Duration::from_secs(3), false));
+        assert!(!last.should_flush(Duration::from_secs(3), false));
+    }
+    #[test]
+    fn lossless_baseline_codec_scales_with_units_and_survives_structural_changes() {
+        let mut sim = Simulation::new();
+        for id in 1..=8 {
+            sim.add_player(id);
+        }
+        for _ in 0..=game_shared::WAVE_PREP_TICKS {
+            sim.step();
+        }
+        let seed = sim.world_delta();
+        for count in [84, 256, 1024] {
+            let mut world = seed.clone();
+            world.enemies = (0..count)
+                .map(|i| {
+                    let mut enemy = seed.enemies[0];
+                    enemy.id += i;
+                    enemy.pos = [(i % 28) as f32 - 14.0, (i / 28) as f32 % 20.0 - 10.0];
+                    enemy
+                })
+                .collect();
+            let mut total = 0;
+            let mut maximum = 0;
+            let started = std::time::Instant::now();
+            for step in 1..=120 {
+                // A nine-tick baseline represents about 300ms of round-trip age.
+                let baseline = world.clone();
+                world.tick += 9;
+                for (index, enemy) in world.enemies.iter_mut().enumerate() {
+                    let angle = (index as f32 * 0.137 + step as f32 * 0.017).sin();
+                    enemy.vel = [angle, angle.cos()];
+                    enemy.pos[0] += enemy.vel[0] * 0.3;
+                    enemy.pos[1] += enemy.vel[1] * 0.3;
+                    enemy.facing.dir = enemy.vel;
+                    enemy.repath_cooldown = step % 12;
+                }
+                for hero in &mut world.heroes {
+                    hero.last_move_seq = Some(step);
+                    hero.mana = 50.0 + step as f32 * 0.1;
+                }
+                if step % 15 == 0 {
+                    world.enemies.remove(0);
+                }
+                let patch = ServerWorldMessage::Patch(build_world_patch(&world, &baseline));
+                let encoded = encode(&patch);
+                let full = encode(&ServerWorldMessage::Full(world.clone()));
+                let size = encoded.len().min(full.len());
+                total += size;
+                maximum = maximum.max(size);
+                let ServerWorldMessage::Patch(decoded) = game_shared::decode(&encoded).unwrap()
+                else {
+                    panic!()
+                };
+                assert_eq!(
+                    game_shared::apply_world_patch(&baseline, &decoded).unwrap(),
+                    world
+                );
+            }
+            eprintln!(
+                "replication scaling: units={count} baseline_age=9 ticks avg_bytes={} max_bytes={maximum} encode_decode_us_per_update={}",
+                total / 120,
+                started.elapsed().as_micros() / 120
+            );
+            if count == 84 {
+                assert!(
+                    maximum < 4000,
+                    "crowded-wave update exceeded measured four-slice budget"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn crowded_snapshot_delivery_survives_five_percent_datagram_loss() {
+        let mut sim = Simulation::new();
+        for id in 1..=8 {
+            sim.add_player(id);
+        }
+        for _ in 0..=game_shared::WAVE_PREP_TICKS {
+            sim.step();
+        }
+        let mut world = sim.world_delta();
+        let enemy = world.enemies[0];
+        world.enemies = (0..84)
+            .map(|i| {
+                let mut enemy = enemy;
+                enemy.id += i;
+                enemy.pos = [(i % 14) as f32 - 7.0, (i / 14) as f32 - 3.0];
+                enemy
+            })
+            .collect();
+        let mut server = RenetServer::new(ConnectionConfig::default());
+        server.add_connection(1);
+        let mut client = renet::RenetClient::new(ConnectionConfig::default());
+        client.set_connected();
+        let mut packet_count = 0;
+        let mut delivered = 0;
+        let mut wire_bytes = 0;
+        let mut state = ClientNetState::default();
+        let mut history = ReplicationHistory::default();
+        let mut client_history = VecDeque::<WorldDelta>::new();
+        let mut reverse_packets = 0;
+        let ticks = 600;
+        for tick in 0..ticks {
+            let dt = Duration::from_secs_f64(1.0 / 30.0);
+            server.update(dt);
+            client.update(dt);
+            world.tick += 1;
+            for enemy in &mut world.enemies {
+                enemy.pos[0] += 0.01;
+                enemy.vel = [0.3, 0.0];
+            }
+            history.record(&world);
+            let packet = history.packet_for(state.last_acked_tick);
+            let payload = packet.payload.clone();
+            state.sent(packet);
+            wire_bytes += payload.len();
+            server.send_message(1, DefaultChannel::Unreliable, payload);
+            for packet in server.get_packets_to_send(1).unwrap() {
+                packet_count += 1;
+                if packet_count % 20 != 0 {
+                    client.process_packet(&packet);
+                }
+            }
+            while let Some(bytes) = client.receive_message(DefaultChannel::Unreliable) {
+                let rebuilt = match game_shared::decode::<ServerWorldMessage>(&bytes).unwrap() {
+                    ServerWorldMessage::Full(world) => world,
+                    ServerWorldMessage::Patch(patch) => {
+                        let baseline = client_history
+                            .iter()
+                            .find(|w| w.tick == patch.baseline_tick)
+                            .expect("server must use a client-confirmed complete version");
+                        game_shared::apply_world_patch(baseline, &patch).unwrap()
+                    }
+                };
+                assert_eq!(
+                    rebuilt, world,
+                    "lossless restoration includes all simulation state"
+                );
+                client.send_message(
+                    DefaultChannel::Unreliable,
+                    encode(&ClientAck { tick: rebuilt.tick }),
+                );
+                client_history.push_back(rebuilt);
+                while client_history.len() > 64 {
+                    client_history.pop_front();
+                }
+                delivered += 1;
+            }
+            for packet in client.get_packets_to_send() {
+                reverse_packets += 1;
+                if reverse_packets % 20 != 0 {
+                    server.process_packet_from(&packet, 1).unwrap();
+                }
+            }
+            while let Some(bytes) = server.receive_message(1, DefaultChannel::Unreliable) {
+                state.acknowledge(
+                    game_shared::decode_with_limit::<ClientAck>(&bytes, 64)
+                        .unwrap()
+                        .tick,
+                );
+            }
+            assert!(client.is_connected(), "tick {tick}");
+        }
+        eprintln!(
+            "crowded snapshot wire: bytes/tick={} packets/tick={:.1} delivered={delivered}/{ticks}",
+            wire_bytes / ticks,
+            packet_count as f64 / ticks as f64
+        );
+        assert!(
+            delivered >= ticks * 4 / 5,
+            "snapshot fragmentation amplified 5% packet loss: {delivered}/{ticks} snapshots survived"
+        );
     }
 
     #[test]
     fn hero_removal_is_separate_from_world_entity_namespace() {
         let mut sim = Simulation::new();
         sim.add_player(1_000_000);
-        let before = sim.world_delta_for(1_000_000);
+        let before = sim.world_delta();
         sim.remove_player(1_000_000);
-        let patch = build_world_patch(&sim.world_delta_for(1_000_000), &before);
-        assert_eq!(patch.removed_hero_ids, vec![1_000_000]);
-        assert!(patch.removed_ids.is_empty());
+        let patch = build_world_patch(&sim.world_delta(), &before);
+        let restored = game_shared::apply_world_patch(&before, &patch).unwrap();
+        assert!(restored.heroes.is_empty());
+        assert_eq!(restored.enemies, before.enemies);
     }
 }
 
@@ -964,7 +729,7 @@ mod presentation_replication_tests {
     fn patches_carry_creation_and_expiry_of_simulation_presentations() {
         let mut sim = Simulation::new();
         sim.add_player(1);
-        let baseline = sim.world_delta_for(1);
+        let baseline = sim.world_delta();
         sim.queue_command(
             1,
             game_shared::ClientCommand::CastAbility {
@@ -973,16 +738,18 @@ mod presentation_replication_tests {
             },
         );
         sim.step();
-        let active = sim.world_delta_for(1);
+        let active = sim.world_delta();
         let patch = build_world_patch(&active, &baseline);
-        assert_eq!(patch.presentations, active.presentations);
-        assert_eq!(patch.presentations.len(), 1);
+        let restored = game_shared::apply_world_patch(&baseline, &patch).unwrap();
+        assert_eq!(restored, active);
+        assert_eq!(restored.presentations.len(), 1);
         for _ in 0..20 {
             sim.step();
         }
-        let expired = sim.world_delta_for(1);
+        let expired = sim.world_delta();
         assert!(
-            build_world_patch(&expired, &active)
+            game_shared::apply_world_patch(&active, &build_world_patch(&expired, &active))
+                .unwrap()
                 .presentations
                 .is_empty()
         );

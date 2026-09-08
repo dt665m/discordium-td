@@ -9,7 +9,7 @@ impl Plugin for GameCameraPlugin {
         app.init_resource::<FollowSettings>()
             .add_systems(Startup, spawn_camera)
             .add_systems(
-                Update,
+                RunFixedMainLoop,
                 camera_controls
                     .before(capture_input)
                     .in_set(ClientUpdateSet::Input),

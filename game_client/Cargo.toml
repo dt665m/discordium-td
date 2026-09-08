@@ -7,8 +7,9 @@ rust-version.workspace = true
 
 [dependencies]
 bevy = { workspace = true, features = ["bevy_dev_tools"] }
-game_shared = { path = "../game_shared" }
-game_sim = { path = "../game_sim", features = ["bevy"] }
+game_replication = { path = "../shared/replication" }
+game_shared = { path = "../shared/protocol" }
+game_sim = { path = "../shared/simulation", features = ["bevy"] }
 log.workspace = true
 renet.workspace = true
 renet-cross.workspace = true

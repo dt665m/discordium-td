@@ -1,3 +1,4 @@
+use game_replication::{NetEntityIndex, NetId, NetIdentityPlugin};
 mod camera;
 mod minimap;
 #[path = "game/simulation_presentations.rs"]
@@ -42,7 +43,7 @@ use std::{
 
 use bevy::dev_tools::fps_overlay::{FpsOverlayConfig, FpsOverlayPlugin, FrameTimeGraphConfig};
 use bevy::{
-    app::AppExit,
+    app::{AppExit, RunFixedMainLoop, RunFixedMainLoopSystems},
     asset::RenderAssetUsages,
     light::NotShadowCaster,
     prelude::*,
@@ -356,12 +357,52 @@ impl Default for LocalSimulation {
 }
 
 struct InputEntry {
-    commands: Vec<ClientCommand>,
+    movement: Option<PendingMove>,
+    actions: Vec<game_shared::ClientAction>,
 }
 
-/// Action commands detected in Update, consumed in the next FixedUpdate tick.
+impl InputEntry {
+    fn is_empty(&self) -> bool {
+        self.movement.is_none() && self.actions.is_empty()
+    }
+    fn queue(&self, sim: &mut Simulation, client_id: u64) {
+        for action in &self.actions {
+            sim.queue_action(client_id, *action);
+        }
+        if let Some(movement) = &self.movement {
+            sim.queue_command(
+                client_id,
+                ClientCommand::Move {
+                    seq: movement.seq,
+                    dir: movement.dir,
+                },
+            );
+        }
+    }
+    #[cfg(test)]
+    fn for_test(commands: Vec<ClientCommand>) -> Self {
+        let mut entry = Self {
+            movement: None,
+            actions: Vec::new(),
+        };
+        for command in commands {
+            match command {
+                ClientCommand::Move { seq, dir } => entry.movement = Some(PendingMove { seq, dir }),
+                _ => entry.actions.push(game_shared::ClientAction {
+                    command,
+                    match_epoch: 0,
+                    after_move_seq: None,
+                    view_tick: None,
+                }),
+            }
+        }
+        entry
+    }
+}
+
+/// Action commands captured before the fixed loop, consumed by its next tick.
 #[derive(Resource, Default)]
-struct PendingActions(Vec<ClientCommand>);
+struct PendingActions(Vec<game_shared::ClientAction>);
 
 #[derive(Resource)]
 struct UnitBarCameraCache {
@@ -468,6 +509,7 @@ struct GoldHudState {
 }
 
 #[derive(Resource)]
+#[cfg_attr(test, derive(Default))]
 struct SceneAssets {
     hero_mesh: Handle<Mesh>,
     enemy_mesh: Handle<Mesh>,
@@ -493,19 +535,9 @@ struct SceneAssets {
     power_bar_material: Handle<StandardMaterial>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-enum ActorKey {
-    Hero(u64),
-    World(u64),
-}
-
-#[derive(Resource, Default)]
-struct RenderIndex {
-    by_id: HashMap<ActorKey, Entity>,
-}
-
 #[derive(Resource, Default)]
 struct WorldView {
+    match_epoch: u32,
     tick: u32,
     phase: MatchPhase,
     match_restart_ticks_remaining: Option<u32>,
@@ -527,6 +559,9 @@ impl WorldView {
     }
 
     fn apply_delta(&mut self, delta: WorldDelta) {
+        if let Some(meta) = delta.sim_meta {
+            self.match_epoch = meta.match_epoch;
+        }
         self.tick = delta.tick;
         self.phase = delta.phase;
         self.match_restart_ticks_remaining = delta.match_restart_ticks_remaining;
@@ -758,15 +793,19 @@ struct RegularAttackStat {
     ticks_remaining: u32,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Component, Clone, Copy, PartialEq)]
 enum ActorKind {
     Hero { local: bool },
     Enemy,
     Tower,
 }
 
+#[derive(Component)]
+struct EnemyIdentity(game_shared::EnemySpawnIdentity);
+
 #[derive(Clone, Copy)]
 struct DesiredActor {
+    spawn_identity: Option<game_shared::EnemySpawnIdentity>,
     player: Option<targeting::PlayerVisual>,
     pos: [f32; 2],
     kind: ActorKind,
@@ -818,7 +857,7 @@ impl Plugin for GameClientPlugin {
             .insert_resource(GoldHudState::default())
             .insert_resource(MainMenuState::default())
             .insert_resource(WorldView::default())
-            .insert_resource(RenderIndex::default())
+            .add_plugins(NetIdentityPlugin)
             .insert_resource(ClientDebugBridgeState::new(debug_bridge_enabled))
             .insert_resource(ClientDebugRecorderState::new(
                 debug_recorder_enabled,
@@ -848,42 +887,52 @@ impl Plugin for GameClientPlugin {
             .add_plugins(ConditionerDebugPlugin::new(ConditionerHandle::default()))
             .add_systems(Startup, (setup_scene, menu::main_menu.spawn()))
             .configure_sets(
-                Update,
-                (
-                    ClientUpdateSet::Input,
-                    ClientUpdateSet::Network,
-                    ClientUpdateSet::Visual,
-                    ClientUpdateSet::Ui,
-                )
-                    .chain(),
+                RunFixedMainLoop,
+                (ClientUpdateSet::Input, ClientUpdateSet::Network)
+                    .chain()
+                    .in_set(RunFixedMainLoopSystems::BeforeFixedMainLoop),
             )
-            .add_systems(Update, handle_menu_buttons.in_set(ClientUpdateSet::Input))
-            .add_systems(
+            .configure_sets(
                 Update,
+                (ClientUpdateSet::Visual, ClientUpdateSet::Ui).chain(),
+            )
+            .add_systems(
+                RunFixedMainLoop,
+                handle_menu_buttons.in_set(ClientUpdateSet::Input),
+            )
+            .add_systems(
+                RunFixedMainLoop,
                 process_menu_actions
                     .after(handle_menu_buttons)
                     .before(capture_input)
                     .in_set(ClientUpdateSet::Input),
             )
-            .add_systems(Update, capture_input.in_set(ClientUpdateSet::Input))
             .add_systems(
-                Update,
+                RunFixedMainLoop,
+                capture_input.in_set(ClientUpdateSet::Input),
+            )
+            .add_systems(
+                RunFixedMainLoop,
                 (toggle_debug_overlay, super::debug_panel::scroll)
                     .chain()
                     .in_set(ClientUpdateSet::Input),
             )
             .add_systems(
-                Update,
+                RunFixedMainLoop,
                 (
-                    send_action_commands,
                     #[cfg(target_arch = "wasm32")]
                     poll_web_bootstrap,
                     network_update,
-                    network_send,
-                    report_conditioner_rtt,
+                    send_action_commands,
                 )
                     .chain()
                     .in_set(ClientUpdateSet::Network),
+            )
+            .add_systems(
+                RunFixedMainLoop,
+                (network_send, report_conditioner_rtt)
+                    .chain()
+                    .in_set(RunFixedMainLoopSystems::AfterFixedMainLoop),
             )
             .add_systems(
                 Update,
@@ -957,7 +1006,7 @@ impl Plugin for GameClientPlugin {
 
         #[cfg(target_arch = "wasm32")]
         app.add_systems(
-            Update,
+            RunFixedMainLoop,
             poll_client_debug_bridge_commands
                 .after(handle_menu_buttons)
                 .before(process_menu_actions)
@@ -1362,6 +1411,7 @@ fn sync_menu_button_visual_state(
 
 #[cfg(target_arch = "wasm32")]
 fn poll_client_debug_bridge_commands(
+    conditioner: Res<ConditionerDebug>,
     debug_bridge: Res<ClientDebugBridgeState>,
     mut menu_state: ResMut<MainMenuState>,
 ) {
@@ -1390,6 +1440,18 @@ fn poll_client_debug_bridge_commands(
     );
 
     match command.as_str() {
+        "network_outage" => conditioner.handle().outage(Duration::from_secs(1)),
+        "network_300ms" => {
+            let _ = conditioner
+                .handle()
+                .configure(renet_cross::conditioner::ConditionerConfig {
+                    enabled: true,
+                    latency: Duration::from_millis(150),
+                    jitter: Duration::from_millis(25),
+                    packet_loss: 0.05,
+                    ..Default::default()
+                });
+        }
         "connect_dev" => {
             menu_state.pending_action = Some(MenuAction::ConnectDev);
             menu_state.connect_request_in_flight = true;
@@ -2304,10 +2366,11 @@ fn sync_dynamic_actors(
     world: Res<WorldView>,
     net_stats: Res<NetStats>,
     snapshot_buffer: Res<SnapshotBuffer>,
-    mut render_index: ResMut<RenderIndex>,
+    render_index: Res<NetEntityIndex>,
     assets: Res<SceneAssets>,
     runtime: Option<NonSend<NetworkRuntime>>,
     dying: Query<(), With<PredictedEnemyDeath>>,
+    actor_kinds: Query<(&ActorKind, Option<&EnemyIdentity>)>,
     mut actors: Query<
         (
             &mut Transform,
@@ -2346,8 +2409,7 @@ fn sync_dynamic_actors(
 
     // Get predicted state from local sim (if initialized), otherwise use server state
     let sim_delta = if local_sim.initialized {
-        let my_id = local_client_id.unwrap_or(0);
-        Some(local_sim.sim.world_delta_for(my_id))
+        Some(local_sim.sim.world_delta())
     } else {
         None
     };
@@ -2463,8 +2525,13 @@ fn sync_dynamic_actors(
             hero.facing.dir
         };
         desired.insert(
-            ActorKey::Hero(hero.client_id),
+            NetId::new(
+                world.match_epoch,
+                game_shared::actor_namespace::HERO,
+                hero.client_id,
+            ),
             DesiredActor {
+                spawn_identity: None,
                 player: Some(targeting::PlayerVisual {
                     id: hero.client_id,
                     target: hero.lock_target_id.filter(|_| hero.lock_mode_active),
@@ -2508,8 +2575,13 @@ fn sync_dynamic_actors(
                 .unwrap_or([0.0, 0.0]);
             let pos = [enemy.pos[0] + offset[0], enemy.pos[1] + offset[1]];
             desired.insert(
-                ActorKey::World(enemy.id),
+                NetId::new(
+                    world.match_epoch,
+                    game_shared::actor_namespace::ENEMY,
+                    enemy.id,
+                ),
                 DesiredActor {
+                    spawn_identity: Some(enemy.spawn),
                     player: None,
                     pos,
                     kind: ActorKind::Enemy,
@@ -2535,8 +2607,13 @@ fn sync_dynamic_actors(
                 .and_then(|interp| interp.enemies.get(&enemy.id).map(|(p, _)| *p))
                 .unwrap_or_else(|| predict_enemy_position(enemy, net_stats.enemy_render_lead()));
             desired.insert(
-                ActorKey::World(enemy.id),
+                NetId::new(
+                    world.match_epoch,
+                    game_shared::actor_namespace::ENEMY,
+                    enemy.id,
+                ),
                 DesiredActor {
+                    spawn_identity: Some(enemy.spawn),
                     player: None,
                     pos,
                     kind: ActorKind::Enemy,
@@ -2567,8 +2644,13 @@ fn sync_dynamic_actors(
     if local_sim.initialized && sim_delta.is_some() {
         for tower in tower_source {
             desired.insert(
-                ActorKey::World(tower.id),
+                NetId::new(
+                    world.match_epoch,
+                    game_shared::actor_namespace::TOWER,
+                    tower.id,
+                ),
                 DesiredActor {
+                    spawn_identity: None,
                     player: None,
                     pos: tower.pos,
                     kind: ActorKind::Tower,
@@ -2587,8 +2669,13 @@ fn sync_dynamic_actors(
     } else {
         for tower in world.towers.values() {
             desired.insert(
-                ActorKey::World(tower.id),
+                NetId::new(
+                    world.match_epoch,
+                    game_shared::actor_namespace::TOWER,
+                    tower.id,
+                ),
                 DesiredActor {
+                    spawn_identity: None,
                     player: None,
                     pos: tower.pos,
                     kind: ActorKind::Tower,
@@ -2607,8 +2694,10 @@ fn sync_dynamic_actors(
     }
 
     for (id, actor) in &desired {
-        if let Some(existing_entity) = render_index.by_id.get(id).copied() {
-            if let Ok((
+        if let Some(existing_entity) = render_index.get(id).copied() {
+            if actor_kinds.get(existing_entity).is_ok_and(|(kind, spawn)| {
+                *kind == actor.kind && spawn.map(|spawn| spawn.0) == actor.spawn_identity
+            }) && let Ok((
                 mut transform,
                 health,
                 mana,
@@ -2658,42 +2747,49 @@ fn sync_dynamic_actors(
                 continue;
             }
 
-            render_index.by_id.remove(id);
             commands.entity(existing_entity).despawn();
         }
 
+        // Despawns above precede this insertion in the same command queue. The
+        // chained visual schedule flushes hooks before subsequent index readers.
         let entity = spawn_actor_entity(&mut commands, &assets, *actor);
-        render_index.by_id.insert(*id, entity);
+        commands.entity(entity).insert(*id);
     }
 
-    let stale_ids: Vec<ActorKey> = render_index
-        .by_id
-        .keys()
+    let stale_ids: Vec<NetId> = render_index
+        .iter()
+        .filter(|(_, entity)| actors.contains(*entity))
+        .map(|(id, _)| id)
         .filter(|id| !desired.contains_key(id))
-        .copied()
         .collect();
 
     for stale_id in stale_ids {
         // Prediction can remove an enemy before a snapshot confirms the kill.
         // Animate its retained visual until authority removes it, avoiding
         // a frozen pose while waiting for confirmation.
-        if let ActorKey::World(id) = stale_id {
-            if world.enemies.contains_key(&id) {
-                if let Some(entity) = render_index.by_id.get(&stale_id) {
-                    if !dying.contains(*entity) {
-                        commands
-                            .entity(*entity)
-                            .insert(PredictedEnemyDeath::default());
-                    }
-                    if let Ok((_, Some(mut health), ..)) = actors.get_mut(*entity) {
-                        health.current = 0.0;
-                    }
-                }
-                continue;
+        if stale_id.epoch == world.match_epoch
+            && stale_id.namespace == 1
+            && let Some(enemy) = world.enemies.get(&stale_id.value)
+            && let Some(entity) = render_index.get(&stale_id)
+            // Numeric IDs may be reused across speculative allocation histories.
+            // A retained corpse must still belong to this authoritative spawn.
+            && actor_kinds.get(*entity).is_ok_and(|(kind, spawn)| {
+                *kind == ActorKind::Enemy
+                    && spawn.map(|spawn| spawn.0) == Some(enemy.spawn)
+            })
+        {
+            if !dying.contains(*entity) {
+                commands
+                    .entity(*entity)
+                    .insert(PredictedEnemyDeath::default());
             }
+            if let Ok((_, Some(mut health), ..)) = actors.get_mut(*entity) {
+                health.current = 0.0;
+            }
+            continue;
         }
-        if let Some(entity) = render_index.by_id.remove(&stale_id) {
-            commands.entity(entity).despawn();
+        if let Some(entity) = render_index.get(&stale_id) {
+            commands.entity(*entity).despawn();
         }
     }
 }
@@ -2701,14 +2797,20 @@ fn sync_dynamic_actors(
 fn local_locked_target_entity(
     world: &WorldView,
     runtime: Option<&NetworkRuntime>,
-    render_index: &RenderIndex,
+    render_index: &NetEntityIndex,
 ) -> Option<Entity> {
     let hero = world.heroes.get(&runtime?.client_id)?;
     if !hero.lock_mode_active {
         return None;
     }
     let target_id = hero.lock_target_id?;
-    render_index.by_id.get(&ActorKey::World(target_id)).copied()
+    render_index
+        .get(&NetId::new(
+            world.match_epoch,
+            game_shared::actor_namespace::ENEMY,
+            target_id,
+        ))
+        .copied()
 }
 
 fn health_bar_width_multiplier(
@@ -2725,7 +2827,7 @@ fn health_bar_width_multiplier(
 
 fn update_unit_bars(
     world: Res<WorldView>,
-    render_index: Res<RenderIndex>,
+    render_index: Res<NetEntityIndex>,
     runtime: Option<NonSend<NetworkRuntime>>,
     mut bars: Query<(&UnitBarFill, &UnitBarLayout, &UnitBarFollow, &mut Transform)>,
     health_stats: Query<&HealthStat>,
@@ -2781,7 +2883,7 @@ fn update_unit_bars(
 
 fn update_unit_bar_background_scales(
     world: Res<WorldView>,
-    render_index: Res<RenderIndex>,
+    render_index: Res<NetEntityIndex>,
     runtime: Option<NonSend<NetworkRuntime>>,
     mut bars: Query<
         (&UnitBarRow, &UnitBarFollow, &UnitBarLayout, &mut Transform),
@@ -3153,7 +3255,7 @@ fn capture_client_debug_bridge_frame(
     snapshot_buffer: Res<SnapshotBuffer>,
     menu_root: Single<&Node, With<MainMenuRoot>>,
     menu_state: Res<MainMenuState>,
-    render_index: Res<RenderIndex>,
+    render_index: Res<NetEntityIndex>,
     mut debug_bridge: ResMut<ClientDebugBridgeState>,
     mut debug_recorder: ResMut<ClientDebugRecorderState>,
     actor_query: Query<
@@ -3186,8 +3288,8 @@ fn capture_client_debug_bridge_frame(
 
     let (predicted_tick, predicted_heroes, predicted_enemies, predicted_towers) =
         if local_sim.initialized {
-            if let Some(client_id) = client_id {
-                let mut predicted = local_sim.sim.world_delta_for(client_id);
+            if client_id.is_some() {
+                let mut predicted = local_sim.sim.world_delta();
                 sort_world_delta_snapshot(&mut predicted);
                 (
                     Some(local_sim.predicted_tick),
@@ -3207,11 +3309,11 @@ fn capture_client_debug_bridge_frame(
             (None, Vec::new(), Vec::new(), Vec::new())
         };
 
-    let mut render_ids: Vec<ActorKey> = render_index.by_id.keys().copied().collect();
+    let mut render_ids: Vec<NetId> = render_index.iter().map(|(id, _)| id).collect();
     render_ids.sort_unstable();
     let mut rendered_actors = Vec::with_capacity(render_ids.len());
     for id in render_ids {
-        let Some(entity) = render_index.by_id.get(&id) else {
+        let Some(entity) = render_index.get(&id) else {
             continue;
         };
         let Ok((transform, local_hero, hero, enemy, tower)) = actor_query.get(*entity) else {
@@ -3229,9 +3331,7 @@ fn capture_client_debug_bridge_frame(
             continue;
         };
         rendered_actors.push(game_shared::DebugRenderActor {
-            id: match id {
-                ActorKey::Hero(id) | ActorKey::World(id) => id,
-            },
+            id: id.value,
             kind,
             pos: [transform.translation.x, transform.translation.z],
         });
@@ -3343,7 +3443,7 @@ fn snapshot_buffer_debug(
 
     game_shared::ClientInterpolationDebug {
         snapshot_ticks,
-        render_time: snapshot_buffer.render_time,
+        render_time: snapshot_buffer.render_time as f32,
         interpolation_delay: snapshot_buffer.interpolation_delay,
         enemy_render_lead,
         older_tick,
@@ -3778,7 +3878,7 @@ fn apply_unit_bar_camera_update(
 fn orient_unit_bars_to_camera(
     camera_cache: Res<UnitBarCameraCache>,
     world: Res<WorldView>,
-    render_index: Res<RenderIndex>,
+    render_index: Res<NetEntityIndex>,
     runtime: Option<NonSend<NetworkRuntime>>,
     actor_query: Query<Ref<Transform>, (With<DynamicActor>, Without<UnitBarVisual>)>,
     mut bars: Query<
@@ -3974,6 +4074,10 @@ fn spawn_actor_entity(
             .id(),
     };
 
+    commands.entity(entity).insert(actor.kind);
+    if let Some(spawn) = actor.spawn_identity {
+        commands.entity(entity).insert(EnemyIdentity(spawn));
+    }
     apply_actor_stats(commands, entity, actor);
     apply_actor_metadata(commands, entity, actor);
     attach_facing_indicator(commands, assets, entity, actor);
@@ -4313,11 +4417,12 @@ mod protocol_regressions {
     use super::*;
 
     fn snapshot(tick: u32) -> TimestampedSnapshot {
-        let mut world = Simulation::new().world_delta_for(1);
+        let mut world = Simulation::new().world_delta();
         world.tick = tick;
         TimestampedSnapshot {
             server_tick: tick,
             receive_time: tick as f32,
+            simulation_time: 0.0,
             world,
         }
     }
@@ -4353,29 +4458,17 @@ mod protocol_regressions {
         for _ in 0..=game_shared::WAVE_PREP_TICKS {
             sim.step();
         }
-        let base = sim.world_delta_for(1_000_000);
+        let base = sim.world_delta();
         assert!(base.enemies.iter().any(|e| e.id == 1_000_000));
-        let patch = WorldPatch {
-            presentations: Vec::new(),
-            tick: base.tick + 1,
-            baseline_tick: base.tick,
-            phase: base.phase,
-            match_restart_ticks_remaining: base.match_restart_ticks_remaining,
-            wave: base.wave,
-            team_life: base.team_life,
-            objectives: base.objectives.clone(),
-            your_last_input_seq: base.your_last_input_seq,
-            hero_patches: vec![],
-            enemy_patches: vec![],
-            tower_patches: vec![],
-            removed_ids: vec![1_000_000],
-            removed_hero_ids: vec![],
-            sim_meta: base.sim_meta,
-        };
+        let mut current = base.clone();
+        current.tick += 1;
+        current.enemies.retain(|enemy| enemy.id != 1_000_000);
+        let patch = game_shared::build_world_patch(&current, &base);
         let mut buffer = SnapshotBuffer::default();
         buffer.push(TimestampedSnapshot {
             server_tick: base.tick,
             receive_time: 0.0,
+            simulation_time: 0.0,
             world: base,
         });
         let rebuilt = reconstruct_from_patch(&buffer, patch).unwrap();
@@ -4397,16 +4490,14 @@ mod protocol_regressions {
         server.step();
         let action = ClientCommand::BasicAttack { seq: 1 };
         let mut local = LocalSimulation::default();
-        local.input_buffer.push_back(InputEntry {
-            commands: vec![
-                action,
-                ClientCommand::Move {
-                    seq: 2,
-                    dir: [0.0, 0.0],
-                },
-            ],
-        });
-        let delta = server.world_delta_for(1);
+        local.input_buffer.push_back(InputEntry::for_test(vec![
+            action,
+            ClientCommand::Move {
+                seq: 2,
+                dir: [0.0, 0.0],
+            },
+        ]));
+        let delta = server.world_delta();
         reconcile_local_sim(
             &mut local,
             &mut ReconciliationSmoothing::default(),
@@ -4414,14 +4505,17 @@ mod protocol_regressions {
             &server.sim_meta(),
             1,
         );
-        assert_eq!(local.input_buffer.front().unwrap().commands, vec![action]);
         assert_eq!(
-            local.sim.world_delta_for(1).heroes[0].regular_attack.phase,
+            local.input_buffer.front().unwrap().actions[0].command,
+            action
+        );
+        assert_eq!(
+            local.sim.world_delta().heroes[0].regular_attack.phase,
             AttackPhase::Windup
         );
         server.queue_command(1, action);
         server.step();
-        let delta = server.world_delta_for(1);
+        let delta = server.world_delta();
         reconcile_local_sim(
             &mut local,
             &mut ReconciliationSmoothing::default(),
@@ -4430,6 +4524,115 @@ mod protocol_regressions {
             1,
         );
         assert!(local.input_buffer.is_empty());
-        assert_eq!(local.sim.world_delta_for(1), delta);
+        assert_eq!(local.sim.world_delta(), delta);
+    }
+}
+
+#[cfg(test)]
+mod render_identity_tests {
+    use super::*;
+
+    fn verify_render_index(
+        index: Res<NetEntityIndex>,
+        actors: Query<(Entity, &NetId), With<DynamicActor>>,
+    ) {
+        for (entity, id) in &actors {
+            assert_eq!(index.get(id), Some(&entity));
+        }
+    }
+
+    fn render_app() -> App {
+        let mut app = App::new();
+        app.add_plugins(NetIdentityPlugin)
+            .init_resource::<Time>()
+            .init_resource::<InputState>()
+            .init_resource::<LocalSimulation>()
+            .init_resource::<ReconciliationSmoothing>()
+            .init_resource::<WorldView>()
+            .init_resource::<NetStats>()
+            .init_resource::<SnapshotBuffer>()
+            .init_resource::<SceneAssets>()
+            .add_systems(Update, (sync_dynamic_actors, verify_render_index).chain());
+        app
+    }
+
+    #[test]
+    fn render_identity_survives_updates_and_replaces_spawn_or_epoch() {
+        let mut sim = Simulation::new();
+        sim.add_player(1_000_000);
+        for _ in 0..=game_shared::WAVE_PREP_TICKS {
+            sim.step();
+        }
+        let mut delta = sim.world_delta();
+        let epoch = delta.sim_meta.unwrap().match_epoch;
+        let hero_id = NetId::new(epoch, game_shared::actor_namespace::HERO, 1_000_000);
+        let enemy_id = NetId::new(epoch, game_shared::actor_namespace::ENEMY, 1_000_000);
+        let mut app = render_app();
+        // The render cleanup owns only DynamicActor, even with other indexed entities.
+        let unrelated =
+            game_replication::spawn(app.world_mut(), NetId::new(epoch, 9, 1), ()).unwrap();
+        app.world_mut()
+            .resource_mut::<WorldView>()
+            .apply_delta(delta.clone());
+        app.update();
+        let hero = game_replication::entity(app.world(), hero_id).unwrap();
+        let enemy = game_replication::entity(app.world(), enemy_id).unwrap();
+        assert_ne!(hero, enemy);
+        app.update();
+        assert_eq!(game_replication::entity(app.world(), hero_id), Some(hero));
+        assert_eq!(game_replication::entity(app.world(), enemy_id), Some(enemy));
+
+        // Predicted removal retains this authoritative spawn; rejection restores
+        // the existing visual instead of allocating another local entity.
+        let mut predicted = delta.clone();
+        predicted.enemies.retain(|e| e.id != enemy_id.value);
+        {
+            let mut local = app.world_mut().resource_mut::<LocalSimulation>();
+            local.sim = Simulation::from_snapshot(&predicted, &predicted.sim_meta.unwrap());
+            local.initialized = true;
+        }
+        app.update();
+        assert!(app.world().get::<PredictedEnemyDeath>(enemy).is_some());
+        {
+            let mut local = app.world_mut().resource_mut::<LocalSimulation>();
+            local.sim = Simulation::from_snapshot(&delta, &delta.sim_meta.unwrap());
+        }
+        app.update();
+        assert_eq!(game_replication::entity(app.world(), enemy_id), Some(enemy));
+        assert!(app.world().get::<PredictedEnemyDeath>(enemy).is_none());
+        app.world_mut()
+            .resource_mut::<LocalSimulation>()
+            .initialized = false;
+
+        delta
+            .enemies
+            .iter_mut()
+            .find(|e| e.id == enemy_id.value)
+            .unwrap()
+            .spawn
+            .ordinal += 1;
+        app.world_mut()
+            .resource_mut::<WorldView>()
+            .apply_delta(delta.clone());
+        app.update();
+        let respawned = game_replication::entity(app.world(), enemy_id).unwrap();
+        assert_ne!(respawned, enemy);
+        assert!(app.world().get_entity(enemy).is_err());
+        assert_eq!(game_replication::entity(app.world(), hero_id), Some(hero));
+
+        delta.sim_meta.as_mut().unwrap().match_epoch = epoch + 1;
+        app.world_mut()
+            .resource_mut::<WorldView>()
+            .apply_delta(delta);
+        app.update();
+        assert_eq!(game_replication::entity(app.world(), hero_id), None);
+        assert_eq!(game_replication::entity(app.world(), enemy_id), None);
+        let next = game_replication::entity(
+            app.world(),
+            NetId::new(epoch + 1, game_shared::actor_namespace::HERO, hero_id.value),
+        )
+        .unwrap();
+        assert_ne!(next, hero);
+        assert!(app.world().get_entity(unrelated).is_ok());
     }
 }

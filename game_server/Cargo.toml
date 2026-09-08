@@ -7,14 +7,16 @@ rust-version.workspace = true
 
 [dependencies]
 axum = "0.8.8"
+bytes = "1"
 axum-server = { version = "0.7.2", features = ["tls-rustls"] }
-bevy = { workspace = true, features = ["std"] }
+bevy = { workspace = true, features = ["std", "multi_threaded"] }
 clap.workspace = true
 env_logger.workspace = true
-game_shared = { path = "../game_shared" }
-game_sim = { path = "../game_sim", features = ["bevy"] }
+game_shared = { path = "../shared/protocol" }
+game_sim = { path = "../shared/simulation", features = ["bevy"] }
 log.workspace = true
 renet.workspace = true
+rtrb.workspace = true
 renet-cross = { workspace = true, features = ["axum"] }
 serde.workspace = true
 serde_json.workspace = true

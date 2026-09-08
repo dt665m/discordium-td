@@ -378,8 +378,10 @@ Load on server startup and send minimal needed read-only metadata to clients.
 ## 18. Handoff Checklist for New Project
 
 - Create crate/module layout:
-- `game_server` (authoritative sim + transport glue)
-- `game_shared` (protocol + shared enums/types)
+- `game_server` (authoritative orchestration + transport glue)
+- `shared/protocol` / `game_shared` (protocol + shared enums/types)
+- `shared/simulation` / `game_sim` (shared ECS gameplay plugins)
+- `shared/replication` / `game_replication` (stable identity + local entity mapping)
 - `game_client` (render/input/prediction)
 - Add `renet_cross` dependency.
 - Implement HTTP bootstrap/signaling endpoints.

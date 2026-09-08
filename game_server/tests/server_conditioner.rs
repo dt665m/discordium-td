@@ -127,7 +127,9 @@ fn run_conditioned_connection(
                             &join.world,
                             &join.world.sim_meta.unwrap(),
                         );
-                        for seq in 1..=5 {
+                        // The six-move recovered burst retains the newest three;
+                        // two walk ticks precede its stationary attack movement.
+                        for seq in 1..game_shared::MAX_MOVEMENT_BACKLOG as u32 {
                             predicted.queue_command(
                                 join.you,
                                 game_shared::ClientCommand::Move {
@@ -140,7 +142,7 @@ fn run_conditioned_connection(
                         expected_stop = Some((
                             join.you,
                             predicted
-                                .world_delta_for(join.you)
+                                .world_delta()
                                 .heroes
                                 .iter()
                                 .find(|h| h.client_id == join.you)
@@ -168,7 +170,13 @@ fn run_conditioned_connection(
         }
         while let Some(bytes) = client.receive_message(renet::DefaultChannel::Unreliable) {
             if let Ok(game_shared::ServerWorldMessage::Full(world)) = game_shared::decode(&bytes) {
-                if test_action && world.your_last_input_seq == Some(101) && !action_sent {
+                if test_action
+                    && world
+                        .heroes
+                        .iter()
+                        .any(|hero| hero.last_move_seq == Some(101))
+                    && !action_sent
+                {
                     conditioner.outage(Duration::from_secs(1));
                     let action = game_shared::ClientCommand::CastAbility {
                         seq: 100,
@@ -196,7 +204,7 @@ fn run_conditioned_connection(
                     {
                         assert!(
                             game_shared::distance_sq(hero.pos, stop) < 0.0001,
-                            "attack executed before preceding walk: {:?} vs {:?}",
+                            "recovered attack violated bounded movement barrier: {:?} vs {:?}",
                             hero.pos,
                             stop
                         );
@@ -244,7 +252,11 @@ fn run_conditioned_connection(
         }
         thread::sleep(Duration::from_millis(5));
     }
-    assert!(client.is_connected());
+    assert!(
+        client.is_connected(),
+        "client disconnected: {:?}",
+        client.disconnect_reason()
+    );
     if walk_attack {
         assert!(walk_confirmed, "walk/attack did not complete");
     }

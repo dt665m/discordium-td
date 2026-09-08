@@ -103,7 +103,8 @@ fn style_players(
 
 fn update_target_arrows(
     mut commands: Commands,
-    index: Res<RenderIndex>,
+    index: Res<NetEntityIndex>,
+    world: Res<WorldView>,
     players: Query<(Entity, &PlayerVisual)>,
     targets: Query<
         (&Transform, Option<&HealthStat>),
@@ -138,7 +139,13 @@ fn update_target_arrows(
         };
         let target = player
             .target
-            .and_then(|id| index.by_id.get(&ActorKey::World(id)))
+            .and_then(|id| {
+                index.get(&NetId::new(
+                    world.match_epoch,
+                    game_shared::actor_namespace::ENEMY,
+                    id,
+                ))
+            })
             .and_then(|entity| targets.get(*entity).ok())
             .filter(|(_, health)| health.is_none_or(|health| health.current > 0.0));
         let Some((target, _)) = target else {
@@ -184,7 +191,8 @@ mod tests {
     #[test]
     fn arrows_follow_lock_state_and_clean_up_with_owner() {
         let mut app = App::new();
-        app.init_resource::<RenderIndex>()
+        app.add_plugins(NetIdentityPlugin)
+            .init_resource::<WorldView>()
             .add_systems(Update, update_target_arrows);
         app.world_mut().spawn((
             camera::GameCamera::default(),
@@ -195,6 +203,7 @@ mod tests {
         let target = app
             .world_mut()
             .spawn((
+                NetId::new(0, game_shared::actor_namespace::ENEMY, 10),
                 DynamicActor,
                 Transform::default(),
                 HealthStat {
@@ -203,10 +212,6 @@ mod tests {
                 },
             ))
             .id();
-        app.world_mut()
-            .resource_mut::<RenderIndex>()
-            .by_id
-            .insert(ActorKey::World(10), target);
         let owner = app
             .world_mut()
             .spawn(PlayerVisual {

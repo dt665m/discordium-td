@@ -3281,6 +3281,7 @@ dependencies = [
  "bevy",
  "bevy-net-debug",
  "clap",
+ "game_replication",
  "game_server",
  "game_shared",
  "game_sim",
@@ -3297,12 +3298,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "game_replication"
+version = "0.1.0"
+dependencies = [
+ "bevy",
+]
+
+[[package]]
 name = "game_server"
 version = "0.1.0"
 dependencies = [
  "axum",
  "axum-server",
  "bevy",
+ "bytes",
  "clap",
  "env_logger",
  "game_shared",
@@ -3310,6 +3319,7 @@ dependencies = [
  "log",
  "renet",
  "renet-cross",
+ "rtrb",
  "serde",
  "serde_json",
  "time",
@@ -3322,6 +3332,7 @@ name = "game_shared"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "miniz_oxide 0.8.9",
  "serde",
 ]
 
@@ -3330,6 +3341,7 @@ name = "game_sim"
 version = "0.1.0"
 dependencies = [
  "bevy",
+ "game_replication",
  "game_shared",
  "log",
  "vleue_navigator",
@@ -5989,6 +6001,12 @@ dependencies = [
  "num-traits",
  "smallvec",
 ]
+
+[[package]]
+name = "rtrb"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9278fb35b3e730abe136e9b395b5b81b96d06b9f5478a50f0c8430a2237b22de"
 
 [[package]]
 name = "rustc-hash"

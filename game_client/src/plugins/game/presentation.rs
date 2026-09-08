@@ -11,7 +11,7 @@ pub(super) fn presentation_hero(
         // A missing predicted actor must not be resurrected from an older snapshot.
         local
             .sim
-            .world_delta_for(id)
+            .world_delta()
             .heroes
             .into_iter()
             .find(|h| h.client_id == id)
@@ -30,6 +30,9 @@ pub(super) struct EnemyHitFeedback {
 }
 
 impl EnemyHitFeedback {
+    pub(super) fn forget(&mut self, id: u64) {
+        self.lowest_hp.remove(&id);
+    }
     /// Establish a baseline without consuming damage discovered by rollback/replay.
     pub(super) fn seed(&mut self, id: u64, hp: f32) {
         self.lowest_hp.entry(id).or_insert(hp);
@@ -73,7 +76,7 @@ mod tests {
         local.sim.add_player(1);
         local.initialized = true;
         let world = WorldView::default(); // No new network frame is required.
-        let mut snapshot = local.sim.world_delta_for(1);
+        let mut snapshot = local.sim.world_delta();
         let meta = snapshot.sim_meta.unwrap();
         let hero = &mut snapshot.heroes[0];
         hero.charge_profile.startup_ticks = 0;
@@ -97,7 +100,7 @@ mod tests {
                 .charge_state
                 .power_active
         );
-        let predicted = local.sim.world_delta_for(1).heroes.remove(0);
+        let predicted = local.sim.world_delta().heroes.remove(0);
         let displayed = presentation_hero(&local, &world, Some(1)).unwrap();
         assert_eq!(displayed.charge_state, predicted.charge_state);
         assert_eq!(
@@ -127,7 +130,7 @@ mod charge_stage_tests {
     fn startup_and_mana_do_not_masquerade_as_power() {
         let mut sim = Simulation::new();
         sim.add_player(1);
-        let mut delta = sim.world_delta_for(1);
+        let mut delta = sim.world_delta();
         delta.heroes[0].mana = 0.0;
         sim.apply_snapshot(&delta, &delta.sim_meta.unwrap());
         sim.queue_command(
@@ -138,7 +141,7 @@ mod charge_stage_tests {
             },
         );
         sim.step();
-        let hero = sim.world_delta_for(1).heroes.remove(0);
+        let hero = sim.world_delta().heroes.remove(0);
         let (ratio, ready) = charge_presentation(Some(&hero));
         assert_eq!(hero.charge_state.phase, ChargePhase::Startup);
         assert_eq!(ratio, 0.0);
@@ -146,7 +149,7 @@ mod charge_stage_tests {
         for _ in 0..hero.charge_profile.startup_ticks {
             sim.step();
         }
-        let hero = sim.world_delta_for(1).heroes.remove(0);
+        let hero = sim.world_delta().heroes.remove(0);
         let (ratio, ready) = charge_presentation(Some(&hero));
         assert_eq!(hero.charge_state.phase, ChargePhase::Charging);
         assert_eq!(ratio, 0.0);
@@ -172,7 +175,7 @@ mod charge_fill_regressions {
         let mut previous = 0.0;
         for _ in 0..300 {
             sim.step();
-            let hero = sim.world_delta_for(1).heroes.remove(0);
+            let hero = sim.world_delta().heroes.remove(0);
             let (ratio, ready) = charge_presentation(Some(&hero));
             assert_eq!(
                 ratio,

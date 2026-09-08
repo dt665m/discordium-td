@@ -15,7 +15,7 @@ clap = { version = "4.5.53", features = ["derive", "env"] }
 env_logger = "0.11.8"
 log = "0.4.22"
 renet = "2.0.0"
-renet-cross = "0.6"
+renet-cross = "0.6.1"
 rtrb = "0.4"
 bevy-net-debug = "0.2"
 serde = { version = "1.0.228", features = ["derive"] }
@@ -52,3 +52,4 @@ opt-level = 3
 
 [patch.crates-io]
 str0m = { git = "https://github.com/dt665m/str0m.git", branch = "feat/dimpl-buffer-resize" }
+sctp-proto = { git = "https://github.com/dt665m/sctp-proto.git", rev = "cb94f37991c185fb9cc2fd41fbe92965e2a1f713" }

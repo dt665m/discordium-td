@@ -25,9 +25,9 @@ The game client projects the displayed snapshot into
 `engine_client::presentation::PresentationFrame`. Renderers consume this frame
 after `PresentationSet::Adapt`, in `PresentationSet::Render`. Stable visual IDs
 let replacement renderers retain per-effect animation/correction state without
-coupling to ability or encounter enums. The default prototype renderer is stateless;
-it draws the current presented frame directly. The optional procedural game
-renderer retains its existing correction and animation behavior.
+coupling to ability or encounter enums. The development gizmo renderer is stateless; it draws the current presented frame
+directly when enabled in the debug menu. Selecting gizmos hides the procedural graphics; switching back restores them
+with their current correction and animation state.
 
 To add a mechanic:
 

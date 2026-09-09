@@ -1,0 +1,10 @@
+{
+  "rules": [
+    {
+      "allowed": {
+        "origins": ["https://discotd.datab.fun"],
+        "methods": ["GET", "HEAD"]
+      }
+    }
+  ]
+}

@@ -1,4 +1,4 @@
-//! Original procedural art for Dreamwake. Gameplay lifetimes remain in the simulation.
+//! Procedural game graphics for Dreamwake. Gameplay lifetimes remain in the simulation.
 use std::{
     collections::HashSet,
     f32::consts::{FRAC_PI_2, PI, TAU},
@@ -14,6 +14,10 @@ use bevy::{
 use super::DreamView;
 use dreamwake_sim::{EnemyKind, EssenceKind, RunPhase};
 use engine_core::PresentationId;
+
+/// Roots owned by the game renderer; hiding them also hides their mesh children.
+#[derive(Component, Clone, Default)]
+pub(super) struct SceneGraphic;
 
 pub struct DreamScenePlugin;
 impl Plugin for DreamScenePlugin {
@@ -135,7 +139,7 @@ fn stone_piece(
     material: Handle<StandardMaterial>,
     transform: Transform,
 ) -> impl Scene {
-    bsn! { Mesh3d(mesh) MeshMaterial3d::<StandardMaterial>(material) Transform {
+    bsn! { SceneGraphic Mesh3d(mesh) MeshMaterial3d::<StandardMaterial>(material) Transform {
         translation: {transform.translation}, rotation: {transform.rotation}, scale: {transform.scale}
     } }
 }
@@ -247,6 +251,7 @@ fn setup_scene(
         ..default()
     });
     commands.spawn((
+        SceneGraphic,
         DirectionalLight {
             color: Color::srgb(0.77, 0.88, 1.0),
             illuminance: 6500.0,
@@ -256,6 +261,7 @@ fn setup_scene(
         Transform::from_xyz(-14.0, 25.0, 10.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
     commands.spawn((
+        SceneGraphic,
         PointLight {
             color: Color::srgb(0.13, 0.95, 0.74),
             intensity: 2_800_000.0,
@@ -265,6 +271,7 @@ fn setup_scene(
         Transform::from_xyz(-10.0, 7.0, -10.0),
     ));
     commands.spawn((
+        SceneGraphic,
         PointLight {
             color: Color::srgb(0.86, 0.4, 0.62),
             intensity: 1_900_000.0,
@@ -749,6 +756,7 @@ fn spawn_actor(
 ) {
     let parent = commands
         .spawn((
+            SceneGraphic,
             Transform::from_translation(position),
             Visibility::default(),
             ActorVisual {
@@ -1286,6 +1294,7 @@ fn spawn_effect(
     };
     let parent = commands
         .spawn((
+            SceneGraphic,
             Transform::default(),
             Visibility::default(),
             EffectVisual(key),
@@ -1552,6 +1561,7 @@ fn sync_scene(
     for hero in &snapshot.heroes {
         if !label_ids.contains(&hero.id) {
             commands.spawn((
+                SceneGraphic,
                 TravelerLabel(hero.id),
                 Text::new("VESPER"),
                 TextFont {
@@ -1639,6 +1649,7 @@ fn sync_scene(
             continue;
         }
         commands.spawn((
+            SceneGraphic,
             DamageLabel(n.id),
             Text::new(format!(
                 "{}{:.0}",

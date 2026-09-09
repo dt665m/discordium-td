@@ -20,9 +20,10 @@ just server                        # Dedicated server, eight players by default
 just client http://127.0.0.1:8080   # Join the dedicated server
 ```
 
-The default renderer uses simple prototype shapes. The previous procedural art is
-an optional renderer, selected with `--renderer legacy`; changing the renderer
-does not change the simulation, protocol, or input mapping.
+Dreamwake starts with its procedural game graphics. Development builds include
+the `debug-tools` feature by default: open F6 and toggle **Gizmos** to replace the game graphics with
+presentation primitives at runtime. Gizmos start off. Build with
+`--no-default-features` to omit these development controls and gizmo systems.
 
 For the browser, install Trunk and the WASM target, start a server, then run:
 

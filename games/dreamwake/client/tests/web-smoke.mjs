@@ -13,8 +13,7 @@ const runtime = process.env.PLAYWRIGHT_RUNTIME_DIR
 const require = createRequire(path.join(runtime, "package.json"));
 const { chromium } = require("playwright");
 const base = process.argv[2] ?? "http://127.0.0.1:1420";
-const server = process.argv[3] ?? "http://127.0.0.1:8080";
-const output = path.resolve(process.argv[4] ?? "target/web-smoke");
+const output = path.resolve(process.argv[3] ?? "target/web-smoke");
 await mkdir(output, { recursive: true });
 
 const browser = await chromium.launch({
@@ -33,7 +32,7 @@ try {
   const context = await browser.newContext({
     viewport: { width: 1440, height: 900 }, deviceScaleFactor: 1,
   });
-  for (const renderer of ["prototype", "legacy"]) {
+  for (const renderer of ["graphics", "gizmos"]) {
     const page = await context.newPage();
     const client = { renderer, page, states: [] };
     clients.push(client);
@@ -47,12 +46,21 @@ try {
         console.log(renderer, text);
       }
     });
-    const url = new URL(base);
-    url.searchParams.set("server", server);
-    url.searchParams.set("autoplay", "1");
-    url.searchParams.set("waitPlayers", "2");
-    url.searchParams.set("renderer", renderer);
-    await page.goto(url.toString(), { waitUntil: "domcontentloaded" });
+    await page.goto(base, { waitUntil: "domcontentloaded" });
+  }
+
+  // Bevy renders its UI into the canvas. These coordinates target the first two
+  // F6 controls at the fixed viewport above, using the same menu as a player.
+  for (const client of clients) {
+    await client.page.waitForSelector("canvas");
+    await client.page.waitForTimeout(5_000);
+    await client.page.keyboard.press("F6");
+    await client.page.waitForTimeout(500);
+    if (client.renderer === "gizmos") {
+      await client.page.mouse.click(1000, 40);
+    }
+    await client.page.mouse.click(1000, 84);
+    await client.page.keyboard.press("F6");
   }
 
   const deadline = Date.now() + 120_000;
@@ -61,7 +69,7 @@ try {
     await new Promise(resolve => setTimeout(resolve, 250));
   }
   assert.equal(errors.length, 0, JSON.stringify(errors, null, 2));
-  assert(clients.every(connected), "Both renderers must reach authoritative combat with two players");
+  assert(clients.every(connected), "Both clients must reach authoritative combat with two players");
 
   // Allow an encounter to advance so screenshots exercise actors and effects,
   // rather than merely proving that a menu can render.
@@ -73,7 +81,7 @@ try {
   await new Promise(resolve => setTimeout(resolve, 500));
   await clients[0].page.screenshot({ path: path.join(output, "diagnostics.png") });
   assert.equal(errors.length, 0, JSON.stringify(errors, null, 2));
-  console.log("Browser smoke passed: prototype + legacy renderers share a two-player WebRTC game.");
+  console.log("Browser smoke passed: two clients share a WebRTC game with runtime gizmo controls.");
 } finally {
   await writeFile(path.join(output, "browser-log.json"), JSON.stringify({ logs, errors }, null, 2));
   await browser.close();

@@ -62,10 +62,15 @@ impl Plugin for PrototypeRendererPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(ClearColor(Color::srgb(0.035, 0.045, 0.055)));
         app.init_resource::<PrototypeSettings>()
-            .add_systems(Update, draw.in_set(PresentationSet::Render));
+            .add_systems(Update, draw_gizmos.in_set(PresentationSet::Render));
     }
 }
-fn draw(frame: Res<PresentationFrame>, settings: Res<PrototypeSettings>, mut gizmos: Gizmos) {
+/// Draw presentation primitives as gizmos; callers may gate this system at runtime.
+pub fn draw_gizmos(
+    frame: Res<PresentationFrame>,
+    settings: Res<PrototypeSettings>,
+    mut gizmos: Gizmos,
+) {
     if let Some(cells) = settings.grid_cells {
         gizmos.grid(
             Isometry3d::from_rotation(Quat::from_rotation_x(std::f32::consts::FRAC_PI_2)),

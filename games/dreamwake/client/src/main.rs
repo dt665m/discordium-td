@@ -1,3 +1,3 @@
 fn main() {
-    dreamwake_client::run(dreamwake_client::Renderer::from_environment());
+    dreamwake_client::run();
 }

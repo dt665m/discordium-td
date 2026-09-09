@@ -1,8 +1,9 @@
 # Dreamwake
 
 Dreamwake is the canonical game under `games/dreamwake/`. It composes the reusable
-plugins under `engine/`; see [architecture](architecture.md). Prototype graphics
-are the default, with optional `--renderer legacy` (browser: `renderer=legacy`).
+plugins under `engine/`; see [architecture](architecture.md). Dreamwake always starts with its procedural game graphics.
+The default-enabled `debug-tools` feature adds an F6 menu toggle for gizmo rendering
+(initially off); use `--no-default-features` to omit those development controls.
 
 Dreamwake is a cooperative, top-down 3D action roguelite built on this repository's Rust, Bevy 0.19.1, Renet, and renet-cross stack. Play Vesper, the Moonbound Traveler, through ten rooms across three dreamscapes. Each player develops a separate Memory build while the party shares enemies, encounter progress, and the final boss.
 
@@ -89,7 +90,7 @@ To build the native release binary:
 just dreamwake-build
 ```
 
-The executable is `target/release/dreamwake` (`dreamwake.exe` on Windows). Use `--renderer legacy` to select the previous procedural art; the default prototype renderer is independent of it.
+The executable is `target/release/dreamwake` (`dreamwake.exe` on Windows). The game graphics are enabled by default. Development builds expose an optional gizmo renderer in the F6 menu.
 
 Earlier archives under `target/dreamwake-release/` predate this consolidation.
 Rebuild from the current workspace before sharing a client/server pair; see the
@@ -165,7 +166,7 @@ Sanctuaries restore an additional 40% maximum health beyond the normal 10% room-
 
 ## The run
 
-The ten-room route includes normal encounters, three elite challenges, two sanctuaries, and the Somnarch's final arena. The default renderer uses neutral prototype shapes. The optional legacy renderer gives the three dreamscapes distinct palettes with floating terrain, luminous plants, crystals, and ruins. Seeds vary encounter names, enemy combinations, reinforcement placement, reward choices, and which rooms contain elites. Later fights introduce additional reinforcement waves.
+The ten-room route includes normal encounters, three elite challenges, two sanctuaries, and the Somnarch's final arena. The game graphics give the three dreamscapes distinct palettes with floating terrain, luminous plants, crystals, and ruins. Seeds vary encounter names, enemy combinations, reinforcement placement, reward choices, and which rooms contain elites. Later fights introduce additional reinforcement waves.
 
 | Enemy | Behavior |
 | --- | --- |

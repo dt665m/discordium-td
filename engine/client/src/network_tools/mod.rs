@@ -11,7 +11,8 @@ use renet_cross::conditioner::ConditionerHandle;
 
 pub struct NetworkToolsPlugin;
 #[derive(Component)]
-struct NetworkToolsRoot;
+/// Root of the F6 debug menu; game plugins can attach additional controls.
+pub struct NetworkToolsRoot;
 #[derive(Component)]
 struct ImpairmentNotice;
 

@@ -36,6 +36,13 @@ This file defines project-specific guidance for coding agents working in this re
   APIs directly. Keep extra machinery only for explicit gameplay or transport
   requirements; see `docs/bevy-integration.md` for the retained exceptions.
 
+## Browser configuration
+
+- Do not build browser URL parameter options into the game. This includes query
+  parameters and fragment options for configuration, gameplay, rendering,
+  debugging, or test automation. Use in-game controls or build/deployment
+  configuration instead.
+
 ## Bevy 0.19 Core Conventions
 
 - Keep Bevy's version centralized in `[workspace.dependencies]`; the workspace targets 0.19.1 and Rust 1.95 or newer.

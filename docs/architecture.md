@@ -84,9 +84,11 @@ Renderers consume positions, stable identities, shapes, colors and other visual
 parameters without importing game simulation types. A camera plugin provides
 the camera/input basis independently of a particular renderer.
 
-Simple prototype graphics are the default. The original procedural scene is an
-optional game-side art plugin. Game networking and simulation never spawn
-meshes or materials, and input never requires that legacy scene plugin.
+Dreamwake always installs its game-side procedural art plugin. The default-enabled
+`debug-tools` feature adds an off-by-default gizmo renderer controlled in the F6
+menu. Builds using `--no-default-features` omit those controls and gizmo rendering systems.
+Game networking and simulation never spawn meshes or materials, and input remains
+independent of the art plugin.
 
 Replacing art therefore consists of supplying a renderer/presentation adapter;
 it does not require a new simulation, authority loop, or wire protocol. UI and
@@ -103,10 +105,11 @@ a game. The [headless gameplay tests](../engine/core/tests/gameplay.rs) exercise
 the same reusable component/plugin boundary.
 
 The browser smoke test at `games/dreamwake/client/tests/web-smoke.mjs` opens two
-WebRTC clients using different renderers against one server and captures both
-views plus diagnostics. Install Playwright in a separate runtime directory, set
-`PLAYWRIGHT_RUNTIME_DIR` to it, then run the script with the client URL, server URL,
-and an output directory under `target/` as its three arguments. The server and
+WebRTC clients against one server and captures game graphics with and without
+the runtime gizmo renderer, plus diagnostics. Install Playwright in a separate runtime directory, set
+`PLAYWRIGHT_RUNTIME_DIR` to it, then run the script with the client URL and
+an output directory under `target/` as its two arguments. Configure the server
+endpoint when building the client with `GAME_WEB_HTTP_BASE`. The server and
 Trunk must already be running.
 
 1. Create a game package under `games/` and depend on the engine crates it needs.

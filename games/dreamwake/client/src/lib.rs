@@ -1,5 +1,7 @@
 //! Dreamwake presentation host. The isolated shared simulation owns all gameplay.
 mod audio;
+#[cfg(feature = "debug-tools")]
+mod debug;
 mod network;
 mod presentation;
 pub mod scene;
@@ -88,45 +90,9 @@ fn fresh_seed() -> u64 {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-pub enum Renderer {
-    #[default]
-    Prototype,
-    Legacy,
-}
-impl Renderer {
-    pub fn from_environment() -> Self {
-        #[cfg(not(target_arch = "wasm32"))]
-        let legacy = std::env::args()
-            .collect::<Vec<_>>()
-            .windows(2)
-            .any(|a| a[0] == "--renderer" && a[1] == "legacy");
-        #[cfg(target_arch = "wasm32")]
-        let legacy = web_sys::window()
-            .and_then(|w| w.location().search().ok())
-            .is_some_and(|s| {
-                s.trim_start_matches('?')
-                    .split('&')
-                    .any(|v| v == "renderer=legacy")
-            });
-        if legacy {
-            Self::Legacy
-        } else {
-            Self::Prototype
-        }
-    }
-}
-
-pub fn run(renderer: Renderer) {
+pub fn run() {
     let mut app = build_app();
-    match renderer {
-        Renderer::Prototype => {
-            app.add_plugins(engine_client::presentation::PrototypeRendererPlugin);
-        }
-        Renderer::Legacy => {
-            app.add_plugins(scene::DreamScenePlugin);
-        }
-    }
+    app.add_plugins(scene::DreamScenePlugin);
     app.run();
 }
 
@@ -174,6 +140,8 @@ pub fn build_app() -> App {
         ),
     )
     .add_systems(Update, playtest_capture);
+    #[cfg(feature = "debug-tools")]
+    app.add_plugins(debug::DreamDebugPlugin);
     app
 }
 
@@ -235,40 +203,17 @@ fn startup_options() -> (u64, Playtest, network::NetworkOptions, DreamConnection
 #[cfg(target_arch = "wasm32")]
 fn startup_options() -> (u64, Playtest, network::NetworkOptions, DreamConnection) {
     let seed = fresh_seed();
-    let mut base = option_env!("GAME_WEB_HTTP_BASE")
-        .or(option_env!("TD_WEB_HTTP_BASE"))
+    let base = option_env!("GAME_WEB_HTTP_BASE")
         .unwrap_or("http://127.0.0.1:8080")
         .to_owned();
-    let mut playtest = Playtest::default();
-    let mut expected_party = 1;
-    if let Some(location) = web_sys::window().map(|w| w.location()) {
-        if let Ok(search) = location.search() {
-            for pair in search.trim_start_matches('?').split('&') {
-                if let Some(value) = pair.strip_prefix("server=") {
-                    if let Ok(decoded) = js_sys::decode_uri_component(value) {
-                        base = decoded.into();
-                    }
-                }
-                if pair == "autoplay=1" {
-                    playtest.autoplay = true;
-                }
-                if pair == "manualRewards=1" {
-                    playtest.manual_rewards = true;
-                }
-                if let Some(value) = pair.strip_prefix("waitPlayers=") {
-                    expected_party = value.parse().unwrap_or(1);
-                }
-            }
-        }
-    }
     (
         seed,
-        playtest,
+        Playtest::default(),
         network::NetworkOptions {
             seed,
             auto_connect: true,
             auto_host: false,
-            expected_party,
+            expected_party: 1,
         },
         DreamConnection {
             http_base: base,

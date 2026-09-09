@@ -102,7 +102,12 @@ impl SnapshotBuffer {
         }
     }
 
-    pub(super) fn sample(&self, render_time: f64, enemy_lead: f32) -> InterpolatedPositions {
+    /// `None` skips enemy interpolation when rendering predicted enemies.
+    pub(super) fn sample(
+        &self,
+        render_time: f64,
+        enemy_lead: Option<f32>,
+    ) -> InterpolatedPositions {
         let mut heroes = HashMap::new();
         let mut enemies = HashMap::new();
 
@@ -156,7 +161,11 @@ impl SnapshotBuffer {
             heroes.insert(current.client_id, position);
         }
 
-        // Interpolate enemies
+        let Some(enemy_lead) = enemy_lead else {
+            return InterpolatedPositions { heroes, enemies };
+        };
+
+        // Interpolate enemies for clients without initialized prediction.
         for enemy_new in &newer.world.enemies {
             if let Some(enemy_old) = older
                 .world
@@ -266,6 +275,180 @@ pub(super) fn reconstruct_from_patch(
 mod playback_tests {
     use super::*;
 
+    fn populated_world(players: u64, enemies: usize) -> WorldDelta {
+        let mut sim = Simulation::new();
+        for id in 1..=players {
+            sim.add_player(id);
+        }
+        for _ in 0..=game_shared::WAVE_PREP_TICKS {
+            sim.step();
+        }
+        let mut world = sim.world_delta();
+        let template = world.enemies[0];
+        world.enemies = (0..enemies)
+            .map(|index| EnemySnapshot {
+                id: 1_000 + index as u64,
+                spawn: game_shared::EnemySpawnIdentity {
+                    wave: 1,
+                    ordinal: index as u32,
+                },
+                pos: [(index % 32) as f32 * 0.25, (index / 32) as f32 * 0.25],
+                vel: [2.0, 0.0],
+                ..template
+            })
+            .collect();
+        world.sim_meta.as_mut().unwrap().next_entity_id = 1_000 + enemies as u64;
+        world
+    }
+
+    fn buffered_pair(older: WorldDelta, newer: WorldDelta) -> SnapshotBuffer {
+        let mut buffer = SnapshotBuffer::default();
+        for (index, world) in [older, newer].into_iter().enumerate() {
+            assert!(buffer.push(TimestampedSnapshot {
+                server_tick: world.tick,
+                receive_time: index as f32 / SERVER_TICK_HZ as f32,
+                simulation_time: 0.0,
+                world,
+            }));
+        }
+        buffer
+    }
+
+    #[test]
+    fn skipping_enemies_preserves_hero_sampling_and_fallback_spawn_boundaries() {
+        let mut older = populated_world(2, 3);
+        older.enemies[0].pos = [0.0, 0.0];
+        let mut newer = older.clone();
+        newer.tick += 1;
+        newer.enemies[0].pos = [4.0, 0.0];
+        newer.enemies[1].spawn.ordinal += 10;
+        newer.enemies[1].pos = [8.0, 0.0];
+        let removed = newer.enemies.pop().unwrap();
+        newer.enemies.push(EnemySnapshot {
+            id: 2_000,
+            pos: [12.0, 0.0],
+            ..removed
+        });
+        let buffer = buffered_pair(older, newer);
+        for render_time in [0.0, 1.0 / 60.0, 1.0 / 30.0] {
+            let heroes_only = buffer.sample(render_time, None);
+            let fallback = buffer.sample(render_time, Some(0.1));
+            assert_eq!(heroes_only.heroes, fallback.heroes);
+            assert!(heroes_only.enemies.is_empty());
+            assert!(!fallback.enemies.contains_key(&removed.id));
+            assert_eq!(fallback.enemies[&1_001].0, [8.2, 0.0]);
+            assert_eq!(fallback.enemies[&2_000].0, [12.2, 0.0]);
+        }
+        assert_eq!(
+            buffer.sample(1.0 / 60.0, Some(0.1)).enemies[&1_000].0,
+            [2.2, 0.0]
+        );
+    }
+
+    #[test]
+    fn both_sampling_modes_observe_new_epoch_without_blending_old_positions() {
+        let older = populated_world(1, 1);
+        let mut newer = older.clone();
+        newer.tick += 1;
+        newer.sim_meta.as_mut().unwrap().match_epoch += 1;
+        newer.heroes[0].pos = [-10.0, 4.0];
+        newer.enemies[0].pos = [-5.0, 2.0];
+        let buffer = buffered_pair(older, newer);
+        let heroes_only = buffer.sample(0.0, None);
+        let fallback = buffer.sample(0.0, Some(0.0));
+        assert_eq!(heroes_only.heroes, fallback.heroes);
+        assert_eq!(heroes_only.heroes[&1], [-10.0, 4.0]);
+        assert_eq!(fallback.enemies[&1_000].0, [-5.0, 2.0]);
+    }
+
+    #[test]
+    #[ignore = "focused client hot-path benchmark; run in release mode with --nocapture"]
+    fn benchmark_client_presentation_hot_paths() {
+        use std::{hint::black_box, time::Instant};
+        const REPETITIONS: usize = 9;
+        const ITERATIONS: usize = 256;
+
+        fn compare(mut previous: impl FnMut(), mut current: impl FnMut()) -> (f64, f64) {
+            fn measure(operation: &mut impl FnMut()) -> f64 {
+                let started = Instant::now();
+                for _ in 0..ITERATIONS {
+                    operation();
+                }
+                started.elapsed().as_secs_f64() * 1e9 / ITERATIONS as f64
+            }
+            for _ in 0..16 {
+                previous();
+                current();
+            }
+            let mut before = Vec::with_capacity(REPETITIONS);
+            let mut after = Vec::with_capacity(REPETITIONS);
+            for repetition in 0..REPETITIONS {
+                if repetition % 2 == 0 {
+                    before.push(measure(&mut previous));
+                    after.push(measure(&mut current));
+                } else {
+                    after.push(measure(&mut current));
+                    before.push(measure(&mut previous));
+                }
+            }
+            before.sort_by(f64::total_cmp);
+            after.sort_by(f64::total_cmp);
+            (before[REPETITIONS / 2], after[REPETITIONS / 2])
+        }
+
+        println!(
+            "path,players,enemies,repetitions,iterations,previous_median_ns,current_median_ns"
+        );
+        for (players, enemies) in [(8, 256), (32, 1_024)] {
+            let older = populated_world(players, enemies);
+            let mut newer = older.clone();
+            newer.tick += 1;
+            let sim = Simulation::from_snapshot(&newer, &newer.sim_meta.unwrap());
+            let buffer = buffered_pair(older, newer);
+            let render_time = 1.0 / 60.0;
+            // Compare behavior outside the timed loops.
+            assert_eq!(
+                sim.hero_snapshot(1).as_ref(),
+                sim.world_delta().heroes.first()
+            );
+            assert_eq!(
+                buffer.sample(render_time, None).heroes,
+                buffer.sample(render_time, Some(0.1)).heroes
+            );
+
+            let (previous, current) = compare(
+                || {
+                    black_box(
+                        black_box(&sim)
+                            .world_delta()
+                            .heroes
+                            .into_iter()
+                            .find(|hero| hero.client_id == black_box(1)),
+                    );
+                },
+                || {
+                    black_box(black_box(&sim).hero_snapshot(black_box(1)));
+                },
+            );
+            println!(
+                "hero_hud,{players},{enemies},{REPETITIONS},{ITERATIONS},{previous:.1},{current:.1}"
+            );
+            let (previous, current) = compare(
+                || {
+                    black_box(
+                        black_box(&buffer).sample(black_box(render_time), Some(black_box(0.1))),
+                    );
+                },
+                || {
+                    black_box(black_box(&buffer).sample(black_box(render_time), None));
+                },
+            );
+            println!(
+                "interpolation,{players},{enemies},{REPETITIONS},{ITERATIONS},{previous:.1},{current:.1}"
+            );
+        }
+    }
+
     fn moving_snapshot(tick: u32, arrival: f32) -> TimestampedSnapshot {
         let mut sim = Simulation::new();
         sim.add_player(7);
@@ -293,9 +476,9 @@ mod playback_tests {
             }
             buffer.push(snapshot);
         }
-        assert_eq!(buffer.sample(0.0, 0.0).heroes[&8], [0.0, 0.0]);
-        assert_eq!(buffer.sample(0.05, 0.0).heroes[&8], [0.0, 0.0]);
-        assert!(buffer.sample(0.12, 0.0).heroes[&8][0] > 0.0);
+        assert_eq!(buffer.sample(0.0, None).heroes[&8], [0.0, 0.0]);
+        assert_eq!(buffer.sample(0.05, None).heroes[&8], [0.0, 0.0]);
+        assert!(buffer.sample(0.12, None).heroes[&8][0] > 0.0);
     }
     #[test]
     fn respawn_moves_to_the_current_life_before_delayed_playback_arrives() {
@@ -309,9 +492,9 @@ mod playback_tests {
             }
             buffer.push(snapshot);
         }
-        assert_eq!(buffer.sample(0.0, 0.0).heroes[&7], [-10.0, 0.0]);
-        assert_eq!(buffer.sample(0.05, 0.0).heroes[&7], [-10.0, 0.0]);
-        assert!(buffer.sample(0.12, 0.0).heroes[&7][0] > -10.0);
+        assert_eq!(buffer.sample(0.0, None).heroes[&7], [-10.0, 0.0]);
+        assert_eq!(buffer.sample(0.05, None).heroes[&7], [-10.0, 0.0]);
+        assert!(buffer.sample(0.12, None).heroes[&7][0] > -10.0);
     }
 
     #[test]
@@ -325,7 +508,7 @@ mod playback_tests {
         let id = newer.world.heroes[0].client_id;
         buffer.push(older);
         buffer.push(newer);
-        assert_eq!(buffer.sample(0.016, 0.0).heroes[&id], [-10.0, 0.0]);
+        assert_eq!(buffer.sample(0.016, None).heroes[&id], [-10.0, 0.0]);
     }
 
     #[test]
@@ -334,7 +517,7 @@ mod playback_tests {
         for tick in 0..4 {
             buffer.push(moving_snapshot(tick, 10.0));
         }
-        let positions = buffer.sample(0.05, 0.0);
+        let positions = buffer.sample(0.05, None);
         assert!((positions.heroes[&7][0] - 0.2).abs() < 0.0001);
         let (_, _, t) = buffer.find_bracketing(0.05);
         assert!((t - 0.5).abs() < 0.0001);
@@ -360,7 +543,7 @@ mod playback_tests {
             }
             buffer.advance_render_time(now, 1.0 / fps as f32);
             let pos = buffer
-                .sample(buffer.render_time, 0.0)
+                .sample(buffer.render_time, None)
                 .heroes
                 .get(&7)
                 .map_or(0.0, |p| p[0]);
@@ -444,14 +627,14 @@ mod playback_tests {
         buffer.push(new_match);
         buffer.advance_render_time(10.0, 10.0);
         assert_eq!(
-            buffer.sample(buffer.render_time, 0.0).heroes[&7],
+            buffer.sample(buffer.render_time, None).heroes[&7],
             [-10.0, 5.0]
         );
         buffer.clear();
         buffer.push(moving_snapshot(0, 20.0));
         buffer.advance_render_time(20.0, 0.016);
         assert_eq!(
-            buffer.sample(buffer.render_time, 0.0).heroes[&7],
+            buffer.sample(buffer.render_time, None).heroes[&7],
             [0.0, 0.0]
         );
     }

@@ -127,13 +127,8 @@ pub(super) fn run_worker(
                     }
                 }
                 let mut produced_output = false;
-                for batch in pending_output
-                    .take()
-                    .into_iter()
-                    .chain(output.try_iter())
-                    .take(QUEUE_TICKS)
-                {
-                    produced_output |= batch.world.is_some() || !batch.messages.is_empty();
+                if let Some(batch) = coalesce_output(pending_output.take(), &output) {
+                    produced_output = true;
                     for message in batch.messages {
                         match message {
                             Outbound::ToClient(id, message) => {
@@ -218,6 +213,20 @@ pub(super) fn run_worker(
         )),
     }
 }
+
+/// A worker pause can leave several app frames waiting. Preserve every reliable
+/// delivery, but encode only the newest world in this bounded receive pass.
+fn coalesce_output(
+    first: Option<OutputBatch>,
+    output: &Receiver<OutputBatch>,
+) -> Option<OutputBatch> {
+    let mut pending = PendingOutput::default();
+    for batch in first.into_iter().chain(output.try_iter()).take(QUEUE_TICKS) {
+        pending.push(batch);
+    }
+    pending.take()
+}
+
 pub(super) fn send_reliable(server: &mut RenetServer, id: u64, message: &ReliableServerMessage) {
     let payload = game_shared::encode(message);
     if !server.can_send_message(id, DefaultChannel::ReliableOrdered, payload.len()) {
@@ -347,6 +356,75 @@ fn receive_messages(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_backlog_keeps_reliable_order_and_only_the_latest_world() {
+        let sim = game_sim::Simulation::new();
+        let batch = |tick: u32| {
+            let mut world = sim.world_delta();
+            world.tick = tick;
+            OutputBatch {
+                messages: vec![
+                    Outbound::Broadcast(ReliableServerMessage::Event(
+                        game_shared::ReliableGameEvent::WaveStarted { wave: tick },
+                    )),
+                    Outbound::ToClient(
+                        u64::from(tick),
+                        ReliableServerMessage::JoinSnapshot(sim.join_snapshot(u64::from(tick))),
+                    ),
+                ],
+                world: Some(world),
+                step_duration_ms: f64::from(tick),
+            }
+        };
+        let (tx, rx) = mpsc::sync_channel(QUEUE_TICKS);
+        // The worker already received the first batch before its pause. A full
+        // channel can hold eight more, but one pass still handles only eight.
+        let first = batch(1);
+        for tick in 2..=QUEUE_TICKS as u32 {
+            assert!(tx.try_send(batch(tick)).is_ok());
+        }
+        assert!(
+            tx.try_send(OutputBatch {
+                messages: vec![Outbound::Broadcast(ReliableServerMessage::Event(
+                    game_shared::ReliableGameEvent::Victory,
+                ))],
+                ..default()
+            })
+            .is_ok()
+        );
+
+        let merged = coalesce_output(Some(first), &rx).unwrap();
+        assert_eq!(merged.world.unwrap().tick, QUEUE_TICKS as u32);
+        assert_eq!(merged.step_duration_ms, QUEUE_TICKS as f64);
+        assert_eq!(merged.messages.len(), QUEUE_TICKS * 2);
+        for (index, pair) in merged.messages.chunks_exact(2).enumerate() {
+            let tick = index as u32 + 1;
+            assert!(matches!(
+                pair[0],
+                Outbound::Broadcast(ReliableServerMessage::Event(
+                    game_shared::ReliableGameEvent::WaveStarted { wave }
+                )) if wave == tick
+            ));
+            assert!(matches!(
+                &pair[1],
+                Outbound::ToClient(id, ReliableServerMessage::JoinSnapshot(join))
+                    if *id == u64::from(tick) && join.you == *id
+            ));
+        }
+
+        // Reliable-only output survives the bounded pass and still requests a
+        // send on the next poll, even though it has no new world snapshot.
+        let remaining = coalesce_output(None, &rx).unwrap();
+        assert!(remaining.world.is_none());
+        assert!(matches!(
+            remaining.messages.as_slice(),
+            [Outbound::Broadcast(ReliableServerMessage::Event(
+                game_shared::ReliableGameEvent::Victory
+            ))]
+        ));
+        assert!(coalesce_output(None, &rx).is_none());
+    }
 
     #[test]
     fn completed_state_does_not_wait_for_an_unrelated_send_slot() {

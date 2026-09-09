@@ -3,6 +3,7 @@ mod conditioner;
 mod debug_bridge;
 mod debug_context;
 mod debug_recorder;
+mod dreamwake;
 mod http_api;
 pub(crate) mod net;
 mod network;

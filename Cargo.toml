@@ -1,5 +1,5 @@
 [workspace]
-members = ["shared/protocol", "shared/simulation", "shared/replication", "game_server", "game_client"]
+members = ["shared/protocol", "shared/simulation", "shared/replication", "shared/dream_net", "game_server", "game_client", "shared/bevy-net-debug"]
 resolver = "2"
 
 [workspace.package]
@@ -17,7 +17,7 @@ log = "0.4.22"
 renet = "2.0.0"
 renet-cross = "0.6.1"
 rtrb = "0.4"
-bevy-net-debug = "0.2"
+bevy-net-debug = { path = "shared/bevy-net-debug" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 tokio = { version = "1.49.0", features = [
@@ -51,5 +51,5 @@ inherits = "release"
 opt-level = 3
 
 [patch.crates-io]
-str0m = { git = "https://github.com/dt665m/str0m.git", branch = "feat/dimpl-buffer-resize" }
 sctp-proto = { git = "https://github.com/dt665m/sctp-proto.git", rev = "cb94f37991c185fb9cc2fd41fbe92965e2a1f713" }
+str0m = { git = "https://github.com/dt665m/str0m.git", branch = "feat/dimpl-buffer-resize" }

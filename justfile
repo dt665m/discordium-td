@@ -6,6 +6,23 @@ WEB_CLIENT := ROOT + "/game_client"
 default:
     @just --list
 
+# Dreamwake: cooperative roguelite using the shared authoritative server and transport.
+dreamwake:
+    cargo run -p game_client --bin dreamwake
+
+dreamwake-web address="127.0.0.1" port="1421":
+    cd "{{WEB_CLIENT}}" && NO_COLOR=false trunk serve dreamwake.html --cargo-profile web-dev --dist "{{ROOT}}/target/dreamwake-web" --address {{address}} --port {{port}}
+
+dreamwake-build:
+    cargo build --release -p game_client --bin dreamwake
+
+dreamwake-web-build http_base="https://dsdp.datab.fun":
+    cd "{{WEB_CLIENT}}" && NO_COLOR=false TD_WEB_HTTP_BASE="{{http_base}}" trunk build dreamwake.html --release --cargo-profile web-release --dist "{{ROOT}}/target/dreamwake-pages"
+
+# Dedicated Dreamwake authority; default capacity matches the existing eight-player server.
+dreamwake-server max_clients="8":
+    cargo run -p game_server -- --dreamwake --max-clients {{max_clients}}
+
 check:
     cargo check --workspace --all-targets
 

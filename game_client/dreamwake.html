@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#07101c" />
+  <title>Dreamwake — The place between waking</title>
+  <style>
+    html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; background: #07101c; }
+    canvas { display: block; width: 100%; height: 100%; touch-action: none; outline: none; }
+    #loading { position: fixed; inset: 0; display: grid; place-content: center; color: #a7e6dc; font: 15px system-ui; text-align: center; letter-spacing: .2em; pointer-events: none; }
+    #loading strong { color: #e8dfc1; font-size: 36px; letter-spacing: .3em; font-weight: 300; margin-bottom: 18px; }
+    body:has(canvas[data-raw-handle]) #loading { display: none; }
+  </style>
+  <link data-trunk rel="rust" data-bin="dreamwake" data-wasm-opt="z"
+    data-wasm-opt-params="--enable-bulk-memory --enable-nontrapping-float-to-int --strip-debug --strip-dwarf --strip-producers" />
+  <link data-trunk rel="copy-file" href="assets/dreamwake/fonts/OFL.txt" />
+</head>
+<body>
+  <div id="loading"><strong>DREAMWAKE</strong>ENTERING THE DREAM</div>
+  <canvas id="game-canvas" tabindex="0"></canvas>
+  <script>
+    document.addEventListener('click', () => document.querySelector('canvas').focus());
+    window.addEventListener('TrunkApplicationStarted', () => document.querySelector('#loading').remove());
+  </script>
+</body>
+</html>

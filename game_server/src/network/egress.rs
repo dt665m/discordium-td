@@ -46,7 +46,7 @@ pub(crate) fn build_server_debug_frame(
                 sent_history_len: state.map_or(0, |state| state.outstanding.len()),
                 snapshot_payload_bytes: state
                     .and_then(|state| state.outstanding.back())
-                    .map(|packet| packet.payload.len()),
+                    .map(|packet| packet.payload_bytes),
                 snapshot_baseline_tick: state
                     .and_then(|state| state.outstanding.back())
                     .and_then(|packet| packet.baseline_tick),

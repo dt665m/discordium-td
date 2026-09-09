@@ -1,0 +1,13 @@
+[package]
+name = "bevy-net-debug"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Built-in Bevy debug UI for renet-cross packet conditioning"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/dt665m/renet-cross"
+readme = "README.md"
+
+[dependencies]
+renet-cross.workspace = true
+bevy = { workspace = true, default-features = false, features = ["std", "bevy_ui", "bevy_text", "default_font"] }

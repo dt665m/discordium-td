@@ -1,7 +1,7 @@
 //! Bounded ownership handoff. No transport or ECS world is shared here.
 use super::*;
 
-/// Preserve reliable deliveries and disconnects in simulation order, including
+/// Preserve reliable deliveries in simulation order, including
 /// when several fixed ticks are exported together after a slow app frame.
 pub(crate) enum Outbound {
     ToClient(u64, ReliableServerMessage),
@@ -14,8 +14,8 @@ pub(crate) struct OutputBatch {
     pub step_duration_ms: f64,
 }
 
-/// A frame can contain several catch-up ticks. Keep their ordered messages but
-/// export only the most recent state, once, after FixedUpdate has finished.
+/// Several ticks can accumulate in an app frame or behind a stalled worker.
+/// Keep their ordered messages but export only the most recent state.
 #[derive(Resource, Default)]
 pub(crate) struct PendingOutput(Option<OutputBatch>);
 impl PendingOutput {
@@ -33,9 +33,13 @@ impl PendingOutput {
             self.0 = Some(batch);
         }
     }
+
+    pub(crate) fn take(&mut self) -> Option<OutputBatch> {
+        self.0.take()
+    }
 }
 pub(crate) fn publish_output(mut pending: ResMut<PendingOutput>, worker: Res<NetworkWorker>) {
-    if let Some(batch) = pending.0.take() {
+    if let Some(batch) = pending.take() {
         worker.send(batch);
     }
 }

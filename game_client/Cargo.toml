@@ -1,15 +1,17 @@
 [package]
 license.workspace = true
 name = "game_client"
+default-run = "game_client"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-bevy = { workspace = true, features = ["bevy_dev_tools"] }
+bevy = { workspace = true, features = ["bevy_dev_tools", "audio", "wav"] }
 game_replication = { path = "../shared/replication" }
 game_shared = { path = "../shared/protocol" }
 game_sim = { path = "../shared/simulation", features = ["bevy"] }
+game_dream_net = { path = "../shared/dream_net" }
 log.workspace = true
 renet.workspace = true
 renet-cross.workspace = true

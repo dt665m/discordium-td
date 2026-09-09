@@ -2,6 +2,17 @@
 
 Server-authoritative Bevy 0.19.1 tower defense prototype using [renet-cross](https://github.com/dt665m/renet-cross) for mixed native/web transport.
 
+## Dreamwake cooperative roguelite
+
+Run `just dreamwake` and choose **Host**, or join an existing Dreamwake server.
+Dreamwake uses the same client/server stack, with eight players by default and a
+configurable admission limit. The ten-room run includes configurable abilities,
+Essences, cooperative encounters, sanctuaries, and a three-phase boss.
+
+See the [Dreamwake play guide](docs/dreamwake.md) for native/browser setup,
+multiplayer hosting, controls, builds, and validation scope. The setup below
+continues to describe the original tower-defense mode.
+
 See the [networking and prediction contract](docs/netcode.md) for replication history,
 packet recovery, timing, and verification.
 

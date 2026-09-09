@@ -22,9 +22,11 @@ state. Cross-platform lockstep determinism is not required.
 
 `game_server::replication::ReplicationHistory` owns one shared history of canonical
 serialized world states and changes between frames. `ClientNetState` holds each
-connection's last acknowledged complete version and references to outstanding
-packets. The movement ACK is already part of each hero, so world payloads do not
-need a duplicate recipient-specific field.
+connection's last acknowledged complete version and metadata for outstanding
+sent versions (tick, baseline tick and payload length). These ACK records
+do not retain packet payloads after shared history evicts them. The movement ACK
+is already part of each hero, so world payloads do not need a duplicate
+recipient-specific field.
 
 A recovery update unions changes after that client's acknowledged frame and reads
 **current values** for those changes. Receiving an intermediate update is not a
@@ -93,7 +95,11 @@ validates lag compensation, runs the shared simulation schedule, and stages
 complete output in a resource. `PostUpdate`
 exports the latest state once per app frame through an eight-batch FIFO. If a
 frame runs several catch-up ticks, their reliable deliveries stay in order while
-obsolete intermediate snapshots are coalesced. Reliable output is never silently
+obsolete intermediate snapshots are coalesced. The network worker applies the
+same rule to a bounded batch of queued app frames after a worker stall, encoding
+only the newest world while preserving all reliable deliveries. Replication can
+reconstruct from retained published ticks even when intermediate ticks were not
+sent. Reliable output is never silently
 discarded: exhausted per-peer retention disconnects that peer, and exhausted
 worker output retention surfaces a pipeline failure. Transport access shared with
 HTTP signaling stays outside the simulation tick.
@@ -132,10 +138,18 @@ identity before reusing an entity. Newcomers/respawns hold their first position
 until the delayed timeline reaches that life, avoiding a jump from latest state
 back onto interpolation.
 
+Lag-compensation history retains each hero's server-owned respawn generation.
+A rewind across a life boundary falls back to the current world even if death
+and respawn occurred at the same position.
+
 Remote heroes interpolate on server-tick spacing, not packet-arrival spacing.
 The playback clock adjusts gradually for jitter and resynchronizes after outages.
 Enemy prediction remains part of the existing whole-world combat contract; it is
-bounded by the same replay horizon. See [predicted presentation](predicted-presentation.md).
+bounded by the same replay horizon. Once prediction is initialized, snapshot
+sampling only computes remote hero positions; enemy interpolation remains the
+uninitialized fallback. HUD reads of the local hero use the simulation's identity
+index instead of extracting the entire world. See
+[predicted presentation](predicted-presentation.md).
 
 ## Verification
 
@@ -163,4 +177,61 @@ results. Generated verification reports belong in `target/reports/`.
 For repeatable bandwidth, CPU, memory and loss/recovery comparisons, see the
 [netcode capacity eval](netcode-eval.md). The
 [server ingress experiment](server-ingress-benchmark.md) separates byte-copy,
-decoding and queue costs from live server measurements.
+decoding and queue costs from live server measurements. The
+[client presentation follow-up](client-presentation-benchmark.md) measures
+indexed HUD reads and skipping unused enemy interpolation.
+
+## Transport receipts and Dreamwake tick scheduling
+
+The game and `renet-cross` use unmodified registry Renet 2.0.0. There is no
+vendored Renet, Cargo patch for Renet, or alternate protocol core. Renet owns
+transport acknowledgments, reliable retransmission and delivery order.
+
+Receive/handshake polling runs every 1 ms. Renet packet generation runs once per
+60 Hz server tick, after simulation and any due snapshot have been queued. It
+continues in menus and paused gameplay, independently of whether a snapshot or
+new gameplay message exists. Catch-up steps produce one flush of the latest state,
+not a burst of historical flushes. The browser flushes in `PostUpdate`, limited to
+60 Hz. This follows the upstream frame-oriented usage of Renet: frequent socket
+polling does not require calling `send_packets` on every poll.
+
+The F6 loss estimate and RTT come directly from upstream Renet. Its outgoing
+packet loss estimate includes ACK-only packets and depends on acknowledgments
+returning within its measurement window. It is not a count of physical network
+drops or rejected gameplay commands. No custom denominator, ACK suppression, or
+statistics correction is applied in the game or transport wrapper.
+
+Dreamwake's shared `TICK_HZ` defines the 60 Hz simulation timestep. The server
+publishes state every three completed server steps (20 Hz), from the latest
+completed state after bounded catch-up. Publication has no separate wall-clock
+deadline that can drift relative to the simulation. The server step clock still
+runs when the gameplay phase is paused or in a menu, so connections and applied
+command progress continue to be published.
+
+The existing `ack_input` and `ack_action` fields describe simulation progress for
+reconciliation: receipt by Renet does not imply execution by the authority. They
+are snapshot fields, not an application transport ACK/retransmission loop.
+
+
+### WebRTC SCTP retransmission-limit correction
+
+During local transport iteration the workspace uses sibling `../renet-cross` and
+patches `sctp-proto` to `../sctp-proto` (upstream 0.10.4, commit
+`215565ad7aa80d3c160048350a2e6ddd8524920c`, with the local partial-reliability fix).
+Renet itself remains unmodified registry 2.0.0.
+
+The SCTP dependency marked `maxRetransmits=0` DATA abandoned on its first send.
+Later SACKs advanced FORWARD-TSN over live packets and generated a growing
+FORWARD-TSN/SACK exchange during ordinary lossless traffic. In production this
+exceeded the server's per-peer UDP receive budget and dropped incoming traffic.
+The correction abandons only at a would-be retransmission, as required by
+[RFC 7496 section 3.1](https://www.rfc-editor.org/rfc/rfc7496.html#section-3.1),
+shares abandonment across fragments, and retires unsent tails without leaking
+stream buffer credit. Receive budgets and Renet's loss calculation are unchanged.
+
+For bounded native packet tracing, opt into the log target
+`renet_cross::packet_trace=trace`. It emits at most 100,000 encrypted packet
+fingerprints per process across all peers, covering accepted sends, incoming
+messages and local quota/input/send errors. It does not record packet payloads.
+Leave the target disabled in normal operation; it is a temporary correlation aid,
+not a replacement for transport counters or an IP packet capture.

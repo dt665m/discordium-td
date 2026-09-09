@@ -25,6 +25,16 @@ pub(crate) struct ReplicationPacket {
     pub payload: Bytes,
 }
 
+/// ACK eligibility outlives payload retention without keeping packet bytes alive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SentSnapshot {
+    pub tick: u32,
+    #[allow(dead_code, reason = "only server diagnostics read this metadata")]
+    pub baseline_tick: Option<u32>,
+    #[allow(dead_code, reason = "only server diagnostics read this metadata")]
+    pub payload_bytes: usize,
+}
+
 #[derive(Default)]
 pub(crate) struct ClientNetState {
     // The same worker-owned peer record holds admission and replication state.
@@ -34,12 +44,16 @@ pub(crate) struct ClientNetState {
     )]
     pub ingress_counts: [usize; 2],
     pub last_acked_tick: Option<u32>,
-    pub outstanding: VecDeque<Arc<ReplicationPacket>>,
+    pub outstanding: VecDeque<SentSnapshot>,
 }
 
 impl ClientNetState {
     pub fn sent(&mut self, packet: Arc<ReplicationPacket>) {
-        self.outstanding.push_back(packet);
+        self.outstanding.push_back(SentSnapshot {
+            tick: packet.tick,
+            baseline_tick: packet.baseline_tick,
+            payload_bytes: packet.payload.len(),
+        });
         while self.outstanding.len() > HISTORY_FRAMES {
             self.outstanding.pop_front();
         }
@@ -256,6 +270,79 @@ mod tests {
                         .sum::<usize>()
             })
             .sum()
+    }
+
+    #[test]
+    fn history_eviction_releases_payloads_without_losing_late_ack_eligibility() {
+        let mut sim = Simulation::new();
+        sim.add_player(1);
+        let mut history = ReplicationHistory::default();
+        history.record(&sim.world_delta());
+        let packet = history.packet_for(None);
+        let retained = Arc::downgrade(&packet);
+        let sent = SentSnapshot {
+            tick: packet.tick,
+            baseline_tick: packet.baseline_tick,
+            payload_bytes: packet.payload.len(),
+        };
+        let mut client = ClientNetState::default();
+        client.sent(packet);
+
+        // This client receives nothing else, so its ACK record remains even
+        // after enough new frames evict the only owner of the original payload.
+        for _ in 0..HISTORY_FRAMES {
+            sim.step();
+            history.record(&sim.world_delta());
+        }
+        assert!(retained.upgrade().is_none());
+        assert_eq!(client.outstanding.front(), Some(&sent));
+        client.acknowledge(sent.tick);
+        assert_eq!(client.last_acked_tick, Some(sent.tick));
+        assert!(client.outstanding.is_empty());
+        assert_eq!(
+            history.packet_for(client.last_acked_tick).baseline_tick,
+            None,
+            "an ACK for an evicted baseline must recover with full state"
+        );
+    }
+
+    #[test]
+    fn sent_metadata_bounds_ack_retention_and_handles_reordering_across_tick_wrap() {
+        let mut client = ClientNetState::default();
+        let first = u32::MAX - 2;
+        for offset in 0..=HISTORY_FRAMES as u32 {
+            let tick = first.wrapping_add(offset);
+            client.sent(Arc::new(ReplicationPacket {
+                tick,
+                baseline_tick: Some(tick.wrapping_sub(1)),
+                payload: Bytes::from_static(b"snapshot"),
+            }));
+        }
+        let last = first.wrapping_add(HISTORY_FRAMES as u32);
+        assert_eq!(client.outstanding.len(), HISTORY_FRAMES);
+        assert_eq!(client.outstanding.front().unwrap().tick, first + 1);
+        assert_eq!(client.outstanding.back().unwrap().tick, last);
+
+        client.acknowledge(first);
+        assert_eq!(
+            client.last_acked_tick, None,
+            "expired sends cannot be ACKed"
+        );
+        client.acknowledge(last.wrapping_add(1));
+        assert_eq!(
+            client.last_acked_tick, None,
+            "unknown sends cannot be ACKed"
+        );
+        client.acknowledge(u32::MAX);
+        assert_eq!(client.last_acked_tick, Some(u32::MAX));
+        assert_eq!(client.outstanding.front().unwrap().tick, 0);
+        client.acknowledge(0);
+        client.acknowledge(u32::MAX);
+        assert_eq!(client.last_acked_tick, Some(0), "old ACKs cannot rewind");
+        assert_eq!(client.outstanding.front().unwrap().tick, 1);
+        client.acknowledge(last);
+        assert_eq!(client.last_acked_tick, Some(last));
+        assert!(client.outstanding.is_empty());
     }
 
     #[test]
@@ -522,6 +609,59 @@ mod tests {
         client.acknowledge(packet.tick);
         assert!(client.outstanding.is_empty());
         assert_eq!(client.last_acked_tick, Some(current.tick));
+    }
+
+    #[test]
+    fn skipped_publication_ticks_recover_after_a_lost_intermediate_update() {
+        let mut sim = Simulation::new();
+        sim.add_player(1);
+        for _ in 0..=game_shared::WAVE_PREP_TICKS {
+            sim.step();
+        }
+        let mut initial = sim.world_delta();
+        initial.tick = 1;
+        let enemy = initial.enemies[0];
+        // Mostly unchanged actors make the real compressed patch smaller than
+        // the full fallback, so recovery exercises the accumulated change set.
+        initial.enemies = (0..84)
+            .map(|index| {
+                let mut enemy = enemy;
+                enemy.id += index;
+                enemy.pos = [index as f32 * 0.25, (index as f32).sin()];
+                enemy
+            })
+            .collect();
+        let mut history = ReplicationHistory::default();
+        let mut client = ClientNetState::default();
+        history.record(&initial);
+        let first = history.packet_for(None);
+        let confirmed = rebuild(&initial, &first);
+        client.sent(first);
+        client.acknowledge(initial.tick);
+
+        let mut current = initial.clone();
+        current.tick = 8;
+        current.enemies[0].pos[0] += 0.5;
+        history.record(&current);
+        // Tick 8 is sent, but its delivery and ACK are lost. Ticks between
+        // published worlds never enter replication history or sent metadata.
+        client.sent(history.packet_for(client.last_acked_tick));
+        current.tick = 16;
+        current.enemies[1].pos[1] -= 0.25;
+        history.record(&current);
+        let latest = history.packet_for(client.last_acked_tick);
+        client.sent(Arc::clone(&latest));
+        client.acknowledge(15);
+        assert_eq!(client.last_acked_tick, Some(1), "tick 15 was never sent");
+        assert_eq!(latest.baseline_tick, Some(1));
+        assert_eq!(
+            rebuild(&confirmed, &latest),
+            current,
+            "the patch must include changes from both published intervals"
+        );
+        client.acknowledge(latest.tick);
+        assert_eq!(client.last_acked_tick, Some(16));
+        assert!(client.outstanding.is_empty());
     }
 
     #[test]

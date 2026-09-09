@@ -51,6 +51,15 @@ use renet_cross::{
 #[derive(Debug, Clone, Parser)]
 #[command(name = "game_server")]
 pub struct ServerArgs {
+    /// Run the server-authoritative Dreamwake cooperative roguelite.
+    #[arg(long, default_value_t = false)]
+    pub dreamwake: bool,
+    /// Shared encounter/reward seed for a Dreamwake party.
+    #[arg(long, default_value_t = 8192)]
+    pub dream_seed: u64,
+    /// Start Dreamwake with the optional Lucid challenge enabled.
+    #[arg(long, default_value_t = false)]
+    pub dream_lucid: bool,
     #[command(flatten)]
     pub network_conditioner: crate::conditioner::NetworkConditionerArgs,
     /// Admission limit; benchmark the chosen player/entity workload before raising it.
@@ -182,6 +191,9 @@ pub fn run(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let ServerArgs {
+        dreamwake,
+        dream_seed,
+        dream_lucid,
         network_conditioner,
         max_clients,
         http_bind,
@@ -255,6 +267,11 @@ pub fn run(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
         debug_recorder.is_some()
     );
 
+    let protocol_id = if dreamwake {
+        game_dream_net::PROTOCOL_ID
+    } else {
+        PROTOCOL_ID
+    };
     let conditioner_config = network_conditioner.config();
     log::info!("server network conditioner startup: {conditioner_config:?}");
     let conditioner = renet_cross::server_conditioner::ServerConditionerHandle::new(
@@ -265,7 +282,7 @@ pub fn run(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
         },
     )?;
     let shared_transport = Arc::new(Mutex::new(
-        MixedTransportBuilder::new(PROTOCOL_ID)
+        MixedTransportBuilder::new(protocol_id)
             .transport_config(renet_cross::ServerTransportConfig {
                 conditioner: Some(conditioner.clone()),
             })
@@ -314,6 +331,10 @@ pub fn run(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
         bootstrap,
     };
 
+    if dreamwake {
+        return crate::dreamwake::run_dreamwake(shared_net, dream_seed, dream_lucid)
+            .map_err(|error| std::io::Error::other(error).into());
+    }
     build_and_run_app(
         mode,
         shared_net,

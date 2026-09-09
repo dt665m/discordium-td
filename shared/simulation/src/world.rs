@@ -1,6 +1,6 @@
 //! Shared entry points operating on the host's simulation entities.
 use super::*;
-use game_shared::ClientAction;
+use game_shared::{ClientAction, HeroSnapshot};
 
 pub fn add_player(world: &mut World, id: u64) {
     world.resource_scope(|world, mut g: Mut<Globals>| g.add_player(world, id));
@@ -16,6 +16,10 @@ pub fn tick(world: &World) -> u32 {
 }
 pub fn world_delta(world: &World) -> WorldDelta {
     snapshot::world_delta(world)
+}
+/// Capture one current-epoch hero through the existing network identity index.
+pub fn hero_snapshot(world: &World, client_id: u64) -> Option<HeroSnapshot> {
+    snapshot::hero_snapshot(world, client_id)
 }
 pub fn sim_meta(world: &World) -> SimMeta {
     world.resource::<Globals>().sim_meta(world)

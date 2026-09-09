@@ -14,11 +14,18 @@ pub struct HistoricalActor {
     pub pos: [f32; 2],
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HistoricalHero {
+    pub id: u64,
+    pub pos: [f32; 2],
+    pub respawn_generation: u32,
+}
+
 #[derive(Debug, Clone)]
 pub struct HistoricalFrame {
     pub match_epoch: u32,
     pub tick: u32,
-    pub heroes: Vec<HistoricalActor>,
+    pub heroes: Vec<HistoricalHero>,
     pub enemies: Vec<HistoricalActor>,
 }
 
@@ -54,9 +61,10 @@ impl StateHistory {
             heroes: world
                 .heroes
                 .iter()
-                .map(|h| HistoricalActor {
+                .map(|h| HistoricalHero {
                     id: h.client_id,
                     pos: h.pos,
+                    respawn_generation: h.respawn_generation,
                 })
                 .collect(),
             enemies: world
@@ -250,7 +258,11 @@ impl StateHistory {
                 .find(|h| h.id == caster)
                 .ok_or(RewindFallback::CasterDiscontinuity)?;
             let max_step = game_shared::HERO_SPEED * game_shared::FIXED_DT_SECONDS + 0.5;
-            if distance_sq(before.pos, after.pos) > max_step * max_step {
+            // A respawn can return to the same position; geometry alone does
+            // not establish that the caster stayed in the same lifetime.
+            if before.respawn_generation != after.respawn_generation
+                || distance_sq(before.pos, after.pos) > max_step * max_step
+            {
                 return Err(RewindFallback::CasterDiscontinuity);
             }
             // A generous per-tick discontinuity guard, not enemy speed policing.
@@ -291,14 +303,50 @@ mod rewind_policy_tests {
     }
 
     #[test]
+    fn recorded_respawns_cannot_be_rewound_even_at_the_same_position() {
+        let mut sim = game_sim::Simulation::new();
+        sim.add_player(1);
+        let mut world = sim.world_delta();
+        let epoch = world.sim_meta.unwrap().match_epoch;
+        let origin = world.heroes[0].pos;
+        world.tick = u32::MAX;
+        world.heroes[0].respawn_generation = u32::MAX;
+        let mut history = StateHistory::default();
+        history.record(&world);
+
+        // Tick wrap alone preserves the caster's continuous lifetime.
+        world.tick = 0;
+        history.record(&world);
+        assert_eq!(
+            history.validated_targets(epoch, u32::MAX, 0, 1, origin),
+            Ok(Vec::new())
+        );
+
+        // A same-position respawn still breaks continuity, including when the
+        // server's generation counter wraps. Exercise snapshot recording too.
+        world.tick = 1;
+        world.heroes[0].respawn_generation = 0;
+        history.record(&world);
+        assert_eq!(
+            history.validated_targets(epoch, u32::MAX, 1, 1, origin),
+            Err(RewindFallback::CasterDiscontinuity)
+        );
+        assert_eq!(
+            history.validated_targets(epoch, 1, 1, 1, origin),
+            Ok(Vec::new())
+        );
+    }
+
+    #[test]
     fn discontinuities_and_disappeared_targets_cannot_be_rewound() {
         let mut history = StateHistory::default();
         history.frames.push_back(HistoricalFrame {
             match_epoch: 0,
             tick: 1,
-            heroes: vec![HistoricalActor {
+            heroes: vec![HistoricalHero {
                 id: 1,
                 pos: [0.0, 0.0],
+                respawn_generation: 0,
             }],
             enemies: vec![
                 HistoricalActor {
@@ -314,9 +362,10 @@ mod rewind_policy_tests {
         history.frames.push_back(HistoricalFrame {
             match_epoch: 0,
             tick: 2,
-            heroes: vec![HistoricalActor {
+            heroes: vec![HistoricalHero {
                 id: 1,
                 pos: [0.1, 0.0],
+                respawn_generation: 0,
             }],
             enemies: vec![HistoricalActor {
                 id: 10,

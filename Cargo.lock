@@ -614,8 +614,6 @@ dependencies = [
 [[package]]
 name = "bevy-net-debug"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2ae0d9e0c8c4fb47c06dfb53cf2032553cbc67259018c66094ea81b8ae030821"
 dependencies = [
  "bevy",
  "renet-cross",
@@ -3281,6 +3279,7 @@ dependencies = [
  "bevy",
  "bevy-net-debug",
  "clap",
+ "game_dream_net",
  "game_replication",
  "game_server",
  "game_shared",
@@ -3295,6 +3294,16 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
+]
+
+[[package]]
+name = "game_dream_net"
+version = "0.1.0"
+dependencies = [
+ "game_shared",
+ "game_sim",
+ "renet",
+ "serde",
 ]
 
 [[package]]
@@ -3314,6 +3323,7 @@ dependencies = [
  "bytes",
  "clap",
  "env_logger",
+ "game_dream_net",
  "game_shared",
  "game_sim",
  "log",
@@ -3344,6 +3354,8 @@ dependencies = [
  "game_replication",
  "game_shared",
  "log",
+ "serde",
+ "serde_json",
  "vleue_navigator",
 ]
 
@@ -3799,6 +3811,12 @@ name = "hexf-parse"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dfa686283ad6dd069f105e5ab091b04c62850d3e4cf5d67debad1933f55023df"
+
+[[package]]
+name = "hound"
+version = "3.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "62adaabb884c94955b19907d60019f4e145d091c75345379e70d1ee696f7854f"
 
 [[package]]
 name = "http"
@@ -5960,6 +5978,7 @@ checksum = "d0a536bb79db59098ef71a4dd4246c02eb87b316deceb1b68e0cde7167ec01eb"
 dependencies = [
  "cpal",
  "dasp_sample",
+ "hound",
  "lewton",
  "num-rational",
  "thiserror 2.0.20",

@@ -9,12 +9,7 @@ pub(super) fn presentation_hero(
     let id = client_id?;
     if local.initialized {
         // A missing predicted actor must not be resurrected from an older snapshot.
-        local
-            .sim
-            .world_delta()
-            .heroes
-            .into_iter()
-            .find(|h| h.client_id == id)
+        local.sim.hero_snapshot(id)
     } else {
         world.heroes.get(&id).cloned()
     }
@@ -108,6 +103,30 @@ mod tests {
             predicted.ability_cooldown_ticks
         );
         assert!(presentation_hero(&local, &world, Some(2)).is_none());
+    }
+
+    #[test]
+    fn hud_fallback_stops_when_the_predicted_hero_disappears() {
+        let mut local = LocalSimulation::default();
+        local.sim.add_player(1);
+        let hero = local.sim.hero_snapshot(1).unwrap();
+        let mut world = WorldView::default();
+        world.heroes.insert(1, hero.clone());
+        assert_eq!(
+            presentation_hero(&local, &world, Some(1)),
+            Some(hero.clone())
+        );
+
+        local.initialized = true;
+        local.sim.remove_player(1);
+        assert!(presentation_hero(&local, &world, Some(1)).is_none());
+        assert!(presentation_hero(&local, &world, None).is_none());
+
+        local.sim.add_player(1);
+        assert_eq!(
+            presentation_hero(&local, &world, Some(1)),
+            local.sim.hero_snapshot(1)
+        );
     }
 }
 

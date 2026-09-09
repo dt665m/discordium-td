@@ -1,4 +1,5 @@
 use super::*;
+use game_shared::HeroSnapshot;
 
 /// Isolated ECS world used by prediction, replay and headless callers.
 #[derive(Debug)]
@@ -32,6 +33,10 @@ impl Simulation {
     }
     pub fn world_delta(&self) -> WorldDelta {
         world::world_delta(&self.world)
+    }
+    /// Read one hero without capturing or sorting the rest of the simulation.
+    pub fn hero_snapshot(&self, client_id: u64) -> Option<HeroSnapshot> {
+        world::hero_snapshot(&self.world, client_id)
     }
     pub fn sim_meta(&self) -> SimMeta {
         world::sim_meta(&self.world)

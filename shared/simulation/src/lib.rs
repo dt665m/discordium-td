@@ -1,4 +1,5 @@
 //! Shared Bevy ECS simulation for server authority and isolated client prediction.
+pub mod dream;
 pub mod plugins;
 mod systems;
 pub use plugins::{SimulationPlugins, SimulationTick};

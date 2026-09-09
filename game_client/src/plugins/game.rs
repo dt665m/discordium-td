@@ -28,8 +28,9 @@ use lifecycle::*;
 #[path = "game/outbound.rs"]
 mod outbound;
 use super::debug_panel::{DebugMetric, DebugPanel, HudMetric};
-use bevy_net_debug::{ConditionerDebug, ConditionerDebugPlugin};
+use bevy_net_debug::ConditionerDebug;
 use outbound::*;
+#[cfg(test)]
 use renet_cross::conditioner::ConditionerHandle;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -851,7 +852,6 @@ impl Plugin for GameClientPlugin {
             .insert_resource(UnitBarCameraCache::default())
             .insert_resource(HudState::default())
             .insert_resource(DebugOverlayState::default())
-            .init_resource::<super::debug_panel::DiagnosticHistory>()
             .insert_resource(SpecialSkillCooldownUiState::default())
             .insert_resource(PowerPieUiState::default())
             .insert_resource(GoldHudState::default())
@@ -884,7 +884,7 @@ impl Plugin for GameClientPlugin {
                 targeting::TargetingPlugin,
                 minimap::MinimapPlugin,
             ))
-            .add_plugins(ConditionerDebugPlugin::new(ConditionerHandle::default()))
+            .add_plugins(game_client::network_tools::NetworkToolsPlugin)
             .add_systems(Startup, (setup_scene, menu::main_menu.spawn()))
             .configure_sets(
                 RunFixedMainLoop,
@@ -913,9 +913,7 @@ impl Plugin for GameClientPlugin {
             )
             .add_systems(
                 RunFixedMainLoop,
-                (toggle_debug_overlay, super::debug_panel::scroll)
-                    .chain()
-                    .in_set(ClientUpdateSet::Input),
+                toggle_debug_overlay.in_set(ClientUpdateSet::Input),
             )
             .add_systems(
                 RunFixedMainLoop,
@@ -975,8 +973,7 @@ impl Plugin for GameClientPlugin {
                     update_match_end_overlay.run_if(resource_changed::<WorldView>),
                     sync_menu_button_visual_state,
                     sync_main_menu_state,
-                    sample_diagnostic_history,
-                    super::debug_panel::update_graphs,
+                    sample_diagnostic_history.before(super::debug_panel::update_graphs),
                     update_debug_overlay,
                 )
                     .chain()
@@ -1193,8 +1190,6 @@ fn setup_scene(
     commands.insert_resource(power_pie_raster_cache);
 
     super::debug_panel::spawn_hud(&mut commands);
-
-    super::debug_panel::spawn(&mut commands);
 
     commands
         .spawn((
@@ -2414,9 +2409,10 @@ fn sync_dynamic_actors(
         None
     };
 
-    // Sample interpolated positions from the snapshot buffer for remote heroes
+    // Predicted enemies do not use snapshot interpolation.
     let interpolated = if snapshot_buffer.has_enough_data() {
-        Some(snapshot_buffer.sample(snapshot_buffer.render_time, net_stats.enemy_render_lead()))
+        let enemy_lead = (!local_sim.initialized).then(|| net_stats.enemy_render_lead());
+        Some(snapshot_buffer.sample(snapshot_buffer.render_time, enemy_lead))
     } else {
         None
     };
@@ -3009,43 +3005,22 @@ fn report_conditioner_rtt(
 }
 
 fn toggle_debug_overlay(
-    mut conditioner: ResMut<ConditionerDebug>,
+    conditioner: Res<ConditionerDebug>,
     mut bridge: ResMut<ClientDebugBridgeState>,
     keyboard: Res<ButtonInput<KeyCode>>,
     mut state: ResMut<DebugOverlayState>,
-    mut query: Query<&mut Visibility, With<DebugPanel>>,
     mut hud: Query<&mut Visibility, (With<super::debug_panel::HudRoot>, Without<DebugPanel>)>,
 ) {
-    if keyboard.just_pressed(KeyCode::F6) {
-        conditioner.visible = !conditioner.visible;
-        if conditioner.visible {
-            state.visible = false;
-        }
-    }
     if keyboard.just_pressed(KeyCode::F4) {
         bridge.pending_marker = true;
     }
-    if keyboard.just_pressed(KeyCode::F3) {
-        state.visible = !state.visible;
-        if state.visible {
-            conditioner.visible = false;
-        }
-    }
-    if keyboard.just_pressed(KeyCode::F3) || keyboard.just_pressed(KeyCode::F6) {
-        for mut vis in &mut hud {
-            *vis = if state.visible {
-                Visibility::Hidden
-            } else {
-                Visibility::Inherited
-            };
-        }
-        for mut vis in &mut query {
-            *vis = if state.visible {
-                Visibility::Inherited
-            } else {
-                Visibility::Hidden
-            };
-        }
+    state.visible = conditioner.visible;
+    for mut vis in &mut hud {
+        *vis = if state.visible {
+            Visibility::Hidden
+        } else {
+            Visibility::Inherited
+        };
     }
 }
 

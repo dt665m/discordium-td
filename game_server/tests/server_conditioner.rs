@@ -101,8 +101,10 @@ fn run_conditioned_connection(
             }
         }
     };
-    let sampling_started = Instant::now();
-    let mut last = sampling_started;
+    let connection_started = Instant::now();
+    let mut sampling_started = None;
+    let sample_duration = Duration::from_secs(if test_action { 8 } else { 5 });
+    let mut last = connection_started;
     let mut received_gameplay = false;
     let mut samples = Vec::new();
     let mut move_sent = false;
@@ -112,7 +114,19 @@ fn run_conditioned_connection(
     let mut expected_stop = None;
     let mut walk_confirmed = false;
     let mut last_input_send = Instant::now();
-    while sampling_started.elapsed() < Duration::from_secs(if test_action { 8 } else { 5 }) {
+    let mut probe_move_seq = 0;
+    loop {
+        if sampling_started.is_some_and(|start: Instant| start.elapsed() >= sample_duration) {
+            break;
+        }
+        // HTTP bootstrap precedes the conditioned UDP handshake. Loss can keep
+        // Renet in Connecting for longer than the gameplay sample window.
+        assert!(
+            sampling_started.is_some() || connection_started.elapsed() < Duration::from_secs(15),
+            "conditioned connection never joined: connecting={} reason={:?}",
+            client.is_connecting(),
+            client.disconnect_reason()
+        );
         let now = Instant::now();
         let dt = now.duration_since(last);
         last = now;
@@ -122,6 +136,7 @@ fn run_conditioned_connection(
             match game_shared::decode(&bytes) {
                 Ok(game_shared::ReliableServerMessage::JoinSnapshot(join)) => {
                     received_gameplay = true;
+                    sampling_started.get_or_insert_with(Instant::now);
                     if walk_attack {
                         let mut predicted = game_sim::Simulation::from_snapshot(
                             &join.world,
@@ -213,6 +228,24 @@ fn run_conditioned_connection(
                 }
             }
         }
+        // Model the real client's stationary input stream while measuring
+        // upstream Renet's RTT under the configured transport conditions.
+        if !test_action
+            && !walk_attack
+            && received_gameplay
+            && last_input_send.elapsed() >= Duration::from_secs_f64(1.0 / 30.0)
+        {
+            last_input_send = Instant::now();
+            probe_move_seq += 1;
+            client.send_message(
+                renet::DefaultChannel::Unreliable,
+                game_shared::encode(&game_shared::ClientMoveBundle {
+                    match_epoch: 0,
+                    actions: vec![],
+                    moves: vec![(probe_move_seq, [0.0, 0.0])],
+                }),
+            );
+        }
         // Retransmit the same movement identity until ACKed, as a redundant bundle does.
         if test_action && move_sent && !action_sent {
             client.send_message(
@@ -247,7 +280,9 @@ fn run_conditioned_connection(
             );
         }
         transport.send_packets(&mut client).unwrap();
-        if sampling_started.elapsed() > Duration::from_secs(3) && client.is_connected() {
+        if sampling_started.is_some_and(|start| start.elapsed() > Duration::from_secs(3))
+            && client.is_connected()
+        {
             samples.push(client.rtt() * 1000.0);
         }
         thread::sleep(Duration::from_millis(5));

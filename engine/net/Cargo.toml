@@ -1,0 +1,11 @@
+[package]
+name="engine_net"
+version.workspace=true
+edition.workspace=true
+rust-version.workspace=true
+license.workspace=true
+[dependencies]
+serde.workspace=true
+renet.workspace=true
+bincode.workspace=true
+miniz_oxide="0.8"

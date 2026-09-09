@@ -1,0 +1,12 @@
+[package]
+name = "engine_client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+bevy = { workspace = true, features = ["3d_api", "bevy_pbr", "bevy_ui_render", "bevy_gizmos_render"] }
+engine_core = { path = "../core" }
+bevy-net-debug.workspace = true
+renet-cross.workspace = true

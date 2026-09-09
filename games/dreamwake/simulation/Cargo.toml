@@ -1,0 +1,14 @@
+[package]
+name = "dreamwake_sim"
+license.workspace = true
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+engine_core = { path = "../../../engine/core" }
+bevy = { workspace = true, features = ["std"] }
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

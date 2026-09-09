@@ -7,6 +7,20 @@ This file defines project-specific guidance for coding agents working in this re
 - Applies to the entire workspace rooted at `discordium-td/`.
 - Favor consistency and correctness over ad-hoc local fixes.
 
+## Engine and game ownership
+
+- `engine/` contains reusable Bevy plugins and supporting services. It must not
+  depend on a package under `games/`, even through tests or build dependencies.
+- Keep engine components and plugins named for capabilities: health, movement,
+  cooldowns, presentation, prediction, transport. Game names, characters,
+  abilities, encounters, progression, and art styles belong under `games/`.
+- `games/dreamwake/` is the canonical game. The original tower-defense game is
+  retired and recoverable from Git checkpoint `e834361`.
+- Graphics are replaceable plugins consuming presentation data. Input/camera and
+  gameplay must not require a particular mesh, material, or art plugin.
+- Run `just architecture` when changing crate dependencies or engine boundaries.
+  See `docs/architecture.md` for the ownership contract.
+
 ## Bevy 0.19 Core Conventions
 
 - Keep Bevy's version centralized in `[workspace.dependencies]`; the workspace targets 0.19.1 and Rust 1.95 or newer.
@@ -42,7 +56,7 @@ This file defines project-specific guidance for coding agents working in this re
 
 ## Scene and UI Composition
 
-- Prefer BSN (`bsn!`, `bsn_list!`) scene functions for reusable UI and static hierarchies; use `spawn_scene` or a scene function's `.spawn()` system. The connection menu in `game_client/src/plugins/game/menu.rs` is an example.
+- Prefer BSN (`bsn!`, `bsn_list!`) scene functions for reusable UI and static hierarchies; use `spawn_scene` or a scene function's `.spawn()` system. The game interface in `games/dreamwake/client/src/ui.rs` is an example.
 - Keep dynamic simulation/presentation lifecycles in their existing ECS systems; scene composition does not replace simulation ownership.
 - Use `FontSize::Px` for fixed-size text in Rust structs, or `px(...)` in BSN. Use `FontSource` for font selection and the current `TextLayout::justify`, `linebreak`, and `no_wrap` constructors.
 - `Assets::get_mut` returns `AssetMut`; bind it as `mut` and pass `&mut asset` to helpers. Only mutate assets when their values actually change so change detection can avoid unnecessary GPU work.

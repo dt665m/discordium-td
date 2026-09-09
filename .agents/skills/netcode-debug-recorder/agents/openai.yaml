@@ -1,7 +1,0 @@
-interface:
-  display_name: "Netcode Debug Recorder"
-  short_description: "Record and verify authoritative netcode traces"
-  default_prompt: "Use $netcode-debug-recorder to capture and compare Discordium TD client/server netcode traces."
-
-policy:
-  allow_implicit_invocation: true

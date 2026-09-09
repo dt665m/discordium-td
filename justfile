@@ -1,151 +1,56 @@
 set shell := ["bash", "-eu", "-o", "pipefail", "-c"]
 
 ROOT := justfile_directory()
-WEB_CLIENT := ROOT + "/game_client"
+WEB_CLIENT := ROOT + "/games/dreamwake/client"
 
 default:
     @just --list
 
-# Dreamwake: cooperative roguelite using the shared authoritative server and transport.
-dreamwake:
-    cargo run -p game_client --bin dreamwake
+# Dreamwake is the canonical game. The engine crates do not choose a game.
+play:
+    cargo run -p dreamwake_client -- --host
 
-dreamwake-web address="127.0.0.1" port="1421":
-    cd "{{WEB_CLIENT}}" && NO_COLOR=false trunk serve dreamwake.html --cargo-profile web-dev --dist "{{ROOT}}/target/dreamwake-web" --address {{address}} --port {{port}}
+dreamwake:
+    cargo run -p dreamwake_client
+
+client http_base="http://127.0.0.1:8080":
+    cargo run -p dreamwake_client -- --http-base {{http_base}}
+
+server max_clients="8":
+    cargo run -p dreamwake_server -- --max-clients {{max_clients}}
+
+dreamwake-server max_clients="8":
+    just server {{max_clients}}
 
 dreamwake-build:
-    cargo build --release -p game_client --bin dreamwake
+    cargo build --release -p dreamwake_client
+
+wasm-target:
+    rustup target add wasm32-unknown-unknown
+
+web-dev http_base="http://127.0.0.1:8080" address="127.0.0.1" port="1420":
+    cd "{{WEB_CLIENT}}" && NO_COLOR=false GAME_WEB_HTTP_BASE="{{http_base}}" trunk serve --cargo-profile web-dev --dist "{{ROOT}}/target/web-dev" --address {{address}} --port {{port}}
+
+dreamwake-web address="127.0.0.1" port="1421":
+    just web-dev http://127.0.0.1:8080 {{address}} {{port}}
+
+web-build http_base="http://127.0.0.1:8080":
+    cd "{{WEB_CLIENT}}" && NO_COLOR=false GAME_WEB_HTTP_BASE="{{http_base}}" trunk build --release --cargo-profile web-release --dist "{{ROOT}}/target/web-release"
 
 dreamwake-web-build http_base="https://dsdp.datab.fun":
-    cd "{{WEB_CLIENT}}" && NO_COLOR=false TD_WEB_HTTP_BASE="{{http_base}}" trunk build dreamwake.html --release --cargo-profile web-release --dist "{{ROOT}}/target/dreamwake-pages"
+    cd "{{WEB_CLIENT}}" && NO_COLOR=false GAME_WEB_HTTP_BASE="{{http_base}}" trunk build --release --cargo-profile web-release --dist "{{ROOT}}/target/dreamwake-pages"
 
-# Dedicated Dreamwake authority; default capacity matches the existing eight-player server.
-dreamwake-server max_clients="8":
-    cargo run -p game_server -- --dreamwake --max-clients {{max_clients}}
+fmt:
+    cargo fmt --all
 
-check:
+architecture:
+    node scripts/check-architecture.mjs
+
+check: architecture
     cargo check --workspace --all-targets
 
 test:
     cargo test --workspace
 
-server http_bind="127.0.0.1:8080" udp_bind="0.0.0.0:5000" webrtc_bind="0.0.0.0:5001":
-    cargo run --release -p game_server -- \
-      --http-bind {{http_bind}} \
-      --udp-bind {{udp_bind}} \
-      --webrtc-bind {{webrtc_bind}} \
-      --public-http-base http://127.0.0.1:8080 \
-      --public-udp-addr 127.0.0.1:5000 \
-      --public-webrtc-addr 127.0.0.1:5001
-
-server-ui http_bind="127.0.0.1:8080" udp_bind="0.0.0.0:5000" webrtc_bind="0.0.0.0:5001":
-    cargo run --release -p game_server --features ui -- \
-      --ui \
-      --http-bind {{http_bind}} \
-      --udp-bind {{udp_bind}} \
-      --webrtc-bind {{webrtc_bind}} \
-      --public-http-base http://127.0.0.1:8080 \
-      --public-udp-addr 127.0.0.1:5000 \
-      --public-webrtc-addr 127.0.0.1:5001
-
-client http_base="http://127.0.0.1:8080":
-    cargo run -p game_client -- --http-base {{http_base}}
-
-# One-time setup for wasm client builds.
-wasm-target:
-    rustup target add wasm32-unknown-unknown
-
-web-build http_base="http://127.0.0.1:8080":
-    cd "{{WEB_CLIENT}}" && \
-      NO_COLOR=false \
-      TD_WEB_HTTP_BASE="{{http_base}}" \
-      trunk build --release --cargo-profile web-release --config Trunk.toml
-
-web-client http_base="http://127.0.0.1:8080" address="127.0.0.1" port="1420":
-    cd "{{WEB_CLIENT}}" && \
-      NO_COLOR=false \
-      TD_WEB_HTTP_BASE="{{http_base}}" \
-      trunk serve --release --cargo-profile web-release --config Trunk.toml --address {{address}} --port {{port}}
-
-# Incremental browser iteration; keep deployment output and optimizations separate.
-web-dev http_base="http://127.0.0.1:8080" address="127.0.0.1" port="1420":
-    cd "{{WEB_CLIENT}}" && \
-      NO_COLOR=false \
-      TD_WEB_HTTP_BASE="{{http_base}}" \
-      trunk serve --release=false --cargo-profile web-dev --config Trunk.toml \
-        --dist "{{ROOT}}/target/web-dev/dist" --address {{address}} --port {{port}}
-
-web-deploy:
-    npx wrangler pages deploy /Users/dt665m/Projects/games/discordium-td/game_client/dist --project-name=discordium-td
-
-web-play http_base="http://127.0.0.1:8080" address="127.0.0.1" port="1420":
-    #!/usr/bin/env bash
-    set -euo pipefail
-
-    cd "{{ROOT}}"
-
-    cleanup() {
-      if [[ -n "${server_pid:-}" ]] && kill -0 "$server_pid" 2>/dev/null; then
-        kill "$server_pid" 2>/dev/null || true
-        wait "$server_pid" 2>/dev/null || true
-      fi
-    }
-    trap cleanup EXIT INT TERM
-
-    cargo run -p game_server -- \
-      --http-bind 127.0.0.1:8080 \
-      --udp-bind 0.0.0.0:5000 \
-      --webrtc-bind 0.0.0.0:5001 \
-      --public-http-base http://127.0.0.1:8080 \
-      --public-udp-addr 127.0.0.1:5000 \
-      --public-webrtc-addr 127.0.0.1:5001 \
-      > /tmp/discordium-td-server.log 2>&1 &
-    server_pid=$!
-
-    for _ in {1..80}; do
-      if curl -sf http://127.0.0.1:8080/healthz > /dev/null; then
-        break
-      fi
-      sleep 0.25
-    done
-
-    echo "Server started (pid=$server_pid). Logs: /tmp/discordium-td-server.log"
-    echo "Starting trunk on http://${address}:${port} (web bootstrap base: ${http_base})"
-    cd "{{WEB_CLIENT}}" && \
-      NO_COLOR=false \
-      TD_WEB_HTTP_BASE="{{http_base}}" \
-      trunk serve --release --cargo-profile web-release --config Trunk.toml --address {{address}} --port {{port}}
-
-play:
-    #!/usr/bin/env bash
-    set -euo pipefail
-
-    cd "{{justfile_directory()}}"
-
-    cleanup() {
-      if [[ -n "${server_pid:-}" ]] && kill -0 "$server_pid" 2>/dev/null; then
-        kill "$server_pid" 2>/dev/null || true
-        wait "$server_pid" 2>/dev/null || true
-      fi
-    }
-    trap cleanup EXIT INT TERM
-
-    cargo run -p game_server -- \
-      --http-bind 127.0.0.1:8080 \
-      --udp-bind 0.0.0.0:5000 \
-      --webrtc-bind 0.0.0.0:5001 \
-      --public-http-base http://127.0.0.1:8080 \
-      --public-udp-addr 127.0.0.1:5000 \
-      --public-webrtc-addr 127.0.0.1:5001 \
-      > /tmp/discordium-td-server.log 2>&1 &
-    server_pid=$!
-
-    for _ in {1..80}; do
-      if curl -sf http://127.0.0.1:8080/healthz > /dev/null; then
-        break
-      fi
-      sleep 0.25
-    done
-
-    echo "Server started (pid=$server_pid). Logs: /tmp/discordium-td-server.log"
-    cargo run -p game_client -- --http-base http://127.0.0.1:8080
+check-web:
+    cargo check -p dreamwake_client --target wasm32-unknown-unknown

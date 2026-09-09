@@ -1,0 +1,37 @@
+[package]
+name = "dreamwake_client"
+default-run = "dreamwake"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "dreamwake"
+path = "src/main.rs"
+
+[dependencies]
+bevy = { workspace = true, features = ["bevy_dev_tools", "audio", "wav"] }
+engine_client = { path = "../../../engine/client" }
+engine_core = { path = "../../../engine/core" }
+dreamwake_sim = { path = "../simulation" }
+dreamwake_protocol = { path = "../protocol" }
+log.workspace = true
+renet.workspace = true
+renet-cross.workspace = true
+bevy-net-debug.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+bevy = { workspace = true, features = ["default"] }
+clap.workspace = true
+dreamwake_server = { path = "../server" }
+ureq = "2.12.1"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+bevy = { workspace = true, features = ["default_app", "default_platform", "3d_api", "bevy_pbr", "bevy_gizmos_render", "bevy_ui_render", "bevy_scene", "ui_picking"] }
+getrandom = { version = "0.2.17", features = ["js"] }
+js-sys = "0.3.82"
+wasm-bindgen = "0.2.105"
+wasm-bindgen-futures = "0.4.55"
+web-sys = { version = "0.3.82", features = ["Window", "Location", "RequestInit", "Response", "AbortController", "AbortSignal"] }

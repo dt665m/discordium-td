@@ -1,0 +1,10 @@
+[package]
+name = "engine_core"
+license.workspace = true
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+bevy = { workspace = true, features = ["std"] }
+serde.workspace = true

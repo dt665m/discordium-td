@@ -1,6 +1,17 @@
 [workspace]
-members = ["shared/protocol", "shared/simulation", "shared/replication", "shared/dream_net", "game_server", "game_client", "shared/bevy-net-debug"]
+members = [
+  "engine/core",
+  "engine/net",
+  "engine/server",
+  "engine/client",
+  "engine/net-debug",
+  "games/dreamwake/simulation",
+  "games/dreamwake/protocol",
+  "games/dreamwake/server",
+  "games/dreamwake/client",
+]
 resolver = "2"
+default-members = ["games/dreamwake/client"]
 
 [workspace.package]
 license = "MIT OR Apache-2.0"
@@ -17,7 +28,7 @@ log = "0.4.22"
 renet = "2.0.0"
 renet-cross = "0.6.1"
 rtrb = "0.4"
-bevy-net-debug = { path = "shared/bevy-net-debug" }
+bevy-net-debug = { path = "engine/net-debug" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 tokio = { version = "1.49.0", features = [

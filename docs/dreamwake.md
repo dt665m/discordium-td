@@ -1,5 +1,9 @@
 # Dreamwake
 
+Dreamwake is the canonical game under `games/dreamwake/`. It composes the reusable
+plugins under `engine/`; see [architecture](architecture.md). Prototype graphics
+are the default, with optional `--renderer legacy` (browser: `renderer=legacy`).
+
 Dreamwake is a cooperative, top-down 3D action roguelite built on this repository's Rust, Bevy 0.19.1, Renet, and renet-cross stack. Play Vesper, the Moonbound Traveler, through ten rooms across three dreamscapes. Each player develops a separate Memory build while the party shares enemies, encounter progress, and the final boss.
 
 The default admission limit is **eight players**. Hosts can configure **1–1,024** with `--max-clients`. Eight simultaneous UDP clients have been verified; the upper configuration limit is not a measured gameplay or performance capacity.
@@ -22,18 +26,18 @@ just dreamwake
 
 Choose **Host** in the opening menu, then choose the normal or Lucid dream. Companions join the displayed invitation address. Everyone selects Ready before the first encounter begins.
 
-Host starts the actual `game_server` entry point in a separate thread, then connects the local player through the same authenticated transport as other clients. Keep the host application open to keep this server running. Its ports are HTTP bootstrap **18082**, UDP **15002**, and WebRTC **15003**.
+Host starts the actual `dreamwake_server` entry point in a separate thread, then connects the local player through the same authenticated transport as other clients. Keep the host application open to keep this server running. Its ports are HTTP bootstrap **18082**, UDP **15002**, and WebRTC **15003**.
 
 To host immediately with a different capacity:
 
 ```bash
-cargo run -p game_client --bin dreamwake -- --host --max-clients 12
+cargo run -p dreamwake_client -- --host --max-clients 12
 ```
 
 A companion joins an existing server with:
 
 ```bash
-cargo run -p game_client --bin dreamwake -- --http-base http://HOST_ADDRESS:18082
+cargo run -p dreamwake_client -- --http-base http://HOST_ADDRESS:18082
 ```
 
 Replace `HOST_ADDRESS` with the host's reachable address. Native clients use UDP; browser clients use WebRTC. They can join the same party.
@@ -47,13 +51,13 @@ just dreamwake-server
 This starts Dreamwake with eight slots. Use `just dreamwake-server 12` for twelve slots. The dedicated defaults are HTTP **8080**, UDP **5000**, and WebRTC **5001**. A local native client connects with:
 
 ```bash
-cargo run -p game_client --bin dreamwake -- --http-base http://127.0.0.1:8080
+cargo run -p dreamwake_client -- --http-base http://127.0.0.1:8080
 ```
 
 For other computers, advertise the address they can reach. For example, replace the example LAN address below with the server's address:
 
 ```bash
-cargo run -p game_server -- --dreamwake --max-clients 8 \
+cargo run -p dreamwake_server -- --max-clients 8 \
   --http-bind 0.0.0.0:8080 \
   --udp-bind 0.0.0.0:5000 \
   --webrtc-bind 0.0.0.0:5001 \
@@ -85,14 +89,11 @@ To build the native release binary:
 just dreamwake-build
 ```
 
-The executable is `target/release/dreamwake` (`dreamwake.exe` on Windows).
+The executable is `target/release/dreamwake` (`dreamwake.exe` on Windows). Use `--renderer legacy` to select the previous procedural art; the default prototype renderer is independent of it.
 
-For the current arm64 macOS build, the release folder is
-`target/dreamwake-release/`. It contains the executable, `START-HERE.md`, the
-project license texts, and the embedded Fira Sans font's OFL/provenance files.
-The matching archive is `target/dreamwake-release-macos-arm64.tar.gz`. This is
-an unsigned local macOS build; macOS may require opening it from Finder or
-approving it in Privacy & Security. It is not a Windows or Linux binary.
+Earlier archives under `target/dreamwake-release/` predate this consolidation.
+Rebuild from the current workspace before sharing a client/server pair; see the
+[deployment guide](deployment.md) for current build commands and configuration.
 
 ## Controls and party flow
 
@@ -164,7 +165,7 @@ Sanctuaries restore an additional 40% maximum health beyond the normal 10% room-
 
 ## The run
 
-The ten-room route includes normal encounters, three elite challenges, two sanctuaries, and the Somnarch's final arena. The three dreamscapes use distinct palettes with floating terrain, luminous plants, crystals, and ruins. Seeds vary encounter names, enemy combinations, reinforcement placement, reward choices, and which rooms contain elites. Later fights introduce additional reinforcement waves.
+The ten-room route includes normal encounters, three elite challenges, two sanctuaries, and the Somnarch's final arena. The default renderer uses neutral prototype shapes. The optional legacy renderer gives the three dreamscapes distinct palettes with floating terrain, luminous plants, crystals, and ruins. Seeds vary encounter names, enemy combinations, reinforcement placement, reward choices, and which rooms contain elites. Later fights introduce additional reinforcement waves.
 
 | Enemy | Behavior |
 | --- | --- |
@@ -181,20 +182,20 @@ Enemy health scales with the connected party. **Lucid Dream** adds enemies, rais
 
 The dedicated server runs the shared ECS simulation at **60 Hz** and publishes compressed full snapshots at **20 Hz**. Native UDP and browser WebRTC use the same authority. Clients predict through the shared simulation with a bounded input history, then reconcile to server snapshots. Rewards, room transitions, and endings come from the server. Reliable action sequences provide stable dash, cast, and repeat-effect identities.
 
-Dreamwake applies attacks to the current server state; it does not implement historical hit rewind. See [Dreamwake netcode follow-ups](dreamwake-netcode-followups.md) for the distinction from the existing tower-defense networking path.
+Dreamwake applies attacks to the current server state; it does not implement historical hit rewind. See [Dreamwake netcode follow-ups](history/dreamwake-netcode-followups.md) for the historical distinction from the retired tower-defense networking path.
 
 Relevant checks:
 
 ```bash
 just check
-cargo test -p game_sim
-cargo test -p game_server dreamwake::tests
-cargo test -p game_client --bin dreamwake
+cargo test -p dreamwake_sim
+cargo test -p dreamwake_server
+cargo test -p dreamwake_client
 ```
 
 The automated coverage includes complete seeded runs, a complete two-player run over real UDP through all boss phases, eight-client UDP state/ownership checks, packet-loss recovery and rejoin, independent rewards, team defeat/revival, all Memory–Essence combinations, and snapshot replay. These checks do not establish 1,024-player performance.
 
-Browser QA completed a normal seed-29 run with two real WebRTC players in
+Before consolidation, browser QA completed a normal seed-29 run with two real WebRTC players in
 **115.8 seconds**, reaching Victory with **110 kills** through all three boss
 phases. Automated input drove combat for the run, so this does not claim fully
 manual combat for the entire run. Late-combat mean FPS was **107–119** on an
@@ -216,8 +217,8 @@ The inspiration reference is the [official Shape of Dreams press kit](https://ze
 ### Network tools (F6)
 
 F6 opens the shared network graphs and original `bevy-net-debug` conditioner
-controls in one scrollable panel. F3 has no network binding. Both client entry
-points load `game_client::network_tools::NetworkToolsPlugin`; game-specific
+controls in one scrollable panel. F3 has no network binding. The canonical client loads
+`engine_client::network_tools::NetworkToolsPlugin`; game-specific
 telemetry stays in their adapters. Dreamwake attaches the plugin's conditioner
 handle to its actual UDP or WebRTC transport, including reconnects.
 
@@ -229,5 +230,4 @@ remains while impairment is active. Use Off to restore the connection.
 Graphs show transport RTT, input-ack jitter, packet loss and send/receive rates.
 Unavailable samples are gaps. Dreamwake uses full snapshots and prediction/replay,
 so delta-baseline and interpolation rows are marked N/A; correction distance is
-not yet sampled. This integration does not add the original recorder/bridge to
-Dreamwake.
+not yet sampled. This integration does not include the retired TD recorder/bridge.

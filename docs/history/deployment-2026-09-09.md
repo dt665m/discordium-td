@@ -100,3 +100,46 @@ To roll back only this hosting migration, restore Pages release
 `41f3db49.discordium-td.pages.dev` and keep the current Oracle binary. That release
 contains the size-optimized WASM and uses the same game protocol. For rollback
 of the game refactor itself, use the older matching pair documented above.
+
+
+## Graphics controls and runtime-optimized WASM
+
+The current browser release is source `ed18fdb030fd49946d6a00193c26e3c7f217a6bd`,
+Pages deployment `7f0119bc-d335-44cb-b35f-38299d68cb70`
+(https://7f0119bc.discordium-td.pages.dev), promoted to https://discotd.datab.fun.
+It includes graphics/debug changes from `5d3b528695ce48ee596802bd59c4ecb876deaad1`.
+Oracle remains on `game_server-dreamwake-afc51b4`; there are no server, simulation,
+or protocol changes, so it was not restarted.
+
+Dreamwake starts with game graphics. F6 retains network diagnostics and the
+conditioner, with a runtime Gizmos button that replaces the graphics and restores
+them when disabled. Those development controls use the default-enabled
+`debug-tools` feature. Browser URL configuration parsing has been removed.
+F3 remains unbound; this release does not restore the retired client's panel.
+
+The performance release uses Cargo optimization level 3, full LTO, one codegen
+unit, and Binaryen `-O3`. Its R2 object is:
+
+`dreamwake/releases/ed18fdb030fd49946d6a00193c26e3c7f217a6bd/dreamwake-240f28f99e435d36_bg.wasm`
+
+The decoded SHA-256 is
+`240f28f99e435d369a727b0ac3265c679701f61e18f05ce80d2f7956627f70ec`.
+Size is 41,023,101 bytes decoded and 10,821,731 bytes gzip, compared with
+26,317,573 / 8,701,831 bytes for the preceding size-oriented graphics build.
+The release build completed in 7m42s. Runtime speedup has not been benchmarked.
+Artifacts, downloaded verification bytes, headers, and manifest are in
+`target/releases/ed18fdb030fd49946d6a00193c26e3c7f217a6bd/`.
+
+Validation: all workspace checks/tests passed for the graphics change; the
+performance profile built successfully. Public R2 checksum, gzip, MIME, CORS,
+and immutable cache headers were verified before Pages promotion. The production
+launcher references the new object. A real browser loaded game graphics, switched
+to gizmos only and back, and displayed connected WebRTC in F6 with zero decode
+and transport errors. No browser console warnings/errors were observed. Public
+server health returned OK. These are functional checks, not an FPS benchmark.
+
+To roll back only the performance settings, restore Pages deployment
+`8589246e-b03c-454e-8816-bc2fbd2a73f8` (source `5d3b528`, same graphics controls).
+To restore the preceding game client, use
+`6a847e05-afb5-45a5-ad5e-d7d87a5bfb53` (source `afc51b4`). Both retain the same
+Oracle server and protocol; keep their immutable R2 objects available.

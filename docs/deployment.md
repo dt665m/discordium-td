@@ -1,7 +1,8 @@
 # Deployment plan: Oracle server and versioned R2 browser releases
 
 Status: current deployment plan. This supersedes the Pages-only deployment
-approach and its emergency WASM shrinking procedure. WASM delivery through R2 is implemented for `afc51b4`. Pages continues to host
+approach and its emergency WASM shrinking procedure. The current browser release is `ed18fdb`, with runtime-oriented WASM optimization
+and in-game graphics controls; Oracle remains on compatible server `afc51b4`. Pages continues to host
 the HTML and JavaScript; broader asset migration remains future work.
 
 ## Verified account access

@@ -1,5 +1,5 @@
 use super::*;
-use engine_core::{ProjectileState, SummonState};
+use engine_core::{CompanionState, ProjectileState};
 
 #[derive(Component, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Projectile {
@@ -26,7 +26,7 @@ pub(crate) struct Wisp {
     pub essence: Option<EssenceKind>,
 }
 impl Wisp {
-    pub fn snapshot(&self, state: &SummonState) -> WispView {
+    pub fn snapshot(&self, state: &CompanionState) -> WispView {
         WispView {
             id: state.id,
             owner: state.owner,
@@ -51,7 +51,7 @@ impl SavedProjectile {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct SavedWisp {
     pub payload: Wisp,
-    pub state: SummonState,
+    pub state: CompanionState,
 }
 impl SavedWisp {
     pub fn snapshot(&self) -> WispView {

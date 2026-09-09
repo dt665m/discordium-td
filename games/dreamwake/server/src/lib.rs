@@ -1,6 +1,7 @@
 //! Dreamwake's game authority, composed with the engine's server services.
 mod authority;
-pub use authority::DreamwakeServerPlugin;
+pub mod plugins;
+pub use plugins::server::DreamwakeServerPlugin;
 
 /// Compose the headless runner with the game's authority plugin. Native hosts
 /// can run this app on their server thread; tests may supply `ServerElapsed`.
@@ -59,6 +60,6 @@ mod tests {
 }
 pub fn run(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
     let shared = engine_server::start(args.network, dreamwake_protocol::PROTOCOL_ID)?;
-    engine_server::runtime::run_app(build_app(shared, args.seed, args.lucid))
+    engine_server::run_app(build_app(shared, args.seed, args.lucid))
         .map_err(|e| std::io::Error::other(e).into())
 }

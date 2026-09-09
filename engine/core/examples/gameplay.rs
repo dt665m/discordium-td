@@ -49,7 +49,7 @@ fn consume_effects(
         &mut Progression,
     )>,
     mut bolts: Query<&mut ProjectileState>,
-    mut companions: Query<&mut SummonState>,
+    mut companions: Query<&mut CompanionState>,
     delays: Query<(Entity, &DelayedAction<u64>)>,
 ) {
     let mut ordered: Vec<_> = bolts.iter_mut().collect();
@@ -93,16 +93,17 @@ fn consume_effects(
 pub fn arena() -> App {
     let mut app = App::new();
     app.init_schedule(ArenaTick)
-        .insert_resource(SimulationStep(0.25))
+        .add_plugins(SystemPlugin::new(0.25))
         .init_resource::<Events>()
         .add_plugins((
-            CombatPlugin(ArenaTick),
-            ActionPlugin(ArenaTick),
-            MotorPlugin(ArenaTick),
+            CombatPlugin::new(ArenaTick),
+            AbilitiesPlugin(ArenaTick),
+            PhysicsPlugin(ArenaTick),
             LoadoutPlugin::<u8, u8, _>::new(ArenaTick),
             DelayedActionPlugin::<u64, _>::new(ArenaTick),
-            ProjectilePlugin::new(ArenaTick),
-            SummonPlugin::new(ArenaTick),
+            GraphicsPlugin(ArenaTick),
+            SpawnPlugin(ArenaTick),
+            ProgressionPlugin::new(ArenaTick, |level| level as f32 * 5.0),
         ))
         .configure_sets(
             ArenaTick,
@@ -128,8 +129,13 @@ pub fn arena() -> App {
         )
         .configure_sets(
             ArenaTick,
-            (ProjectileStep, SummonStep).in_set(ArenaStep::Mechanics),
+            (ProjectileStep, CompanionStep).in_set(ArenaStep::Mechanics),
         )
+        .configure_sets(
+            ArenaTick,
+            (HealthStep, ProgressionStep, SpawnStep).after(ArenaStep::Resolve),
+        )
+        .configure_sets(ArenaTick, GraphicsStep.before(ArenaStep::Timers))
         .add_systems(ArenaTick, move_robots.in_set(ArenaStep::Move))
         .add_systems(ArenaTick, refresh_targets.in_set(ArenaStep::Index))
         .add_systems(ArenaTick, consume_effects.in_set(ArenaStep::Resolve));
@@ -190,7 +196,7 @@ pub fn populate(app: &mut App) {
         expired: false,
         pending_impacts: vec![],
     });
-    app.world_mut().spawn(SummonState {
+    app.world_mut().spawn(CompanionState {
         id: 200,
         owner: 1,
         faction: 1,
@@ -221,7 +227,7 @@ type Robot = (
 pub struct SavedArena {
     robots: Vec<Robot>,
     projectiles: Vec<ProjectileState>,
-    summons: Vec<SummonState>,
+    summons: Vec<CompanionState>,
     delays: Vec<DelayedAction<u64>>,
     events: Events,
 }
@@ -247,7 +253,11 @@ pub fn save(app: &mut App) -> SavedArena {
         .cloned()
         .collect();
     projectiles.sort_by_key(|bolt| bolt.id);
-    let mut summons: Vec<_> = world.query::<&SummonState>().iter(world).cloned().collect();
+    let mut summons: Vec<_> = world
+        .query::<&CompanionState>()
+        .iter(world)
+        .cloned()
+        .collect();
     summons.sort_by_key(|summon| summon.id);
     let mut delays: Vec<_> = world
         .query::<&DelayedAction<u64>>()

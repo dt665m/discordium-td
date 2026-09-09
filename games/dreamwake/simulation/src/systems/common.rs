@@ -55,14 +55,14 @@ pub(crate) fn action_effect(
 ) {
     commands.spawn((
         DreamOwned,
-        engine_core::PresentationInstance {
-            id: engine_core::PresentationId {
+        engine_core::GraphicsInstance {
+            id: engine_core::GraphicsId {
                 match_epoch: (run.seed ^ (run.seed >> 32)) as u32,
                 owner,
                 action_seq: source.sequence,
                 slot: source.slot,
             },
-            kind: engine_core::PresentationKind::RadialPulse,
+            kind: engine_core::GraphicsKind::RadialPulse,
             pos: position,
             radius,
             age_ticks: 0,

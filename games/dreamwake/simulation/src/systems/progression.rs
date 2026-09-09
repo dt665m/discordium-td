@@ -52,7 +52,7 @@ pub(crate) fn resolve_deaths(
         let previous_level = hero.progression.level;
         let gained = hero
             .progression
-            .gain(xp, |level| 45.0 + level as f32 * 22.0)
+            .gain(xp, crate::catalog::experience_threshold)
             .expect("Dreamwake XP curve is positive and finite");
         for offset in 1..=gained {
             hero.health.max_hp += 10.0;

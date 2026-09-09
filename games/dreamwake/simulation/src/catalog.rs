@@ -308,3 +308,8 @@ impl EssenceKind {
         }
     }
 }
+
+/// Next-level threshold shared by direct and scheduled engine progression.
+pub(crate) fn experience_threshold(level: u32) -> f32 {
+    45.0 + level as f32 * 22.0
+}

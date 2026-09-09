@@ -32,7 +32,7 @@ fn timers_report_transitions_but_do_not_dirty_idle_components() {
         .add_plugins((
             ActionPlugin(Tick),
             MotorPlugin(Tick),
-            CombatPlugin(Tick),
+            CombatEffectsPlugin(Tick),
             LoadoutPlugin::<u8, u8, _>::new(Tick),
             DelayedActionPlugin::<u8, _>::new(Tick),
         ))

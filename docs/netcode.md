@@ -1,73 +1,81 @@
 # Networking and authority
 
-The networking foundation is independent of the game. `engine_net` provides
-bounded serialization/compression, generic input/action/state envelopes, channel
-configuration, sequence comparison, a configurable fixed-step clock, and
-`PeerInbox<I, A>` for per-peer held input and reliable action queues.
+`engine_net` provides bounded encoding, channel configuration, sequence comparison,
+transport cadence and `PeerInbox<I, A>` for held input and reliable action queues.
+Games supply message types, admission rules and payload validation.
 
-`engine_server` constructs the HTTP session service and mixed UDP/WebRTC
-transport. `ServerPlugin<A: Authority>` registers polling and exit systems around
-one non-send `ServerDriver<A>`. The driver owns connection events, fixed-step
-dispatch, publication cadence and packet generation. Games implement admission,
-payload validation, simulation steps and snapshot publication. Production runs
-through Bevy's headless schedule runner; embedded apps can install the same
-plugin. `ServerElapsed` supplies deterministic elapsed time for tests, otherwise
-polling uses `Time<Real>`. Time cannot move backwards. Exit cleanup releases
-admission and game ownership and disconnects transports; `run_app` returns
-recorded failures after the app exits. Direct `poll(elapsed)` remains available.
+## Server execution
 
-## Canonical game
+The [engine server plugin](../engine/server/src/plugins/server/mod.rs),
+`ServerPlugin<A: Authority>`, registers polling and shutdown around one non-send
+`ServerDriver<A>`. The driver owns connection events, simulation dispatch,
+publication cadence and packet generation. `ServerElapsed` can override elapsed
+time for embedded hosts and deterministic tests; otherwise polling uses `Time<Real>`.
+Time must not move backwards. `run_app` returns recorded failures after exit.
 
-Dreamwake supplies concrete input/action/snapshot types in its protocol crate and
-implements server authority in `DreamwakeServerPlugin` in its server crate.
-`dreamwake_server::build_app(shared, seed, lucid)` composes that plugin with the
-generic runtime. Native clients connect over UDP;
-browser clients connect over WebRTC through the same session service. Native
-hosting invokes that same server composition in a thread and connects over UDP.
+[DreamwakeServerPlugin](../games/dreamwake/server/src/plugins/server/mod.rs) supplies
+game authority. Dedicated and native-hosted servers use
+`dreamwake_server::build_app(shared, seed, lucid)`. Native clients use UDP; browser
+clients use WebRTC through the same HTTP session service.
 
-The game simulates at 60 Hz and publishes compressed full snapshots at 20 Hz.
-Transport receives are polled more frequently, but generated game packets follow
-the fixed clock. Catch-up is capped at six steps per poll and publication sends
-only the latest completed state. Polling faster does not increase simulation time.
+Dreamwake simulates at 60 Hz and publishes compressed full snapshots at 20 Hz.
+Catch-up is capped at six simulation steps per poll; publication sends the latest
+completed state. Socket polling frequency does not increase simulation time.
 
-Inputs carry an epoch and sequence. The game's authority validates ownership,
-channels, bounds, and finite directions. The engine inbox rejects old epochs and
-replayed sequences, enforces game-supplied message/queue limits, and consumes at
-most one reliable action per player per tick. Received sequence numbers and
-applied acknowledgements are separate. The game acknowledges actions after
-processing, including unavailable menu choices; an epoch reset clears pending
-commands and acknowledgements. Freshness is engine-owned, while the game chooses
-which held fields to neutralize after its timeout. Stale revisions do not replace
-client state, and reconnects restore authoritative state.
+## Input and acknowledgement invariants
 
-Clients restore the complete snapshot, prune acknowledged inputs, and replay a
-bounded pending history through the same `DreamwakePlugin` simulation wrapped by
-`DreamSimulation`. Generic replay iteration
-is shared; deciding which game actions are still pending belongs to the game
-adapter. A displayed game snapshot feeds both UI and the presentation adapter.
+- Inputs and actions carry an epoch and sequence. Validate ownership, channels,
+  bounds and finite directions before applying them.
+- The engine inbox rejects old epochs and replayed sequences, enforces supplied
+  message/queue limits and consumes at most one reliable action per player per tick.
+- Received sequences and applied acknowledgements are distinct. Dreamwake
+  acknowledges actions after processing, including unavailable menu choices.
+- Epoch resets clear pending commands and acknowledgements. The engine tracks
+  freshness; the game chooses held-input fields to neutralize on timeout.
+- Stale revisions must not replace client state. Reconnects restore authority.
 
-Snapshots include authoritative engine components for health, actions, movement,
-combat/status, loadouts, projectiles, summons, and delayed execution, together
-with game payloads and presentation instances. The component extraction changes
-the saved-state wire layout and increments the game protocol identity to version
-3. Rebuild clients and servers together; version 2 peers are incompatible.
-The engine itself has no hardcoded game protocol ID or game action enum.
+Dreamwake resolves attacks against the current server state.
 
-Dreamwake evaluates attacks in the current server state. The retired TD delta
-replication and historical hit-rewind algorithms are not active in this game.
+## Snapshots and prediction
 
-## Diagnostics and checks
+Clients restore a complete authoritative snapshot, prune acknowledged inputs and
+replay bounded pending history through the same `DreamwakePlugin` and
+`DreamSimulation` used by authority. The game decides which actions remain pending;
+the resulting displayed snapshot feeds UI and graphics.
 
-F6 opens the shared client network tools. Each game supplies its telemetry adapter;
-the conditioner acts on real transport packets. The engine's server configuration
-also supports packet conditioning. TD-specific recorder/bridge tooling is retired.
+Snapshots include authoritative health, actions, movement, combat/status, loadouts,
+projectiles, companions and delayed execution alongside game payloads. The
+`presentations` field contains `GraphicsInstance` effects. Preserve all state needed
+for replay, including cooldowns, hit history, readiness and stable identities.
+See [predicted graphics](predicted-graphics.md) for effect lifecycle rules.
 
-`cargo test --workspace` includes codec bounds, sequence wrap, fixed-clock cadence,
-engine plugin timing/shutdown and inbox tests, game action validation, snapshot restore/replay, multiplayer
-UDP ownership/ACKs, eight-player state, loss/rejoin, and complete cooperative runs.
-These checks do not establish large-party performance or deployed browser quality.
-Use `just check-web` for WASM compilation and verify an actual browser session when
-changing transport, graphics, or web configuration.
+The current protocol identity is defined in the [game protocol crate](../games/dreamwake/protocol/src/lib.rs).
+Bump it when serialized authoritative layout changes, and rebuild clients and
+servers together. The engine must not contain a game protocol ID or game action enum.
 
-See [deployment](deployment.md) for the environment variable migration and
-[the historical netcode record](history/td-netcode.md) for the retired TD path.
+## Diagnostics and validation
+
+F3 shows passive performance and network metrics; F6 opens shared network tools.
+Both are available in every build. Packet conditioning acts on real
+transport traffic; see the [conditioner guide](../engine/net-debug/README.md) for
+controls and RTT calibration. Server configuration also supports conditioning.
+
+| Metric | Meaning |
+| --- | --- |
+| Frame time / FPS | Bevy's smoothed frame duration; FPS is 1,000 divided by milliseconds |
+| Mean / worst frame time | Available samples from the last 120 frames |
+| RTT | Renet transport round-trip estimate, separate from gameplay acknowledgement age |
+| Snapshot / acknowledgement / reconciliation age | Milliseconds since the corresponding event |
+| Pending inputs / replay work | Input-frame counts |
+| Tick lead | Displayed tick minus latest server tick |
+| Prediction stalled | Latest snapshot is over 300 ms old |
+| Correction / reconcile shift | Client-view displacement in world units during reconciliation; positions may represent different ticks |
+
+The renderer smooths correction targets. Graphs leave unavailable samples as gaps;
+delta-baseline and interpolation rows are N/A for Dreamwake's full-snapshot replay.
+
+Use `cargo test --workspace` for codec, sequencing, authority, replay and multiplayer
+coverage. Transport or browser changes also require WASM compilation and a real
+browser session; unit tests do not establish deployed connectivity or performance.
+
+See [deployment](deployment.md) for server configuration and release instructions.

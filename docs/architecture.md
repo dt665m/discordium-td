@@ -1,40 +1,59 @@
 # Engine and game boundaries
 
-Dreamwake is the current game; Bevy and the plugins under `engine/` are its
-foundation. New games depend on the same engine crates and provide their own
-game rules. No engine crate may depend on `games/`, including through a test,
-build dependency, or another workspace crate.
+`engine/` provides reusable Bevy capabilities. `games/dreamwake/` supplies game
+rules and composes those capabilities. Engine crates must not depend on a game
+crate, including through build, test, or transitive workspace dependencies.
 
 ## Ownership
 
-Engine code describes reusable capabilities: health, action locks, motion,
-shields, immunity, timed statuses, cooldowns, projectile and summon lifecycles,
-targeting, progression arithmetic, presentation identities, network sessions,
-input histories, cameras, and render primitives. Generic ability machinery is
-allowed: a loadout can hold game-supplied ability and modifier types, and a delayed
-action can carry game payloads. Named abilities, balance values, encounter rules,
-reward tables, characters, and art palettes remain under `games/`.
+The engine owns generic mechanics, transport, input history, cameras and graphics
+contracts. Dreamwake owns characters, named abilities, balance, Essence mappings,
+encounters, XP awards and curves, rewards, menus, audio and art.
 
-Game code composes those capabilities. Dreamwake chooses its tick rate and
-snapshot cadence, ability rules, enemy behavior, encounter phases, rewards,
-interface, music, and server-authoritative acceptance rules. These are explicit
-game choices, not defaults for every future prototype.
+Authoritative gameplay belongs in ECS components. Complete snapshots save those
+components alongside game payloads; views project this state rather than keeping
+another mutable gameplay model. Server authority and client prediction both use
+`DreamwakePlugin` through the [DreamSimulation wrapper](../games/dreamwake/simulation/src/simulation.rs).
 
-Authoritative actor state belongs in ECS components. Snapshot structs are
-projections or saved state used for transport and replay; they must not become a
-second independently mutable authority for health or movement. Client prediction
-executes the same game simulation as the server, restores complete authoritative
-state, and replays bounded pending inputs. Engine mechanics are independent ECS
-components, alongside game-specific actor and ability payloads; saved state
-includes both. A view field such as displayed shield is a projection of its
-combat component, not another gameplay store.
+## Core capabilities
 
-## Gameplay and server composition
+Each capability registers its plugins in `plugins/<capability>/mod.rs`, with
+components, policies and systems alongside it. The [core plugin tree](../engine/core/src/plugins/mod.rs)
+exposes:
 
-`dreamwake_sim::DreamwakePlugin::new(seed, lucid)` installs the shared gameplay
-resources and schedules, including the initial player. `DreamSimulation::new(seed,
-lucid)` wraps that plugin for both server authority and client prediction. For
-explicit composition:
+| Plugin | Responsibility |
+| --- | --- |
+| `SystemPlugin::new(dt)` | Supplies the game-selected `SimulationStep` delta |
+| `AbilitiesPlugin` | Committed actions; typed `LoadoutPlugin` and `DelayedActionPlugin` are opt-in |
+| `CombatPlugin` | Health, shields, statuses, damage, projectiles and companions |
+| `PhysicsPlugin` | Authoritative planar movement, bounds and spatial helpers |
+| `SpawnPlugin` | Optional simulation lifetimes and Bevy ownership cleanup |
+| `ProgressionPlugin` | Actor XP/levels using a supplied curve, with upgrade arithmetic helpers |
+| `GraphicsPlugin` | Serializable effect identities and simulation lifetimes, without GPU dependencies |
+
+Games choose schedules and order the public system sets. Combat can disable
+projectile candidate collection when effects must resolve sequentially against
+live targets. See [Bevy integration](bevy-integration.md) for scheduling rules.
+
+Optional mechanics remain component-driven:
+
+- `Meter<K>` bounds current value and capacity and rejects invalid or unaffordable
+  spending atomically. `MeterPlugin<K, S>` regenerates actors carrying both
+  `Meter<K>` and `Regeneration<K>` using the supplied rate and simulation delta.
+- `ProgressionPlugin::new(schedule, curve)` consumes actor-local
+  `PendingExperience` and records `ExperienceResult`. `Progression::gain` provides
+  the same arithmetic synchronously. Games supply XP awards, thresholds and rewards.
+- `Lifetime` expiry uses Bevy commands. `DespawnWithOwner` and `OwnedSpawns` form
+  a `linked_spawn` relationship for recursive cleanup. Runtime `Entity` links
+  must be rebuilt from stable game IDs when restoring snapshots.
+
+## Game and host composition
+
+[DreamwakePlugin](../games/dreamwake/simulation/src/plugin.rs) installs the core
+capabilities, typed ability plugins and game systems. `DreamInputs` supplies one
+step's inputs; `DreamStep` is explicitly stepped at 60 Hz for authority and replay.
+The [state module](../games/dreamwake/simulation/src/state/mod.rs) owns saved actor
+state and restoration.
 
 ```rust
 use bevy::prelude::*;
@@ -47,94 +66,28 @@ simulation.continue_run();
 simulation.step(Default::default());
 ```
 
-The public `DreamInputs` resource supplies inputs to the explicitly stepped
-`DreamStep` schedule. The wrapper drives that schedule at the game's fixed 60 Hz,
-independently of wall time, for authority and replay. Its isolated simulation world
-is intentional; client/server outer Apps do not contain a second set of game
-rules. The game explicitly composes
-the engine's action, motor, combat, loadout, projectile, summon, delayed-action,
-health, and presentation plugins in its simulation schedules. A new game can
-select only the capabilities it needs; the engine has no Dreamwake dependency.
-Public engine sets are assigned to ordered `DreamSystems` phases in one
-`DreamStep` schedule. See [Bevy integration](bevy-integration.md) for source-backed
-scheduling, component-access, and non-duplication contracts.
+The [engine server plugin](../engine/server/src/plugins/server/mod.rs) owns polling,
+fixed ticks, publication and shutdown around one non-send `ServerDriver<A>`.
+The [game server plugin](../games/dreamwake/server/src/plugins/server/mod.rs) owns
+admission, validation, simulation and party policy. Dedicated and native-hosted
+servers use the same `dreamwake_server::build_app` composition. See
+[networking](netcode.md) for sequencing and snapshot rules.
 
-Dreamwake supplies attack/combo definitions, Essence mappings, enemy decisions,
-difficulty, encounter transitions, rewards, late admission, and party policy.
-The engine applies supplied timings, magnitudes, caps, and lifecycle policies.
-For example, shield grants can add with or without a cap, and immunity grants
-can replace a longer duration with a shorter one. Those choices preserve the
-game's existing behavior. Sanctuary recovery remains 50% total maximum health
-(10% room entry plus 40% sanctuary recovery); its message now matches that total.
+[Engine client plugins](../engine/client/src/plugins/mod.rs) group camera, graphics
+and network tools. [Game client plugins](../games/dreamwake/client/src/plugins/mod.rs)
+group camera, graphics, input, audio, UI, network and diagnostics. Input owns one
+mapping into world space; camera framing is independent of art. UI owns typography;
+diagnostics owns telemetry, overlays and development controls.
 
-`engine_server::runtime::ServerPlugin<A>` drives one authority through transport
-polling, fixed ticks, publication, and graceful exit. It holds a single non-send
-`ServerDriver<A>`, allowing that authority to own its simulation world.
-`DreamwakeServerPlugin` installs the game authority, and
-`dreamwake_server::build_app(shared, seed, lucid)` composes it with a headless
-runner. Dedicated and native-hosted servers use this same composition.
-`engine_net::session::PeerInbox<I, A>` owns sequencing, bounded command queues,
-message budgets, freshness, and received/applied acknowledgements. The game
-retains authenticated roster indexing and validates channels and game payloads.
+`DreamGraphicsPlugin` adapts snapshots into `engine_client::graphics::GraphicsFrame`.
+The client's `build_app()` leaves the renderer selectable; `run()` installs
+`DreamScenePlugin`. Renderer meshes, materials and correction blending remain
+separate from [simulation-owned effects](predicted-graphics.md).
 
-## Graphics
+## Adding capabilities or games
 
-The game converts its displayed snapshot into the engine's presentation data.
-Renderers consume positions, stable identities, shapes, colors and other visual
-parameters without importing game simulation types. A camera plugin provides
-the camera/input basis independently of a particular renderer.
-
-Dreamwake always installs its game-side procedural art plugin. The default-enabled
-`debug-tools` feature adds an off-by-default gizmo renderer controlled in the F6
-menu. Builds using `--no-default-features` omit those controls and gizmo rendering systems.
-Game networking and simulation never spawn meshes or materials, and input remains
-independent of the art plugin.
-
-Replacing art therefore consists of supplying a renderer/presentation adapter;
-it does not require a new simulation, authority loop, or wire protocol. UI and
-audio are separate game plugins, so prototypes can compose only what they need.
-
-## Adding another prototype
-
-Run `cargo run -p engine_core --example sandbox` for a small headless drone
-example using engine health/presentation alongside Bevy transforms/timers and
-ordinary focused systems. For the
-gameplay components, run `cargo run -p engine_core --example gameplay`; its
-[source](../engine/core/examples/gameplay.rs) composes mechanics without importing
-a game. The [headless gameplay tests](../engine/core/tests/gameplay.rs) exercise
-the same reusable component/plugin boundary.
-
-The browser smoke test at `games/dreamwake/client/tests/web-smoke.mjs` opens two
-WebRTC clients against one server and captures game graphics with and without
-the runtime gizmo renderer, plus diagnostics. Install Playwright in a separate runtime directory, set
-`PLAYWRIGHT_RUNTIME_DIR` to it, then run the script with the client URL and
-an output directory under `target/` as its two arguments. Configure the server
-endpoint when building the client with `GAME_WEB_HTTP_BASE`. The server and
-Trunk must already be running.
-
-1. Create a game package under `games/` and depend on the engine crates it needs.
-2. Compose the generic simulation plugins with game-specific systems. Keep
-   scheduling dependencies explicit and world coordinates canonical: +Y up,
-   -Z forward, +X right.
-3. Define that game's input/actions and complete snapshot state. Use the shared
-   bounded network envelopes and transport infrastructure for multiplayer.
-4. Project the displayed state into the generic presentation contract and
-   install a renderer plus the independent camera plugin.
-5. Test simulation without graphics, snapshot restore/replay, action rejection,
-   and the native/browser paths the prototype supports.
-
-Avoid creating a universal game enum in the engine or moving a whole game's
-systems into `engine/` after renaming its structs. Extract a capability when its
-inputs, state ownership, and behavior are meaningful independently of the game.
-
-## Consolidation history
-
-Checkpoint `e834361` records the complete prototype and accumulated TD fixes
-before reorganization. Dreamwake already contained local `main`'s committed
-refactor; the consolidation did not start from a separate divergent history.
-
-The retired TD application, delta protocol, worker integration, and TD-specific
-debug recorder/verifier remain recoverable in that checkpoint. Dreamwake uses
-its full-state prediction/replay protocol. TD-only algorithms are not silently
-substituted into that protocol; reusable transport fixes and codec behavior are
-preserved in the engine dependency stack and extracted infrastructure.
+Keep reusable mechanics driven by game-supplied data, and preserve complete
+snapshot restore/replay. Start from the independent [gameplay example](../engine/core/examples/gameplay.rs)
+and [headless tests](../engine/core/tests/gameplay.rs); add a game package only for
+its rules and payloads. Run `just architecture` when changing plugin boundaries
+or dependencies, and validate affected behavior with the relevant tests.

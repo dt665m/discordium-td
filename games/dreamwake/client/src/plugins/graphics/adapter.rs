@@ -1,0 +1,149 @@
+//! Game-specific mapping; engine renderers never see a DreamSnapshot or game enum.
+use crate::DreamView;
+use bevy::prelude::*;
+use engine_client::graphics::*;
+
+fn point(p: [f32; 2], y: f32) -> Vec3 {
+    Vec3::new(p[0], y, p[1])
+}
+pub(super) fn adapt(view: Res<DreamView>, mut frame: ResMut<GraphicsFrame>) {
+    let snap = &view.0;
+    frame.visuals.clear();
+    let mut actor = |namespace, id, position, primitive, scale, color| {
+        frame.visuals.push(Visual {
+            id: VisualId::Entity { namespace, id },
+            position,
+            primitive,
+            scale,
+            color,
+        })
+    };
+    for hero in &snap.heroes {
+        actor(
+            0,
+            hero.id,
+            point(hero.position, 0.7),
+            Primitive::Box,
+            Vec3::new(0.8, 1.4, 0.8),
+            if hero.hit_flash > 0.0 {
+                Color::WHITE
+            } else {
+                Color::srgb(0.3, 0.85, 1.0)
+            },
+        );
+        actor(
+            5,
+            hero.id,
+            point(hero.position, 0.2),
+            Primitive::Arrow {
+                direction: point(hero.facing, 0.0),
+            },
+            Vec3::splat(if hero.attack_flash > 0.0 { 3.0 } else { 1.8 }),
+            if hero.attack_flash > 0.0 {
+                Color::srgb(1.0, 0.9, 0.3)
+            } else {
+                Color::srgb(0.6, 0.95, 1.0)
+            },
+        );
+    }
+    for enemy in &snap.enemies {
+        actor(
+            1,
+            enemy.id,
+            point(enemy.position, 0.7),
+            Primitive::Sphere,
+            Vec3::splat(0.65),
+            if enemy.hit_flash > 0.0 {
+                Color::WHITE
+            } else {
+                Color::srgb(1.0, 0.35, 0.3)
+            },
+        );
+        if enemy.windup > 0.0 {
+            actor(
+                2,
+                enemy.id,
+                point(enemy.target, 0.08),
+                Primitive::Ring,
+                Vec3::splat(enemy.warn_radius),
+                Color::srgb(1.0, 0.55, 0.15),
+            );
+        }
+    }
+    for shot in &snap.projectiles {
+        actor(
+            3,
+            shot.id,
+            point(shot.position, 0.4),
+            Primitive::Sphere,
+            Vec3::splat(shot.radius.max(0.15)),
+            if shot.friendly {
+                Color::srgb(0.4, 1.0, 0.7)
+            } else {
+                Color::srgb(1.0, 0.25, 0.2)
+            },
+        );
+    }
+    for wisp in &snap.wisps {
+        actor(
+            4,
+            wisp.id,
+            point(wisp.position, 1.0),
+            Primitive::Sphere,
+            Vec3::splat(0.3),
+            Color::srgb(0.75, 0.6, 1.0),
+        );
+    }
+    for effect in &snap.presentations {
+        frame.visuals.push(Visual {
+            id: VisualId::Effect(effect.id),
+            primitive: Primitive::Ring,
+            position: point(effect.pos, 0.12),
+            scale: Vec3::splat(effect.radius),
+            color: Color::srgb(0.9, 0.85, 1.0),
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plugins::graphics::DreamGraphicsPlugin;
+    #[derive(Resource, Default)]
+    struct Observed(Vec<VisualId>);
+    struct AlternateRenderer;
+    impl Plugin for AlternateRenderer {
+        fn build(&self, app: &mut App) {
+            app.init_resource::<Observed>().add_systems(
+                Update,
+                (|frame: Res<GraphicsFrame>, mut seen: ResMut<Observed>| {
+                    seen.0 = frame.visuals.iter().map(|v| v.id).collect();
+                })
+                .in_set(GraphicsSet::Render),
+            );
+        }
+    }
+    #[test]
+    fn alternate_renderer_consumes_same_game_state_without_scene_or_camera_entities() {
+        let snapshot = dreamwake_sim::DreamSimulation::new(7, false).snapshot();
+        let expected = snapshot.heroes.len() * 2;
+        let mut app = App::new();
+        app.insert_resource(DreamView(snapshot)).add_plugins((
+            GraphicsPlugin,
+            DreamGraphicsPlugin,
+            AlternateRenderer,
+        ));
+        app.update();
+        assert_eq!(app.world().resource::<Observed>().0.len(), expected);
+        assert_eq!(app.world().resource::<DreamView>().0.tick, 0);
+        let identity = app.world().resource::<Observed>().0[0];
+        app.world_mut().resource_mut::<DreamView>().0.heroes[0].position = [3.0, -2.0];
+        app.update();
+        let frame = app.world().resource::<GraphicsFrame>();
+        assert_eq!(frame.visuals[0].id, identity);
+        assert_eq!(frame.visuals[0].position, Vec3::new(3.0, 0.7, -2.0));
+        app.world_mut().resource_mut::<DreamView>().0.heroes.clear();
+        app.update();
+        assert!(app.world().resource::<Observed>().0.is_empty());
+    }
+}

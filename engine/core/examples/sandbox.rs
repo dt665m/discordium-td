@@ -42,8 +42,8 @@ pub fn demonstrate() {
                 ..Default::default()
             });
         })
-        .insert_resource(SimulationStep(0.25))
-        .add_plugins((HealthPlugin(Tick), PresentationPlugin(Tick)))
+        .add_plugins(SystemPlugin::new(0.25))
+        .add_plugins((HealthPlugin(Tick), GraphicsPlugin(Tick)))
         // Movement and recharge touch independent components and need no ordering.
         .add_systems(Tick, (move_drones, recharge_scans));
     let drone = app
@@ -58,7 +58,7 @@ pub fn demonstrate() {
         .id();
 
     // Stable presentation identity and its lifetime remain simulation-owned.
-    let id = PresentationId {
+    let id = GraphicsId {
         match_epoch: 1,
         owner: 1,
         action_seq: 1,
@@ -66,9 +66,9 @@ pub fn demonstrate() {
     };
     let scan = app
         .world_mut()
-        .spawn(PresentationInstance {
+        .spawn(GraphicsInstance {
             id,
-            kind: PresentationKind::RadialPulse,
+            kind: GraphicsKind::RadialPulse,
             pos: [0.0; 2],
             radius: 3.0,
             age_ticks: 0,
@@ -85,15 +85,9 @@ pub fn demonstrate() {
         app.world().get::<Scan>(drone).unwrap().0.remaining_secs(),
         0.25
     );
+    assert_eq!(app.world().get::<GraphicsInstance>(scan).unwrap().id, id);
     assert_eq!(
-        app.world().get::<PresentationInstance>(scan).unwrap().id,
-        id
-    );
-    assert_eq!(
-        app.world()
-            .get::<PresentationInstance>(scan)
-            .unwrap()
-            .age_ticks,
+        app.world().get::<GraphicsInstance>(scan).unwrap().age_ticks,
         1
     );
 
@@ -112,7 +106,7 @@ pub fn demonstrate() {
         app.world().get::<Scan>(drone).unwrap().0.remaining_secs(),
         0.0
     );
-    assert!(app.world().get::<PresentationInstance>(scan).is_none());
+    assert!(app.world().get::<GraphicsInstance>(scan).is_none());
     assert_eq!(
         app.world().get::<Transform>(drone).unwrap().translation,
         Vec3::new(1.0, 0.0, -0.5)

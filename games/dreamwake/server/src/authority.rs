@@ -11,6 +11,7 @@ use renet::RenetServer;
 #[cfg(test)]
 use renet::ServerEvent;
 
+#[cfg(test)]
 use engine_server::SharedNet;
 
 #[cfg(test)]
@@ -24,7 +25,7 @@ use engine_net::clock::TickClock;
 
 type Peer = engine_net::session::PeerInbox<DreamInput, DreamAction>;
 
-struct DreamAuthority {
+pub(crate) struct DreamAuthority {
     sim: DreamSimulation,
     peers: BTreeMap<u64, Peer>,
     epoch: u32,
@@ -36,7 +37,7 @@ struct DreamAuthority {
 }
 
 impl DreamAuthority {
-    fn new(seed: u64, lucid: bool, max_clients: usize) -> Self {
+    pub(crate) fn new(seed: u64, lucid: bool, max_clients: usize) -> Self {
         let mut sim = DreamSimulation::new(seed, lucid);
         sim.remove_player(1);
         Self {
@@ -382,7 +383,7 @@ fn send_states(server: &mut RenetServer, authority: &mut DreamAuthority) {
     }
 }
 
-impl engine_server::runtime::Authority for DreamAuthority {
+impl engine_server::Authority for DreamAuthority {
     fn admit(&mut self, id: u64, server: &mut RenetServer) -> bool {
         if !DreamAuthority::admit(self, id) {
             return false;
@@ -406,29 +407,6 @@ impl engine_server::runtime::Authority for DreamAuthority {
         send_states(server, self);
     }
 }
-/// Installs Dreamwake admission, commands and snapshots on the reusable server
-/// runtime. Its sole authority owns the same shared simulation used by prediction.
-pub struct DreamwakeServerPlugin {
-    pub shared: SharedNet,
-    pub seed: u64,
-    pub lucid: bool,
-}
-
-impl bevy::prelude::Plugin for DreamwakeServerPlugin {
-    fn build(&self, app: &mut bevy::prelude::App) {
-        let authority = DreamAuthority::new(self.seed, self.lucid, self.shared.max_clients);
-        app.world_mut()
-            .insert_non_send(engine_server::runtime::ServerDriver::new(
-                self.shared.clone(),
-                wire::connection_config(),
-                dreamwake_sim::TICK_HZ,
-                wire::TICKS_PER_SNAPSHOT,
-                authority,
-            ));
-        app.add_plugins(engine_server::runtime::ServerPlugin::<DreamAuthority>::default());
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -436,7 +414,7 @@ mod tests {
 
     #[test]
     fn production_plugin_connects_two_udp_players_and_acknowledges_applied_commands() {
-        use engine_server::runtime::{ServerDriver, ServerElapsed, ServerFailure};
+        use engine_server::{ServerDriver, ServerElapsed, ServerFailure};
         use renet_cross::MixedTransportBuilder;
         use std::sync::{Arc, Mutex};
         let transport = MixedTransportBuilder::new(wire::PROTOCOL_ID)

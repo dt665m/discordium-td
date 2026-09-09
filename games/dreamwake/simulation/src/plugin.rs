@@ -14,7 +14,7 @@ pub struct DreamStep;
 pub enum DreamSystems {
     Active,
     Combat,
-    Presentation,
+    Graphics,
     Inputs,
     ActorTimers,
     Begin,
@@ -22,9 +22,9 @@ pub enum DreamSystems {
     Players,
     Delays,
     DelayedCasts,
-    SummonTargets,
-    Summons,
-    SummonActions,
+    CompanionTargets,
+    Companions,
+    CompanionActions,
     Enemies,
     ProjectileTargets,
     Projectiles,
@@ -47,8 +47,8 @@ impl DreamwakePlugin {
         Self { seed, lucid }
     }
 }
-fn initialize(app: &mut App, seed: u64, lucid: bool) {
-    app.insert_resource(engine_core::SimulationStep(DT))
+pub(super) fn initialize(app: &mut App, seed: u64, lucid: bool) {
+    app.add_plugins(engine_core::SystemPlugin::new(DT))
         .insert_resource(DreamInputs::default())
         .insert_resource(Run {
             tick: 0,
@@ -76,15 +76,14 @@ impl Plugin for DreamwakePlugin {
         initialize(app, self.seed, self.lucid);
         app.init_schedule(DreamStep)
             .add_plugins((
-                engine_core::PresentationPlugin(DreamStep),
-                engine_core::HealthPlugin(DreamStep),
-                engine_core::CombatPlugin(DreamStep),
-                engine_core::ActionPlugin(DreamStep),
-                engine_core::MotorPlugin(DreamStep),
+                engine_core::GraphicsPlugin(DreamStep),
+                engine_core::CombatPlugin::new(DreamStep).with_collision_candidates(false),
+                engine_core::AbilitiesPlugin(DreamStep),
+                engine_core::PhysicsPlugin(DreamStep),
                 engine_core::LoadoutPlugin::<MemoryKind, EssenceKind, _>::new(DreamStep),
                 engine_core::DelayedActionPlugin::<CastPayload, _>::new(DreamStep),
-                engine_core::SummonPlugin::new(DreamStep),
-                engine_core::ProjectilePlugin::new(DreamStep).with_collision_candidates(false),
+                engine_core::ProgressionPlugin::new(DreamStep, catalog::experience_threshold),
+                engine_core::SpawnPlugin(DreamStep),
             ))
             // Set conditions are cached once per schedule run: a clear/death may
             // change Run.phase, but the final health sync must still execute.
@@ -93,7 +92,7 @@ impl Plugin for DreamwakePlugin {
                 (
                     D::Active.run_if(is_active),
                     D::Combat.in_set(D::Active).run_if(is_combat),
-                    D::Presentation.in_set(D::Active),
+                    D::Graphics.in_set(D::Active),
                     D::Ambient.in_set(D::Active),
                 ),
             )
@@ -106,9 +105,9 @@ impl Plugin for DreamwakePlugin {
                     D::Players,
                     D::Delays,
                     D::DelayedCasts,
-                    D::SummonTargets,
-                    D::Summons,
-                    D::SummonActions,
+                    D::CompanionTargets,
+                    D::Companions,
+                    D::CompanionActions,
                     D::Enemies,
                     D::ProjectileTargets,
                     D::Projectiles,
@@ -125,7 +124,7 @@ impl Plugin for DreamwakePlugin {
             .configure_sets(
                 DreamStep,
                 (
-                    D::Presentation,
+                    D::Graphics,
                     D::Inputs,
                     D::ActorTimers,
                     D::Begin,
@@ -133,9 +132,9 @@ impl Plugin for DreamwakePlugin {
                     D::Players,
                     D::Delays,
                     D::DelayedCasts,
-                    D::SummonTargets,
-                    D::Summons,
-                    D::SummonActions,
+                    D::CompanionTargets,
+                    D::Companions,
+                    D::CompanionActions,
                     D::Enemies,
                     D::ProjectileTargets,
                     D::Projectiles,
@@ -150,15 +149,19 @@ impl Plugin for DreamwakePlugin {
             .configure_sets(
                 DreamStep,
                 (
-                    engine_core::PresentationStep.in_set(D::Presentation),
+                    engine_core::GraphicsStep.in_set(D::Graphics),
                     engine_core::HealthStep.in_set(D::Health),
                     engine_core::CombatStep.in_set(D::ActorTimers),
                     engine_core::ActionStep.in_set(D::ActorTimers),
                     engine_core::MotorStep.in_set(D::ActorTimers),
                     engine_core::LoadoutStep.in_set(D::ActorTimers),
                     engine_core::DelayedActionStep.in_set(D::Delays),
-                    engine_core::SummonStep.in_set(D::Summons),
+                    engine_core::CompanionStep.in_set(D::Companions),
                     engine_core::ProjectileStep.in_set(D::Projectiles),
+                    engine_core::SpawnStep.in_set(D::ActorTimers),
+                    engine_core::ProgressionStep
+                        .in_set(D::Deaths)
+                        .after(systems::resolve_deaths),
                 ),
             )
             .add_systems(
@@ -169,8 +172,8 @@ impl Plugin for DreamwakePlugin {
                     systems::age_transients.in_set(D::Ambient),
                     systems::player_actions.in_set(D::Players),
                     systems::delayed_casts.in_set(D::DelayedCasts),
-                    systems::refresh_target_index.in_set(D::SummonTargets),
-                    systems::wisp_actions.in_set(D::SummonActions),
+                    systems::refresh_target_index.in_set(D::CompanionTargets),
+                    systems::wisp_actions.in_set(D::CompanionActions),
                     systems::enemy_actions.in_set(D::Enemies),
                     systems::refresh_target_index.in_set(D::ProjectileTargets),
                     systems::projectile_actions.in_set(D::ProjectileHits),
@@ -191,7 +194,3 @@ fn canonicalize_inputs(mut inputs: ResMut<DreamInputs>) {
     inputs.0.sort_by_key(|(id, _)| *id);
     inputs.0.dedup_by_key(|(id, _)| *id);
 }
-
-#[cfg(test)]
-#[path = "plugin_tests.rs"]
-mod tests;

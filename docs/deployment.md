@@ -1,140 +1,165 @@
-# Deployment plan: Oracle server and versioned R2 browser releases
+# Deployment runbook
 
-Status: current deployment plan. This supersedes the Pages-only deployment
-approach and its emergency WASM shrinking procedure. The current browser release is `ed18fdb`, with runtime-oriented WASM optimization
-and in-game graphics controls; Oracle remains on compatible server `afc51b4`. Pages continues to host
-the HTML and JavaScript; broader asset migration remains future work.
+Cloudflare Pages serves the browser launcher, JavaScript and other Trunk assets.
+R2 serves immutable gzip-compressed WASM. The authoritative server runs on Oracle.
+The endpoints below are deployment configuration, not a live-status report.
 
-## Verified account access
+## Deployment targets
 
-On 2026-09-09, Cloudflare's zone API confirmed that active zone `datab.fun`
-belongs to account `d17e5f9b4425c16ef79568b0b4660380`
-(`Dt665m@gmail.com's Account`). An authenticated `wrangler r2 bucket list`
-against that account succeeded and returned an existing bucket. R2 bucket creation, object upload, custom-domain attachment, and CORS updates
-have now succeeded with the current credentials. The dedicated bucket is
-`dreamwake-releases`, served by `assets.datab.fun` with minimum TLS 1.2.
-The CLI credentials cannot read/manage zone Cache Rules (HTTP 403).
+| Target | Configuration |
+| --- | --- |
+| Browser | [discotd.datab.fun](https://discotd.datab.fun) |
+| Pages | Project `discordium-td`, production branch `main` |
+| Server | `https://dsdp.datab.fun`; [health endpoint](https://dsdp.datab.fun/healthz) |
+| R2 | Bucket `dreamwake-releases`, public asset base `https://assets.datab.fun` |
+| Cloudflare account | `d17e5f9b4425c16ef79568b0b4660380` |
+| Oracle SSH | `oracle-free` |
+| Server service | `discordium-td.service` |
+| Server checkout | `/home/ubuntu/projects/discordium-td` |
+| Server override | `/etc/systemd/system/discordium-td.service.d/90-dreamwake.conf` |
 
-## Current release and operational references
+Use a tested source revision and a new release ID containing only letters,
+digits, hyphens or underscores. Keep the previous server binary, systemd override,
+Pages deployment ID and corresponding R2 objects available as a rollback pair.
+Protocol changes require matching client/server builds; coordinate their promotion.
 
-- Browser: https://discotd.datab.fun
-- Server health: https://dsdp.datab.fun/healthz
-- Oracle SSH alias: `oracle-free`; systemd service: `discordium-td`
-- [Current release, build commands, validation, and matching rollback pair](history/deployment-2026-09-09.md)
-- [Earlier deployment history](history/deployment-2026-09-08.md)
+Commands below run from the repository root unless stated otherwise. Replace
+`YOUR_RELEASE_ID` with the chosen identifier. Use the same value on the build host
+and Oracle. Rust 1.95+, the WASM target, Trunk, Python 3 and authenticated Wrangler 4
+are required.
 
-The deployment records describe completed releases, not alternative plans.
-Keep the current client/server pair available until R2 delivery is verified.
-Shared server configuration uses `ENGINE_` environment variables. Preserve TLS,
-CORS, public addresses, and the eight-player limit when promoting a new binary.
-Build clients and servers from the same release when the wire protocol changes.
-
-## Architecture
-
-Keep `discotd.datab.fun` on Pages for the small HTML launcher. Store the browser
-build's WASM, JavaScript modules, and external assets together in R2 beneath an
-immutable release prefix such as `/dreamwake/releases/<release-id>/`. Serve R2
-through the dedicated custom domain `assets.datab.fun`. Browser caching is
-enabled with immutable one-year headers. Edge caching remains pending: responses
-currently report `CF-Cache-Status: DYNAMIC`; configure a Cache Rule making this
-host's `/dreamwake/releases/` paths eligible for cache using origin cache headers. Keep Oracle's authoritative server at `dsdp.datab.fun`.
-
-Pages documents a 25 MiB per-file limit and explicitly recommends R2 for larger
-files. Use an R2 custom domain; the `r2.dev` development endpoint is not the
-release delivery path. Start with direct R2 delivery; introduce a Worker only
-if measured requirements call for custom routing or content negotiation.
-
-## Current WASM packaging and publishing
-
-Build with `just web-build https://dsdp.datab.fun`, then package the Trunk output:
+## Build and package the browser
 
 ```sh
-python3 scripts/package-r2-wasm.py target/web-release target/releases/RELEASE_ID \
-  --release RELEASE_ID
+RELEASE_ID=YOUR_RELEASE_ID
+RELEASE_DIR="target/releases/$RELEASE_ID"
+just check
+just test
+just check-web
+just web-build https://dsdp.datab.fun
+python3 scripts/package-r2-wasm.py target/web-release "$RELEASE_DIR" \
+  --release "$RELEASE_ID"
 ```
 
-Use a new immutable release identifier and output directory each time. The
-command produces `pages/`, `r2/`, and `manifest.json`; it preserves JavaScript on
-Pages and updates both WASM references and the preload integrity hash. For the
-initial migration only, `--wasm target/wasm-opt/release/dreamwake_bg.wasm` selected
-the matching original build instead of the emergency size-optimized file.
+The [packager](../scripts/package-r2-wasm.py) requires a new output directory and
+exactly one WASM file with Trunk's root-relative init/preload references. It emits:
 
-Upload the gzip file from `r2/` to the manifest's `bucket/key` with Wrangler:
+- `pages/`: Trunk output with WASM removed and HTML references/integrity updated.
+- `r2/dreamwake-<first16-sha256>_bg.wasm.gz`: compressed WASM, named from its decoded bytes.
+- `manifest.json`: release ID, bucket/key/URL, checksums, sizes and content metadata.
+
+The manifest does not include source commit, protocol identity or matching server
+binary. Keep that pairing with the release artifacts outside the source docs.
+The build uses the runtime-oriented `web-release` profile and Binaryen `-O3`;
+no additional size-shrinking pass is needed for Pages because WASM is uploaded to R2.
+
+## Upload and verify WASM
 
 ```sh
-CLOUDFLARE_ACCOUNT_ID=d17e5f9b4425c16ef79568b0b4660380 \
-  npx wrangler r2 object put BUCKET/KEY --remote --file WASM_GZIP_PATH \
+export CLOUDFLARE_ACCOUNT_ID=d17e5f9b4425c16ef79568b0b4660380
+R2_KEY=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["key"])' "$RELEASE_DIR/manifest.json")
+WASM_GZIP="$RELEASE_DIR/r2/${R2_KEY##*/}.gz"
+npx wrangler@4 r2 object put "dreamwake-releases/$R2_KEY" \
+  --remote --file "$WASM_GZIP" \
   --content-type application/wasm --content-encoding gzip \
   --cache-control 'public, max-age=31536000, immutable'
+
+ASSET_URL=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["url"])' "$RELEASE_DIR/manifest.json")
+curl --fail --silent --show-error --compressed \
+  --dump-header "$RELEASE_DIR/asset-headers.txt" \
+  --header 'Origin: https://discotd.datab.fun' \
+  "$ASSET_URL" --output "$RELEASE_DIR/verified.wasm"
+python3 - "$RELEASE_DIR" <<'PY'
+import hashlib, json, pathlib, sys
+release = pathlib.Path(sys.argv[1])
+manifest = json.loads((release / "manifest.json").read_text())
+data = (release / "verified.wasm").read_bytes()
+assert len(data) == manifest["bytes"]
+assert hashlib.sha256(data).hexdigest() == manifest["sha256"]
+PY
 ```
 
-Verify the public URL using `curl --compressed` with
-`Origin: https://discotd.datab.fun`; verify the decoded SHA-256 against the
-manifest before deploying `pages/` with Wrangler Pages. The upload directory
-must contain no WASM. The checked-in `deploy/r2-cors.json` allows GET/HEAD from
-the game origin only. Keep R2 objects for all retained Pages releases.
+Check the saved headers for `Content-Type: application/wasm`, `Content-Encoding:
+gzip`, immutable cache control and `Access-Control-Allow-Origin:
+https://discotd.datab.fun`. The checksum must match decoded WASM, not gzip bytes.
+Do not promote the launcher if upload or verification fails.
 
-## Remaining implementation sequence
+[Bucket CORS configuration](../deploy/r2-cors.json) allows GET/HEAD from the game
+origin. When intentionally applying that configuration:
 
-1. Add the remaining edge Cache Rule to the existing asset domain. The bucket,
-   custom domain, and game-origin GET/HEAD CORS are configured. Decide how approved preview origins
-   will be supported before enabling preview playtests. Use upload credentials
-   scoped to the release bucket and keep them outside Git.
-2. Add a repeatable packaging command. Build once, collect all generated assets,
-   and create a release manifest containing commit, protocol identity, build
-   settings, filenames, hashes, sizes, and matching server release. Generate the
-   Pages launcher with absolute release-specific asset URLs. Preserve module
-   import paths, preload URLs, and integrity hashes; ensure Bevy's future
-   external asset paths resolve to the release prefix as well.
-3. Upload assets before publishing the launcher. Set correct MIME types
-   (`application/wasm`, JavaScript, etc.) and immutable cache headers. Verify
-   object hashes, CORS, streaming WASM compilation, and cache behavior. Benchmark
-   HTTP compression and validate Content-Encoding against delivered bytes;
-   merely uploading a `.gz` or `.br` file is not sufficient.
-4. Validate the candidate browser/server pair before promotion where practical.
-   Use an isolated candidate server endpoint for protocol-breaking releases;
-   do not test an incompatible preview against the shared active server.
-   Promote the Oracle binary and Pages launcher in a coordinated release step.
-   Record both identities; this is not an atomic switch across both providers.
-5. Automate rollback of the matching server and Pages deployment. Retain every
-   R2 prefix referenced by a retained Pages release; garbage collection must
-   protect active and rollback releases and allow for cached launchers/open tabs.
+```sh
+npx wrangler@4 r2 bucket cors set dreamwake-releases --file deploy/r2-cors.json
+```
 
-Upload/verification failure must stop before the active launcher or server is
-changed. A failed post-promotion smoke test should restore the previous pair.
-Publish immutable release URLs directly in each Pages deployment rather than
-using a mutable `latest` manifest that can mix incompatible assets.
+Preview sites need an explicitly allowed origin on both R2 and the server.
+A protocol-breaking candidate also needs a matching isolated server and a browser
+build using that server's endpoint.
 
-## Optimization policy
+## Stage and promote the server
 
-Browser releases favor runtime performance: Cargo's `web-release` profile uses
-`opt-level = 3`, full LTO, and one codegen unit; Trunk runs Binaryen with `-O3`.
-Do not add size-shrinking passes to fit the Pages limit; WASM is delivered by R2.
-Keep compression and immutable caching for download efficiency. These settings
-express the optimization goal, not a measured speedup: compare startup/compile
-time, frame time, and memory under comparable gameplay before claiming gains.
+On Oracle, stage the tested source at
+`/home/ubuntu/projects/deployments/$RELEASE_ID/discordium-td`. Build on the server
+or a compatible Linux target; a macOS release binary cannot run on Oracle.
 
-References: [Cargo profiles](https://doc.rust-lang.org/cargo/reference/profiles.html)
-and [Trunk Rust assets](https://trunk-rs.github.io/trunk/guide/assets/index.html).
+```sh
+ssh oracle-free
+RELEASE_ID=YOUR_RELEASE_ID
+. "$HOME/.cargo/env"
+cd "/home/ubuntu/projects/deployments/$RELEASE_ID/discordium-td"
+cargo build --release --locked -p dreamwake_server -j 2
+install -m 755 target/release/game_server \
+  "/home/ubuntu/projects/discordium-td/target/releases/game_server-$RELEASE_ID"
+sudo systemctl cat discordium-td
+sudo cp /etc/systemd/system/discordium-td.service.d/90-dreamwake.conf \
+  "/home/ubuntu/projects/deployments/$RELEASE_ID/previous-service.conf"
+sudoedit /etc/systemd/system/discordium-td.service.d/90-dreamwake.conf
+```
 
-Keep size reporting and regression budgets as diagnostics, but do not reject
-R2 assets at the Pages 25 MiB threshold. Verify applicable R2 and CDN object/cache
-limits when implementing; storage capacity and cacheability are separate limits.
+Change the override's `ExecStart` executable to the staged versioned binary,
+retaining its arguments and environment. The package is `dreamwake_server`, but
+its binary is `game_server`. Game flags are `--seed` and optional `--lucid`.
+Preserve the configured admission limit, normally `--max-clients 8`.
 
-## Acceptance criteria
+Preserve [server configuration](../engine/server/src/config.rs): TLS certificate/key,
+CORS origin, public HTTP/UDP/WebRTC addresses and bind addresses. The configured
+TLS paths are `/home/ubuntu/origin-cert.pem` and `/home/ubuntu/origin-key.pem`;
+HTTPS uses port 443, native UDP 5000 and WebRTC UDP 5001. Keep private key contents
+out of the repository. Public transport addresses must resolve to Oracle, not the
+local defaults.
 
-- A real browser build larger than 25 MiB loads from the asset domain.
-- Correct MIME, CORS, integrity, compression, and cache responses are verified.
-- Cold and warm loads render and establish WebRTC with no decoding errors.
-- Native UDP and browser clients share authoritative gameplay successfully.
-- Upload failure leaves the active release intact; rollback restores a tested
-  client/server pair without re-uploading or rebuilding assets.
-- Release commands, infrastructure configuration, retention rules, and build
-  performance measurements are documented and reproducible.
+```sh
+sudo systemctl daemon-reload
+sudo systemctl restart discordium-td
+sudo systemctl status discordium-td --no-pager
+sudo journalctl -u discordium-td -n 100 --no-pager
+curl --fail --silent --show-error https://dsdp.datab.fun/healthz
+```
 
-## Sources
+## Promote Pages and validate the pair
 
-- [Pages limits](https://developers.cloudflare.com/pages/platform/limits/)
-- [R2 public buckets and custom domains](https://developers.cloudflare.com/r2/buckets/public-buckets/)
-- [R2 CORS](https://developers.cloudflare.com/r2/buckets/cors/)
-- [R2 cache configuration](https://developers.cloudflare.com/cache/interaction-cloudflare-products/r2/)
+Back on the browser build host, retain the previous production deployment ID,
+then publish the verified launcher:
+
+```sh
+npx wrangler@4 pages deployment list --project-name discordium-td --environment production
+npx wrangler@4 pages deploy "$RELEASE_DIR/pages" \
+  --project-name discordium-td --branch main
+```
+
+Check the production browser with both cold and warm loads: graphics render,
+WASM downloads without integrity/CORS errors, and WebRTC receives authoritative
+snapshots. Use F6 to inspect decode/transport errors. Join the same game from a
+native UDP client and exercise movement, abilities and rewards. HTTP health alone
+does not validate either gameplay transport. See [browser validation](bevy-integration.md#validation).
+
+## Rollback and retention
+
+If validation fails, restore the saved server override, reload systemd and restart
+the service. In Cloudflare Pages, roll back to the retained matching production
+deployment, then repeat health and browser/native connectivity checks. A
+client-only change may retain the server only when protocol and behavior remain
+compatible.
+
+Never overwrite a published R2 release key. Retain every object referenced by the
+active or rollback Pages deployments, including those needed by cached launchers
+and open tabs. Rollback must use the retained artifacts rather than rebuilding them.

@@ -189,7 +189,8 @@ pub struct DreamSnapshot {
     pub enemies: Vec<EnemyView>,
     pub projectiles: Vec<ProjectileView>,
     pub wisps: Vec<WispView>,
-    pub presentations: Vec<engine_core::PresentationInstance>,
+    /// Historical wire field name retained while graphics types are reorganized.
+    pub presentations: Vec<engine_core::GraphicsInstance>,
     pub damage_numbers: Vec<DamageNumber>,
     pub rewards: Vec<Reward>,
     pub kills: u32,

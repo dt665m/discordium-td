@@ -12,11 +12,13 @@ This file defines project-specific guidance for coding agents working in this re
 - `engine/` contains reusable Bevy plugins and supporting services. It must not
   depend on a package under `games/`, even through tests or build dependencies.
 - Keep engine components and plugins named for capabilities: health, movement,
-  actions, combat, cooldowns, loadouts, projectiles, summons, presentation,
+  actions, combat, cooldowns, loadouts, projectiles, companions, graphics,
   prediction, transport, and sessions. Generic ability machinery and progression
   arithmetic belong in the engine when driven by game-supplied data. Game names,
   characters, named ability/combo definitions, balance, Essence mappings,
   encounters, reward/progression rules, and art styles belong under `games/`.
+- Organize core capabilities under `engine/core/src/plugins/{system,abilities,combat,physics,spawn,progression,graphics}/mod.rs`. Keep plugin registration at each capability root and split components/systems by real responsibilities.
+- Games supply simulation schedules, meter capacities/regeneration rates, and XP thresholds/rewards. `SystemPlugin` supplies a fixed replay delta; it does not replace Bevy scheduling. Runtime ownership links use Bevy relationships and must be rebuilt from stable game IDs after snapshot restore.
 - Compose shared gameplay through `dreamwake_sim::DreamwakePlugin`; server
   authority and client prediction use its `DreamSimulation` wrapper. Save engine
   components alongside game payloads in complete authoritative snapshots rather
@@ -25,8 +27,7 @@ This file defines project-specific guidance for coding agents working in this re
   sequencing/queue/budget/freshness mechanics in `PeerInbox<I, A>`.
   `DreamwakeServerPlugin` owns game admission, validation, snapshots, and party
   policy. Dedicated and native-hosted production paths must use that composition.
-- `games/dreamwake/` is the canonical game. The original tower-defense game is
-  retired and recoverable from Git checkpoint `e834361`.
+- `games/dreamwake/` owns Dreamwake's game rules and content.
 - Graphics are replaceable plugins consuming presentation data. Input/camera and
   gameplay must not require a particular mesh, material, or art plugin.
 - Run `just architecture` when changing crate dependencies or engine boundaries.
@@ -78,7 +79,7 @@ This file defines project-specific guidance for coding agents working in this re
 
 ## Scene and UI Composition
 
-- Prefer BSN (`bsn!`, `bsn_list!`) scene functions for reusable UI and static hierarchies; use `spawn_scene` or a scene function's `.spawn()` system. The game interface in `games/dreamwake/client/src/ui.rs` is an example.
+- Prefer BSN (`bsn!`, `bsn_list!`) scene functions for reusable UI and static hierarchies; use `spawn_scene` or a scene function's `.spawn()` system. The game interface in `games/dreamwake/client/src/plugins/ui/mod.rs` is an example.
 - Keep dynamic simulation/presentation lifecycles in their existing ECS systems; scene composition does not replace simulation ownership.
 - Use `FontSize::Px` for fixed-size text in Rust structs, or `px(...)` in BSN. Use `FontSource` for font selection and the current `TextLayout::justify`, `linebreak`, and `no_wrap` constructors.
 - `Assets::get_mut` returns `AssetMut`; bind it as `mut` and pass `&mut asset` to helpers. Only mutate assets when their values actually change so change detection can avoid unnecessary GPU work.
@@ -127,33 +128,26 @@ This file defines project-specific guidance for coding agents working in this re
 - Prefer small focused systems and helper functions over giant monolithic systems.
 - Reuse existing components/resources before introducing new ones.
 
-## What to Search First
+## Documentation
 
-When unsure, search these topics in Bevy 0.19 docs/examples:
-
-- Transforms and directions:
-  - `Transform`, `GlobalTransform`, `forward`, `right`, `looking_at`
-- Scheduling and ordering:
-  - `Update`, `FixedUpdate`, `SystemSet`, `.chain()`, `in_set`, `before`, `after`
-- ECS data flow:
-  - `Component`, `Resource`, `Query`, `Commands`, `ChildOf`
-- Camera/input:
-  - camera-relative movement, world-space movement
-- UI diagnostics:
-  - Bevy dev tools FPS overlay
+- Keep docs focused on current behavior, architecture contracts and reproducible
+  workflows. Update the relevant guide when behavior changes.
+- Do not add progress logs, dated implementation reports, completed checklists,
+  archived plans or benchmark transcripts. Git preserves project history.
+- Remove obsolete instructions and links instead of appending corrections.
+- Keep each topic in one guide and link to it; avoid copying reference details
+  across the README, agent guidance and specialist docs.
 
 ## Validation Before Finishing
 
 - For Rust changes, run formatting and the checks/tests covering the affected crates and behavior. Use `just check` when it covers the needed checks; do not duplicate equivalent commands.
 - Broaden to workspace checks/tests for cross-crate contracts or merge/release validation. Documentation-only edits need relevant link/example validation rather than a game build.
 - Fix failures caused by this change and rerun affected checks before finishing.
+## Predicted mechanic graphics
 
-
-## Predicted mechanic presentation
-
-- New transient mechanic visuals must be simulation-owned `PresentationInstance`
+- New transient mechanic visuals must be simulation-owned `GraphicsInstance`
   state (or existing predicted actor components), not spawned from network receive
-  handlers. See `docs/predicted-presentation.md`.
+  handlers. See `docs/predicted-graphics.md`.
 - Allocate identities from match epoch, actor, input sequence and a stable slot;
   do not allocate a fresh random ID on replay.
 - The shared simulation owns acceptance, lifetime and gameplay. The client renderer

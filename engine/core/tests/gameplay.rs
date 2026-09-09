@@ -10,7 +10,7 @@ fn standalone_plugins_restore_and_replay_robot_arena() {
 
 #[test]
 fn inactive_owner_stops_owned_projectile_and_companion_firing() {
-    use engine_core::{CollisionTarget, Health, ProjectileState, SummonState};
+    use engine_core::{CollisionTarget, CompanionState, Health, ProjectileState};
     let mut app = robot_arena::arena();
     robot_arena::populate(&mut app);
     let world = app.world_mut();
@@ -28,7 +28,7 @@ fn inactive_owner_stops_owned_projectile_and_companion_firing() {
     let projectile = world.query::<&ProjectileState>().single(world).unwrap();
     assert!(projectile.expired);
     assert!(projectile.hit_ids.is_empty());
-    let companion = world.query::<&SummonState>().single(world).unwrap();
+    let companion = world.query::<&CompanionState>().single(world).unwrap();
     assert!(!companion.expired);
     assert_eq!(companion.fire_remaining, 0.0);
     assert_eq!(companion.remaining, 0.75);

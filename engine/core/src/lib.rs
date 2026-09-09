@@ -1,24 +1,34 @@
 //! Renderer-independent deterministic simulation plugins and components.
-pub mod action;
-pub mod combat;
-mod cooldown;
-mod health;
-pub mod loadout;
-pub mod locomotion;
-mod presentation;
-pub mod progression;
-pub mod projectile;
-pub mod spatial;
-pub mod summon;
-pub mod targeting;
-pub use action::*;
-pub use combat::*;
-pub use cooldown::*;
-pub use health::*;
-pub use loadout::*;
-pub use locomotion::*;
-pub use presentation::*;
-pub use progression::*;
-pub use projectile::*;
-pub use summon::*;
-pub use targeting::*;
+pub mod plugins;
+pub use abilities::{
+    AbilitiesPlugin, AbilitySlot, ActionPlugin, ActionState, ActionStep, DelayedAction,
+    DelayedActionPlugin, DelayedActionStep, Loadout, LoadoutPlugin, LoadoutStep, tick_actions,
+    tick_delayed_actions, tick_loadouts,
+};
+pub use combat::companions::{CompanionPlugin, CompanionState, CompanionStep, tick_companions};
+pub use combat::projectiles::{
+    ProjectileImpact, ProjectilePlugin, ProjectileSourcePolicy, ProjectileState, ProjectileStep,
+    advance_projectiles, tick_projectiles,
+};
+pub use combat::targeting::*;
+pub use combat::{
+    CombatEffectsPlugin, CombatPlugin, CombatState, CombatStep, DamageOutcome, Depleted,
+    DurationPolicy, Health, HealthPlugin, HealthStep, Meter, MeterPlugin, MeterStep, Regeneration,
+    ShieldPolicy, StatusId, TimedStatus, regenerate_meters, resolve_damage, tick_combat,
+    update_health,
+};
+pub use graphics::{
+    GraphicsId, GraphicsInstance, GraphicsKind, GraphicsPlugin, GraphicsStep, age_graphics,
+};
+pub use physics::{
+    CircleBounds, MotorPlugin, MotorState, MotorStep, PhysicsPlugin, spatial, tick_motors,
+};
+pub use plugins::{abilities, combat, graphics, physics, progression, spawn, system};
+pub use progression::{
+    ExperienceResult, PendingExperience, Progression, ProgressionError, ProgressionPlugin,
+    ProgressionStep, add_capped, multiply_capped, multiply_floored, purchase_rank, spend_currency,
+};
+pub use spawn::{
+    DespawnWithOwner, Lifetime, OwnedSpawns, SpawnPlugin, SpawnStep, expire_lifetimes,
+};
+pub use system::{SimulationStep, SystemPlugin, advance_cooldown};

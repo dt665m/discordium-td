@@ -4,11 +4,11 @@ Optional Bevy 0.19.1 debug panel for `renet-cross` client packet conditioning. T
 
 ```toml
 [dependencies]
-renet-cross = "0.6"
-bevy-net-debug = "0.2"
+renet-cross.workspace = true
+bevy-net-debug.workspace = true
 ```
 
-Use Bevy 0.19.1 in the consuming application.
+Workspace applications use the centrally configured Bevy 0.19.1 dependency.
 
 Attach one shared control handle to the client transport and the plugin:
 
@@ -46,8 +46,8 @@ Licensed under either the [MIT License](LICENSE-MIT) or the
 
 ## Workspace integration
 
-Vendored from `bevy-net-debug` 0.2.0 (https://github.com/dt665m/renet-cross).
-The workspace edition exposes the existing root marker as `ConditionerPanel`
+Vendored from [`bevy-net-debug` 0.2.0](https://github.com/dt665m/renet-cross).
+The workspace edition exposes the root marker as `ConditionerPanel`
 so a host can parent its controls into a shared diagnostics layout. The packet
 conditioner implementation remains in renet-cross; no queues or controls are
 reimplemented here. Original MIT and Apache licenses are included.

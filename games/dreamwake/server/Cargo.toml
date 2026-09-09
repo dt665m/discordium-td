@@ -8,6 +8,7 @@ license.workspace=true
 name="game_server"
 path="src/main.rs"
 [dependencies]
+bevy={workspace=true,features=["std"]}
 engine_server={path="../../../engine/server"}
 engine_net={path="../../../engine/net"}
 dreamwake_protocol={path="../protocol"}

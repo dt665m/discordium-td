@@ -2921,6 +2921,7 @@ dependencies = [
 name = "dreamwake_server"
 version = "0.1.0"
 dependencies = [
+ "bevy",
  "clap",
  "dreamwake_protocol",
  "dreamwake_sim",
@@ -3001,6 +3002,7 @@ version = "0.1.0"
 dependencies = [
  "bevy",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -3019,6 +3021,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "axum-server",
+ "bevy",
  "clap",
  "engine_net",
  "log",

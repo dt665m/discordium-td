@@ -1,0 +1,20 @@
+//! Game rules compose shared gameplay plugins; rendering remains client-only.
+use super::*;
+use engine_core::spatial::{add, length, normalize, scale, sub};
+use std::f32::consts::TAU;
+mod common;
+pub(super) use common::*;
+mod combat;
+pub(super) use combat::*;
+mod player;
+pub(super) use player::*;
+mod memories;
+pub(super) use memories::*;
+mod summons;
+pub(super) use summons::*;
+mod enemies;
+pub(super) use enemies::*;
+mod projectiles;
+pub(super) use projectiles::*;
+mod progression;
+pub(super) use progression::*;

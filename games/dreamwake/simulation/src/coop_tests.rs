@@ -89,6 +89,44 @@ fn admission_empty_roster_and_party_restart() {
 }
 
 #[test]
+fn late_join_clones_progression_loadout_and_stats_but_refreshes_combat() {
+    let mut sim = party(39);
+    edit_hero(&mut sim, 1, |h| {
+        h.health.hp = 30.0;
+        h.health.max_hp = 300.0;
+        h.progression.level = 4;
+        h.progression.xp = 12.0;
+        h.view.attack_power = 2.0;
+        h.view.shards = 77;
+        h.motor.position = [3.0, 4.0];
+        h.motor.dash_cooldown = 0.8;
+        h.action.recovery = 0.7;
+        h.combat.shield = 21.0;
+        h.combat.shield_remaining = 3.0;
+        h.loadout.0[0] = memory_slot(MemoryKind::Wisp);
+        h.loadout.0[0].modifier = Some(EssenceKind::Twin);
+        h.loadout.0[0].level = 3;
+        h.loadout.0[0].cooldown = 5.0;
+    });
+    assert!(sim.add_player(33));
+    let joined = sim.snapshot_for(33).hero;
+    assert_eq!(joined.hp, 300.0);
+    assert_eq!(joined.level, 4);
+    assert_eq!(joined.xp, 12.0);
+    assert_eq!(joined.attack_power, 2.0);
+    assert_eq!(joined.shards, 77);
+    assert_eq!(joined.position, [4.5, 4.0]);
+    assert_eq!(joined.memories[0].kind, MemoryKind::Wisp);
+    assert_eq!(joined.memories[0].essence, Some(EssenceKind::Twin));
+    assert_eq!(joined.memories[0].level, 3);
+    assert_eq!(joined.memories[0].cooldown, 0.0);
+    assert_eq!(joined.attack_cooldown, 0.0);
+    assert_eq!(joined.dash_cooldown, 0.0);
+    assert_eq!(joined.shield, 0.0);
+    assert!(joined.invulnerable);
+}
+
+#[test]
 fn players_move_independently_and_duplicate_tick_inputs_execute_once() {
     let mut sim = party(11);
     let before = sim.snapshot();
@@ -122,7 +160,7 @@ fn two_attacks_damage_one_shared_enemy_and_have_distinct_owners() {
     add_enemy(&mut sim, EnemyKind::Boss, [0.0, -2.0]);
     for id in [1, 22] {
         edit_hero(&mut sim, id, |h| {
-            h.view.position = [0.0; 2];
+            h.motor.position = [0.0; 2];
             h.view.critical_chance = 0.0;
         });
     }
@@ -154,28 +192,28 @@ fn enemies_target_living_players_and_area_attacks_hit_the_party() {
     empty_arena(&mut sim);
     add_enemy(&mut sim, EnemyKind::Melee, [0.0, 0.5]);
     edit_hero(&mut sim, 1, |h| {
-        h.view.position = [12.0, 12.0];
+        h.motor.position = [12.0, 12.0];
         h.health.hp = 0.0;
     });
     edit_hero(&mut sim, 22, |h| {
-        h.view.position = [0.0; 2];
-        h.dodge_left = 0.0;
+        h.motor.position = [0.0; 2];
+        h.combat.invulnerability_remaining = 0.0;
     });
     for mut e in sim.world.query::<EnemyActor>().iter_mut(&mut sim.world) {
-        e.recovery = 0.0;
+        e.action.recovery = 0.0;
     }
     sim.step_multiplayer(&[]);
     assert_eq!(sim.snapshot().enemies[0].target, [0.0; 2]);
     for id in [1, 22] {
         edit_hero(&mut sim, id, |h| {
             h.health.hp = 220.0;
-            h.view.position = [0.0; 2];
-            h.dodge_left = 0.0;
+            h.motor.position = [0.0; 2];
+            h.combat.invulnerability_remaining = 0.0;
         });
     }
     for mut e in sim.world.query::<EnemyActor>().iter_mut(&mut sim.world) {
-        e.view.windup = DT * 0.5;
-        e.view.target = [0.0; 2];
+        e.action.windup = DT * 0.5;
+        e.action.target = [0.0; 2];
         e.view.warn_radius = 3.0;
     }
     sim.step_multiplayer(&[(
@@ -269,13 +307,13 @@ fn projectile_leech_and_summons_belong_to_the_casting_player() {
     for id in [1, 22] {
         edit_hero(&mut sim, id, |h| {
             h.health.hp = 100.0;
-            h.view.position = [0.0; 2];
+            h.motor.position = [0.0; 2];
             h.view.critical_chance = 0.0;
         });
     }
     edit_hero(&mut sim, 22, |h| {
-        h.view.memories[0] = MemorySlot::new(MemoryKind::Starfall);
-        h.view.memories[0].essence = Some(EssenceKind::Leech);
+        h.loadout.0[0] = memory_slot(MemoryKind::Starfall);
+        h.loadout.0[0].modifier = Some(EssenceKind::Leech);
     });
     sim.step_multiplayer(&[(
         22,
@@ -289,8 +327,8 @@ fn projectile_leech_and_summons_belong_to_the_casting_player() {
     assert!(sim.snapshot_for(22).hero.hp > 100.0);
     assert_eq!(sim.snapshot_for(1).hero.hp, 100.0);
     edit_hero(&mut sim, 22, |h| {
-        h.view.memories[0] = MemorySlot::new(MemoryKind::Wisp);
-        h.view.memories[0].essence = Some(EssenceKind::Echo);
+        h.loadout.0[0] = memory_slot(MemoryKind::Wisp);
+        h.loadout.0[0].modifier = Some(EssenceKind::Echo);
     });
     sim.step_multiplayer(&[(
         22,
@@ -301,7 +339,7 @@ fn projectile_leech_and_summons_belong_to_the_casting_player() {
         },
     )]);
     assert_eq!(sim.snapshot().wisps[0].owner, 22);
-    assert_eq!(sim.snapshot().state.delayed[0].owner, 22);
+    assert_eq!(sim.snapshot().state.delayed[0].payload.owner, 22);
     sim.remove_player(22);
     assert!(sim.snapshot().wisps.is_empty());
     assert!(sim.snapshot().state.delayed.is_empty());

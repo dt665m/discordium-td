@@ -22,17 +22,7 @@ const MAX_MESSAGES_PER_TICK: usize = 64;
 #[cfg(test)]
 use engine_net::clock::TickClock;
 
-#[derive(Default)]
-struct Peer {
-    input: DreamInput,
-    received_input: Option<u32>,
-    applied_input: Option<u32>,
-    received_action: Option<u32>,
-    applied_action: Option<u32>,
-    input_at: Duration,
-    actions: VecDeque<(u32, DreamAction)>,
-    budget: usize,
-}
+type Peer = engine_net::session::PeerInbox<DreamInput, DreamAction>;
 
 struct DreamAuthority {
     sim: DreamSimulation,
@@ -68,7 +58,7 @@ impl DreamAuthority {
         if self.peers.len() >= self.max_clients || !self.sim.add_player(id) {
             return false;
         }
-        self.peers.insert(id, Peer::default());
+        self.peers.insert(id, Peer::new(self.epoch));
         // A second player cannot inherit a paused single-player session.
         if self.peers.len() > 1 {
             self.sim.set_paused(false);
@@ -109,10 +99,8 @@ impl DreamAuthority {
         let Some(peer) = self.peers.get_mut(&id) else {
             return Err("No admitted player session");
         };
-        if peer.budget >= MAX_MESSAGES_PER_TICK {
-            return Err("Input rate exceeded");
-        }
-        peer.budget += 1;
+        peer.consume_message(MAX_MESSAGES_PER_TICK)
+            .map_err(|_| "Input rate exceeded")?;
         match message {
             DreamClientMessage::Input {
                 epoch,
@@ -122,7 +110,7 @@ impl DreamAuthority {
                 if channel != wire::INPUT_CHANNEL {
                     return Err("Input on invalid channel");
                 }
-                if epoch != self.epoch || !wire::newer(seq, peer.received_input) {
+                if !peer.accepts_input(epoch, seq) {
                     return Ok(());
                 }
                 input.movement = Self::direction(input.movement).ok_or("Invalid movement")?;
@@ -132,9 +120,7 @@ impl DreamAuthority {
                 input.dash = false;
                 input.casts = [false; 4];
                 input.action_sequences = [0; 5];
-                peer.input = input;
-                peer.received_input = Some(seq);
-                peer.input_at = now;
+                peer.receive_input(epoch, seq, input, now);
             }
             DreamClientMessage::Action {
                 epoch,
@@ -144,7 +130,7 @@ impl DreamAuthority {
                 if channel != wire::ACTION_CHANNEL {
                     return Err("Action on invalid channel");
                 }
-                if epoch != self.epoch || !wire::newer(seq, peer.received_action) {
+                if !peer.accepts_action(epoch, seq) {
                     return Ok(());
                 }
                 match &mut action {
@@ -159,11 +145,8 @@ impl DreamAuthority {
                     }
                     _ => {}
                 }
-                if peer.actions.len() >= MAX_PENDING_ACTIONS {
-                    return Err("Action queue exceeded");
-                }
-                peer.received_action = Some(seq);
-                peer.actions.push_back((seq, action));
+                peer.queue_action(epoch, seq, action, MAX_PENDING_ACTIONS)
+                    .map_err(|_| "Action queue exceeded")?;
             }
         }
         Ok(())
@@ -187,7 +170,7 @@ impl DreamAuthority {
         self.sim.restart_party(self.seed, lucid);
         self.epoch = self.epoch.wrapping_add(1).max(1);
         for peer in self.peers.values_mut() {
-            *peer = Peer::default();
+            peer.reset(self.epoch);
         }
         self.notices.clear();
     }
@@ -203,14 +186,14 @@ impl DreamAuthority {
 
     fn step(&mut self, now: Duration) {
         for peer in self.peers.values_mut() {
-            peer.budget = 0;
+            peer.begin_tick();
         }
         let mut inputs: BTreeMap<_, _> = self
             .peers
             .iter()
             .map(|(&id, peer)| {
                 let mut input = peer.input;
-                if now.saturating_sub(peer.input_at) > INPUT_TIMEOUT {
+                if !peer.input_is_fresh(now, INPUT_TIMEOUT) {
                     input.movement = [0.0; 2];
                     input.attack = false;
                 }
@@ -220,11 +203,7 @@ impl DreamAuthority {
         let actions: Vec<_> = self
             .peers
             .iter_mut()
-            .filter_map(|(&id, peer)| {
-                peer.actions
-                    .pop_front()
-                    .map(|(seq, action)| (id, seq, action))
-            })
+            .filter_map(|(&id, peer)| peer.next_action().map(|(seq, action)| (id, seq, action)))
             .collect();
         let original_epoch = self.epoch;
         for (id, seq, action) in actions {
@@ -311,14 +290,14 @@ impl DreamAuthority {
             }
             if original_epoch == self.epoch {
                 if let Some(peer) = self.peers.get_mut(&id) {
-                    peer.applied_action = Some(seq);
+                    peer.acknowledge_action(seq);
                 }
             }
         }
         let inputs: Vec<_> = inputs.into_iter().collect();
         self.sim.step_multiplayer(&inputs);
         for peer in self.peers.values_mut() {
-            peer.applied_input = peer.received_input;
+            peer.acknowledge_input();
         }
     }
 
@@ -427,16 +406,27 @@ impl engine_server::runtime::Authority for DreamAuthority {
         send_states(server, self);
     }
 }
-pub(crate) fn run_dreamwake(shared: SharedNet, seed: u64, lucid: bool) -> Result<(), String> {
-    let authority = DreamAuthority::new(seed, lucid, shared.max_clients);
-    engine_server::runtime::ServerDriver::new(
-        shared,
-        wire::connection_config(),
-        dreamwake_sim::TICK_HZ,
-        wire::TICKS_PER_SNAPSHOT,
-        authority,
-    )
-    .run()
+/// Installs Dreamwake admission, commands and snapshots on the reusable server
+/// runtime. Its sole authority owns the same shared simulation used by prediction.
+pub struct DreamwakeServerPlugin {
+    pub shared: SharedNet,
+    pub seed: u64,
+    pub lucid: bool,
+}
+
+impl bevy::prelude::Plugin for DreamwakeServerPlugin {
+    fn build(&self, app: &mut bevy::prelude::App) {
+        let authority = DreamAuthority::new(self.seed, self.lucid, self.shared.max_clients);
+        app.world_mut()
+            .insert_non_send(engine_server::runtime::ServerDriver::new(
+                self.shared.clone(),
+                wire::connection_config(),
+                dreamwake_sim::TICK_HZ,
+                wire::TICKS_PER_SNAPSHOT,
+                authority,
+            ));
+        app.add_plugins(engine_server::runtime::ServerPlugin::<DreamAuthority>::default());
+    }
 }
 
 #[cfg(test)]
@@ -445,8 +435,8 @@ mod tests {
     use std::thread;
 
     #[test]
-    fn production_driver_connects_two_udp_players_and_acknowledges_applied_commands() {
-        use engine_server::runtime::ServerDriver;
+    fn production_plugin_connects_two_udp_players_and_acknowledges_applied_commands() {
+        use engine_server::runtime::{ServerDriver, ServerElapsed, ServerFailure};
         use renet_cross::MixedTransportBuilder;
         use std::sync::{Arc, Mutex};
         let transport = MixedTransportBuilder::new(wire::PROTOCOL_ID)
@@ -470,13 +460,7 @@ mod tests {
             transport: Arc::new(Mutex::new(transport)),
             bootstrap: bootstrap.clone(),
         };
-        let mut driver = ServerDriver::new(
-            shared,
-            wire::connection_config(),
-            dreamwake_sim::TICK_HZ,
-            wire::TICKS_PER_SNAPSHOT,
-            DreamAuthority::new(29, false, 8),
-        );
+        let mut app = crate::build_app(shared, 29, false);
         let mut clients: Vec<_> = (0..2)
             .map(|_| {
                 let id = bootstrap.create_session().unwrap().client_id;
@@ -527,14 +511,24 @@ mod tests {
                 }
                 client.transport.send_packets(&mut client.renet).unwrap();
             }
-            driver.poll(TICK * frame).unwrap();
+            app.world_mut().resource_mut::<ServerElapsed>().0 = Some(TICK * frame);
+            app.update();
+            assert!(app.world().resource::<ServerFailure>().error().is_none());
             for (index, client) in clients.iter_mut().enumerate() {
                 while let Some(bytes) = client.renet.receive_message(wire::STATE_CHANNEL) {
                     states[index] = Some(wire::decode::<DreamServerMessage>(&bytes).unwrap());
                 }
             }
         }
-        assert_eq!(driver.authority.peers.len(), 2);
+        assert_eq!(
+            app.world()
+                .get_non_send::<ServerDriver<DreamAuthority>>()
+                .unwrap()
+                .authority
+                .peers
+                .len(),
+            2
+        );
         let mut worlds = Vec::new();
         for (index, state) in states.into_iter().enumerate() {
             let DreamServerMessage::State {
@@ -554,6 +548,16 @@ mod tests {
             worlds.push((snapshot.tick, snapshot.heroes, snapshot.enemies));
         }
         assert_eq!(worlds[0], worlds[1]);
+        app.world_mut().write_message(bevy::app::AppExit::Success);
+        app.update();
+        assert!(
+            app.world()
+                .get_non_send::<ServerDriver<DreamAuthority>>()
+                .unwrap()
+                .authority
+                .peers
+                .is_empty()
+        );
     }
 
     #[test]

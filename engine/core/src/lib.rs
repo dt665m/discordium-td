@@ -1,9 +1,24 @@
 //! Renderer-independent deterministic simulation plugins and components.
+pub mod action;
+pub mod combat;
 mod cooldown;
 mod health;
-mod movement;
+pub mod loadout;
+pub mod locomotion;
 mod presentation;
+pub mod progression;
+pub mod projectile;
+pub mod spatial;
+pub mod summon;
+pub mod targeting;
+pub use action::*;
+pub use combat::*;
 pub use cooldown::*;
 pub use health::*;
-pub use movement::*;
+pub use loadout::*;
+pub use locomotion::*;
 pub use presentation::*;
+pub use progression::*;
+pub use projectile::*;
+pub use summon::*;
+pub use targeting::*;

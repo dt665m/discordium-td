@@ -22,21 +22,25 @@ pub(super) fn spawn_enemy(
     commands.spawn((
         DreamOwned,
         Health::new(hp),
+        engine_core::CombatState::default(),
+        engine_core::MotorState {
+            position,
+            facing: [0.0, 1.0],
+            ..Default::default()
+        },
+        engine_core::ActionState {
+            target: position,
+            recovery: 0.9 + run.random() * 0.9,
+            ..Default::default()
+        },
         Enemy {
             view: EnemyBody {
                 id,
-                position,
-                facing: [0.0, 1.0],
                 kind,
-                windup: 0.0,
-                target: position,
                 warn_radius: 0.0,
                 phase: 1,
-                slowed: false,
                 hit_flash: 0.0,
             },
-            recovery: 0.9 + run.random() * 0.9,
-            slow_left: 0.0,
             attack_index: 0,
         },
     ));
@@ -61,7 +65,7 @@ fn enter_room(world: &mut World) {
         for (index, mut hero) in party.into_iter().enumerate() {
             hero.ready = false;
             hero.rewards.clear();
-            hero.view.position = if run.party_size <= 8 {
+            hero.motor.position = if run.party_size <= 8 {
                 [
                     (index as f32 - (run.party_size as f32 - 1.0) * 0.5) * 1.8,
                     3.5,
@@ -71,16 +75,15 @@ fn enter_room(world: &mut World) {
                 let radius = ((index as f32 + 1.0).sqrt() * 0.9).min(9.0);
                 [angle.cos() * radius, angle.sin() * radius + 3.5]
             };
-            hero.view.velocity = [0.0; 2];
-            hero.dash_left = 0.0;
-            hero.dodge_left = 0.9;
-            hero.view.invulnerable = true;
-            hero.view.dashing = false;
-            hero.view.dash_cooldown = 0.0;
-            hero.view.attack_cooldown = 0.0;
+            hero.motor.velocity = [0.0; 2];
+            hero.motor.dash_remaining = 0.0;
+            hero.combat
+                .grant_invulnerability(0.9, engine_core::DurationPolicy::Reset);
+            hero.motor.dash_cooldown = 0.0;
+            hero.action.cancel();
             hero.health.hp = (hero.health.hp + hero.health.max_hp * 0.10).min(hero.health.max_hp);
-            for memory in &mut hero.view.memories {
-                memory.cooldown = 0.0;
+            for memory in &mut hero.loadout.0 {
+                memory.refresh();
             }
         }
         if room == 3 || room == 7 {
@@ -92,7 +95,7 @@ fn enter_room(world: &mut World) {
             }
             .into();
             run.message =
-                "Restored 40% health. Spend 45 shards to refine a Memory, then choose a blessing."
+                "Restored 50% health. Spend 45 shards to refine a Memory, then choose a blessing."
                     .into();
             for mut hero in world.query::<HeroActor>().iter_mut(world) {
                 hero.health.hp =
@@ -285,16 +288,18 @@ pub(super) fn upgrade(hero: &mut HeroActorItem<'_, '_>, kind: UpgradeKind) {
         UpgradeKind::Attack => hero.view.attack_power += 0.30,
         UpgradeKind::Ability => hero.view.ability_power += 0.28,
         UpgradeKind::Movement => {
-            hero.view.movement_speed = (hero.view.movement_speed * 1.14).min(13.0);
-            hero.view.dash_cooldown = 0.0;
+            hero.view.movement_speed =
+                engine_core::multiply_capped(hero.view.movement_speed, 1.14, 13.0);
+            hero.motor.dash_cooldown = 0.0;
         }
         UpgradeKind::Critical => {
-            hero.view.critical_chance = (hero.view.critical_chance + 0.15).min(0.85)
+            hero.view.critical_chance =
+                engine_core::add_capped(hero.view.critical_chance, 0.15, 0.85)
         }
         UpgradeKind::Recovery => {
-            hero.view.recovery = (hero.view.recovery * 0.82).max(0.28);
-            for slot in &mut hero.view.memories {
-                slot.cooldown *= 0.82;
+            hero.view.recovery = engine_core::multiply_floored(hero.view.recovery, 0.82, 0.28);
+            for slot in &mut hero.loadout.0 {
+                slot.scale_remaining(0.82);
             }
         }
         UpgradeKind::Health => {
@@ -302,9 +307,13 @@ pub(super) fn upgrade(hero: &mut HeroActorItem<'_, '_>, kind: UpgradeKind) {
             hero.health.hp = (hero.health.hp + 75.0).min(hero.health.max_hp);
         }
         UpgradeKind::Defense => {
-            hero.view.defense = (hero.view.defense + 0.10).min(0.60);
-            hero.view.shield += 35.0;
-            hero.shield_left = 12.0;
+            hero.view.defense = engine_core::add_capped(hero.view.defense, 0.10, 0.60);
+            hero.combat.grant_shield(
+                35.0,
+                12.0,
+                engine_core::ShieldPolicy::Add,
+                engine_core::DurationPolicy::Reset,
+            );
         }
     }
     recalculate_cooldowns(hero);
@@ -312,10 +321,10 @@ pub(super) fn upgrade(hero: &mut HeroActorItem<'_, '_>, kind: UpgradeKind) {
 
 pub(super) fn recalculate_cooldowns(hero: &mut HeroActorItem<'_, '_>) {
     let recovery = hero.view.recovery;
-    for slot in &mut hero.view.memories {
+    for slot in &mut hero.loadout.0 {
         slot.max_cooldown = slot.kind.cooldown()
             * recovery
-            * if slot.essence == Some(EssenceKind::Haste) {
+            * if slot.modifier == Some(EssenceKind::Haste) {
                 0.62
             } else {
                 1.0
@@ -340,27 +349,25 @@ pub(super) fn choose_reward(world: &mut World, id: u64, choice: usize, slot: usi
         };
         match reward.kind {
             RewardKind::Memory(kind) => {
-                let memory = &mut hero.view.memories[slot];
+                let memory = &mut hero.loadout.0[slot];
                 if memory.kind == kind {
-                    if memory.level >= 8 {
+                    if !memory.upgrade(8) {
                         return false;
                     }
-                    memory.level += 1;
                 } else {
-                    memory.kind = kind;
-                    memory.level = 1;
+                    memory.replace(kind, 1, true);
                 }
-                memory.cooldown = 0.0;
+                memory.refresh();
             }
             RewardKind::Essence(kind) => {
-                hero.view.memories[slot].essence = Some(kind);
-                hero.view.memories[slot].cooldown = 0.0;
+                hero.loadout.0[slot].modifier = Some(kind);
+                hero.loadout.0[slot].refresh();
             }
             RewardKind::Upgrade(kind) => upgrade(&mut hero, kind),
         }
         recalculate_cooldowns(&mut hero);
-        if hero.pending_levels > 0 && run.phase == RunPhase::Reward {
-            hero.pending_levels -= 1;
+        if hero.progression.pending_levels > 0 && run.phase == RunPhase::Reward {
+            hero.progression.pending_levels -= 1;
             hero.rewards = make_rewards(&mut run, true);
         } else {
             hero.rewards.clear();
@@ -382,10 +389,13 @@ pub(super) fn buy_memory_upgrade(world: &mut World, id: u64, slot: usize) -> boo
     let Some(mut hero) = query.iter_mut(world).find(|h| h.view.id == id) else {
         return false;
     };
-    if hero.ready || hero.view.shards < 45 || hero.view.memories[slot].level >= 8 {
+    if hero.ready {
         return false;
     }
-    hero.view.shards -= 45;
-    hero.view.memories[slot].level += 1;
-    true
+    engine_core::purchase_rank(
+        &mut hero.actor.view.shards,
+        &mut hero.loadout.0[slot].level,
+        45,
+        8,
+    )
 }

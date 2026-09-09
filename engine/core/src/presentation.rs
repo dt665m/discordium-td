@@ -33,9 +33,11 @@ pub fn age_presentations(
 }
 
 /// Register lifecycle systems in a game's explicitly ordered simulation schedule.
+#[derive(SystemSet, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct PresentationStep;
 pub struct PresentationPlugin<S: ScheduleLabel + Clone>(pub S);
 impl<S: ScheduleLabel + Clone> Plugin for PresentationPlugin<S> {
     fn build(&self, app: &mut App) {
-        app.add_systems(self.0.clone(), age_presentations);
+        app.add_systems(self.0.clone(), age_presentations.in_set(PresentationStep));
     }
 }

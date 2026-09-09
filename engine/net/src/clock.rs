@@ -1,6 +1,9 @@
 use std::time::Duration;
 /// One fixed-step clock owns simulation, publication and the transport send tick.
 /// Socket/handshake polling runs more frequently, independently of this clock.
+/// This is transport policy (bounded catch-up and coalesced publication), not an
+/// application clock. Bevy's app runner/Time<Real> supply elapsed time; its
+/// virtual-time FixedUpdate loop does not implement this drop/cadence contract.
 pub struct TickClock {
     period: Duration,
     snapshot_interval: u32,

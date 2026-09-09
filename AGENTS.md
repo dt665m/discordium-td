@@ -12,14 +12,29 @@ This file defines project-specific guidance for coding agents working in this re
 - `engine/` contains reusable Bevy plugins and supporting services. It must not
   depend on a package under `games/`, even through tests or build dependencies.
 - Keep engine components and plugins named for capabilities: health, movement,
-  cooldowns, presentation, prediction, transport. Game names, characters,
-  abilities, encounters, progression, and art styles belong under `games/`.
+  actions, combat, cooldowns, loadouts, projectiles, summons, presentation,
+  prediction, transport, and sessions. Generic ability machinery and progression
+  arithmetic belong in the engine when driven by game-supplied data. Game names,
+  characters, named ability/combo definitions, balance, Essence mappings,
+  encounters, reward/progression rules, and art styles belong under `games/`.
+- Compose shared gameplay through `dreamwake_sim::DreamwakePlugin`; server
+  authority and client prediction use its `DreamSimulation` wrapper. Save engine
+  components alongside game payloads in complete authoritative snapshots rather
+  than maintaining duplicate gameplay state in display views.
+- Keep generic server scheduling/lifecycle in `ServerPlugin<A>` and generic
+  sequencing/queue/budget/freshness mechanics in `PeerInbox<I, A>`.
+  `DreamwakeServerPlugin` owns game admission, validation, snapshots, and party
+  policy. Dedicated and native-hosted production paths must use that composition.
 - `games/dreamwake/` is the canonical game. The original tower-defense game is
   retired and recoverable from Git checkpoint `e834361`.
 - Graphics are replaceable plugins consuming presentation data. Input/camera and
   gameplay must not require a particular mesh, material, or art plugin.
 - Run `just architecture` when changing crate dependencies or engine boundaries.
   See `docs/architecture.md` for the ownership contract.
+- Do not wrap or reimplement capabilities already provided by Bevy. Use its
+  math/geometry, transforms, timers, change detection, scheduling, and lifecycle
+  APIs directly. Keep extra machinery only for explicit gameplay or transport
+  requirements; see `docs/bevy-integration.md` for the retained exceptions.
 
 ## Bevy 0.19 Core Conventions
 
@@ -66,13 +81,20 @@ This file defines project-specific guidance for coding agents working in this re
 ## System Ordering and Dependencies
 
 - Explicitly order dependent systems using `.chain()` or explicit schedules.
+- Expose public system sets from reusable plugins, and assign them to the game's
+  ordered phases. Keep independent systems unordered within a phase. Normal
+  dependency edges apply deferred commands; do not substitute ignore-deferred
+  edges where a consumer requires newly spawned state.
+- Request only component access a system actually uses, and avoid mutating idle
+  components. Prefer Bevy change-detection helpers over parallel dirty flags.
 - Recommended high-level order per frame:
   - Input capture
   - Network receive/apply snapshot
   - Prediction/reconciliation
   - Gameplay visual sync
   - FX / UI updates
-- Fixed-step gameplay commands should run in `FixedUpdate`.
+- Fixed-step gameplay commands should run in `FixedUpdate` or an explicitly
+  stepped simulation schedule shared by authoritative execution and replay.
 - Do not rely on incidental ordering from registration order when dependency is real.
 - Window close/exit systems run in `Last` in Bevy 0.19. Run graceful disconnect and other `AppExit` cleanup after `bevy::window::ExitSystems` so it executes in the final frame.
 
@@ -81,6 +103,10 @@ This file defines project-specific guidance for coding agents working in this re
 - Authoritative state must originate from server simulation.
 - Client prediction may smooth movement/rotation, but must reconcile to server snapshots.
 - Keep predicted-only state isolated and reset safely when authoritative actor disappears/rejoins.
+- Received input/action sequences are not applied acknowledgements. Preserve
+  epoch checks, bounded queues, and one action per player per simulation tick.
+- Bump the game protocol identity when changing serialized authoritative layout,
+  and rebuild clients and servers together.
 
 ## Combat and Movement
 

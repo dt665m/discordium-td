@@ -1,5 +1,22 @@
 //! Dreamwake's game authority, composed with the engine's server services.
 mod authority;
+pub use authority::DreamwakeServerPlugin;
+
+/// Compose the headless runner with the game's authority plugin. Native hosts
+/// can run this app on their server thread; tests may supply `ServerElapsed`.
+pub fn build_app(shared: engine_server::SharedNet, seed: u64, lucid: bool) -> bevy::prelude::App {
+    use bevy::{app::ScheduleRunnerPlugin, prelude::*};
+    let mut app = App::new();
+    app.add_plugins(MinimalPlugins.set(ScheduleRunnerPlugin::run_loop(
+        std::time::Duration::from_millis(1),
+    )))
+    .add_plugins(DreamwakeServerPlugin {
+        shared,
+        seed,
+        lucid,
+    });
+    app
+}
 #[derive(Debug, Clone, clap::Parser)]
 #[command(name = "game_server")]
 pub struct ServerArgs {
@@ -42,6 +59,6 @@ mod tests {
 }
 pub fn run(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
     let shared = engine_server::start(args.network, dreamwake_protocol::PROTOCOL_ID)?;
-    authority::run_dreamwake(shared, args.seed, args.lucid)
+    engine_server::runtime::run_app(build_app(shared, args.seed, args.lucid))
         .map_err(|e| std::io::Error::other(e).into())
 }

@@ -36,10 +36,10 @@ fn enemy(sim: &mut DreamSimulation, kind: EnemyKind, pos: [f32; 2]) {
 }
 fn memory(sim: &mut DreamSimulation, kind: MemoryKind, essence: Option<EssenceKind>) {
     test_hero(sim, |hero| {
-        hero.view.position = [0.0, 0.0];
-        hero.view.facing = [0.0, -1.0];
-        hero.view.memories[0] = MemorySlot::new(kind);
-        hero.view.memories[0].essence = essence;
+        hero.motor.position = [0.0, 0.0];
+        hero.motor.facing = [0.0, -1.0];
+        hero.loadout.0[0] = memory_slot(kind);
+        hero.loadout.0[0].modifier = essence;
         hero.view.critical_chance = 0.0;
         encounters::recalculate_cooldowns(hero);
     });
@@ -85,15 +85,124 @@ fn opening_pause_bounds_and_restart() {
 }
 
 #[test]
+fn missed_swings_advance_combo_and_idle_time_does_not_reset_it() {
+    let mut sim = start(63);
+    clear_enemies(&mut sim);
+    enemy(&mut sim, EnemyKind::Boss, [20.0, 20.0]);
+    test_hero(&mut sim, |h| {
+        h.motor.position = [0.0; 2];
+        h.combat.invulnerability_remaining = 100.0;
+    });
+    let attack = DreamInput {
+        attack: true,
+        aim: [0.0, -1.0],
+        ..Default::default()
+    };
+    sim.step(attack);
+    assert_eq!(sim.snapshot().hero.combo, 1);
+    for _ in 0..300 {
+        sim.step(DreamInput::default());
+    }
+    assert_eq!(sim.snapshot().hero.combo, 1);
+    for mut e in sim.world.query::<EnemyActor>().iter_mut(&mut sim.world) {
+        e.motor.position = [20.0, 20.0];
+    }
+    sim.step(attack);
+    assert_eq!(sim.snapshot().hero.combo, 2);
+}
+
+#[test]
+fn casting_is_allowed_during_dash_while_basic_attack_is_blocked() {
+    let mut sim = start(64);
+    memory(&mut sim, MemoryKind::Aegis, None);
+    sim.step(DreamInput {
+        dash: true,
+        attack: true,
+        casts: [true, false, false, false],
+        aim: [0.0, -1.0],
+        ..Default::default()
+    });
+    let snapshot = sim.snapshot();
+    assert!(snapshot.hero.dashing);
+    assert_eq!(snapshot.hero.shield, 55.0);
+    assert!(snapshot.hero.memories[0].cooldown > 0.0);
+    assert_eq!(snapshot.hero.combo, 0);
+}
+
+#[test]
+fn enemies_can_follow_during_recovery_but_cannot_commit_again() {
+    let mut sim = start(65);
+    clear_enemies(&mut sim);
+    enemy(&mut sim, EnemyKind::Melee, [0.0, -10.0]);
+    test_hero(&mut sim, |h| h.motor.position = [0.0; 2]);
+    for mut e in sim.world.query::<EnemyActor>().iter_mut(&mut sim.world) {
+        e.action.begin_recovery(5.0);
+    }
+    let before = sim.snapshot().enemies[0].position;
+    sim.step(DreamInput::default());
+    let after = sim.snapshot();
+    assert!(distance(after.enemies[0].position, [0.0; 2]) < distance(before, [0.0; 2]));
+    assert_eq!(after.enemies[0].windup, 0.0);
+    assert!(after.state.enemies[0].action.recovery > 4.0);
+}
+
+#[test]
+fn generic_components_are_authoritative_and_survive_json_restore() {
+    let mut sim = start(66);
+    memory(&mut sim, MemoryKind::Wisp, Some(EssenceKind::Echo));
+    cast(&mut sim);
+    test_hero(&mut sim, |h| {
+        h.combat.shield = 17.0;
+        h.combat.shield_remaining = 2.0;
+        h.motor.movement_lock = 0.3;
+        h.action.recovery = 0.4;
+        h.progression.xp = 13.0;
+    });
+    let count = sim
+        .world
+        .query_filtered::<(
+            &Health,
+            &engine_core::CombatState,
+            &engine_core::MotorState,
+            &engine_core::ActionState,
+            &MemoryLoadout,
+            &engine_core::Progression,
+        ), With<Hero>>()
+        .iter(&sim.world)
+        .count();
+    assert_eq!(count, 1);
+    assert_eq!(
+        sim.world
+            .query::<(&Wisp, &engine_core::SummonState)>()
+            .iter(&sim.world)
+            .count(),
+        1
+    );
+    let snapshot = sim.snapshot();
+    assert_eq!(snapshot.hero.shield, 17.0);
+    assert_eq!(snapshot.hero.attack_cooldown, 0.4);
+    assert_eq!(snapshot.hero.xp, 13.0);
+    let encoded = serde_json::to_vec(&snapshot).unwrap();
+    let decoded: DreamSnapshot = serde_json::from_slice(&encoded).unwrap();
+    let mut restored = DreamSimulation::from_snapshot(&decoded);
+    assert_eq!(snapshot, restored.snapshot());
+    for _ in 0..40 {
+        sim.step(DreamInput::default());
+        restored.step(DreamInput::default());
+        assert_eq!(sim.snapshot(), restored.snapshot());
+    }
+}
+
+#[test]
 fn basic_combo_has_direction_healing_and_memory_refresh() {
     let mut sim = start(3);
     clear_enemies(&mut sim);
     enemy(&mut sim, EnemyKind::Elite, [0.0, -2.0]);
     test_hero(&mut sim, |h| {
-        h.view.position = [0.0; 2];
+        h.motor.position = [0.0; 2];
         h.health.hp = 100.0;
         h.view.combo = 2;
-        h.view.memories[0].cooldown = 3.0;
+        h.loadout.0[0].cooldown = 3.0;
     });
     sim.step(DreamInput {
         action_sequences: [0; 5],
@@ -155,7 +264,7 @@ fn twin_echo_vast_and_haste_change_cast_behavior() {
     let mut vast = start(5);
     memory(&mut vast, MemoryKind::Starfall, Some(EssenceKind::Vast));
     cast(&mut vast);
-    assert_eq!(vast.snapshot().state.projectiles[0].pierce, 4);
+    assert_eq!(vast.snapshot().state.projectiles[0].state.hits_remaining, 4);
     assert!(vast.snapshot().projectiles[0].radius > 0.5);
     let mut haste = start(5);
     memory(&mut haste, MemoryKind::Nova, Some(EssenceKind::Haste));
@@ -172,7 +281,7 @@ fn frost_status_damage_synergy_and_leech_heal() {
     assert!(sim.snapshot().enemies[0].slowed);
     let first_hp = sim.snapshot().enemies[0].hp;
     test_hero(&mut sim, |h| {
-        h.view.memories[0].cooldown = 0.0;
+        h.loadout.0[0].cooldown = 0.0;
     });
     cast(&mut sim);
     assert!((first_hp - sim.snapshot().enemies[0].hp - 52.0 * 1.2).abs() < 0.01);
@@ -190,12 +299,12 @@ fn dash_protects_from_a_committed_warning() {
     clear_enemies(&mut sim);
     enemy(&mut sim, EnemyKind::Melee, [0.0, 0.5]);
     test_hero(&mut sim, |h| {
-        h.view.position = [0.0; 2];
-        h.dodge_left = 0.0;
+        h.motor.position = [0.0; 2];
+        h.combat.invulnerability_remaining = 0.0;
     });
     for mut target in sim.world.query::<EnemyActor>().iter_mut(&mut sim.world) {
-        target.view.windup = DT * 0.5;
-        target.view.target = [0.0; 2];
+        target.action.windup = DT * 0.5;
+        target.action.target = [0.0; 2];
         target.view.warn_radius = 3.0;
     }
     let before = sim.snapshot().hero.hp;
@@ -215,11 +324,11 @@ fn warning_target_stays_committed_and_can_be_evaded() {
     clear_enemies(&mut sim);
     enemy(&mut sim, EnemyKind::Melee, [0.0, 0.5]);
     test_hero(&mut sim, |h| {
-        h.view.position = [0.0; 2];
-        h.dodge_left = 0.0;
+        h.motor.position = [0.0; 2];
+        h.combat.invulnerability_remaining = 0.0;
     });
     for mut target in sim.world.query::<EnemyActor>().iter_mut(&mut sim.world) {
-        target.recovery = 0.0;
+        target.action.recovery = 0.0;
     }
     sim.step(DreamInput::default());
     let target = sim.snapshot().enemies[0].target;
@@ -282,7 +391,7 @@ fn rest_recovers_health_and_spends_shards() {
     });
     sim.continue_run();
     assert_eq!(sim.snapshot().phase, RunPhase::Rest);
-    assert!(sim.snapshot().hero.hp > 140.0);
+    assert_eq!(sim.snapshot().hero.hp, 150.0);
     assert!(sim.buy_memory_upgrade(0));
     assert_eq!(sim.snapshot().hero.shards, 45);
     assert_eq!(sim.snapshot().hero.memories[0].level, 2);
@@ -732,8 +841,8 @@ fn world_ring_ids_use_actor_and_encounter_state_instead_of_wall_clock_tick() {
     enemy(&mut initial, EnemyKind::Melee, [0.0, 0.5]);
     enemy(&mut initial, EnemyKind::Melee, [4.0, 0.0]);
     test_hero(&mut initial, |h| {
-        h.view.position = [0.0; 2];
-        h.view.xp = h.view.xp_next;
+        h.motor.position = [0.0; 2];
+        h.progression.xp = h.progression.xp_next;
     });
     let mut targets: Vec<_> = initial
         .world
@@ -742,11 +851,19 @@ fn world_ring_ids_use_actor_and_encounter_state_instead_of_wall_clock_tick() {
         .map(|(e, v)| (v.view.id, e))
         .collect();
     targets.sort_unstable();
-    if let Some(mut first) = initial.world.get_mut::<Enemy>(targets[0].1) {
-        first.view.windup = DT * 0.5;
-        first.view.target = [0.0; 2];
-        first.view.warn_radius = 2.0;
+    if let Some(mut action) = initial
+        .world
+        .get_mut::<engine_core::ActionState>(targets[0].1)
+    {
+        action.windup = DT * 0.5;
+        action.target = [0.0; 2];
     }
+    initial
+        .world
+        .get_mut::<Enemy>(targets[0].1)
+        .unwrap()
+        .view
+        .warn_radius = 2.0;
     if let Some(mut second) = initial.world.get_mut::<Health>(targets[1].1) {
         second.hp = 0.0;
     }

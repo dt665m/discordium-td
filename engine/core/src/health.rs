@@ -74,9 +74,11 @@ pub fn update_health(mut commands: Commands, actors: Query<(Entity, &Health, Has
     }
 }
 
+#[derive(SystemSet, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct HealthStep;
 pub struct HealthPlugin<S: ScheduleLabel + Clone>(pub S);
 impl<S: ScheduleLabel + Clone> Plugin for HealthPlugin<S> {
     fn build(&self, app: &mut App) {
-        app.add_systems(self.0.clone(), update_health);
+        app.add_systems(self.0.clone(), update_health.in_set(HealthStep));
     }
 }

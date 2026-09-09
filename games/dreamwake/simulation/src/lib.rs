@@ -4,39 +4,20 @@ mod catalog;
 #[cfg(test)]
 mod coop_tests;
 mod encounters;
+mod plugin;
+pub use plugin::{DreamInputs, DreamStep, DreamSystems, DreamwakePlugin};
 mod snapshot_access;
 mod state;
 mod systems;
 #[cfg(test)]
 mod tests;
 mod types;
-use bevy::{
-    ecs::{query::QueryState, schedule::ScheduleLabel},
-    prelude::*,
-};
+use bevy::{ecs::query::QueryState, prelude::*};
 use engine_core::Health;
 use state::*;
 use std::sync::Mutex;
 pub use types::*;
 
-#[derive(ScheduleLabel, Clone, Debug, PartialEq, Eq, Hash)]
-struct DreamTick;
-#[derive(ScheduleLabel, Clone, Debug, PartialEq, Eq, Hash)]
-struct DreamAmbient;
-#[derive(ScheduleLabel, Clone, Debug, PartialEq, Eq, Hash)]
-struct PresentationTick;
-#[derive(ScheduleLabel, Clone, Debug, PartialEq, Eq, Hash)]
-struct HealthTick;
-fn update_actor_health(world: &mut World) {
-    world.run_schedule(HealthTick);
-}
-#[derive(ScheduleLabel, Clone, Debug, PartialEq, Eq, Hash)]
-struct CooldownTick;
-#[derive(ScheduleLabel, Clone, Debug, PartialEq, Eq, Hash)]
-struct MovementTick;
-fn move_projectiles(world: &mut World) {
-    world.run_schedule(MovementTick);
-}
 type SnapshotData = (
     Option<&'static Hero>,
     Option<&'static Enemy>,
@@ -46,6 +27,13 @@ type SnapshotData = (
     Option<&'static Number>,
     Option<&'static DelayedCast>,
     Option<&'static Health>,
+    Option<&'static engine_core::CombatState>,
+    Option<&'static engine_core::MotorState>,
+    Option<&'static engine_core::ActionState>,
+    Option<&'static MemoryLoadout>,
+    Option<&'static engine_core::Progression>,
+    Option<&'static engine_core::ProjectileState>,
+    Option<&'static engine_core::SummonState>,
 );
 
 pub struct DreamSimulation {
@@ -57,61 +45,15 @@ impl DreamSimulation {
     /// before admitting authenticated connections.
     pub fn new(seed: u64, lucid: bool) -> Self {
         let mut app = App::new();
-        app.init_schedule(DreamTick)
-            .init_schedule(DreamAmbient)
-            .init_schedule(PresentationTick)
-            .init_schedule(HealthTick)
-            .init_schedule(CooldownTick)
-            .init_schedule(MovementTick)
-            .add_plugins((
-                engine_core::PresentationPlugin(PresentationTick),
-                engine_core::HealthPlugin(HealthTick),
-            ))
-            .add_plugins((
-                engine_core::CooldownPlugin::<Hero, _>::new(CooldownTick),
-                engine_core::CooldownPlugin::<Enemy, _>::new(CooldownTick),
-                engine_core::MovementPlugin::<Projectile, _>::new(MovementTick),
-            ))
-            .insert_resource(engine_core::SimulationStep(DT))
-            .add_systems(DreamAmbient, systems::age_transients)
-            .insert_resource(Input::default())
-            .insert_resource(Run {
-                tick: 0,
-                seed,
-                rng: seed.max(1),
-                phase: RunPhase::Intro,
-                room: 0,
-                encounter_name: "The dream is waiting".into(),
-                rewards: vec![],
-                kills: 0,
-                elapsed: 0.0,
-                lucid,
-                paused: false,
-                cleared: 0,
-                next_id: 1 << 63,
-                message: "Vesper · Moonbound".into(),
-                party_size: 1,
-                reinforcements: 0,
-            })
-            .add_systems(
-                DreamTick,
-                (
-                    systems::begin_tick,
-                    systems::age_transients,
-                    systems::player_actions,
-                    systems::delayed_casts,
-                    systems::wisp_actions,
-                    systems::enemy_actions,
-                    move_projectiles,
-                    systems::projectile_actions,
-                    update_actor_health,
-                    systems::resolve_deaths,
-                    systems::finish_encounter,
-                )
-                    .chain(),
-            );
-        app.world_mut()
-            .spawn((DreamOwned, Hero::default(), Health::new(220.0)));
+        app.add_plugins(DreamwakePlugin::new(seed, lucid));
+        Self::from_app(app)
+    }
+    /// Consume a precomposed headless app containing DreamwakePlugin.
+    pub fn from_app(mut app: App) -> Self {
+        assert!(
+            app.world().contains_resource::<Run>(),
+            "DreamwakePlugin is required"
+        );
         let mut world = std::mem::take(app.world_mut());
         let snapshot_query = Mutex::new(world.query_filtered());
         Self {
@@ -119,29 +61,19 @@ impl DreamSimulation {
             snapshot_query,
         }
     }
+    pub fn world(&self) -> &World {
+        &self.world
+    }
+    pub fn world_mut(&mut self) -> &mut World {
+        &mut self.world
+    }
     pub fn step(&mut self, input: DreamInput) {
         self.step_multiplayer(&[(1, input)]);
     }
-    /// Input owners come from authenticated server connections. Missing inputs are
-    /// neutral; a duplicate owner within a tick is accepted only once.
+    /// Owners originate from authenticated connections; duplicate owners execute once.
     pub fn step_multiplayer(&mut self, inputs: &[(u64, DreamInput)]) {
-        let run = self.world.resource::<Run>();
-        if run.paused || run.phase == RunPhase::Intro || run.party_size == 0 {
-            return;
-        }
-        let phase = run.phase;
-        self.world.run_schedule(PresentationTick);
-        if phase != RunPhase::Combat {
-            self.world.run_schedule(DreamAmbient);
-            return;
-        }
-        let mut ordered = inputs.to_vec();
-        ordered.sort_by_key(|(id, _)| *id);
-        ordered.dedup_by_key(|(id, _)| *id);
-        self.world.resource_mut::<Input>().0 = ordered;
-        self.world.run_schedule(CooldownTick);
-        self.world.run_schedule(DreamTick);
-        self.world.run_schedule(HealthTick);
+        self.world.resource_mut::<DreamInputs>().0 = inputs.to_vec();
+        self.world.run_schedule(DreamStep);
     }
     pub fn snapshot(&self) -> DreamSnapshot {
         self.snapshot_for(1)
@@ -158,29 +90,59 @@ impl DreamSimulation {
             numbers: vec![],
             delayed: vec![],
         };
-        for (hero, enemy, projectile, wisp, effect, number, delayed, health) in self
+        for (
+            hero,
+            enemy,
+            projectile,
+            wisp,
+            effect,
+            number,
+            delayed,
+            health,
+            combat,
+            motor,
+            action,
+            loadout,
+            progression,
+            projectile_state,
+            summon_state,
+        ) in self
             .snapshot_query
             .lock()
             .expect("Dream snapshot query poisoned")
             .iter(&self.world)
         {
             if let Some(v) = hero {
-                saved.heroes.push(SavedActor {
+                saved.heroes.push(SavedHero {
                     actor: v.clone(),
                     health: *health.expect("actor health"),
+                    combat: combat.expect("actor combat").clone(),
+                    motor: *motor.expect("actor motor"),
+                    action: *action.expect("actor action"),
+                    loadout: loadout.expect("hero loadout").clone(),
+                    progression: *progression.expect("hero progression"),
                 });
             }
             if let Some(v) = enemy {
-                saved.enemies.push(SavedActor {
+                saved.enemies.push(SavedEnemy {
                     actor: v.clone(),
                     health: *health.expect("actor health"),
+                    combat: combat.expect("actor combat").clone(),
+                    motor: *motor.expect("actor motor"),
+                    action: *action.expect("actor action"),
                 });
             }
             if let Some(v) = projectile {
-                saved.projectiles.push(v.clone());
+                saved.projectiles.push(SavedProjectile {
+                    payload: v.clone(),
+                    state: projectile_state.expect("projectile state").clone(),
+                });
             }
             if let Some(v) = wisp {
-                saved.wisps.push(v.clone());
+                saved.wisps.push(SavedWisp {
+                    payload: v.clone(),
+                    state: summon_state.expect("summon state").clone(),
+                });
             }
             if let Some(v) = effect {
                 saved.effects.push(v.clone());
@@ -194,23 +156,14 @@ impl DreamSimulation {
         }
         saved.heroes.sort_by_key(|v| v.view.id);
         saved.enemies.sort_by_key(|v| v.view.id);
-        saved.projectiles.sort_by_key(|v| v.view.id);
-        saved.wisps.sort_by_key(|v| v.view.id);
+        saved.projectiles.sort_by_key(|v| v.state.id);
+        saved.wisps.sort_by_key(|v| v.state.id);
         saved
             .effects
             .sort_by_key(|v| (v.id.owner, v.id.action_seq, v.id.slot));
         saved.numbers.sort_by_key(|v| v.0.id);
-        saved.delayed.sort_by_key(|v| v.id);
-        let fallback = SavedActor {
-            health: Health::new(220.0),
-            actor: Hero {
-                view: HeroBody {
-                    id: player_id,
-                    ..Hero::default().view
-                },
-                ..Hero::default()
-            },
-        };
+        saved.delayed.sort_by_key(|v| v.payload.id);
+        let fallback = SavedHero::new(player_id);
         let local = saved
             .heroes
             .iter()
@@ -223,25 +176,21 @@ impl DreamSimulation {
             room: run.room,
             realm: (run.room / 3).min(2),
             encounter_name: run.encounter_name,
-            hero: local.view.snapshot(&local.health),
-            heroes: saved
-                .heroes
-                .iter()
-                .map(|h| h.view.snapshot(&h.health))
-                .collect(),
+            hero: local.snapshot(),
+            heroes: saved.heroes.iter().map(SavedHero::snapshot).collect(),
             ready: local.ready,
             awaiting_party: local.ready
                 && matches!(
                     run.phase,
                     RunPhase::Intro | RunPhase::Reward | RunPhase::Rest | RunPhase::Transition
                 ),
-            enemies: saved
-                .enemies
+            enemies: saved.enemies.iter().map(SavedEnemy::snapshot).collect(),
+            projectiles: saved
+                .projectiles
                 .iter()
-                .map(|v| v.view.snapshot(&v.health))
+                .map(SavedProjectile::snapshot)
                 .collect(),
-            projectiles: saved.projectiles.iter().map(|v| v.view.clone()).collect(),
-            wisps: saved.wisps.iter().map(|v| v.view.clone()).collect(),
+            wisps: saved.wisps.iter().map(SavedWisp::snapshot).collect(),
             presentations: saved.effects.clone(),
             damage_numbers: saved.numbers.iter().map(|v| v.0.clone()).collect(),
             rewards: local.rewards.clone(),
@@ -273,16 +222,18 @@ impl DreamSimulation {
         let state = &snapshot.state;
         self.world.insert_resource(state.run.clone());
         for v in &state.heroes {
-            self.world.spawn((DreamOwned, v.actor.clone(), v.health));
+            v.clone().spawn(&mut self.world);
         }
         for v in &state.enemies {
-            self.world.spawn((DreamOwned, v.actor.clone(), v.health));
+            v.clone().spawn(&mut self.world);
         }
         for v in &state.projectiles {
-            self.world.spawn((DreamOwned, v.clone()));
+            self.world
+                .spawn((DreamOwned, v.payload.clone(), v.state.clone()));
         }
         for v in &state.wisps {
-            self.world.spawn((DreamOwned, v.clone()));
+            self.world
+                .spawn((DreamOwned, v.payload.clone(), v.state.clone()));
         }
         for v in &state.effects {
             self.world.spawn((DreamOwned, v.clone()));
@@ -303,34 +254,29 @@ impl DreamSimulation {
             return true;
         }
         let count = query.iter(&self.world).len();
-        let mut hero = SavedActor {
-            actor: Hero::default(),
-            health: Health::new(220.0),
-        };
-        hero.view.id = id;
+        let mut hero = SavedHero::new(id);
         if let Some(first) = query.iter(&self.world).min_by_key(|h| h.view.id) {
-            hero.view = first.view.clone();
-            hero.health = *first.health;
+            hero.actor.view = first.view.clone();
             hero.view.id = id;
+            hero.health = *first.health;
             hero.health.hp = hero.health.max_hp;
-            hero.view.shield = 0.0;
-            hero.view.position[0] += 1.5;
-            hero.view.position[0] = hero.view.position[0].clamp(-16.0, 16.0);
-            hero.view.velocity = [0.0; 2];
-            hero.view.dashing = false;
-            hero.view.invulnerable = true;
-            hero.view.attack_cooldown = 0.0;
-            hero.view.dash_cooldown = 0.0;
-            for memory in &mut hero.view.memories {
-                memory.cooldown = 0.0;
+            hero.motor.position = first.motor.position;
+            hero.motor.facing = first.motor.facing;
+            hero.motor.position[0] = (hero.motor.position[0] + 1.5).clamp(-16.0, 16.0);
+            hero.loadout = first.loadout.clone();
+            hero.progression = *first.progression;
+            hero.progression.pending_levels = 0;
+            for memory in &mut hero.loadout.0 {
+                memory.refresh();
             }
         }
         let run = self.world.resource::<Run>();
         if matches!(run.phase, RunPhase::Reward | RunPhase::Rest) {
             hero.rewards = run.rewards.clone();
         }
-        hero.dodge_left = 1.5;
-        self.world.spawn((DreamOwned, hero.actor, hero.health));
+        hero.combat
+            .grant_invulnerability(1.5, engine_core::DurationPolicy::Reset);
+        hero.spawn(&mut self.world);
         self.resize_party(count, count + 1);
         true
     }
@@ -349,15 +295,15 @@ impl DreamSimulation {
             .world
             .query_filtered::<(
                 Entity,
-                Option<&Projectile>,
-                Option<&Wisp>,
+                Option<&engine_core::ProjectileState>,
+                Option<&engine_core::SummonState>,
                 Option<&DelayedCast>,
             ), With<DreamOwned>>()
             .iter(&self.world)
             .filter(|(_, p, w, c)| {
-                p.is_some_and(|v| v.view.owner == id && v.view.friendly)
-                    || w.is_some_and(|v| v.view.owner == id)
-                    || c.is_some_and(|v| v.owner == id)
+                p.is_some_and(|v| v.owner == id && v.faction == 1)
+                    || w.is_some_and(|v| v.owner == id)
+                    || c.is_some_and(|v| v.payload.owner == id)
             })
             .map(|(e, ..)| e)
             .collect();
@@ -418,7 +364,7 @@ impl DreamSimulation {
         let Some(mut hero) = query.iter_mut(&mut self.world).find(|h| h.view.id == id) else {
             return false;
         };
-        hero.view.memories.swap(a, b);
+        hero.loadout.swap(a, b);
         true
     }
     pub fn continue_run(&mut self) {

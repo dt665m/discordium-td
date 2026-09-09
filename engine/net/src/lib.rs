@@ -2,6 +2,7 @@
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 pub mod clock;
+pub mod session;
 pub mod wire;
 pub use wire::{decode, decode_with_limit, encode};
 pub const INPUT_CHANNEL: u8 = 0;

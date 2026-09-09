@@ -8,6 +8,7 @@ use bevy::{
     asset::RenderAssetUsages,
     mesh::{Indices, PrimitiveTopology},
     prelude::*,
+    transform::helper::TransformHelper,
 };
 
 use super::DreamView;
@@ -18,14 +19,22 @@ pub struct DreamScenePlugin;
 impl Plugin for DreamScenePlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(Startup, setup_scene)
-            .add_systems(Update, (sync_scene, animate_scene).chain())
-            .add_systems(
-                PostUpdate,
-                (place_damage_numbers, place_traveler_labels)
-                    .chain()
-                    .after(bevy::transform::TransformSystems::Propagate),
-            );
+            .add_systems(Update, (sync_scene, animate_scene).chain());
+        add_label_placement_systems(app);
     }
+}
+
+fn add_label_placement_systems(app: &mut App) {
+    app.add_systems(
+        PostUpdate,
+        (place_damage_numbers, place_traveler_labels)
+            .chain()
+            // UI layout precedes transform propagation in Bevy 0.19.
+            // Compute current transforms locally so Node/Text changes
+            // reach this frame's layout, using the updated projection.
+            .after(bevy::camera::CameraUpdateSystems)
+            .before(bevy::ui::UiSystems::Content),
+    );
 }
 
 use engine_client::camera::CameraRig as DreamCameraRig;
@@ -1769,16 +1778,20 @@ fn animate_scene(
 fn place_damage_numbers(
     view: Res<DreamView>,
     scale: Res<UiScale>,
-    cameras: Query<(&Camera, &GlobalTransform), With<DreamCameraRig>>,
+    cameras: Query<(Entity, &Camera), With<DreamCameraRig>>,
+    transforms: TransformHelper,
     mut numbers: Query<(&DamageLabel, &mut Node, &mut TextColor)>,
 ) {
-    let Ok((camera, transform)) = cameras.single() else {
+    let Ok((entity, camera)) = cameras.single() else {
+        return;
+    };
+    let Ok(transform) = transforms.compute_global_transform(entity) else {
         return;
     };
     for (label, mut node, mut color) in &mut numbers {
         if let Some(n) = view.0.damage_numbers.iter().find(|n| n.id == label.0) {
             if let Ok(screen) =
-                camera.world_to_viewport(transform, world(n.position, 1.7 + n.age * 1.3))
+                camera.world_to_viewport(&transform, world(n.position, 1.7 + n.age * 1.3))
             {
                 node.left = px(screen.x / scale.0 - 12.0);
                 node.top = px(screen.y / scale.0 - 12.0);
@@ -1803,11 +1816,15 @@ pub(super) fn companion_color(id: u64) -> Color {
 fn place_traveler_labels(
     view: Res<DreamView>,
     scale: Res<UiScale>,
-    cameras: Query<(&Camera, &GlobalTransform), With<DreamCameraRig>>,
+    cameras: Query<(Entity, &Camera), With<DreamCameraRig>>,
+    transforms: TransformHelper,
     actors: Query<(&ActorVisual, &Transform)>,
     mut labels: Query<(&TravelerLabel, &mut Node, &mut Text, &mut TextColor)>,
 ) {
-    let Ok((camera, camera_transform)) = cameras.single() else {
+    let Ok((entity, camera)) = cameras.single() else {
+        return;
+    };
+    let Ok(camera_transform) = transforms.compute_global_transform(entity) else {
         return;
     };
     for (label, mut node, mut text, mut color) in &mut labels {
@@ -1844,7 +1861,7 @@ fn place_traveler_labels(
             .map(|(_, transform)| transform.translation)
             .unwrap_or_else(|| world(hero.position, 0.0));
         if let Ok(screen) = camera.world_to_viewport(
-            camera_transform,
+            &camera_transform,
             origin + Vec3::Y * if hero.hp > 0.0 { 2.3 } else { 0.6 },
         ) {
             node.display = if view.0.phase == RunPhase::Intro {
@@ -1864,6 +1881,97 @@ fn place_traveler_labels(
 mod tests {
     use super::*;
     use dreamwake_sim::DreamSimulation;
+
+    #[test]
+    fn labels_use_current_camera_hierarchy_and_projection_before_ui_content() {
+        use bevy::camera::{CameraUpdateSystems, RenderTargetInfo};
+        use bevy::ui::UiSystems;
+        #[derive(Resource, Default)]
+        struct ContentPosition(Option<(Val, Val)>);
+        let mut snapshot = DreamSimulation::new(7, false).snapshot();
+        snapshot.phase = RunPhase::Combat;
+        snapshot.hero.position = [0.0, 0.0];
+        snapshot.heroes[0] = snapshot.hero.clone();
+        let hero_id = snapshot.hero.id;
+        let mut app = App::new();
+        app.insert_resource(DreamView(snapshot))
+            .insert_resource(UiScale(1.0))
+            .init_resource::<ContentPosition>()
+            .configure_sets(
+                PostUpdate,
+                (
+                    CameraUpdateSystems,
+                    UiSystems::Content,
+                    UiSystems::Layout,
+                    bevy::transform::TransformSystems::Propagate,
+                )
+                    .chain(),
+            )
+            .add_systems(
+                PostUpdate,
+                (
+                    (|mut cameras: Query<&mut Camera>| {
+                        for mut camera in &mut cameras {
+                            camera.computed.clip_from_view =
+                                Mat4::orthographic_rh(-10.0, 10.0, -10.0, 10.0, 0.1, 100.0);
+                        }
+                    })
+                    .in_set(CameraUpdateSystems),
+                    (|nodes: Query<&Node, With<TravelerLabel>>,
+                      mut observed: ResMut<ContentPosition>| {
+                        let node = nodes.single().unwrap();
+                        observed.0 = Some((node.left, node.top));
+                    })
+                    .in_set(UiSystems::Content),
+                ),
+            );
+        add_label_placement_systems(&mut app);
+        let parent = app
+            .world_mut()
+            .spawn(Transform::from_xyz(3.0, 0.0, 0.0))
+            .id();
+        let mut camera = Camera::default();
+        camera.computed.target_info = Some(RenderTargetInfo {
+            physical_size: UVec2::new(800, 600),
+            scale_factor: 1.0,
+        });
+        let camera_entity = app
+            .world_mut()
+            .spawn((
+                camera,
+                DreamCameraRig::default(),
+                Transform::from_xyz(2.0, 0.0, 10.0),
+                GlobalTransform::default(),
+                ChildOf(parent),
+            ))
+            .id();
+        app.world_mut().spawn((
+            TravelerLabel(hero_id),
+            Node::default(),
+            Text::default(),
+            TextColor::default(),
+        ));
+        app.world_mut().run_schedule(PostUpdate);
+        let camera = app.world().get::<Camera>(camera_entity).unwrap();
+        let expected = camera
+            .world_to_viewport(
+                &GlobalTransform::from(Transform::from_xyz(5.0, 0.0, 10.0)),
+                Vec3::Y * 2.3,
+            )
+            .unwrap();
+        assert_eq!(
+            app.world().resource::<ContentPosition>().0,
+            Some((px(expected.x - 12.0), px(expected.y - 8.0)))
+        );
+        // No propagation ran: passing this test requires the fresh hierarchy.
+        assert_eq!(
+            app.world()
+                .get::<GlobalTransform>(camera_entity)
+                .unwrap()
+                .translation(),
+            Vec3::ZERO
+        );
+    }
 
     #[test]
     fn scene_tracks_every_authoritative_hero_and_cleans_up_departures() {

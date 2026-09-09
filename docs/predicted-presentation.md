@@ -2,7 +2,9 @@
 
 Transient effects are accepted, identified, aged, and expired in the shared
 simulation. Network receive code restores authoritative state; it does not spawn
-meshes or invent effect identities. Client prediction replays the same simulation.
+meshes or invent effect identities. Client prediction and server authority both
+use the simulation installed by `dreamwake_sim::DreamwakePlugin` through the
+`DreamSimulation` wrapper.
 
 `engine_core::PresentationInstance` contains a neutral primitive, position,
 radius, age, duration, and stable identity. Its `PresentationId` consists of
@@ -10,9 +12,14 @@ match epoch, owner, action sequence, and stable slot. `RadialPulse` is the curre
 primitive; game abilities choose when to emit it.
 
 The generic `PresentationPlugin` ages instances in the schedule supplied by the
-game and despawns expired effects. Dreamwake registers that plugin in an explicit
-presentation schedule and stores instances directly as ECS components. Snapshots
-include the active instances for complete restore/replay.
+game and despawns expired effects. Dreamwake assigns its `PresentationStep` set
+to the ordered presentation phase of `DreamStep` and stores instances directly
+as ECS components. Snapshots
+include the active instances for complete restore/replay. They also save the
+engine's authoritative action, motor, combat/status, loadout, projectile, summon,
+and delayed-action state alongside game payloads. Restoring only positions or
+visible effects would lose cooldowns, hit history, or pending execution and make
+replay diverge.
 
 The game client projects the displayed snapshot into
 `engine_client::presentation::PresentationFrame`. Renderers consume this frame
@@ -24,8 +31,9 @@ renderer retains its existing correction and animation behavior.
 
 To add a mechanic:
 
-1. Validate and execute it in game simulation, using generic mechanics where
-   appropriate. Create presentation state only for accepted actions.
+1. Validate and execute it in game simulation, composing the relevant engine
+   mechanics. Keep named ability definitions, balance, and effect mappings in
+   the game. Create presentation state only for accepted actions.
 2. Allocate identities deterministically from the action and stable slots;
    replay must not allocate random replacement IDs.
 3. Map its presented state into neutral primitives in the game adapter, or

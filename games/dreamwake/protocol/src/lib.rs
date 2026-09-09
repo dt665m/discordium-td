@@ -5,7 +5,7 @@ pub use engine_net::{
     decode_with_limit, encode, newer,
 };
 use serde::{Deserialize, Serialize};
-pub const PROTOCOL_ID: u64 = 0x4452_4541_4d00_0002;
+pub const PROTOCOL_ID: u64 = 0x4452_4541_4d00_0003;
 pub const DEFAULT_MAX_PLAYERS: usize = 8;
 pub const MAX_PLAYERS: usize = 1024;
 pub const MAX_INPUT_BYTES: usize = 2048;

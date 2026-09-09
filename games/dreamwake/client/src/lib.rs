@@ -33,6 +33,32 @@ pub struct DreamConnection {
 }
 #[derive(Resource, Default)]
 struct CapturedInput(DreamInput);
+
+/// Input stages all run in PreUpdate, before the fixed prediction loop.
+#[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DreamInputSystems {
+    Receive,
+    Keyboard,
+    Buttons,
+    Apply,
+    Capture,
+}
+
+fn configure_input_schedule(app: &mut App) {
+    // In Bevy 0.19 UI focus and input capture both run in PreUpdate. Explicitly
+    // consume current Interaction before routing clicks or suppressing attacks.
+    app.configure_sets(
+        PreUpdate,
+        (
+            DreamInputSystems::Receive,
+            DreamInputSystems::Keyboard.after(InputSystems),
+            DreamInputSystems::Buttons.after(bevy::ui::UiSystems::Focus),
+            DreamInputSystems::Apply,
+            DreamInputSystems::Capture,
+        )
+            .chain(),
+    );
+}
 #[derive(Resource, Default)]
 struct Playtest {
     autoplay: bool,
@@ -110,6 +136,7 @@ pub fn build_app() -> App {
     let (seed, playtest, options, connection) = startup_options();
     let view = DreamSimulation::new(seed, false).snapshot();
     let mut app = App::new();
+    configure_input_schedule(&mut app);
     app.add_plugins(DefaultPlugins.set(WindowPlugin {
         primary_window: Some(Window {
             title: "DREAMWAKE — The place between waking".into(),
@@ -140,9 +167,11 @@ pub fn build_app() -> App {
     ))
     .add_systems(
         PreUpdate,
-        (keyboard_actions, apply_ui_actions, capture_input)
-            .chain()
-            .after(InputSystems),
+        (
+            keyboard_actions.in_set(DreamInputSystems::Keyboard),
+            apply_ui_actions.in_set(DreamInputSystems::Apply),
+            capture_input.in_set(DreamInputSystems::Capture),
+        ),
     )
     .add_systems(Update, playtest_capture);
     app

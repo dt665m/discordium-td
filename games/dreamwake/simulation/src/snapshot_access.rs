@@ -26,7 +26,7 @@ impl DreamSnapshot {
             return false;
         };
         let local = &self.state.heroes[index];
-        self.hero = local.view.snapshot(&local.health);
+        self.hero = local.snapshot();
         self.ready = local.ready;
         self.awaiting_party = local.ready
             && matches!(

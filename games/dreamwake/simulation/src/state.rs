@@ -1,22 +1,58 @@
+//! Game identity and policy state, composed with authoritative engine components.
 use super::*;
 use bevy::ecs::query::QueryData;
-use bevy::prelude::*;
-use engine_core::{CooldownOwner, Health, advance_cooldown};
 use serde::{Deserialize, Serialize};
+mod projectiles;
+pub(super) use projectiles::*;
 
+pub(super) const FROST_STATUS: engine_core::StatusId = engine_core::StatusId(1);
+pub(super) type MemoryLoadout = engine_core::Loadout<MemoryKind, EssenceKind>;
+pub(super) type EquippedMemory = engine_core::AbilitySlot<MemoryKind, EssenceKind>;
+pub(super) fn memory_slot(kind: MemoryKind) -> EquippedMemory {
+    engine_core::AbilitySlot::new(kind, kind.cooldown())
+}
+fn initial_loadout() -> MemoryLoadout {
+    engine_core::Loadout(
+        [
+            MemoryKind::Crescent,
+            MemoryKind::Starfall,
+            MemoryKind::Nova,
+            MemoryKind::Aegis,
+        ]
+        .into_iter()
+        .map(memory_slot)
+        .collect(),
+    )
+}
+fn memory_view(slot: &EquippedMemory) -> MemorySlot {
+    MemorySlot {
+        kind: slot.kind,
+        level: slot.level,
+        essence: slot.modifier,
+        cooldown: slot.cooldown,
+        max_cooldown: slot.max_cooldown,
+    }
+}
 #[derive(QueryData)]
 #[query_data(mutable)]
 pub(super) struct HeroActor {
     pub actor: &'static mut Hero,
     pub health: &'static mut Health,
+    pub combat: &'static mut engine_core::CombatState,
+    pub motor: &'static mut engine_core::MotorState,
+    pub action: &'static mut engine_core::ActionState,
+    pub loadout: &'static mut MemoryLoadout,
+    pub progression: &'static mut engine_core::Progression,
 }
 #[derive(QueryData)]
 #[query_data(mutable)]
 pub(super) struct EnemyActor {
     pub actor: &'static mut Enemy,
     pub health: &'static mut Health,
+    pub combat: &'static mut engine_core::CombatState,
+    pub motor: &'static mut engine_core::MotorState,
+    pub action: &'static mut engine_core::ActionState,
 }
-
 macro_rules! actor_access {
     ($item:ident, $readonly:ident, $actor:ty) => {
         impl std::ops::Deref for $item<'_, '_> {
@@ -33,7 +69,7 @@ macro_rules! actor_access {
         impl std::ops::Deref for $readonly<'_, '_> {
             type Target = $actor;
             fn deref(&self) -> &Self::Target {
-                self.actor
+                &self.actor
             }
         }
     };
@@ -41,86 +77,20 @@ macro_rules! actor_access {
 actor_access!(HeroActorItem, HeroActorReadOnlyItem, Hero);
 actor_access!(EnemyActorItem, EnemyActorReadOnlyItem, Enemy);
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(super) struct SavedActor<T> {
-    pub actor: T,
-    pub health: Health,
-}
-impl<T> std::ops::Deref for SavedActor<T> {
-    type Target = T;
-    fn deref(&self) -> &T {
-        &self.actor
-    }
-}
-impl<T> std::ops::DerefMut for SavedActor<T> {
-    fn deref_mut(&mut self) -> &mut T {
-        &mut self.actor
-    }
-}
-
-impl CooldownOwner for Hero {
-    fn tick_cooldowns(&mut self, dt: f32) {
-        for timer in [
-            &mut self.view.attack_cooldown,
-            &mut self.view.dash_cooldown,
-            &mut self.dash_left,
-            &mut self.dodge_left,
-            &mut self.movement_lock,
-            &mut self.shield_left,
-        ] {
-            advance_cooldown(timer, dt);
-        }
-        for slot in &mut self.view.memories {
-            advance_cooldown(&mut slot.cooldown, dt);
-        }
-    }
-}
-impl CooldownOwner for Enemy {
-    fn tick_cooldowns(&mut self, dt: f32) {
-        advance_cooldown(&mut self.recovery, dt);
-        advance_cooldown(&mut self.slow_left, dt);
-    }
-}
-
 #[derive(Component)]
 pub(super) struct DreamOwned;
 #[derive(Component, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(super) struct Hero {
     pub view: HeroBody,
-    pub dash_left: f32,
-    pub dodge_left: f32,
-    pub dash_direction: [f32; 2],
-    pub movement_lock: f32,
-    pub shield_left: f32,
     pub ready: bool,
     pub rewards: Vec<Reward>,
-    pub pending_levels: u32,
-    pub attack_sequence: u32,
 }
 impl Default for Hero {
     fn default() -> Self {
         Self {
             view: HeroBody {
                 id: 1,
-                position: [0.0, 2.0],
-                facing: [0.0, -1.0],
-                velocity: [0.0; 2],
-                shield: 0.0,
-                level: 1,
-                xp: 0.0,
-                xp_next: 50.0,
                 shards: 0,
-                memories: [
-                    MemoryKind::Crescent,
-                    MemoryKind::Starfall,
-                    MemoryKind::Nova,
-                    MemoryKind::Aegis,
-                ]
-                .map(MemorySlot::new),
-                attack_cooldown: 0.0,
-                dash_cooldown: 0.0,
-                invulnerable: false,
-                dashing: false,
                 combo: 0,
                 hit_flash: 0.0,
                 attack_flash: 0.0,
@@ -131,62 +101,157 @@ impl Default for Hero {
                 recovery: 1.0,
                 defense: 0.0,
             },
-            dash_left: 0.0,
-            dodge_left: 0.0,
-            dash_direction: [0.0, -1.0],
-            movement_lock: 0.0,
-            shield_left: 0.0,
             ready: false,
-            rewards: Vec::new(),
-            pending_levels: 0,
-            attack_sequence: 0,
+            rewards: vec![],
         }
     }
 }
 #[derive(Component, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(super) struct Enemy {
     pub view: EnemyBody,
-    pub recovery: f32,
-    pub slow_left: f32,
+    /// Pattern indexing is a game choice, distinct from engine action identity.
     pub attack_index: u32,
 }
-#[derive(Component, Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(super) struct Projectile {
-    pub view: ProjectileView,
-    pub previous_position: [f32; 2],
-    pub speed: f32,
-    pub damage: f32,
-    pub lifetime: f32,
-    pub pierce: u8,
-    pub hit_ids: Vec<u64>,
+/// Snapshots save the engine components themselves, never a mutable view copy.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(super) struct SavedHero {
+    pub actor: Hero,
+    pub health: Health,
+    pub combat: engine_core::CombatState,
+    pub motor: engine_core::MotorState,
+    pub action: engine_core::ActionState,
+    pub loadout: MemoryLoadout,
+    pub progression: engine_core::Progression,
 }
-impl engine_core::MovementOwner for Projectile {
-    fn integrate_motion(&mut self, dt: f32) {
-        self.previous_position = self.view.position;
-        self.view.position = engine_core::spatial::integrate(
-            self.view.position,
-            engine_core::spatial::scale(self.view.direction, self.speed),
-            dt,
-        );
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(super) struct SavedEnemy {
+    pub actor: Enemy,
+    pub health: Health,
+    pub combat: engine_core::CombatState,
+    pub motor: engine_core::MotorState,
+    pub action: engine_core::ActionState,
+}
+macro_rules! saved_access {
+    ($saved:ty, $actor:ty) => {
+        impl std::ops::Deref for $saved {
+            type Target = $actor;
+            fn deref(&self) -> &Self::Target {
+                &self.actor
+            }
+        }
+        impl std::ops::DerefMut for $saved {
+            fn deref_mut(&mut self) -> &mut Self::Target {
+                &mut self.actor
+            }
+        }
+    };
+}
+saved_access!(SavedHero, Hero);
+saved_access!(SavedEnemy, Enemy);
+impl SavedHero {
+    pub fn new(id: u64) -> Self {
+        let mut actor = Hero::default();
+        actor.view.id = id;
+        Self {
+            actor,
+            health: Health::new(220.0),
+            combat: Default::default(),
+            motor: engine_core::MotorState {
+                position: [0.0, 2.0],
+                facing: [0.0, -1.0],
+                dash_direction: [0.0, -1.0],
+                ..Default::default()
+            },
+            action: Default::default(),
+            loadout: initial_loadout(),
+            progression: engine_core::Progression {
+                level: 1,
+                xp: 0.0,
+                xp_next: 50.0,
+                pending_levels: 0,
+            },
+        }
+    }
+    pub fn spawn(self, world: &mut World) {
+        world.spawn((
+            DreamOwned,
+            self.actor,
+            self.health,
+            self.combat,
+            self.motor,
+            self.action,
+            self.loadout,
+            self.progression,
+        ));
+    }
+    pub fn snapshot(&self) -> HeroView {
+        HeroView {
+            id: self.view.id,
+            position: self.motor.position,
+            facing: self.motor.facing,
+            velocity: self.motor.velocity,
+            hp: self.health.hp,
+            max_hp: self.health.max_hp,
+            shield: self.combat.shield,
+            level: self.progression.level,
+            xp: self.progression.xp,
+            xp_next: self.progression.xp_next,
+            shards: self.view.shards,
+            memories: std::array::from_fn(|i| memory_view(&self.loadout.0[i])),
+            attack_cooldown: self.action.recovery,
+            dash_cooldown: self.motor.dash_cooldown,
+            invulnerable: self.combat.is_invulnerable() || self.motor.dash_remaining > 0.0,
+            dashing: self.motor.dash_remaining > 0.0 && self.health.hp > 0.0,
+            combo: self.view.combo,
+            hit_flash: self.view.hit_flash,
+            attack_flash: self.view.attack_flash,
+            attack_power: self.view.attack_power,
+            ability_power: self.view.ability_power,
+            movement_speed: self.view.movement_speed,
+            critical_chance: self.view.critical_chance,
+            recovery: self.view.recovery,
+            defense: self.view.defense,
+        }
     }
 }
-#[derive(Component, Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(super) struct Wisp {
-    pub view: WispView,
-    pub damage: f32,
-    pub fire_left: f32,
-    pub orbit: f32,
+impl SavedEnemy {
+    pub fn spawn(self, world: &mut World) {
+        world.spawn((
+            DreamOwned,
+            self.actor,
+            self.health,
+            self.combat,
+            self.motor,
+            self.action,
+        ));
+    }
+    pub fn snapshot(&self) -> EnemyView {
+        EnemyView {
+            id: self.view.id,
+            position: self.motor.position,
+            facing: self.motor.facing,
+            hp: self.health.hp,
+            max_hp: self.health.max_hp,
+            kind: self.view.kind,
+            windup: self.action.windup,
+            target: self.action.target,
+            warn_radius: self.view.warn_radius,
+            phase: self.view.phase,
+            slowed: self.combat.status(FROST_STATUS).is_some(),
+            hit_flash: self.view.hit_flash,
+        }
+    }
 }
 pub(super) type Effect = engine_core::PresentationInstance;
 #[derive(Component, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(super) struct Number(pub DamageNumber);
-#[derive(Component, Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(super) struct DelayedCast {
+pub(super) type DelayedCast = engine_core::DelayedAction<CastPayload>;
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(super) struct CastPayload {
     pub action_sequence: u32,
     pub presentation_slot: u16,
     pub owner: u64,
     pub id: u64,
-    pub remaining: f32,
     pub kind: MemoryKind,
     pub essence: Option<EssenceKind>,
     pub power: f32,
@@ -228,38 +293,22 @@ impl Run {
         ((self.random() * count as f32) as usize).min(count.saturating_sub(1))
     }
 }
-#[derive(Resource, Default)]
-pub(super) struct Input(pub Vec<(u64, DreamInput)>);
-
-/// Complete authoritative continuation, including random generator and delayed casts.
+pub(super) type Input = DreamInputs;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(super) struct SavedState {
     pub run: Run,
-    pub heroes: Vec<SavedActor<Hero>>,
-    pub enemies: Vec<SavedActor<Enemy>>,
-    pub projectiles: Vec<Projectile>,
-    pub wisps: Vec<Wisp>,
+    pub heroes: Vec<SavedHero>,
+    pub enemies: Vec<SavedEnemy>,
+    pub projectiles: Vec<SavedProjectile>,
+    pub wisps: Vec<SavedWisp>,
     pub effects: Vec<Effect>,
     pub numbers: Vec<Number>,
     pub delayed: Vec<DelayedCast>,
 }
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(super) struct HeroBody {
     pub id: u64,
-    pub position: [f32; 2],
-    pub facing: [f32; 2],
-    pub velocity: [f32; 2],
-    pub shield: f32,
-    pub level: u32,
-    pub xp: f32,
-    pub xp_next: f32,
     pub shards: u32,
-    pub memories: [MemorySlot; 4],
-    pub attack_cooldown: f32,
-    pub dash_cooldown: f32,
-    pub invulnerable: bool,
-    pub dashing: bool,
     pub combo: u32,
     pub hit_flash: f32,
     pub attack_flash: f32,
@@ -270,68 +319,11 @@ pub(super) struct HeroBody {
     pub recovery: f32,
     pub defense: f32,
 }
-impl HeroBody {
-    pub fn snapshot(&self, health: &Health) -> HeroView {
-        HeroView {
-            hp: health.hp,
-            max_hp: health.max_hp,
-            id: self.id,
-            position: self.position,
-            facing: self.facing,
-            velocity: self.velocity,
-            shield: self.shield,
-            level: self.level,
-            xp: self.xp,
-            xp_next: self.xp_next,
-            shards: self.shards,
-            memories: self.memories,
-            attack_cooldown: self.attack_cooldown,
-            dash_cooldown: self.dash_cooldown,
-            invulnerable: self.invulnerable,
-            dashing: self.dashing,
-            combo: self.combo,
-            hit_flash: self.hit_flash,
-            attack_flash: self.attack_flash,
-            attack_power: self.attack_power,
-            ability_power: self.ability_power,
-            movement_speed: self.movement_speed,
-            critical_chance: self.critical_chance,
-            recovery: self.recovery,
-            defense: self.defense,
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(super) struct EnemyBody {
     pub id: u64,
-    pub position: [f32; 2],
-    pub facing: [f32; 2],
     pub kind: EnemyKind,
-    /// Seconds remaining before the committed attack. Zero means no warning.
-    pub windup: f32,
-    /// The committed target stays still while the player evades the warning.
-    pub target: [f32; 2],
     pub warn_radius: f32,
     pub phase: u8,
-    pub slowed: bool,
     pub hit_flash: f32,
-}
-impl EnemyBody {
-    pub fn snapshot(&self, health: &Health) -> EnemyView {
-        EnemyView {
-            hp: health.hp,
-            max_hp: health.max_hp,
-            id: self.id,
-            position: self.position,
-            facing: self.facing,
-            kind: self.kind,
-            windup: self.windup,
-            target: self.target,
-            warn_radius: self.warn_radius,
-            phase: self.phase,
-            slowed: self.slowed,
-            hit_flash: self.hit_flash,
-        }
-    }
 }

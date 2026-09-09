@@ -64,7 +64,10 @@ impl Plugin for DreamNetworkPlugin {
                 diagnostics::sample.before(engine_client::network_tools::graphs::update_graphs),
             )
             .add_systems(Startup, auto_connect)
-            .add_systems(PreUpdate, poll_network.before(super::keyboard_actions))
+            .add_systems(
+                PreUpdate,
+                poll_network.in_set(super::DreamInputSystems::Receive),
+            )
             .add_systems(FixedUpdate, predict_and_send)
             .add_systems(PostUpdate, flush_network)
             .add_systems(Last, close_connection.after(bevy::window::ExitSystems));

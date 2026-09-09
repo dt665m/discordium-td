@@ -6,8 +6,9 @@ has been retired; its source and the pre-consolidation prototype are recoverable
 from Git checkpoint `e834361`.
 
 The engine owns reusable mechanics, transport, diagnostics, and presentation
-interfaces. Dreamwake owns its characters, abilities, encounters, progression,
-menus, audio, and game protocol. Engine crates never depend on a game crate.
+interfaces. Dreamwake owns its characters, named abilities and balance,
+encounters, progression rules, menus, audio, and game protocol. Engine crates
+never depend on a game crate.
 
 ## Run
 
@@ -37,9 +38,9 @@ for controls and the [deployment guide](docs/deployment.md) for packaging.
 
 | Location | Responsibility |
 | --- | --- |
-| `engine/core` | Renderer-independent ECS components and simulation plugins |
-| `engine/net` | Bounded codec, generic network envelopes, sequence and clock utilities |
-| `engine/server` | Shared HTTP bootstrap and mixed UDP/WebRTC server infrastructure |
+| `engine/core` | ECS action, motor, combat, loadout, projectile, summon and presentation plugins; progression helpers |
+| `engine/net` | Bounded codec, generic envelopes, per-peer sequenced inboxes and clock utilities |
+| `engine/server` | Generic Bevy server runtime, HTTP bootstrap and mixed UDP/WebRTC transport |
 | `engine/client` | Camera, presentation contract/renderers, prediction utilities and diagnostics |
 | `engine/net-debug` | Vendored packet-conditioner UI, with original licenses |
 | `games/dreamwake/simulation` | Game-specific simulation, abilities, enemies, encounters and rewards |
@@ -51,6 +52,17 @@ See [architecture and prototyping](docs/architecture.md) before adding mechanics
 or another game. A new game should compose engine plugins and supply its own
 rules and presentation adapter.
 
+`dreamwake_sim::DreamwakePlugin` composes the shared gameplay used by server
+authority and client prediction. `DreamwakeServerPlugin` installs game authority
+on `engine_server::runtime::ServerPlugin`; dedicated and native-hosted servers
+run that same composition. Complete snapshots save the engine components and
+game payloads needed for replay. The saved-state layout uses protocol version 3;
+rebuild clients and servers together.
+
+The standalone [gameplay example](engine/core/examples/gameplay.rs) and
+[headless tests](engine/core/tests/gameplay.rs) show engine mechanics composed
+without a game dependency.
+
 ## Validate
 
 ```sh
@@ -59,6 +71,7 @@ just check       # Dependency/naming boundaries and native workspace targets
 just test        # Engine mechanics, game replay and real UDP multiplayer tests
 just check-web   # Browser client target
 cargo run -p engine_core --example sandbox  # Independent headless prototype
+cargo run -p engine_core --example gameplay # Reusable gameplay plugin composition
 ```
 
 `scripts/check-architecture.mjs` rejects engine-to-game dependencies (including

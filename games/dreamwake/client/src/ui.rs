@@ -46,10 +46,13 @@ impl Plugin for DreamUiPlugin {
         app.init_resource::<UiActions>()
             .add_systems(Startup, spawn_hud)
             .add_systems(
+                PreUpdate,
+                route_buttons.in_set(super::DreamInputSystems::Buttons),
+            )
+            .add_systems(
                 Update,
                 (
                     scale_interface,
-                    route_buttons,
                     sync_overlay,
                     sync_hud,
                     sync_memory_emblems,
@@ -1176,7 +1179,7 @@ fn reward_panel(
         commands,
         area,
         if rest {
-            "40% health restored. Refine a Memory with shards, then choose one free blessing."
+            "50% health restored. Refine a Memory with shards, then choose one free blessing."
                 .into()
         } else {
             format!(
@@ -1649,6 +1652,54 @@ fn end_panel(
 mod tests {
     use super::*;
     use dreamwake_sim::DreamSimulation;
+
+    #[test]
+    fn current_frame_ui_focus_routes_click_and_blocks_attack_before_prediction() {
+        use super::super::{
+            CapturedInput, DreamInputSystems, Playtest, apply_ui_actions, capture_input,
+            configure_input_schedule,
+        };
+        let mut snapshot = DreamSimulation::new(42, false).snapshot();
+        snapshot.phase = RunPhase::Combat;
+        let mut app = App::new();
+        configure_input_schedule(&mut app);
+        app.insert_resource(DreamView(snapshot))
+            .init_resource::<DreamPreferences>()
+            .init_resource::<UiActions>()
+            .init_resource::<CapturedInput>()
+            .init_resource::<Playtest>()
+            .init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<ButtonInput<MouseButton>>()
+            .add_systems(
+                PreUpdate,
+                (
+                    // Stand in for Bevy's focus calculation at its actual set boundary.
+                    (|mut buttons: Query<&mut Interaction>| {
+                        for mut interaction in &mut buttons {
+                            *interaction = Interaction::Pressed;
+                        }
+                    })
+                    .in_set(bevy::ui::UiSystems::Focus),
+                    route_buttons.in_set(DreamInputSystems::Buttons),
+                    apply_ui_actions.in_set(DreamInputSystems::Apply),
+                    capture_input.in_set(DreamInputSystems::Capture),
+                ),
+            );
+        app.world_mut()
+            .resource_mut::<ButtonInput<MouseButton>>()
+            .press(MouseButton::Left);
+        app.world_mut().spawn((
+            Node::default(),
+            Interaction::None,
+            ActionButton(UiAction::ToggleMute),
+            BackgroundColor::default(),
+            BorderColor::default(),
+        ));
+        app.world_mut().run_schedule(PreUpdate);
+        assert!(app.world().resource::<DreamPreferences>().muted);
+        assert!(app.world().resource::<UiActions>().0.is_empty());
+        assert!(!app.world().resource::<CapturedInput>().0.attack);
+    }
 
     fn ui_app() -> App {
         let mut app = App::new();

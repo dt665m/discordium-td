@@ -50,9 +50,10 @@ codegen-units = 256
 [profile.web-dev.package."*"]
 opt-level = 3
 
+# R2 hosts the WASM: prioritize runtime optimization over the Pages file-size limit.
 [profile.web-release]
 inherits = "release"
-opt-level = "s"
+opt-level = 3
 lto = true
 codegen-units = 1
 strip = true

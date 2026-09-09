@@ -106,12 +106,15 @@ using a mutable `latest` manifest that can mix incompatible assets.
 
 ## Optimization policy
 
-The initial R2 deployment uses the original WASM without the emergency
-post-build shrinking passes. Benchmark the current size-oriented build against a performance-
-oriented release profile using comparable gameplay and browser conditions.
-Choose settings from download time, startup/compile time, frame time, and memory
-measurements. The recent optimization passes were not proven to hurt runtime
-performance; the objective is to remove the hosting limit from that tradeoff.
+Browser releases favor runtime performance: Cargo's `web-release` profile uses
+`opt-level = 3`, full LTO, and one codegen unit; Trunk runs Binaryen with `-O3`.
+Do not add size-shrinking passes to fit the Pages limit; WASM is delivered by R2.
+Keep compression and immutable caching for download efficiency. These settings
+express the optimization goal, not a measured speedup: compare startup/compile
+time, frame time, and memory under comparable gameplay before claiming gains.
+
+References: [Cargo profiles](https://doc.rust-lang.org/cargo/reference/profiles.html)
+and [Trunk Rust assets](https://trunk-rs.github.io/trunk/guide/assets/index.html).
 
 Keep size reporting and regression budgets as diagnostics, but do not reject
 R2 assets at the Pages 25 MiB threshold. Verify applicable R2 and CDN object/cache

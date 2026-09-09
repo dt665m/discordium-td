@@ -2,17 +2,19 @@
 use std::{
     collections::HashSet,
     f32::consts::{FRAC_PI_2, PI, TAU},
+    time::Duration,
 };
 
 use bevy::{
     asset::RenderAssetUsages,
+    math::StableInterpolate,
     mesh::{Indices, PrimitiveTopology},
     prelude::*,
     transform::helper::TransformHelper,
 };
 
 use super::DreamView;
-use dreamwake_sim::{EnemyKind, EssenceKind, RunPhase};
+use dreamwake_sim::{DreamSnapshot, EnemyKind, EssenceKind, RunPhase, TICK_HZ};
 use engine_core::PresentationId;
 
 /// Roots owned by the game renderer; hiding them also hides their mesh children.
@@ -22,8 +24,12 @@ pub(super) struct SceneGraphic;
 pub struct DreamScenePlugin;
 impl Plugin for DreamScenePlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, setup_scene)
-            .add_systems(Update, (sync_scene, animate_scene).chain());
+        app.add_systems(Startup, setup_scene).add_systems(
+            Update,
+            (sync_scene, animate_scene)
+                .chain()
+                .in_set(engine_client::presentation::PresentationSet::Render),
+        );
         add_label_placement_systems(app);
     }
 }
@@ -661,19 +667,101 @@ fn crystal_garden(commands: &mut Commands, art: &SceneArt, base: Vec3, seed: u32
     }
 }
 
+const ACTOR_SAMPLE_GRACE_SECS: f32 = 0.15;
+
 #[derive(Component)]
 struct ActorVisual {
     id: u64,
     kind: Option<EnemyKind>,
     local: bool,
     motion: f32,
+    gait_phase: f32,
+    target_motion: f32,
+    last_position: Vec3,
+    last_tick: u32,
+    sample_age: Timer,
+    seed: u64,
+    room: usize,
     windup: f32,
     hit: f32,
-    dashing: bool,
+    dash: f32,
     attack: f32,
     shield: bool,
     slowed: bool,
     hp: f32,
+}
+
+impl ActorVisual {
+    /// Sample simulation motion, never the renderer's remaining correction distance.
+    fn sample_target(
+        &mut self,
+        position: Vec3,
+        seed: u64,
+        room: usize,
+        tick: u32,
+        dt: Duration,
+    ) -> bool {
+        let reset = self.seed != seed
+            || self.room != room
+            || (tick == 0 && self.last_tick > 0)
+            || self.last_position.distance_squared(position) > 16.0;
+        if reset || tick != self.last_tick {
+            self.sample_age.reset();
+        } else {
+            self.sample_age.tick(dt);
+        }
+        if reset {
+            self.motion = 0.0;
+            self.target_motion = 0.0;
+            self.gait_phase = 0.0;
+            self.attack = 0.0;
+            self.hit = 0.0;
+            self.windup = 0.0;
+            self.dash = 0.0;
+        } else if tick < self.last_tick {
+            // Reconciliation can move back a few ticks without changing rooms.
+            // Rebase the velocity sample, but retain the continuous visual pose.
+            self.target_motion = 0.0;
+        } else if tick > self.last_tick {
+            self.target_motion = self.last_position.distance(position) * TICK_HZ as f32
+                / (tick - self.last_tick) as f32;
+        }
+        if self.sample_age.is_finished() {
+            self.target_motion = 0.0;
+        }
+        self.last_position = position;
+        self.last_tick = tick;
+        self.seed = seed;
+        self.room = room;
+        reset
+    }
+
+    fn advance_pose(
+        &mut self,
+        motion: f32,
+        attack: f32,
+        windup: f32,
+        hit: f32,
+        dash: f32,
+        dt: f32,
+    ) {
+        self.motion.smooth_nudge(&motion.clamp(0.0, 14.0), 18.0, dt);
+        // The phase belongs to this actor and stops with it instead of jumping to a
+        // global clock's unrelated footfall when movement resumes.
+        if self.motion < 0.001 && motion == 0.0 {
+            self.motion = 0.0;
+        }
+        self.gait_phase = (self.gait_phase + self.motion * (11.0 / 7.0) * dt) % TAU;
+        for (pose, target) in [
+            (&mut self.attack, attack),
+            (&mut self.windup, windup),
+            (&mut self.hit, hit),
+            (&mut self.dash, dash),
+        ] {
+            let response = if target > *pose { 50.0 } else { 18.0 };
+            pose.smooth_nudge(&target, response, dt);
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -753,6 +841,7 @@ fn spawn_actor(
     kind: Option<EnemyKind>,
     position: Vec3,
     local: bool,
+    snapshot: &DreamSnapshot,
 ) {
     let parent = commands
         .spawn((
@@ -764,9 +853,16 @@ fn spawn_actor(
                 kind,
                 local,
                 motion: 0.0,
+                gait_phase: 0.0,
+                target_motion: 0.0,
+                last_position: position,
+                last_tick: snapshot.tick,
+                sample_age: Timer::from_seconds(ACTOR_SAMPLE_GRACE_SECS, TimerMode::Once),
+                seed: snapshot.seed,
+                room: snapshot.room,
                 windup: 0.0,
                 hit: 0.0,
-                dashing: false,
+                dash: 0.0,
                 attack: 0.0,
                 shield: false,
                 slowed: false,
@@ -914,9 +1010,11 @@ fn spawn_actor(
                     Quat::IDENTITY,
                 );
             }
-            fixed_part(
+            part(
                 commands,
                 parent,
+                art,
+                PartKind::Blade,
                 &art.cube,
                 &art.gold,
                 Vec3::new(0.49, 1.0, -0.25),
@@ -996,7 +1094,11 @@ fn spawn_actor(
                     commands,
                     parent,
                     art,
-                    PartKind::LeftArm,
+                    if side < 0.0 {
+                        PartKind::LeftArm
+                    } else {
+                        PartKind::RightArm
+                    },
                     &art.crystal,
                     &art.violet,
                     Vec3::new(side * 0.64, 1.0, 0.0),
@@ -1487,45 +1589,83 @@ fn sync_scene(
     let dt = time.delta_secs().min(0.1);
     for (entity, mut actor, mut transform) in &mut actors {
         existing.insert(actor.id);
-        let (position, direction) = if actor.kind.is_none() {
+        let (position, direction, speed, attack, windup, hit, dash) = if actor.kind.is_none() {
             let Some(h) = snapshot.heroes.iter().find(|hero| hero.id == actor.id) else {
                 commands.entity(entity).despawn();
                 continue;
             };
-            actor.motion = Vec2::from_array(h.velocity).length();
-            actor.hit = h.hit_flash;
-            actor.attack = h.attack_flash;
-            actor.dashing = h.dashing;
             actor.shield = h.hp > 0.0 && (h.shield > 0.0 || h.invulnerable);
             actor.hp = h.hp / h.max_hp.max(1.0);
-            (h.position, h.facing)
+            (
+                h.position,
+                h.facing,
+                Some(Vec2::from_array(h.velocity).length()),
+                h.attack_flash,
+                0.0,
+                h.hit_flash,
+                f32::from(h.dashing),
+            )
         } else if let Some(e) = snapshot.enemies.iter().find(|e| e.id == actor.id) {
-            actor.motion = world(e.position, 0.0).distance(transform.translation) / dt.max(0.001);
-            actor.windup = e.windup;
-            actor.hit = e.hit_flash;
             actor.hp = e.hp / e.max_hp;
             actor.slowed = e.slowed;
-            (e.position, e.facing)
+            (
+                e.position,
+                e.facing,
+                None,
+                0.0,
+                e.windup.min(0.6),
+                e.hit_flash,
+                0.0,
+            )
         } else {
             commands.entity(entity).despawn();
             continue;
         };
         let downed = actor.kind.is_none() && actor.hp <= 0.0;
         let target = world(position, 0.0);
-        // Remote actors blend snapshot corrections; teleports and local authority remain exact.
-        transform.translation =
-            if actor.local || transform.translation.distance_squared(target) > 36.0 {
-                target
-            } else {
-                transform.translation.lerp(target, 1.0 - (-dt * 24.0).exp())
-            };
+        let reset = actor.sample_target(
+            target,
+            snapshot.seed,
+            snapshot.room,
+            snapshot.tick,
+            time.delta(),
+        );
+        // Both sampled enemy speed and a hero's retained velocity become stale
+        // when prediction stops. Allow normal gaps between fixed ticks first.
+        let idle = snapshot.paused
+            || snapshot.phase != RunPhase::Combat
+            || downed
+            || actor.sample_age.is_finished();
+        let motion = if idle {
+            0.0
+        } else {
+            speed.unwrap_or(actor.target_motion)
+        };
+        actor.advance_pose(
+            motion,
+            if idle { 0.0 } else { attack },
+            if idle { 0.0 } else { windup },
+            if idle { 0.0 } else { hit },
+            if idle { 0.0 } else { dash },
+            dt,
+        );
+        let yaw = facing(direction);
+        if reset || transform.translation.distance_squared(target) > 16.0 {
+            transform.translation = target;
+            transform.rotation = yaw;
+        } else {
+            // These are renderer-owned transforms. Local prediction remains exact
+            // in DreamView while its fixed ticks blend at display frequency.
+            transform
+                .translation
+                .smooth_nudge(&target, if actor.local { 65.0 } else { 24.0 }, dt);
+            transform.rotation.smooth_nudge(&yaw, 22.0, dt);
+        }
         transform.scale = if downed {
             Vec3::new(0.90, 0.27, 0.90)
         } else {
             Vec3::ONE
         };
-        let yaw = facing(direction);
-        transform.rotation = transform.rotation.slerp(yaw, 1.0 - (-dt * 22.0).exp());
     }
     for hero in &snapshot.heroes {
         if !existing.contains(&hero.id) {
@@ -1536,6 +1676,7 @@ fn sync_scene(
                 None,
                 world(hero.position, 0.0),
                 hero.id == snapshot.hero.id,
+                snapshot,
             );
         }
     }
@@ -1548,6 +1689,7 @@ fn sync_scene(
                 Some(e.kind),
                 world(e.position, 0.0),
                 false,
+                snapshot,
             );
         }
     }
@@ -1704,14 +1846,15 @@ fn animate_scene(
             continue;
         };
         let mut next = part.base;
-        let phase = t * 11.0 + (actor.id % 997) as f32 * 2.3;
+        let phase = actor.gait_phase;
         let stride = (actor.motion / 7.0).clamp(0.0, 1.0);
         let hover = matches!(actor.kind, Some(EnemyKind::Ranged | EnemyKind::Support));
         let bob = if hover {
             0.10 * (t * 2.4 + (actor.id % 997) as f32).sin()
         } else {
-            phase.sin().abs() * 0.04 * stride
+            (1.0 - (phase * 2.0).cos()) * 0.018 * stride
         };
+        let breath = (t * 2.1 + (actor.id % 997) as f32).sin() * 0.012 * (1.0 - stride);
         match part.kind {
             PartKind::LeftArm | PartKind::RightArm | PartKind::LeftLeg | PartKind::RightLeg => {
                 let side = if matches!(part.kind, PartKind::LeftArm | PartKind::RightLeg) {
@@ -1719,19 +1862,28 @@ fn animate_scene(
                 } else {
                     -1.0
                 };
-                let swing = phase.sin() * stride * 0.5 * side;
-                next.rotation *=
-                    Quat::from_rotation_x(swing - actor.attack * 4.0 - actor.windup.min(0.6));
+                let arm = matches!(part.kind, PartKind::LeftArm | PartKind::RightArm);
+                let swing = phase.sin() * stride * if arm { 0.32 } else { 0.40 } * side;
+                let commit = if arm {
+                    actor.attack * 2.4 + actor.windup * 0.7
+                } else {
+                    0.0
+                };
+                next.rotation *= Quat::from_rotation_x(swing - commit);
                 next.translation.y += bob;
             }
             PartKind::Cape => {
                 next.rotation *= Quat::from_rotation_x(
-                    -stride * 0.25 - 0.10 * (t * 5.0).sin() - if actor.dashing { 0.6 } else { 0.0 },
+                    -stride * 0.20 - 0.06 * (t * 5.0).sin() - actor.dash * 0.6,
                 );
+                next.translation.y += bob + breath;
             }
             PartKind::Blade => {
-                next.rotation *= Quat::from_rotation_y(-actor.attack * 13.0);
-                next.translation.x += actor.attack * 2.5;
+                // Hilt and blade receive one rigid pose around the same grip.
+                let pivot = Vec3::new(0.49, 1.0, -0.25);
+                let swing = Quat::from_rotation_y(-actor.attack * 9.0);
+                next.translation = pivot + swing * (next.translation - pivot) + Vec3::Y * bob;
+                next.rotation = swing * next.rotation;
             }
             PartKind::Halo => {
                 next.rotation *= Quat::from_rotation_z(t * 0.5);
@@ -1762,7 +1914,7 @@ fn animate_scene(
                 };
             }
             PartKind::Body | PartKind::Eye => {
-                next.translation.y += bob;
+                next.translation.y += bob + breath;
             }
         }
         if actor.hit > 0.0 && !matches!(part.kind, PartKind::Health | PartKind::Shield) {
@@ -1892,6 +2044,231 @@ fn place_traveler_labels(
 mod tests {
     use super::*;
     use dreamwake_sim::DreamSimulation;
+
+    fn actor_pose() -> ActorVisual {
+        ActorVisual {
+            id: 1,
+            kind: Some(EnemyKind::Ranged),
+            local: false,
+            motion: 0.0,
+            gait_phase: 0.0,
+            target_motion: 0.0,
+            last_position: Vec3::ZERO,
+            last_tick: 0,
+            sample_age: Timer::from_seconds(ACTOR_SAMPLE_GRACE_SECS, TimerMode::Once),
+            seed: 7,
+            room: 0,
+            windup: 0.0,
+            hit: 0.0,
+            dash: 0.0,
+            attack: 0.0,
+            shield: false,
+            slowed: false,
+            hp: 1.0,
+        }
+    }
+
+    #[test]
+    fn stalled_snapshot_gait_settles_and_recovers_without_between_tick_flicker() {
+        let mut snapshot = DreamSimulation::new(7, false).snapshot();
+        snapshot.phase = RunPhase::Combat;
+        snapshot.hero.velocity = [7.0, 0.0];
+        snapshot.heroes[0] = snapshot.hero.clone();
+        let mut app = actor_scene_app(snapshot);
+        app.update();
+        // Simulate 30 Hz view updates on a 120 Hz display. Intermediate frames
+        // must keep walking even though their snapshot tick is unchanged.
+        for frame in 0..120 {
+            if frame % 4 == 0 {
+                let mut view = app.world_mut().resource_mut::<DreamView>();
+                view.0.tick += 2;
+            }
+            app.update();
+            let world = app.world_mut();
+            let actor = world.query::<&ActorVisual>().single(world).unwrap();
+            assert!(!actor.sample_age.is_finished());
+            if frame > 30 {
+                assert!(actor.motion > 6.8);
+            }
+        }
+        // Frozen hero velocity remains nonzero, just like an interrupted
+        // prediction stream. Rendering must still settle to idle.
+        for _ in 0..120 {
+            app.update();
+        }
+        {
+            let world = app.world_mut();
+            let actor = world.query::<&ActorVisual>().single(world).unwrap();
+            assert!(actor.sample_age.is_finished());
+            assert_eq!(actor.motion, 0.0);
+            assert_eq!(actor.target_motion, 0.0);
+        }
+        app.world_mut().resource_mut::<DreamView>().0.tick += 1;
+        app.update();
+        let world = app.world_mut();
+        let actor = world.query::<&ActorVisual>().single(world).unwrap();
+        assert!(!actor.sample_age.is_finished());
+        assert!(actor.motion > 0.0);
+
+        // Enemy samples use the same grace period and recover their measured
+        // speed from the next tick rather than preserving stale render motion.
+        let mut enemy = actor_pose();
+        enemy.sample_target(Vec3::X, 7, 0, TICK_HZ, Duration::ZERO);
+        assert_eq!(enemy.target_motion, 1.0);
+        enemy.sample_target(Vec3::X, 7, 0, TICK_HZ, Duration::from_secs(1));
+        assert_eq!(enemy.target_motion, 0.0);
+        enemy.sample_target(Vec3::X * 2.0, 7, 0, TICK_HZ * 2, Duration::ZERO);
+        assert!(!enemy.sample_age.is_finished());
+        assert_eq!(enemy.target_motion, 1.0);
+    }
+
+    fn actor_scene_app(snapshot: DreamSnapshot) -> App {
+        let mut app = App::new();
+        app.add_plugins((
+            MinimalPlugins,
+            bevy::asset::AssetPlugin::default(),
+            bevy::scene::ScenePlugin,
+        ))
+        .insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
+            Duration::from_secs_f32(1.0 / 120.0),
+        ))
+        .init_resource::<Assets<Mesh>>()
+        .init_resource::<Assets<StandardMaterial>>()
+        .insert_resource(UiScale(1.0))
+        .insert_resource(DreamView(snapshot))
+        .add_plugins(DreamScenePlugin);
+        app
+    }
+
+    #[test]
+    fn enemy_gait_uses_snapshot_motion_not_render_correction() {
+        let mut actor = actor_pose();
+        actor.sample_target(Vec3::X, 7, 0, TICK_HZ, Duration::ZERO);
+        assert_eq!(actor.target_motion, 1.0);
+        // Display frames between simulation ticks retain the sampled speed.
+        actor.sample_target(Vec3::X, 7, 0, TICK_HZ, Duration::ZERO);
+        assert_eq!(actor.target_motion, 1.0);
+        // The target stopped. A renderer still catching up must not imply walking.
+        actor.sample_target(Vec3::X, 7, 0, TICK_HZ + 1, Duration::ZERO);
+        assert_eq!(actor.target_motion, 0.0);
+        actor.sample_target(Vec3::X, 7, 0, TICK_HZ + 1, Duration::ZERO);
+        assert_eq!(actor.target_motion, 0.0);
+    }
+
+    #[test]
+    fn idle_pose_settles_and_stops_its_footfall_phase() {
+        let mut actor = actor_pose();
+        actor.motion = 7.0;
+        actor.attack = 0.2;
+        actor.hit = 0.2;
+        actor.windup = 0.6;
+        actor.dash = 1.0;
+        for _ in 0..120 {
+            actor.advance_pose(0.0, 0.0, 0.0, 0.0, 0.0, 1.0 / 60.0);
+        }
+        assert_eq!(actor.motion, 0.0);
+        assert!(actor.attack < 0.001 && actor.hit < 0.001 && actor.dash < 0.001);
+        let phase = actor.gait_phase;
+        actor.advance_pose(0.0, 0.0, 0.0, 0.0, 0.0, 1.0 / 30.0);
+        assert_eq!(actor.gait_phase, phase);
+    }
+
+    #[test]
+    fn pose_blending_is_consistent_at_30_and_120_hz() {
+        let run = |hz: usize| {
+            let mut actor = actor_pose();
+            for _ in 0..hz {
+                actor.advance_pose(7.0, 0.2, 0.5, 0.1, 1.0, 1.0 / hz as f32);
+            }
+            actor
+        };
+        let slow = run(30);
+        let fast = run(120);
+        for (a, b) in [
+            (slow.motion, fast.motion),
+            (slow.attack, fast.attack),
+            (slow.windup, fast.windup),
+            (slow.hit, fast.hit),
+            (slow.dash, fast.dash),
+        ] {
+            assert!((a - b).abs() < 0.0001);
+        }
+        assert!((slow.gait_phase - fast.gait_phase).abs() < 0.15);
+    }
+
+    #[test]
+    fn actor_pose_resets_on_teleport_run_room_and_tick_restart() {
+        for (position, seed, room, tick) in [
+            (Vec3::X * 5.0, 7, 0, 61),
+            (Vec3::ZERO, 8, 0, 61),
+            (Vec3::ZERO, 7, 1, 61),
+            (Vec3::ZERO, 7, 0, 0),
+        ] {
+            let mut actor = actor_pose();
+            actor.last_tick = 60;
+            actor.motion = 7.0;
+            actor.gait_phase = 2.0;
+            actor.attack = 0.2;
+            actor.dash = 1.0;
+            assert!(actor.sample_target(position, seed, room, tick, Duration::ZERO));
+            assert_eq!(actor.motion, 0.0);
+            assert_eq!(actor.target_motion, 0.0);
+            assert_eq!(actor.gait_phase, 0.0);
+            assert_eq!(actor.attack, 0.0);
+            assert_eq!(actor.dash, 0.0);
+        }
+    }
+
+    #[test]
+    fn small_reconciliation_rebases_motion_without_snapping_the_render_root() {
+        let mut snapshot = DreamSimulation::new(7, false).snapshot();
+        snapshot.phase = RunPhase::Combat;
+        snapshot.tick = 100;
+        snapshot.hero.position = [0.0, 0.0];
+        snapshot.heroes[0] = snapshot.hero.clone();
+        let mut app = App::new();
+        app.add_plugins((
+            MinimalPlugins,
+            bevy::asset::AssetPlugin::default(),
+            bevy::scene::ScenePlugin,
+        ))
+        .insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
+            std::time::Duration::from_secs_f32(1.0 / 120.0),
+        ))
+        .init_resource::<Assets<Mesh>>()
+        .init_resource::<Assets<StandardMaterial>>()
+        .insert_resource(UiScale(1.0))
+        .insert_resource(DreamView(snapshot))
+        .add_plugins(DreamScenePlugin);
+        app.update();
+        {
+            let mut view = app.world_mut().resource_mut::<DreamView>();
+            view.0.tick = 101;
+            view.0.heroes[0].position = [1.0, 0.0];
+        }
+        app.update();
+        let before = {
+            let world = app.world_mut();
+            world
+                .query_filtered::<&Transform, With<ActorVisual>>()
+                .single(world)
+                .unwrap()
+                .translation
+                .x
+        };
+        assert!(before > 0.0 && before < 1.0);
+        {
+            let mut view = app.world_mut().resource_mut::<DreamView>();
+            view.0.tick = 100;
+            view.0.heroes[0].position = [0.9, 0.0];
+        }
+        app.update();
+        let world = app.world_mut();
+        let mut query = world.query::<(&ActorVisual, &Transform)>();
+        let (actor, transform) = query.single(world).unwrap();
+        assert_eq!(actor.target_motion, 0.0);
+        assert!(transform.translation.x > before && transform.translation.x < 0.9);
+    }
 
     #[test]
     fn labels_use_current_camera_hierarchy_and_projection_before_ui_content() {

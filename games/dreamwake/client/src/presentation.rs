@@ -6,7 +6,13 @@ use engine_client::{camera::CameraSettings, presentation::*};
 pub struct DreamPresentationPlugin;
 impl Plugin for DreamPresentationPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Update, adapt.in_set(PresentationSet::Adapt));
+        app.insert_resource(CameraSettings {
+            offset: Vec3::new(18.0, 32.0, 26.0),
+            viewport_height: 40.0,
+            smoothing: 5.0,
+            ..default()
+        })
+        .add_systems(Update, adapt.in_set(PresentationSet::Adapt));
     }
 }
 fn point(p: [f32; 2], y: f32) -> Vec3 {
@@ -18,8 +24,11 @@ fn adapt(
     mut camera: ResMut<CameraSettings>,
 ) {
     let snap = &view.0;
-    camera.target = (point(snap.hero.position, 0.0) * 0.65 + point(snap.hero.facing, 0.0) * 0.75)
-        .clamp(Vec3::new(-8.0, 0.0, -8.0), Vec3::new(8.0, 0.0, 8.0));
+    let target = (point(snap.hero.position, 0.0) * 0.30)
+        .clamp(Vec3::new(-5.0, 0.0, -5.0), Vec3::new(5.0, 0.0, 5.0));
+    if camera.target != target {
+        camera.target = target;
+    }
     frame.visuals.clear();
     let mut actor = |namespace, id, position, primitive, scale, color| {
         frame.visuals.push(Visual {
@@ -120,6 +129,20 @@ fn adapt(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn stationary_aim_does_not_move_the_camera() {
+        let mut snapshot = dreamwake_sim::DreamSimulation::new(7, false).snapshot();
+        snapshot.hero.position = [8.0, -4.0];
+        let mut app = App::new();
+        app.insert_resource(DreamView(snapshot))
+            .add_plugins((PresentationPlugin, DreamPresentationPlugin));
+        app.update();
+        let target = app.world().resource::<CameraSettings>().target;
+        assert_eq!(target, Vec3::new(2.4, 0.0, -1.2));
+        app.world_mut().resource_mut::<DreamView>().0.hero.facing = [-1.0, 0.0];
+        app.update();
+        assert_eq!(app.world().resource::<CameraSettings>().target, target);
+    }
     #[derive(Resource, Default)]
     struct Observed(Vec<VisualId>);
     struct AlternateRenderer;

@@ -10,6 +10,8 @@ use dreamwake_sim::{DreamInput, DreamSimulation, DreamSnapshot, RunPhase};
 use renet::RenetClient;
 use std::{collections::VecDeque, time::Duration};
 
+const PREDICTION_MAX_SNAPSHOT_AGE: f64 = 0.30;
+
 #[cfg(not(target_arch = "wasm32"))]
 type Transport = renet_cross::UdpNetcodeClientTransport;
 #[cfg(target_arch = "wasm32")]
@@ -348,7 +350,7 @@ fn poll_network(world: &mut World) {
         {
             let mut telemetry = world.resource_mut::<diagnostics::Telemetry>();
             if changed_epoch {
-                telemetry.reset_ack();
+                telemetry.reset_samples();
             }
             telemetry.snapshots += 1;
             if !changed_epoch {
@@ -388,11 +390,13 @@ fn poll_network(world: &mut World) {
         });
         let mut prediction = DreamSimulation::from_snapshot(&snapshot);
         let client_id = runtime.client_id;
+        let mut replay_count = 0;
         engine_client::prediction::replay_bounded(
             &mut prediction,
             runtime.pending.iter(),
             18,
             |prediction, frame| {
+                replay_count += 1;
                 let mut input = frame.input;
                 if !newer(frame.seq, ack_input) {
                     input.movement = [0.0; 2];
@@ -406,6 +410,15 @@ fn poll_network(world: &mut World) {
             },
         );
         let displayed = presented_snapshot(prediction.snapshot_for(client_id), &snapshot);
+        let shift = diagnostics::reconcile_shift(
+            &world.resource::<DreamView>().0,
+            &displayed,
+            changed_epoch,
+            client_id,
+        );
+        world
+            .resource_mut::<diagnostics::Telemetry>()
+            .record_reconciliation(replay_count, shift, now);
         runtime.last_snapshot = Some(*snapshot);
         runtime.prediction = Some(prediction);
         let mut conn = world.resource_mut::<DreamConnection>();
@@ -504,7 +517,7 @@ fn predict_and_send(world: &mut World) {
     }
     let client_id = runtime.client_id;
     // Stop speculative simulation during an outage. Inputs still flow for recovery.
-    if now - runtime.last_received <= 0.30 {
+    if now - runtime.last_received <= PREDICTION_MAX_SNAPSHOT_AGE {
         if let Some(prediction) = &mut runtime.prediction {
             prediction.step_multiplayer(&[(client_id, input)]);
             let mut shown = prediction.snapshot_for(client_id);

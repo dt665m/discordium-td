@@ -95,6 +95,16 @@ follow `UiSystems::Focus`, so they read current `Interaction` state. `FixedUpdat
 then predicts; `Update` adapts and renders presentation; `PostUpdate` flushes
 network packets. Same-frame UI actions are no longer held until the next frame.
 
+Camera follow runs in `Update` with explicit ordering:
+`PresentationSet::Adapt` → `CameraSystems::Follow` → `PresentationSet::Render`.
+Dreamwake owns framing, follow targets, and response settings; the engine owns
+the reusable camera rig and uses Bevy `StableInterpolate::smooth_nudge` for focus
+and zoom easing. Keyboard/gamepad movement and gamepad aim map screen axes once
+through the actual camera basis into canonical XZ space. Mouse aim projects
+directly onto the ground plane; autopilot input already uses world coordinates.
+Renderer-only pose smoothing derives visual transforms without changing
+authoritative or predicted gameplay state.
+
 Legacy world labels update after `CameraUpdateSystems` and before
 `UiSystems::Content`. Bevy's UI layout runs before transform propagation, so
 placing labels after propagation was too late for that frame's layout. A single

@@ -29,7 +29,7 @@ wasm-target:
     rustup target add wasm32-unknown-unknown
 
 web-dev http_base="http://127.0.0.1:8080" address="127.0.0.1" port="1420":
-    cd "{{WEB_CLIENT}}" && NO_COLOR=false GAME_WEB_HTTP_BASE="{{http_base}}" trunk serve --cargo-profile web-dev --dist "{{ROOT}}/target/web-dev" --address {{address}} --port {{port}}
+    cd "{{WEB_CLIENT}}" && NO_COLOR=false GAME_WEB_HTTP_BASE="{{http_base}}" trunk serve --cargo-profile web-dev --dist "{{ROOT}}/out/dreamwake-web-dev" --address {{address}} --port {{port}}
 
 dreamwake-web address="127.0.0.1" port="1421":
     just web-dev http://127.0.0.1:8080 {{address}} {{port}}

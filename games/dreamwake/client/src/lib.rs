@@ -2,6 +2,7 @@
 mod audio;
 #[cfg(feature = "debug-tools")]
 mod debug;
+mod diagnostics_overlay;
 mod network;
 mod presentation;
 pub mod scene;
@@ -130,6 +131,7 @@ pub fn build_app() -> App {
         audio::DreamAudioPlugin,
         network::DreamNetworkPlugin,
         typography::DreamTypographyPlugin,
+        diagnostics_overlay::DreamDiagnosticsPlugin,
     ))
     .add_systems(
         PreUpdate,
@@ -441,8 +443,7 @@ fn capture_input(
         axis(KeyCode::KeyS, KeyCode::KeyW),
     );
     let mut aim = Vec2::from_array(view.0.hero.facing);
-    // Camera has no yaw: screen right is +X and screen up is -Z. Cursor is
-    // projected once onto the canonical XZ plane; no downstream axis flips.
+    // Cursor projection already produces canonical world coordinates.
     if let (Ok(window), Ok((camera, transform))) = (windows.single(), cameras.single()) {
         if let Some(cursor) = window.cursor_position() {
             if let Some(point) = engine_client::camera::cursor_on_ground(camera, transform, cursor)
@@ -475,7 +476,11 @@ fn capture_input(
             -pad.get(GamepadAxis::RightStickY).unwrap_or_default(),
         );
         if right.length() > 0.22 {
-            aim = right.normalize();
+            aim = cameras
+                .single()
+                .map_or(right.normalize(), |(_, transform)| {
+                    engine_client::camera::screen_axes_to_world(transform, right.normalize())
+                });
         }
         captured.0.attack |= pad.pressed(GamepadButton::RightTrigger2);
         captured.0.dash |= pad.just_pressed(GamepadButton::LeftTrigger);
@@ -491,7 +496,13 @@ fn capture_input(
             captured.0.casts[i] |= pad.just_pressed(button);
         }
     }
-    captured.0.movement = movement.clamp_length_max(1.0).to_array();
+    let movement = movement.clamp_length_max(1.0);
+    captured.0.movement = cameras
+        .single()
+        .map_or(movement, |(_, transform)| {
+            engine_client::camera::screen_axes_to_world(transform, movement)
+        })
+        .to_array();
     captured.0.aim = aim.to_array();
 }
 

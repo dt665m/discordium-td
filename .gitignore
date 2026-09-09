@@ -3,6 +3,9 @@
 **/node_modules
 .wrangler
 
+# Generated build output
+/out/
+
 # cargo defaults
 debug/
 target/

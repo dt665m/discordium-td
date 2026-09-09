@@ -312,7 +312,7 @@ fn spawn_hud(mut commands: Commands) {
                             label("W A S D   Move", 11.0, MUTED),
                             label("LMB   Slash", 11.0, MUTED),
                             (label("SPACE   Dash ready", 11.0, TEAL) template_value(HudText::Dash)),
-                            label("TAB   Build  /  ESC   Pause", 11.0, MUTED),
+                            label("TAB   Build  /  ESC   Pause  /  F3   Metrics", 11.0, MUTED),
                         ]
                     ),
                 ]

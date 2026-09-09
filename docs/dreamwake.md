@@ -112,7 +112,25 @@ Rebuild from the current workspace before sharing a client/server pair; see the
 | Pause / menu | Escape | Start |
 | Mute / unmute | M, or menu button | Menu button with pointer |
 | Zoom | + / − | — |
+| Performance / network metrics | F3 | — |
 | Restart | F5 while paused or after an ending; host only | Host's menu button with pointer |
+
+F3 opens a passive metrics panel in every build, independently of the F6 network
+tools menu and the `debug-tools` feature. It does not intercept clicks. Metrics
+refresh about four times per second and continue while the game is paused.
+The large frame-time value uses Bevy's smoothed frame duration in milliseconds;
+headline FPS is 1,000 divided by that same duration. Mean and worst frame times
+describe the **last N frames** actually available, up to 120, rather than a fixed
+duration. The game section
+shows the simulation tick, actor/effect counts, local world position, and speed
+in world units per second. Network RTT, snapshot age, acknowledgement age, and
+reconciliation age are in milliseconds. Pending inputs and replay work count
+frames; signed tick lead is the displayed tick minus the latest server tick.
+Prediction is marked stalled when the last snapshot is over 300 ms old.
+Reconcile shift is the local position shift in the client view during
+reconciliation, measured in world units; the renderer smooths that target.
+The compared positions can represent different ticks, so this is not an exact
+measure of prediction error.
 
 A dash has a 1.15-second recovery and a brief invulnerability window. Basic strikes briefly lock movement; aim before committing. Enemy warning circles mark committed attacks, so moving out before the warning ends avoids their area damage.
 
@@ -217,8 +235,9 @@ The inspiration reference is the [official Shape of Dreams press kit](https://ze
 
 ### Network tools (F6)
 
-F6 opens the shared network graphs and original `bevy-net-debug` conditioner
-controls in one scrollable panel. F3 has no network binding. The canonical client loads
+F3 provides compact, read-only performance and network metrics. F6 opens the
+shared network graphs and original `bevy-net-debug` conditioner controls in one
+scrollable panel. The canonical client loads
 `engine_client::network_tools::NetworkToolsPlugin`; game-specific
 telemetry stays in their adapters. Dreamwake attaches the plugin's conditioner
 handle to its actual UDP or WebRTC transport, including reconnects.
@@ -230,5 +249,10 @@ remains while impairment is active. Use Off to restore the connection.
 
 Graphs show transport RTT, input-ack jitter, packet loss and send/receive rates.
 Unavailable samples are gaps. Dreamwake uses full snapshots and prediction/replay,
-so delta-baseline and interpolation rows are marked N/A; correction distance is
-not yet sampled. This integration does not include the retired TD recorder/bridge.
+so delta-baseline and interpolation rows are marked N/A. The Correction row
+shows reconciliation displacement in world units and the sample's age in
+milliseconds. It measures the local position shift in the client view during
+reconciliation; the renderer smooths that target. The compared positions can
+represent different ticks, so this is not same-tick prediction error.
+This integration does not include the retired TD
+recorder/bridge.

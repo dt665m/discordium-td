@@ -9,26 +9,28 @@ pub(crate) fn resolve_deaths(
     let mut dead: Vec<_> = enemies
         .iter()
         .filter(|(_, e)| e.health.hp <= 0.0)
-        .map(|(entity, e)| (e.view.id, entity, e.view.kind, e.motor.position))
+        .map(|(entity, e)| (e.view.id, entity, e.view.kind, e.motor.position, e.ai.role))
         .collect();
     dead.sort_by_key(|v| v.0);
     let mut xp = 0.0;
     let mut shards = 0;
-    let kills = dead.len();
-    for (id, entity, kind, position) in dead {
-        run.kills += 1;
-        xp += match kind {
-            EnemyKind::Boss => 160.0,
-            EnemyKind::Elite => 60.0,
-            EnemyKind::Support => 22.0,
-            _ => 16.0,
-        };
-        shards += if run.lucid { 9 } else { 6 }
-            * if matches!(kind, EnemyKind::Elite | EnemyKind::Boss) {
-                4
-            } else {
-                1
+    let kills = dead.iter().filter(|v| v.4 == EnemyRole::Encounter).count();
+    for (id, entity, kind, position, role) in dead {
+        if role == EnemyRole::Encounter {
+            run.kills += 1;
+            xp += match kind {
+                EnemyKind::Boss => 160.0,
+                EnemyKind::Elite => 60.0,
+                EnemyKind::Support => 22.0,
+                _ => 16.0,
             };
+            shards += if run.lucid { 9 } else { 6 }
+                * if matches!(kind, EnemyKind::Elite | EnemyKind::Boss) {
+                    4
+                } else {
+                    1
+                };
+        }
         action_effect(
             &mut commands,
             &run,
@@ -43,7 +45,7 @@ pub(crate) fn resolve_deaths(
         );
         commands.entity(entity).despawn();
     }
-    let mut party: Vec<_> = heroes.iter_mut().collect();
+    let mut party: Vec<_> = heroes.iter_mut().filter(|h| h.active).collect();
     party.sort_by_key(|h| h.view.id);
     let mut alive = 0;
     for mut hero in party {
@@ -66,7 +68,7 @@ pub(crate) fn resolve_deaths(
                         sequence: previous_level + offset,
                         slot: 0xc400,
                     },
-                    hero.motor.position,
+                    planar_position(&hero.motion),
                     3.5,
                     45,
                 );
@@ -75,8 +77,9 @@ pub(crate) fn resolve_deaths(
         if hero.health.hp > 0.0 {
             alive += 1;
         } else {
-            hero.motor.velocity = [0.0; 2];
-            hero.motor.dash_remaining = 0.0;
+            hero.motion.velocity = [0.0; 3];
+            hero.motion.dash_ticks = 0;
+            hero.ray.beam = None;
         }
     }
     if alive == 0 && run.party_size > 0 {
@@ -94,7 +97,11 @@ pub(crate) fn finish_encounter(
     if run.phase != RunPhase::Combat {
         return;
     }
-    if enemies.iter().len() <= 2 && run.reinforcements > 0 {
+    let encounter_enemies = enemies
+        .iter()
+        .filter(|enemy| enemy.ai.role == EnemyRole::Encounter)
+        .count();
+    if encounter_enemies <= 2 && run.reinforcements > 0 {
         let count = run.reinforcements.min(5 + run.room as u32 / 3);
         run.reinforcements -= count;
         run.message = "The dream fractures · A new wave approaches".into();
@@ -124,13 +131,17 @@ pub(crate) fn finish_encounter(
         }
         return;
     }
-    if !enemies.is_empty() {
+    if encounter_enemies != 0 {
         return;
     }
     run.cleared += 1;
     for mut hero in &mut heroes {
-        hero.motor.velocity = [0.0; 2];
-        hero.motor.dash_remaining = 0.0;
+        if !hero.active {
+            continue;
+        }
+        hero.motion.velocity = [0.0; 3];
+        hero.motion.dash_ticks = 0;
+        hero.ray.beam = None;
         hero.view.shards += if run.lucid { 30 } else { 20 };
         hero.ready = false;
         if hero.health.hp <= 0.0 {
@@ -145,6 +156,9 @@ pub(crate) fn finish_encounter(
         run.message = "Dream unraveled · Choose one gift to carry onward".into();
         run.rewards = encounters::make_rewards(&mut run, false);
         for mut hero in &mut heroes {
+            if !hero.active {
+                continue;
+            }
             hero.rewards = run.rewards.clone();
         }
     }

@@ -29,10 +29,14 @@ pub enum DreamSystems {
     ProjectileTargets,
     Projectiles,
     ProjectileHits,
+    CombatPoses,
+    CombatDamage,
+    Rays,
     Health,
     Deaths,
     Finish,
     FinalHealth,
+    BeamGraphics,
 }
 
 /// Game rules and engine gameplay plugins, without transport, graphics or audio.
@@ -50,6 +54,16 @@ impl DreamwakePlugin {
 pub(super) fn initialize(app: &mut App, seed: u64, lucid: bool) {
     app.add_plugins(engine_core::SystemPlugin::new(DT))
         .insert_resource(DreamInputs::default())
+        .init_resource::<crate::combat_history::CombatHistory>()
+        .init_resource::<systems::CombatBatch>()
+        .init_resource::<systems::StaticCombatHistory>()
+        .init_resource::<crate::combat::ActionTransactions>()
+        .init_resource::<crate::combat_trace::CombatTraceState>()
+        .insert_resource(
+            crate::collision::CollisionManifest::current(1)
+                .build()
+                .expect("game collision manifest"),
+        )
         .insert_resource(Run {
             tick: 0,
             seed,
@@ -67,8 +81,21 @@ pub(super) fn initialize(app: &mut App, seed: u64, lucid: bool) {
             message: "Vesper · Moonbound".into(),
             party_size: 1,
             reinforcements: 0,
+            encounter_spawns: 0,
         });
-    SavedHero::new(1).spawn(app.world_mut());
+    SavedHero::new(1, seed).spawn(app.world_mut());
+    let id = app.world_mut().resource_mut::<Run>().id();
+    let platform = Platform::new(id);
+    let collision = app
+        .world()
+        .resource::<crate::collision::CollisionWorld>()
+        .clone();
+    let view = platform.presentation(collision.manifest().scene_revision());
+    app.world_mut().spawn((DreamOwned, platform));
+    app.insert_resource(
+        crate::platform::MotionEnvironment::committed(&collision, &[view], 0)
+            .expect("initial support scene"),
+    );
 }
 impl Plugin for DreamwakePlugin {
     fn build(&self, app: &mut App) {
@@ -111,7 +138,10 @@ impl Plugin for DreamwakePlugin {
                     D::Enemies,
                     D::ProjectileTargets,
                     D::Projectiles,
+                    D::CombatPoses,
                     D::ProjectileHits,
+                    D::Rays,
+                    D::CombatDamage,
                     D::Health,
                     D::Deaths,
                     D::Finish,
@@ -138,13 +168,17 @@ impl Plugin for DreamwakePlugin {
                     D::Enemies,
                     D::ProjectileTargets,
                     D::Projectiles,
+                    D::CombatPoses,
                     D::ProjectileHits,
-                    D::Health,
-                    D::Deaths,
-                    D::Finish,
-                    D::FinalHealth,
+                    D::Rays,
+                    D::CombatDamage,
+                    (D::Health, D::Deaths, D::Finish, D::FinalHealth).chain(),
                 )
                     .chain(),
+            )
+            .configure_sets(
+                DreamStep,
+                D::BeamGraphics.in_set(D::Combat).after(D::FinalHealth),
             )
             .configure_sets(
                 DreamStep,
@@ -177,10 +211,27 @@ impl Plugin for DreamwakePlugin {
                     systems::enemy_actions.in_set(D::Enemies),
                     systems::refresh_target_index.in_set(D::ProjectileTargets),
                     systems::projectile_actions.in_set(D::ProjectileHits),
+                    systems::advance_covers.in_set(D::CombatPoses),
+                    systems::capture_combat_poses
+                        .in_set(D::CombatPoses)
+                        .after(systems::advance_covers),
+                    systems::ray_actions.in_set(D::Rays),
+                    systems::tick_dreamlance.in_set(D::ActorTimers),
+                    systems::resolve_combat_batch.in_set(D::CombatDamage),
+                    systems::beam_graphics.in_set(D::BeamGraphics),
+                    crate::combat_trace::finalize_combat_traces
+                        .in_set(D::CombatDamage)
+                        .after(systems::resolve_combat_batch),
                     systems::resolve_deaths.in_set(D::Deaths),
                     systems::finish_encounter.in_set(D::Finish),
                     engine_core::update_health.in_set(D::FinalHealth),
                 ),
+            )
+            .add_systems(
+                DreamStep,
+                crate::platform::advance_platforms
+                    .in_set(D::Begin)
+                    .after(systems::begin_tick),
             );
     }
 }

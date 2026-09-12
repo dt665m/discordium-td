@@ -2,9 +2,22 @@
 use super::*;
 use bevy::ecs::query::QueryData;
 use serde::{Deserialize, Serialize};
+mod enemies;
+pub(crate) use enemies::*;
+mod platform;
+pub(crate) use platform::*;
+mod cover;
+pub(crate) use cover::*;
+mod charge;
+pub(crate) use charge::*;
+mod ray;
+pub(crate) use ray::*;
+mod combat;
+pub(crate) use combat::*;
 mod projectiles;
 pub(super) use projectiles::*;
 
+pub(super) const CRITICAL_RANDOM_DOMAIN: u64 = 0x4352_4954;
 pub(super) const FROST_STATUS: engine_core::StatusId = engine_core::StatusId(1);
 pub(super) type MemoryLoadout = engine_core::Loadout<MemoryKind, EssenceKind>;
 pub(super) type EquippedMemory = engine_core::AbilitySlot<MemoryKind, EssenceKind>;
@@ -36,10 +49,15 @@ fn memory_view(slot: &EquippedMemory) -> MemorySlot {
 #[derive(QueryData)]
 #[query_data(mutable)]
 pub(super) struct HeroActor {
+    pub charge: &'static mut ChargedMovement,
+    pub ray: &'static mut RayState,
     pub actor: &'static mut Hero,
     pub health: &'static mut Health,
     pub combat: &'static mut engine_core::CombatState,
-    pub motor: &'static mut engine_core::MotorState,
+    pub combat_identity: &'static mut CombatIdentity,
+    pub defense_episodes: &'static mut DefenseEpisodes,
+    pub motion: &'static mut engine_core::KinematicState,
+    pub motion_status: &'static mut engine_core::KinematicStatus,
     pub action: &'static mut engine_core::ActionState,
     pub loadout: &'static mut MemoryLoadout,
     pub progression: &'static mut engine_core::Progression,
@@ -47,9 +65,12 @@ pub(super) struct HeroActor {
 #[derive(QueryData)]
 #[query_data(mutable)]
 pub(super) struct EnemyActor {
+    pub ai: &'static mut EnemyAi,
     pub actor: &'static mut Enemy,
     pub health: &'static mut Health,
     pub combat: &'static mut engine_core::CombatState,
+    pub combat_identity: &'static mut CombatIdentity,
+    pub defense_episodes: &'static mut DefenseEpisodes,
     pub motor: &'static mut engine_core::MotorState,
     pub action: &'static mut engine_core::ActionState,
 }
@@ -80,14 +101,21 @@ actor_access!(EnemyActorItem, EnemyActorReadOnlyItem, Enemy);
 #[derive(Component)]
 pub(super) struct DreamOwned;
 #[derive(Component, Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[require(CombatIdentity, DefenseEpisodes, RayState, ChargedMovement)]
 pub(super) struct Hero {
     pub view: HeroBody,
+    /// Network admission is authoritative game state. Pending heroes can supply
+    /// an owner checkpoint but cannot participate before initial scope decode.
+    pub active: bool,
+    /// Complete saved owner prediction state; never a public HeroView field.
+    pub critical_rng: engine_core::system::RandomStream,
     pub ready: bool,
     pub rewards: Vec<Reward>,
 }
 impl Default for Hero {
     fn default() -> Self {
         Self {
+            active: true,
             view: HeroBody {
                 id: 1,
                 shards: 0,
@@ -101,12 +129,15 @@ impl Default for Hero {
                 recovery: 1.0,
                 defense: 0.0,
             },
+            critical_rng: engine_core::system::RandomStream::new(0, 1, 1, CRITICAL_RANDOM_DOMAIN)
+                .expect("fixed nonzero hero generation"),
             ready: false,
             rewards: vec![],
         }
     }
 }
 #[derive(Component, Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[require(CombatIdentity, DefenseEpisodes)]
 pub(super) struct Enemy {
     pub view: EnemyBody,
     /// Pattern indexing is a game choice, distinct from engine action identity.
@@ -115,19 +146,26 @@ pub(super) struct Enemy {
 /// Snapshots save the engine components themselves, never a mutable view copy.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(super) struct SavedHero {
+    pub charge: ChargedMovement,
+    pub ray: RayState,
     pub actor: Hero,
     pub health: Health,
     pub combat: engine_core::CombatState,
-    pub motor: engine_core::MotorState,
+    pub combat_identity: CombatIdentity,
+    pub defense_episodes: DefenseEpisodes,
+    pub motion: engine_core::KinematicState,
     pub action: engine_core::ActionState,
     pub loadout: MemoryLoadout,
     pub progression: engine_core::Progression,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(super) struct SavedEnemy {
+    pub ai: EnemyAi,
     pub actor: Enemy,
     pub health: Health,
     pub combat: engine_core::CombatState,
+    pub combat_identity: CombatIdentity,
+    pub defense_episodes: DefenseEpisodes,
     pub motor: engine_core::MotorState,
     pub action: engine_core::ActionState,
 }
@@ -149,19 +187,21 @@ macro_rules! saved_access {
 saved_access!(SavedHero, Hero);
 saved_access!(SavedEnemy, Enemy);
 impl SavedHero {
-    pub fn new(id: u64) -> Self {
+    pub fn new(id: u64, seed: u64) -> Self {
         let mut actor = Hero::default();
         actor.view.id = id;
+        actor.critical_rng =
+            engine_core::system::RandomStream::new(seed, id, 1, CRITICAL_RANDOM_DOMAIN)
+                .expect("fixed nonzero hero generation");
         Self {
             actor,
-            health: Health::new(220.0),
+            charge: Default::default(),
+            ray: Default::default(),
+            health: Health::new(STARTING_HEALTH),
             combat: Default::default(),
-            motor: engine_core::MotorState {
-                position: [0.0, 2.0],
-                facing: [0.0, -1.0],
-                dash_direction: [0.0, -1.0],
-                ..Default::default()
-            },
+            combat_identity: Default::default(),
+            defense_episodes: Default::default(),
+            motion: engine_core::KinematicState::new([0.0, 0.0, 2.0], 1),
             action: Default::default(),
             loadout: initial_loadout(),
             progression: engine_core::Progression {
@@ -176,9 +216,13 @@ impl SavedHero {
         world.spawn((
             DreamOwned,
             self.actor,
+            self.ray,
+            self.charge,
             self.health,
             self.combat,
-            self.motor,
+            self.combat_identity,
+            self.defense_episodes,
+            self.motion,
             self.action,
             self.loadout,
             self.progression,
@@ -187,9 +231,11 @@ impl SavedHero {
     pub fn snapshot(&self) -> HeroView {
         HeroView {
             id: self.view.id,
-            position: self.motor.position,
-            facing: self.motor.facing,
-            velocity: self.motor.velocity,
+            position: crate::collision::planar_position(&self.motion),
+            elevation: self.motion.position[1],
+            crouched: self.motion.stance == engine_core::Stance::Crouched,
+            facing: self.motion.facing,
+            velocity: crate::collision::planar_velocity(&self.motion),
             hp: self.health.hp,
             max_hp: self.health.max_hp,
             shield: self.combat.shield,
@@ -199,9 +245,22 @@ impl SavedHero {
             shards: self.view.shards,
             memories: std::array::from_fn(|i| memory_view(&self.loadout.0[i])),
             attack_cooldown: self.action.recovery,
-            dash_cooldown: self.motor.dash_cooldown,
-            invulnerable: self.combat.is_invulnerable() || self.motor.dash_remaining > 0.0,
-            dashing: self.motor.dash_remaining > 0.0 && self.health.hp > 0.0,
+            stamina: self.charge.stamina.current(),
+            max_stamina: self.charge.stamina.capacity(),
+            charge_ticks: match self.charge.state.phase {
+                engine_core::ChargePhase::Charging { ticks } => ticks,
+                _ => 0,
+            },
+            charge_executing: matches!(
+                self.charge.state.phase,
+                engine_core::ChargePhase::Executing { .. }
+            ),
+            charge_cooldown_ticks: self.charge.state.cooldown_ticks,
+            dreamlance_ammo: self.ray.ammo.current() as u8,
+            dreamlance_cooldown: self.ray.cooldown,
+            dash_cooldown: f32::from(self.motion.dash_cooldown_ticks) * DT,
+            invulnerable: self.combat.is_invulnerable() || self.motion.dash_ticks > 0,
+            dashing: self.motion.dash_ticks > 0 && self.health.hp > 0.0,
             combo: self.view.combo,
             hit_flash: self.view.hit_flash,
             attack_flash: self.view.attack_flash,
@@ -218,9 +277,12 @@ impl SavedEnemy {
     pub fn spawn(self, world: &mut World) {
         world.spawn((
             DreamOwned,
+            self.ai,
             self.actor,
             self.health,
             self.combat,
+            self.combat_identity,
+            self.defense_episodes,
             self.motor,
             self.action,
         ));
@@ -248,6 +310,7 @@ pub(super) struct Number(pub DamageNumber);
 pub(super) type DelayedCast = engine_core::DelayedAction<CastPayload>;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(super) struct CastPayload {
+    pub spawn: Option<(crate::starfall::SpawnKey, u32)>,
     pub action_sequence: u32,
     pub presentation_slot: u16,
     pub owner: u64,
@@ -276,6 +339,7 @@ pub(super) struct Run {
     pub message: String,
     pub party_size: usize,
     pub reinforcements: u32,
+    pub encounter_spawns: usize,
 }
 impl Run {
     pub fn id(&mut self) -> u64 {
@@ -296,9 +360,13 @@ impl Run {
 pub(super) type Input = DreamInputs;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(super) struct SavedState {
+    pub combat_history: crate::combat_history::CombatArchive,
+    pub collision: crate::collision::CollisionManifest,
     pub run: Run,
     pub heroes: Vec<SavedHero>,
     pub enemies: Vec<SavedEnemy>,
+    pub covers: Vec<SavedCover>,
+    pub platforms: Vec<SavedPlatform>,
     pub projectiles: Vec<SavedProjectile>,
     pub wisps: Vec<SavedWisp>,
     pub effects: Vec<Effect>,

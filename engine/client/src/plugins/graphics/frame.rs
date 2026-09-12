@@ -10,8 +10,10 @@ pub enum VisualId {
 pub enum Primitive {
     Sphere,
     Box,
+    OrientedBox { rotation: Quat },
     Ring,
     Arrow { direction: Vec3 },
+    Beam { direction: Vec3 },
 }
 #[derive(Clone, Debug)]
 pub struct Visual {
@@ -19,6 +21,7 @@ pub struct Visual {
     pub primitive: Primitive,
     pub position: Vec3,
     /// Box dimensions; X is radius for spheres/rings and length for arrows.
+    /// Beams start at `position`: X/Y are thickness and Z is length.
     pub scale: Vec3,
     pub color: Color,
 }

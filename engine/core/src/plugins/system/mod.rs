@@ -1,3 +1,5 @@
+pub mod random;
+pub use random::{RandomError, RandomStream, RandomStreamState};
 pub mod timing;
 use bevy::prelude::*;
 pub use timing::*;

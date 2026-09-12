@@ -1,5 +1,6 @@
 //! Canonical movement, displacement, bounds and shared geometry.
 mod bounds;
+pub mod kinematic;
 mod movement;
 pub mod spatial;
 pub mod systems;

@@ -98,8 +98,8 @@ fn late_join_clones_progression_loadout_and_stats_but_refreshes_combat() {
         h.progression.xp = 12.0;
         h.view.attack_power = 2.0;
         h.view.shards = 77;
-        h.motor.position = [3.0, 4.0];
-        h.motor.dash_cooldown = 0.8;
+        h.motion.position = [3.0, 0.0, 4.0];
+        h.motion.dash_cooldown_ticks = 48;
         h.action.recovery = 0.7;
         h.combat.shield = 21.0;
         h.combat.shield_remaining = 3.0;
@@ -160,7 +160,7 @@ fn two_attacks_damage_one_shared_enemy_and_have_distinct_owners() {
     add_enemy(&mut sim, EnemyKind::Boss, [0.0, -2.0]);
     for id in [1, 22] {
         edit_hero(&mut sim, id, |h| {
-            h.motor.position = [0.0; 2];
+            h.motion.position = [0.0; 3];
             h.view.critical_chance = 0.0;
         });
     }
@@ -192,22 +192,23 @@ fn enemies_target_living_players_and_area_attacks_hit_the_party() {
     empty_arena(&mut sim);
     add_enemy(&mut sim, EnemyKind::Melee, [0.0, 0.5]);
     edit_hero(&mut sim, 1, |h| {
-        h.motor.position = [12.0, 12.0];
+        h.motion.position = [12.0, 0.0, 12.0];
         h.health.hp = 0.0;
     });
     edit_hero(&mut sim, 22, |h| {
-        h.motor.position = [0.0; 2];
+        h.motion.position = [0.0; 3];
         h.combat.invulnerability_remaining = 0.0;
     });
     for mut e in sim.world.query::<EnemyActor>().iter_mut(&mut sim.world) {
         e.action.recovery = 0.0;
+        e.ai.wake_delay = 0.0;
     }
     sim.step_multiplayer(&[]);
     assert_eq!(sim.snapshot().enemies[0].target, [0.0; 2]);
     for id in [1, 22] {
         edit_hero(&mut sim, id, |h| {
             h.health.hp = 220.0;
-            h.motor.position = [0.0; 2];
+            h.motion.position = [0.0; 3];
             h.combat.invulnerability_remaining = 0.0;
         });
     }
@@ -307,7 +308,7 @@ fn projectile_leech_and_summons_belong_to_the_casting_player() {
     for id in [1, 22] {
         edit_hero(&mut sim, id, |h| {
             h.health.hp = 100.0;
-            h.motor.position = [0.0; 2];
+            h.motion.position = [0.0; 3];
             h.view.critical_chance = 0.0;
         });
     }
@@ -359,6 +360,7 @@ fn multiplayer_json_restore_and_reordered_input_replay_match_exactly() {
                 (
                     id,
                     DreamInput {
+                        charge: Default::default(),
                         action_sequences: [0; 5],
                         movement: [(tick as f32 * 0.04 + id as f32).sin(), -0.3],
                         aim: [0.2, -1.0],
@@ -422,6 +424,7 @@ fn bot_input(snapshot: &DreamSnapshot) -> DreamInput {
         };
     }
     DreamInput {
+        charge: Default::default(),
         action_sequences: [0; 5],
         movement,
         aim: direction,

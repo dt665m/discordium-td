@@ -66,3 +66,12 @@ fn movement_normalizes_and_dash_overrides_lock_with_bounds() {
     assert_eq!(motor.velocity, [0.0; 2]);
     assert_eq!(motor.dash_cooldown, 1.5);
 }
+
+#[test]
+fn spatial_normalization_preserves_the_cross_platform_replay_contract() {
+    // Real combat replay vector: native hypot rounded its norm one ULP above
+    // WASM, then persisted a different enemy facing on the second tick.
+    let direction = spatial::normalize([f32::from_bits(0x4123_d675), f32::from_bits(0xbfd6_8968)]);
+    assert_eq!(direction[0].to_bits(), 0x3f7c_a35b);
+    assert_eq!(spatial::normalize([0.0, 0.0]), [0.0, 0.0]);
+}

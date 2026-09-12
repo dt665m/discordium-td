@@ -48,11 +48,13 @@ mod nested_reference {
         ))
         .add_systems(DreamStep, advance)
         .add_systems(Old::Ambient, systems::age_transients)
+        .add_systems(Old::Actors, systems::tick_dreamlance)
         .add_systems(Old::Target, systems::refresh_target_index)
         .add_systems(
             Old::Game,
             (
                 systems::begin_tick,
+                crate::platform::advance_platforms,
                 systems::age_transients,
                 systems::player_actions,
                 delays,
@@ -61,10 +63,16 @@ mod nested_reference {
                 systems::wisp_actions,
                 systems::enemy_actions,
                 projectiles,
+                systems::advance_covers,
+                systems::capture_combat_poses,
                 systems::projectile_actions,
+                systems::ray_actions,
+                systems::resolve_combat_batch,
+                crate::combat_trace::finalize_combat_traces,
                 health,
                 systems::resolve_deaths,
                 systems::finish_encounter,
+                systems::beam_graphics,
             )
                 .chain(),
         );
@@ -152,6 +160,7 @@ fn flattened_schedule_matches_previous_nested_schedule_through_replay_and_clear(
     }
     for tick in 0..180_u32 {
         let input = DreamInput {
+            charge: Default::default(),
             movement: [0.6, -0.2],
             aim: [0.0, -1.0],
             attack: true,
@@ -238,6 +247,7 @@ fn ambient_and_frozen_phases_match_previous_schedule() {
                 DreamOwned,
                 engine_core::GraphicsInstance {
                     id: engine_core::GraphicsId {
+                        scope: None,
                         match_epoch: 9,
                         owner: 1,
                         action_seq: 7,

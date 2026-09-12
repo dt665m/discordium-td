@@ -1,10 +1,24 @@
 use crate::DreamView;
 use bevy::prelude::*;
 use engine_client::camera::CameraSettings;
-pub(super) fn target(view: Res<DreamView>, mut camera: ResMut<CameraSettings>) {
+pub(super) fn target(
+    view: Res<DreamView>,
+    mut camera: ResMut<CameraSettings>,
+    time: Option<Res<Time>>,
+    mut kick: Local<f32>,
+    runtime: Option<NonSendMut<crate::plugins::network::Runtime>>,
+) {
+    *kick *= (-time.as_ref().map_or(0.0, |time| time.delta_secs()) * 24.0).exp();
+    if let Some(mut runtime) = runtime {
+        if let Some(session) = runtime.prediction.as_mut() {
+            let cues = std::mem::take(&mut session.events.camera_cues);
+            *kick = (*kick + f32::from(cues) * 0.06).min(0.12);
+        }
+    } else {
+        *kick = 0.0;
+    }
     let p = view.0.hero.position;
-    let target = (Vec3::new(p[0], 0.0, p[1]) * 0.30)
-        .clamp(Vec3::new(-5.0, 0.0, -5.0), Vec3::new(5.0, 0.0, 5.0));
+    let target = Vec3::new(p[0], view.0.hero.elevation + *kick, p[1]);
     if camera.target != target {
         camera.target = target;
     }

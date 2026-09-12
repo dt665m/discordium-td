@@ -7,6 +7,19 @@ pub(super) fn spawn_enemy(
     kind: EnemyKind,
     position: [f32; 2],
 ) {
+    if run.encounter_spawns >= MAX_ENCOUNTER_SPAWNS {
+        return;
+    }
+    run.encounter_spawns += 1;
+    spawn_enemy_role(commands, run, kind, position, EnemyRole::Encounter);
+}
+fn spawn_enemy_role(
+    commands: &mut Commands,
+    run: &mut Run,
+    kind: EnemyKind,
+    position: [f32; 2],
+    role: EnemyRole,
+) {
     let scale = 1.0 + run.room as f32 * 0.105;
     let hp = match kind {
         EnemyKind::Melee => 92.0,
@@ -22,6 +35,17 @@ pub(super) fn spawn_enemy(
     commands.spawn((
         DreamOwned,
         Health::new(hp),
+        EnemyAi {
+            role,
+            home: position,
+            awake: false,
+            target: None,
+            wake_delay: if role == EnemyRole::Encounter {
+                0.9 + run.random() * 0.9
+            } else {
+                0.0
+            },
+        },
         engine_core::CombatState::default(),
         engine_core::MotorState {
             position,
@@ -30,7 +54,6 @@ pub(super) fn spawn_enemy(
         },
         engine_core::ActionState {
             target: position,
-            recovery: 0.9 + run.random() * 0.9,
             ..Default::default()
         },
         Enemy {
@@ -48,7 +71,7 @@ pub(super) fn spawn_enemy(
 
 fn enter_room(world: &mut World) {
     let cleanup: Vec<_> = world
-        .query_filtered::<Entity, (With<DreamOwned>, Without<Hero>)>()
+        .query_filtered::<Entity, (With<DreamOwned>, Without<Hero>, Without<Platform>)>()
         .iter(world)
         .collect();
     for entity in cleanup {
@@ -58,28 +81,50 @@ fn enter_room(world: &mut World) {
         run.paused = false;
         run.rewards.clear();
         run.reinforcements = 0;
+        run.encounter_spawns = 0;
         let room = run.room;
         let mut hero_query = world.query::<HeroActor>();
-        let mut party: Vec<_> = hero_query.iter_mut(world).collect();
+        let mut party: Vec<_> = hero_query.iter_mut(world).filter(|h| h.active).collect();
         party.sort_by_key(|h| h.view.id);
         for (index, mut hero) in party.into_iter().enumerate() {
             hero.ready = false;
             hero.rewards.clear();
-            hero.motor.position = if run.party_size <= 8 {
+            let position = if run.party_size <= 8 {
                 [
                     (index as f32 - (run.party_size as f32 - 1.0) * 0.5) * 1.8,
+                    0.0,
                     3.5,
                 ]
             } else {
                 let angle = index as f32 * 2.399963;
                 let radius = ((index as f32 + 1.0).sqrt() * 0.9).min(9.0);
-                [angle.cos() * radius, angle.sin() * radius + 3.5]
+                [angle.cos() * radius, 0.0, angle.sin() * radius + 3.5]
             };
-            hero.motor.velocity = [0.0; 2];
-            hero.motor.dash_remaining = 0.0;
+            let respawn = hero.health.hp <= 0.0;
+            if hero.combat_identity.discontinuity(respawn).is_err() {
+                continue;
+            }
+            if respawn {
+                hero.critical_rng = engine_core::system::RandomStream::new(
+                    run.seed,
+                    hero.view.id,
+                    hero.combat_identity.generation,
+                    CRITICAL_RANDOM_DOMAIN,
+                )
+                .expect("validated nonzero combat generation");
+                *hero.defense_episodes = DefenseEpisodes::default();
+                hero.ray.last_key = None;
+            }
+            hero.ray.refill();
+            let facing = hero.motion.facing;
+            let scene_revision = hero.motion.scene_revision;
+            *hero.motion = engine_core::KinematicState::new(position, scene_revision);
+            hero.motion.facing = facing;
+            hero.motion.velocity = [0.0; 3];
+            hero.motion.dash_ticks = 0;
             hero.combat
                 .grant_invulnerability(0.9, engine_core::DurationPolicy::Reset);
-            hero.motor.dash_cooldown = 0.0;
+            hero.motion.dash_cooldown_ticks = 0;
             hero.action.cancel();
             hero.health.hp = (hero.health.hp + hero.health.max_hp * 0.10).min(hero.health.max_hp);
             for memory in &mut hero.loadout.0 {
@@ -98,11 +143,17 @@ fn enter_room(world: &mut World) {
                 "Restored 50% health. Spend 45 shards to refine a Memory, then choose a blessing."
                     .into();
             for mut hero in world.query::<HeroActor>().iter_mut(world) {
+                if !hero.active {
+                    continue;
+                }
                 hero.health.hp =
                     (hero.health.hp + hero.health.max_hp * 0.4).min(hero.health.max_hp);
             }
             run.rewards = make_rewards(&mut run, false);
             for mut hero in world.query::<HeroActor>().iter_mut(world) {
+                if !hero.active {
+                    continue;
+                }
                 hero.rewards = run.rewards.clone();
             }
             return;
@@ -136,6 +187,23 @@ fn enter_room(world: &mut World) {
         let mut queue = bevy::ecs::world::CommandQueue::default();
         {
             let mut commands = Commands::new(&mut queue, world);
+            for ground_position in DEMO_COVER_POSITIONS {
+                commands.spawn((
+                    DreamOwned,
+                    Cover {
+                        id: run.id(),
+                        marker_id: run.id(),
+                        ground_position,
+                        present: true,
+                        open: false,
+                        next_transition_tick: run
+                            .tick
+                            .checked_add(COVER_PERIOD_TICKS)
+                            .expect("room tick budget"),
+                    },
+                    CombatIdentity::default(),
+                ));
+            }
             if room == TOTAL_ROOMS - 1 {
                 run.encounter_name = "The Somnarch · Keeper of the Unwaking".into();
                 run.message =
@@ -173,6 +241,18 @@ fn enter_room(world: &mut World) {
                 }
             }
         }
+        {
+            let mut commands = Commands::new(&mut queue, world);
+            for position in AMBIENT_ENEMY_POSITIONS {
+                spawn_enemy_role(
+                    &mut commands,
+                    &mut run,
+                    EnemyKind::Melee,
+                    position,
+                    EnemyRole::Ambient,
+                );
+            }
+        }
         queue.apply(world);
     });
 }
@@ -187,13 +267,18 @@ pub(super) fn reconcile_ready(world: &mut World) -> bool {
         return false;
     }
     let mut query = world.query::<HeroActorReadOnly>();
-    if query.iter(world).len() == 0 || query.iter(world).any(|hero| !hero.ready) {
+    if !query.iter(world).any(|hero| hero.active)
+        || query.iter(world).any(|hero| hero.active && !hero.ready)
+    {
         return false;
     }
     if matches!(phase, RunPhase::Reward | RunPhase::Rest) {
         world.resource_mut::<Run>().phase = RunPhase::Transition;
         world.resource_mut::<Run>().rewards.clear();
         for mut hero in world.query::<HeroActor>().iter_mut(world) {
+            if !hero.active {
+                continue;
+            }
             hero.ready = false;
             hero.rewards.clear();
         }
@@ -220,7 +305,7 @@ pub(super) fn continue_run(world: &mut World, id: u64) -> bool {
     }
     {
         let mut query = world.query::<HeroActor>();
-        let Some(mut hero) = query.iter_mut(world).find(|h| h.view.id == id) else {
+        let Some(mut hero) = query.iter_mut(world).find(|h| h.view.id == id && h.active) else {
             return false;
         };
         hero.ready = true;
@@ -290,7 +375,7 @@ pub(super) fn upgrade(hero: &mut HeroActorItem<'_, '_>, kind: UpgradeKind) {
         UpgradeKind::Movement => {
             hero.view.movement_speed =
                 engine_core::multiply_capped(hero.view.movement_speed, 1.14, 13.0);
-            hero.motor.dash_cooldown = 0.0;
+            hero.motion.dash_cooldown_ticks = 0;
         }
         UpgradeKind::Critical => {
             hero.view.critical_chance =
@@ -338,7 +423,7 @@ pub(super) fn choose_reward(world: &mut World, id: u64, choice: usize, slot: usi
             return false;
         }
         let mut query = world.query::<HeroActor>();
-        let Some(mut hero) = query.iter_mut(world).find(|h| h.view.id == id) else {
+        let Some(mut hero) = query.iter_mut(world).find(|h| h.view.id == id && h.active) else {
             return false;
         };
         if hero.ready {
@@ -386,7 +471,7 @@ pub(super) fn buy_memory_upgrade(world: &mut World, id: u64, slot: usize) -> boo
         return false;
     }
     let mut query = world.query::<HeroActor>();
-    let Some(mut hero) = query.iter_mut(world).find(|h| h.view.id == id) else {
+    let Some(mut hero) = query.iter_mut(world).find(|h| h.view.id == id && h.active) else {
         return false;
     };
     if hero.ready {

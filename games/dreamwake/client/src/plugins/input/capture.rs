@@ -6,7 +6,7 @@ use crate::plugins::{
 };
 use crate::{DreamConnection, DreamPreferences, DreamView};
 use bevy::window::PrimaryWindow;
-use dreamwake_sim::{DreamSnapshot, RunPhase};
+use dreamwake_sim::{DreamPresentation, RunPhase};
 use engine_client::camera::CameraRig as DreamCameraRig;
 pub(super) fn keyboard_actions(
     keys: Res<ButtonInput<KeyCode>>,
@@ -15,7 +15,23 @@ pub(super) fn keyboard_actions(
     connection: Res<DreamConnection>,
     mut actions: ResMut<UiActions>,
     gamepads: Query<&Gamepad>,
+    identity_ui: Option<Res<crate::ui::identity::TravelerIdentityUi>>,
+    focus: Option<Res<bevy::input_focus::InputFocus>>,
+    editable: Query<
+        (),
+        Or<(
+            With<bevy::text::EditableText>,
+            With<bevy::ui_widgets::Button>,
+        )>,
+    >,
 ) {
+    if identity_ui.is_some_and(|ui| ui.open)
+        || focus
+            .and_then(|f| f.get())
+            .is_some_and(|e| editable.contains(e))
+    {
+        return;
+    }
     if keys.just_pressed(KeyCode::Escape) {
         actions.0.push(UiAction::TogglePause);
     }
@@ -189,6 +205,7 @@ pub(crate) fn apply_ui_actions(world: &mut World) {
         }
     }
     world.resource_mut::<CapturedInput>().0 = DreamInput::default();
+    world.resource_mut::<CapturedActions>().0 = Default::default();
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -202,15 +219,77 @@ pub(crate) fn capture_input(
     view: Res<DreamView>,
     prefs: Res<DreamPreferences>,
     mut captured: ResMut<CapturedInput>,
+    (
+        time,
+        mut runtime,
+        mut captured_actions,
+        mut captured_beam,
+        mut captured_charge,
+        mut connection,
+    ): (
+        Res<Time<Real>>,
+        Option<NonSendMut<network::Runtime>>,
+        ResMut<CapturedActions>,
+        ResMut<CapturedBeam>,
+        ResMut<CapturedCharge>,
+        ResMut<DreamConnection>,
+    ),
     playtest: Res<Playtest>,
+    identity_ui: Option<Res<crate::ui::identity::TravelerIdentityUi>>,
+    focus: Option<Res<bevy::input_focus::InputFocus>>,
+    mut charge_input: charge::ChargeInput,
+    editable: Query<
+        (),
+        Or<(
+            With<bevy::text::EditableText>,
+            With<bevy::ui_widgets::Button>,
+        )>,
+    >,
 ) {
-    if prefs.paused || prefs.build_open || view.0.phase != RunPhase::Combat {
+    captured_beam.0 = None;
+    let suppressed = prefs.paused
+        || prefs.build_open
+        || view.0.phase != RunPhase::Combat
+        || identity_ui.is_some_and(|ui| ui.open)
+        || focus
+            .and_then(|f| f.get())
+            .is_some_and(|e| editable.contains(e));
+    charge_input.collect(
+        &mut captured_charge,
+        !suppressed && !playtest.autoplay,
+        &gamepads,
+    );
+    if suppressed {
         captured.0 = DreamInput::default();
+        captured_actions.0 = Default::default();
+        captured_charge.flush(&mut captured_actions);
+        if captured_beam.1 {
+            let _ = captured_actions
+                .0
+                .push(dreamwake_protocol::DreamAction::BeamStop);
+            captured_beam.1 = false;
+        }
         return;
     }
     if playtest.autoplay {
-        captured.0 = autopilot(&view.0);
+        if !captured_charge.flush(&mut captured_actions) {
+            connection.status = "Charge cancellation waiting for queued actions".into();
+        }
+        if captured_beam.1 {
+            if captured_actions
+                .0
+                .push(dreamwake_protocol::DreamAction::BeamStop)
+                .is_err()
+            {
+                connection.status = "Beam stopping: waiting for queued actions".into();
+            }
+            captured_beam.1 = false;
+        }
+        captured.0 = playtest.spatial.input(&view.0, autopilot(&view.0));
         return;
+    }
+    if !captured_charge.flush(&mut captured_actions) {
+        connection.status = "Charge waiting for queued actions".into();
     }
     let axis =
         |positive, negative| f32::from(keys.pressed(positive)) - f32::from(keys.pressed(negative));
@@ -232,6 +311,9 @@ pub(crate) fn capture_input(
         .iter()
         .any(|interaction| *interaction != Interaction::None);
     captured.0.attack = mouse.pressed(MouseButton::Left) && !over_ui;
+    let mut dreamlance = mouse.just_pressed(MouseButton::Right) && !over_ui;
+    let mut beam_held = mouse.pressed(MouseButton::Middle) && !over_ui;
+    let mut beam_pressed = mouse.just_pressed(MouseButton::Middle) && !over_ui;
     captured.0.dash |= keys.just_pressed(KeyCode::Space);
     for (i, key) in [KeyCode::KeyQ, KeyCode::KeyE, KeyCode::KeyR, KeyCode::KeyF]
         .into_iter()
@@ -259,6 +341,9 @@ pub(crate) fn capture_input(
                 });
         }
         captured.0.attack |= pad.pressed(GamepadButton::RightTrigger2);
+        dreamlance |= pad.just_pressed(GamepadButton::RightTrigger);
+        beam_held |= pad.pressed(GamepadButton::LeftTrigger2);
+        beam_pressed |= pad.just_pressed(GamepadButton::LeftTrigger2);
         captured.0.dash |= pad.just_pressed(GamepadButton::LeftTrigger);
         for (i, button) in [
             GamepadButton::South,
@@ -280,9 +365,64 @@ pub(crate) fn capture_input(
         })
         .to_array();
     captured.0.aim = aim.to_array();
+    let stamp = if dreamlance || beam_held {
+        runtime
+            .as_mut()
+            .and_then(|runtime| runtime.capture_combat_view(time.elapsed()))
+    } else {
+        None
+    };
+    if dreamlance {
+        if let Some(view) = stamp {
+            if captured_actions
+                .0
+                .push(dreamwake_protocol::DreamAction::Dreamlance {
+                    aim: aim.to_array(),
+                    view,
+                })
+                .is_err()
+            {
+                connection.status = "Dreamlance unavailable: too many queued actions".into();
+            }
+        } else {
+            connection.status = "Dreamlance unavailable: waiting for a coherent view".into();
+        }
+    }
+    if beam_pressed {
+        if let Some(view) = stamp {
+            if captured_actions
+                .0
+                .push(dreamwake_protocol::DreamAction::BeamBegin {
+                    aim: aim.to_array(),
+                    view,
+                })
+                .is_err()
+            {
+                connection.status = "Beam unavailable: too many queued actions".into();
+            }
+        } else {
+            connection.status = "Beam unavailable: waiting for a coherent view".into();
+        }
+    }
+    if captured_beam.1 && !beam_held {
+        if captured_actions
+            .0
+            .push(dreamwake_protocol::DreamAction::BeamStop)
+            .is_err()
+        {
+            connection.status = "Beam stopping: waiting for queued actions".into();
+        }
+    }
+    captured_beam.1 = beam_held;
+    if beam_held {
+        captured_beam.0 = stamp.map(|view| dreamwake_protocol::live::BeamAimSample {
+            aim: aim.to_array(),
+            view,
+        });
+    }
 }
 
-fn autopilot(view: &DreamSnapshot) -> DreamInput {
+fn autopilot(view: &DreamPresentation) -> DreamInput {
     let p = Vec2::from_array(view.hero.position);
     let closest = view.enemies.iter().min_by(|a, b| {
         Vec2::from_array(a.position)
@@ -313,7 +453,7 @@ fn autopilot(view: &DreamSnapshot) -> DreamInput {
             movement += away.normalize_or_zero() * 2.0;
         }
     }
-    if p.length() > 15.0 {
+    if p.length() > dreamwake_sim::ARENA_RADIUS - 4.0 {
         movement -= p.normalize() * 2.0;
     }
     DreamInput {

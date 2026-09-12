@@ -1,0 +1,112 @@
+{
+  "revision": 2,
+  "spatial_basis": "Epic publicly documented Fortnite/Unreal Replication Graph; portable details explicitly derived",
+  "engineering_sections": 27,
+  "report_word_count_whitespace": 23693,
+  "primary_source_entries": 62,
+  "implementation_tasks": 103,
+  "acceptance_cases": 156,
+  "feature_requirements": 93,
+  "contract_tests_passed": 89,
+  "original_contract_tests": 42,
+  "new_spatial_scope_contract_tests": 47,
+  "randomized_delivery_seeds": 100,
+  "randomized_delivery_ticks_per_seed": 80,
+  "spatial_oracle_seeds": 25,
+  "spatial_oracle_actors_per_seed": 200,
+  "spatial_oracle_update_query_rounds_per_seed": 20,
+  "scope_message_permutations": 120,
+  "python_version": "3.14.7",
+  "checked_local_html_links": 204,
+  "conservative_scale_membership_estimate": 469900,
+  "checks": [
+    "62 source IDs unique and preserved",
+    "planning counts, IDs, source and test references resolved",
+    "canonical planning matches CSV/JSON exports",
+    "M1/M2/M3 graph gates enforced",
+    "production task and acceptance execution claims remain unexecuted",
+    "27 engineering sections retained",
+    "canonical spatial and protocol text identical to embedded report",
+    "all report source references resolve",
+    "HTML package links, source anchors and local anchors resolved",
+    "both TOML profiles parsed with cross-field constraints",
+    "scope/privacy/dormancy safety defaults enforced",
+    "history, replay and checkpoint memory budgets checked",
+    "50,000-actor class counts and conservative spatial membership budget checked",
+    "planning exporter idempotent",
+    "89 contract tests passed in this validation run",
+    "recorded desktop/mobile browser checks pass; review scope retained separately"
+  ],
+  "browser_review": {
+    "automated_checks": [
+      {
+        "file": "ENGINEERING_SPEC.html",
+        "viewport": "desktop",
+        "width": 1440,
+        "scrollWidth": 1440,
+        "headingCount": 28,
+        "brokenLocalAnchors": []
+      },
+      {
+        "file": "ENGINEERING_SPEC.html",
+        "viewport": "mobile",
+        "width": 390,
+        "scrollWidth": 390,
+        "headingCount": 28,
+        "brokenLocalAnchors": []
+      },
+      {
+        "file": "SPATIAL_REPLICATION.html",
+        "viewport": "desktop",
+        "width": 1440,
+        "scrollWidth": 1440,
+        "headingCount": 13,
+        "brokenLocalAnchors": []
+      },
+      {
+        "file": "SPATIAL_REPLICATION.html",
+        "viewport": "mobile",
+        "width": 390,
+        "scrollWidth": 390,
+        "headingCount": 13,
+        "brokenLocalAnchors": []
+      },
+      {
+        "file": "PROTOCOL_ADDENDUM.html",
+        "viewport": "desktop",
+        "width": 1440,
+        "scrollWidth": 1440,
+        "headingCount": 9,
+        "brokenLocalAnchors": []
+      },
+      {
+        "file": "PROTOCOL_ADDENDUM.html",
+        "viewport": "mobile",
+        "width": 390,
+        "scrollWidth": 390,
+        "headingCount": 9,
+        "brokenLocalAnchors": []
+      }
+    ],
+    "screenshots_visually_reviewed": [
+      "ENGINEERING_SPEC_desktop_top.png",
+      "SPATIAL_REPLICATION_desktop_top.png",
+      "SPATIAL_REPLICATION_mobile_top.png",
+      "core_architecture_desktop.png"
+    ],
+    "review_scope": "Desktop document header, source/provenance table and core architecture; mobile spatial introduction. Screenshot captures are QA-only, not packaged. All three pages checked at both viewport widths for overflow and local anchors."
+  },
+  "not_executed": [
+    "156 production acceptance cases",
+    "production implementation tasks",
+    "real network transport",
+    "3D collision or game rendering",
+    "cross-platform qualification",
+    "100-client/50,000-potential-actor production benchmark",
+    "24-hour soak",
+    "production field authorization/occlusion implementation",
+    "commercial-game comparative benchmark"
+  ],
+  "production_status": "Engineering handoff and executable contract models; not a production client/server library",
+  "validation_scope": "Local consistency and contract execution only; web URLs are recorded research sources, not freshly probed by this validator."
+}

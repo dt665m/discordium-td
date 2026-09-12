@@ -1,4 +1,6 @@
-//! One bounded, lossless codec for gameplay messages. Small inputs stay raw.
+//! One bounded, lossless codec for gameplay messages. By default every input is
+//! immediately eligible; compressed framing is selected only when strictly smaller
+//! than raw framing. Policy can disable compression or raise the eligibility size.
 use bincode::Options;
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -23,9 +25,30 @@ pub(crate) fn deserialize<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, bincod
         .deserialize(bytes)
 }
 
+/// Outgoing compression selection. Decoders always accept both wire forms.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CompressionMode {
+    #[default]
+    Auto,
+    Off,
+}
+
+/// Local encoding policy; it does not alter the negotiated wire format.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CompressionPolicy {
+    pub mode: CompressionMode,
+    /// Minimum serialized body bytes, before the raw/compressed framing. Zero
+    /// considers every message; an eligible candidate still has to save bytes.
+    pub minimum_bytes: usize,
+}
+
 pub fn encode<T: Serialize>(value: &T) -> Vec<u8> {
+    encode_with_compression(value, CompressionPolicy::default())
+}
+
+pub fn encode_with_compression<T: Serialize>(value: &T, policy: CompressionPolicy) -> Vec<u8> {
     let raw = serialize(value);
-    if raw.len() >= 256 {
+    if policy.mode == CompressionMode::Auto && raw.len() >= policy.minimum_bytes {
         let compressed = miniz_oxide::deflate::compress_to_vec(&raw, 1);
         if compressed.len() + 5 < raw.len() + 1 {
             let mut framed = Vec::with_capacity(compressed.len() + 5);
@@ -85,6 +108,62 @@ pub fn decode_with_limit<T: DeserializeOwned>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn small_repetitive_state_compresses_with_bounded_exact_decode() {
+        let value = vec![17u8; 20];
+        let raw = serialize(&value);
+        let encoded = encode(&value);
+        assert_eq!(encoded[0], 1);
+        assert!(encoded.len() < raw.len() + 1);
+        assert_eq!(
+            decode_with_limit::<Vec<u8>>(&encoded, raw.len()).unwrap(),
+            value
+        );
+        assert!(decode_with_limit::<Vec<u8>>(&encoded, raw.len() - 1).is_err());
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert!(decode::<Vec<u8>>(&trailing).is_err());
+        assert!(decode::<Vec<u8>>(&encoded[..encoded.len() - 1]).is_err());
+    }
+    #[test]
+    fn configured_compression_preserves_raw_and_exact_threshold_semantics() {
+        let value = vec![17u8; 20];
+        let raw_bytes = serialize(&value).len();
+        let off = encode_with_compression(
+            &value,
+            CompressionPolicy {
+                mode: CompressionMode::Off,
+                minimum_bytes: 0,
+            },
+        );
+        assert_eq!(off[0], 0);
+        assert_eq!(off.len(), raw_bytes + 1);
+        assert_eq!(decode::<Vec<u8>>(&off).unwrap(), value);
+        let skipped = encode_with_compression(
+            &value,
+            CompressionPolicy {
+                minimum_bytes: raw_bytes + 1,
+                ..Default::default()
+            },
+        );
+        assert_eq!(skipped, off);
+        let eligible = encode_with_compression(
+            &value,
+            CompressionPolicy {
+                minimum_bytes: raw_bytes,
+                ..Default::default()
+            },
+        );
+        assert_eq!(eligible[0], 1);
+        assert_eq!(eligible, encode(&value));
+        assert_eq!(decode::<Vec<u8>>(&eligible).unwrap(), value);
+    }
+    #[test]
+    fn expanding_compression_candidate_keeps_the_raw_frame() {
+        let value = 17u8;
+        assert_eq!(encode(&value), vec![0, value]);
+        assert_eq!(decode::<u8>(&encode(&value)).unwrap(), value);
+    }
     #[test]
     fn compressed_roundtrip_and_decode_limits() {
         let value = vec![17u32; 8192];

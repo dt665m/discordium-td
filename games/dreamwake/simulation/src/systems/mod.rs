@@ -1,9 +1,14 @@
 //! Game rules compose shared gameplay plugins; rendering remains client-only.
 use super::*;
+use crate::collision::{CollisionWorld, planar_position};
 use engine_core::spatial::{add, length, normalize, scale, sub};
 use std::f32::consts::TAU;
 mod common;
 pub(super) use common::*;
+mod covers;
+pub(super) use covers::*;
+mod rays;
+pub(super) use rays::*;
 mod combat;
 pub(super) use combat::*;
 mod player;

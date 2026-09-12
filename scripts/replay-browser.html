@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dreamwake native / WASM replay verification</title>
+<style>
+body { max-width: 960px; margin: 40px auto; padding: 0 24px; font: 16px/1.5 system-ui; color: #e5edf2; background: #101820; }
+h1 { font-size: 26px; } button { padding: 10px 18px; cursor: pointer; }
+pre { padding: 20px; background: #182731; white-space: pre-wrap; overflow-wrap: anywhere; }
+.pass { color: #81e5a3; } .fail { color: #ffa094; }
+</style>
+<h1>Native / WASM replay verification</h1>
+<p>Replays the same synthetic combat and wall/dash checkpoints in this browser. Every checkpoint boundary is restored before checking the next tick.</p>
+<p>This checks these native and browser builds. It does not qualify other CPU architectures, transport behavior, or release gates.</p>
+<button id="run">Run verification</button>
+<p id="status" role="status">Ready</p>
+<pre id="result">No browser result yet.</pre>
+<script type="module">
+const run = document.querySelector('#run'), status = document.querySelector('#status'), result = document.querySelector('#result');
+async function checked(name, hashes) {
+  const response = await fetch(name, { cache: 'no-store' });
+  if (!response.ok) throw new Error(`${name}: HTTP ${response.status}`);
+  const bytes = await response.arrayBuffer();
+  const digest = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', bytes)), b => b.toString(16).padStart(2, '0')).join('');
+  if (digest !== hashes[name]) throw new Error(`${name}: artifact hash mismatch`);
+  return bytes;
+}
+run.onclick = async () => {
+  run.disabled = true; status.className = ''; status.textContent = 'Verifying artifacts and replaying…';
+  result.textContent = 'Running in a worker…';
+  let worker;
+  try {
+    const provenance = await (await fetch('provenance.json', { cache: 'no-store' })).json();
+    if (provenance.source_changed.length) throw new Error('Sources changed during the build');
+    await checked('replay_web.js', provenance.artifacts);
+    const wasm = await checked('replay_web_bg.wasm', provenance.artifacts);
+    const fixtures = [];
+    for (const name of ['combat', 'wall-dash']) {
+      const manifest = JSON.parse(new TextDecoder().decode(await checked(`${name}.json`, provenance.artifacts)));
+      if (manifest.version !== 3 || manifest.scenario !== name || manifest.steps !== (name === 'combat' ? 120 : 256) || !manifest.segments.length || manifest.segments.length > 256)
+        throw new Error(`${name}: invalid segment manifest`);
+      fixtures.push([name, manifest]);
+    }
+    const source = `import init, { verify_fixture } from ${JSON.stringify(new URL('replay_web.js', location.href).href)};
+      self.onmessage = async ({ data }) => { try {
+        await init({ module_or_path: data.wasm });
+        const results = [];
+        for (const [name, manifest] of data.fixtures) {
+          let steps = 0, previous = null;
+          const segments = [];
+          for (const filename of manifest.segments) {
+            if (!/^[a-z0-9-]+\\.json$/.test(filename)) throw new Error('invalid segment filename');
+            const response = await fetch(new URL(filename, data.base), { cache: 'no-store' });
+            if (!response.ok) throw new Error(filename + ': HTTP ' + response.status);
+            const bytes = await response.arrayBuffer();
+            if (bytes.byteLength > 32 * 1024 * 1024) throw new Error('segment byte budget exceeded');
+            const digest = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', bytes)), b => b.toString(16).padStart(2, '0')).join('');
+            if (digest !== data.hashes[filename]) throw new Error(filename + ': artifact hash mismatch');
+            const report = JSON.parse(verify_fixture(new Uint8Array(bytes)));
+            if (report.scenario !== name || report.start_step !== steps || (previous !== null && report.initial_digest !== previous))
+              throw new Error(name + ': segment continuity failure at replay step ' + steps);
+            steps += report.steps; previous = report.final_digest; segments.push(report);
+          }
+          if (steps !== manifest.steps) throw new Error(name + ': incomplete trajectory');
+          results.push([name, { steps, restored_boundaries: steps, final_digest: previous, segments }]);
+        }
+        self.postMessage({ results });
+      } catch (error) { self.postMessage({ error: String(error) }); } };`;
+    const url = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
+    worker = new Worker(url, { type: 'module' }); URL.revokeObjectURL(url);
+    const actual = await new Promise((resolve, reject) => {
+      worker.onmessage = ({data}) => data.error ? reject(new Error(data.error)) : resolve(data.results);
+      worker.onerror = event => reject(new Error(event.message));
+      worker.postMessage({ wasm, fixtures, hashes: provenance.artifacts, base: location.href }, [wasm]);
+    });
+    for (const [name, report] of actual) {
+      const native = provenance.native_results[name];
+      if (report.segments.length !== native.segments.length || report.segments.some((segment, i) => ['start_step', 'steps', 'restored_boundaries', 'initial_digest', 'final_digest', 'final_tick'].some(key => segment[key] !== native.segments[i][key])))
+        throw new Error(`${name}: native segment report mismatch`);
+      if (report.final_digest !== native.final_digest || report.steps !== native.steps || report.restored_boundaries !== native.restored_boundaries)
+        throw new Error(`${name}: native report mismatch`);
+    }
+    result.textContent = JSON.stringify({ status: 'passed', browser: navigator.userAgent, results: Object.fromEntries(actual) }, null, 2);
+    status.textContent = 'Passed: native and browser checkpoints match'; status.className = 'pass';
+  } catch (error) {
+    status.textContent = 'Failed'; status.className = 'fail'; result.textContent = String(error);
+  } finally { worker?.terminate(); run.disabled = false; }
+};
+</script>
+</html>

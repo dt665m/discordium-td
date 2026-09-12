@@ -1,188 +1,141 @@
-//! Passive F3 diagnostics. Bevy owns frame sampling; this panel only presents it.
-use bevy::{
-    diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin},
-    input::InputSystems,
-    picking::Pickable,
-    prelude::*,
-    ui::FocusPolicy,
-};
-use dreamwake_sim::TOTAL_ROOMS;
-
+//! Game and network rows extend the engine's passive diagnostics panel.
 use crate::DreamView;
+use bevy::{picking::Pickable, prelude::*, ui::FocusPolicy};
+use dreamwake_sim::TOTAL_ROOMS;
+use engine_client::ui::debug::{DebugUiPlugin, DebugUiRoot, DebugUiSettings, DebugUiState};
 
 pub struct DreamDiagnosticsPlugin;
 
-#[derive(Resource, Default)]
-pub(super) struct DiagnosticsOverlay {
-    pub visible: bool,
-}
-
-/// Rows owned by the network adapter, separate from the performance/game query.
 #[derive(Component, Clone, Copy, Default)]
 pub(super) enum OverlayMetric {
     #[default]
     Network,
     Prediction,
 }
-
-#[derive(Component, Clone, Copy, Default)]
-enum PerformanceMetric {
-    #[default]
-    Headline,
-    Window,
-    Game,
-}
-
 #[derive(Component, Clone, Default)]
-struct OverlayPanel;
-
-struct RefreshClock(Timer);
-impl Default for RefreshClock {
-    fn default() -> Self {
-        Self(Timer::from_seconds(0.25, TimerMode::Repeating))
-    }
-}
+struct GameMetric;
+#[derive(Component, Clone, Default)]
+struct ActionMetric;
 
 impl Plugin for DreamDiagnosticsPlugin {
     fn build(&self, app: &mut App) {
-        if !app.is_plugin_added::<FrameTimeDiagnosticsPlugin>() {
-            app.add_plugins(FrameTimeDiagnosticsPlugin::new(120));
-        }
-        app.init_resource::<DiagnosticsOverlay>()
-            .add_systems(Startup, spawn_overlay)
-            .add_systems(PreUpdate, toggle_overlay.after(InputSystems))
-            .add_systems(Update, update_metrics);
+        app.insert_resource(DebugUiSettings {
+            background: Color::srgba(0.025, 0.041, 0.071, 0.94),
+            border: Color::srgba(0.39, 0.64, 0.70, 0.30),
+            text: Color::srgb(0.91, 0.95, 0.95),
+            muted: Color::srgb(0.64, 0.74, 0.79),
+            ..default()
+        })
+        .add_plugins(DebugUiPlugin)
+        .add_systems(PostStartup, spawn_rows)
+        .add_systems(Update, (update_game_metrics, update_action_metrics));
     }
 }
 
-fn metric_text(value: &str, size: f32, color: Color) -> impl Scene {
-    let value = value.to_owned();
-    bsn! {
-        Text(value)
-        TextFont { font_size: px(size) }
-        TextColor(color)
-        template_value(FocusPolicy::Pass)
-        template_value(Pickable::IGNORE)
-    }
-}
-
-fn spawn_overlay(mut commands: Commands) {
-    let white = Color::srgb(0.91, 0.95, 0.95);
-    let muted = Color::srgb(0.64, 0.74, 0.79);
+fn spawn_rows(
+    mut commands: Commands,
+    root: Single<Entity, With<DebugUiRoot>>,
+    settings: Res<DebugUiSettings>,
+) {
+    let parent = *root;
+    let white = settings.text;
+    let muted = settings.muted;
     commands.spawn_scene(bsn! {
-        OverlayPanel
-        Node {
-            display: Display::None,
-            position_type: PositionType::Absolute,
-            left: px(12), top: px(165), width: px(350), max_width: percent(95),
-            padding: px(12), row_gap: px(7),
-            flex_direction: FlexDirection::Column,
-            border: px(1), border_radius: BorderRadius::all(px(6)),
-        }
-        BackgroundColor(Color::srgba(0.025, 0.041, 0.071, 0.94))
-        BorderColor::all(Color::srgba(0.39, 0.64, 0.70, 0.30))
-        GlobalZIndex(900)
+        Node { flex_direction: FlexDirection::Column, row_gap: px(7) }
         template_value(FocusPolicy::Pass)
         template_value(Pickable::IGNORE)
         Children [
-            metric_text("METRICS  ·  F3 to hide", 11.0, muted),
-            (metric_text("— FPS  ·  — ms", 22.0, white) template_value(PerformanceMetric::Headline)),
-            (metric_text("Waiting for frame samples", 14.0, muted) template_value(PerformanceMetric::Window)),
-            (metric_text("GAME", 14.0, white) template_value(PerformanceMetric::Game)),
-            (metric_text("NETWORK\nWaiting for connection", 14.0, muted) template_value(OverlayMetric::Network)),
-            (metric_text("PREDICTION\nWaiting for samples", 14.0, muted) template_value(OverlayMetric::Prediction)),
+            (engine_client::ui::label("GAME", 14.0, white) GameMetric),
+            (engine_client::ui::label("NETWORK\nWaiting for connection", 14.0, muted) template_value(OverlayMetric::Network)),
+            (engine_client::ui::label("PREDICTION\nWaiting for samples", 14.0, muted) template_value(OverlayMetric::Prediction)),
+            (engine_client::ui::label("ACTION\nWaiting for an action", 12.0, muted) ActionMetric),
         ]
-    });
+    }).insert(ChildOf(parent));
 }
 
-fn toggle_overlay(
-    keys: Res<ButtonInput<KeyCode>>,
-    mut overlay: ResMut<DiagnosticsOverlay>,
-    mut panels: Query<&mut Node, With<OverlayPanel>>,
-) {
-    if !keys.just_pressed(KeyCode::F3) {
-        return;
-    }
-    overlay.visible = !overlay.visible;
-    for mut panel in &mut panels {
-        panel.display = if overlay.visible {
-            Display::Flex
-        } else {
-            Display::None
-        };
-    }
-}
-
-fn update_metrics(
+fn update_action_metrics(
     time: Res<Time<Real>>,
-    overlay: Res<DiagnosticsOverlay>,
-    diagnostics: Res<DiagnosticsStore>,
+    overlay: Res<DebugUiState>,
     view: Res<DreamView>,
-    mut refresh: Local<RefreshClock>,
-    mut rows: Query<(&PerformanceMetric, &mut Text), Without<OverlayMetric>>,
+    runtime: Option<NonSend<crate::plugins::network::Runtime>>,
+    mut next_update: Local<f64>,
+    mut rows: Query<&mut Text, With<ActionMetric>>,
 ) {
     if !overlay.visible {
+        *next_update = 0.0;
         return;
     }
-    refresh.0.tick(time.delta());
-    if !overlay.is_changed() && !refresh.0.just_finished() {
+    let now = time.elapsed_secs_f64();
+    if now < *next_update && !overlay.is_changed() {
         return;
     }
-    if overlay.is_changed() {
-        refresh.0.reset();
-    }
-    let frames = diagnostics.get(&FrameTimeDiagnosticsPlugin::FRAME_TIME);
-    let frame_ms = frames
-        .and_then(|d| d.smoothed())
-        .filter(|value| value.is_finite() && *value > 0.0);
-    // Average frame duration first: averaging instantaneous FPS can overstate
-    // throughput when short event-driven frames alternate with longer frames.
-    let fps = frame_ms
-        .map(|value| 1000.0 / value)
-        .filter(|value| value.is_finite());
-    let headline = format!(
-        "{} FPS  ·  {} ms",
-        fps.map_or_else(|| "—".into(), |v| format!("{v:.0}")),
-        frame_ms.map_or_else(|| "—".into(), |v| format!("{v:.1}")),
-    );
-    let window = if let Some(frames) = frames.filter(|d| d.history_len() > 0) {
-        let count = frames.history_len().min(120);
-        let (sum, worst) = frames
-            .values()
-            .skip(frames.history_len() - count)
-            .fold((0.0_f64, 0.0_f64), |(sum, worst), value| {
-                (sum + value, worst.max(*value))
-            });
+    *next_update = now + 0.25;
+    let value = runtime
+        .as_ref()
+        .and_then(|r| r.outcomes.latest_trace(view.0.hero.id));
+    let content = value.map_or_else(|| "ACTION\nWaiting for an action".to_string(), |trace| {
+        let tick = |value: Option<engine_net::types::ServerTick>| value.map_or_else(|| "—".to_string(), |t| t.0.to_string());
+        let verdict = trace.outcome.as_ref().map_or_else(
+            || if trace.lookup_unavailable { "Lookup unavailable".into() } else { "Pending verdict".into() },
+            |outcome| format!("{:?}: {:?} · {:.0} damage", outcome.data.status, outcome.data.reason, outcome.data.damage),
+        );
         format!(
-            "Mean {:.1} ms · worst {worst:.1} ms\nLast {count} frames",
-            sum / count as f64
+            "ACTION {} · {}:{}:{}:{}\nSample E {} · view R {} · target C {}\nQuery {} · executed {}\nCheckpoint {} · presented timeline {}\n{}",
+            trace.kind, trace.key.connection.0, trace.key.stream.0, trace.key.command.0, trace.key.slot,
+            tick(trace.view.map(|v| v.sampled_at)), tick(trace.view.map(|v| v.viewed_at)), trace.target_c.0,
+            tick(trace.outcome.as_ref().and_then(|o| o.data.query_tick)), tick(trace.outcome.as_ref().map(|o| o.execution_tick)),
+            tick(trace.checkpoint.map(|o| o.tick)), tick(trace.presented_timeline.map(|o| o.tick)), verdict,
         )
-    } else {
-        "Waiting for frame samples".into()
-    };
+    });
+    for mut text in &mut rows {
+        if text.0 != content {
+            text.0.clone_from(&content);
+        }
+    }
+}
+
+fn update_game_metrics(
+    time: Res<Time<Real>>,
+    overlay: Res<DebugUiState>,
+    view: Res<DreamView>,
+    mut next_update: Local<f64>,
+    mut rows: Query<&mut Text, With<GameMetric>>,
+) {
+    if !overlay.visible {
+        *next_update = 0.0;
+        return;
+    }
+    let now = time.elapsed_secs_f64();
+    if now < *next_update && !overlay.is_changed() {
+        return;
+    }
+    *next_update = now + 0.25;
     let snap = &view.0;
+    let cell_size = engine_net::interest::Limits::default().cell_size as f32;
+    let cell = snap
+        .hero
+        .position
+        .map(|axis| (axis / cell_size).floor() as i32);
     let game = format!(
-        "GAME  {}/{} · {:?} · tick {}\nHeroes {} · enemies {} · shots {} · FX {}\nLocal ({:.1}, {:.1}) · {:.1} units/s",
+        "GAME  {}/{} · {:?} · tick {}\nHeroes {} · enemies {} · props {} · shots {} · FX {}\nLocal ({:.1}, {:.1}) · cell ({}, {}) · {:.1} units/s",
         snap.room + 1,
         TOTAL_ROOMS,
         snap.phase,
         snap.tick,
         snap.heroes.len(),
         snap.enemies.len(),
+        snap.covers.len(),
         snap.projectiles.len(),
         snap.presentations.len(),
         snap.hero.position[0],
         snap.hero.position[1],
+        cell[0],
+        cell[1],
         Vec2::from_array(snap.hero.velocity).length(),
     );
-    for (metric, mut text) in &mut rows {
-        let value = match metric {
-            PerformanceMetric::Headline => &headline,
-            PerformanceMetric::Window => &window,
-            PerformanceMetric::Game => &game,
-        };
-        if text.0 != *value {
-            text.0.clone_from(value);
+    for mut text in &mut rows {
+        if text.0 != game {
+            text.0.clone_from(&game);
         }
     }
 }
@@ -203,7 +156,9 @@ mod tests {
             bevy::diagnostic::DiagnosticsPlugin,
         ))
         .init_resource::<ButtonInput<KeyCode>>()
-        .insert_resource(DreamView(DreamSimulation::new(7, false).snapshot()))
+        .insert_resource(DreamView(crate::offline_presentation(
+            DreamSimulation::new(7, false).snapshot(),
+        )))
         .add_plugins(DreamDiagnosticsPlugin);
         app
     }
@@ -212,16 +167,18 @@ mod tests {
     fn overlay_starts_hidden_and_every_node_passes_pointer_input() {
         let mut app = overlay_app();
         app.update();
-        assert!(!app.world().resource::<DiagnosticsOverlay>().visible);
+        assert!(!app.world().resource::<DebugUiState>().visible);
         let world = app.world_mut();
         assert_eq!(
             world
-                .query_filtered::<&Node, With<OverlayPanel>>()
+                .query_filtered::<&Node, With<DebugUiRoot>>()
                 .single(world)
                 .unwrap()
                 .display,
             Display::None
         );
+        assert_eq!(world.query::<&GameMetric>().iter(world).count(), 1);
+        assert_eq!(world.query::<&OverlayMetric>().iter(world).count(), 2);
         let mut nodes = world.query_filtered::<(
             Option<&Interaction>,
             Option<&FocusPolicy>,
@@ -245,7 +202,7 @@ mod tests {
             .resource_mut::<ButtonInput<KeyCode>>()
             .press(KeyCode::F3);
         app.update();
-        assert!(app.world().resource::<DiagnosticsOverlay>().visible);
+        assert!(app.world().resource::<DebugUiState>().visible);
         assert!(!app.world().resource::<ConditionerDebug>().visible);
         app.world_mut()
             .resource_mut::<ButtonInput<KeyCode>>()
@@ -254,7 +211,7 @@ mod tests {
             .resource_mut::<ButtonInput<KeyCode>>()
             .press(KeyCode::F6);
         app.update();
-        assert!(app.world().resource::<DiagnosticsOverlay>().visible);
+        assert!(app.world().resource::<DebugUiState>().visible);
         assert!(app.world().resource::<ConditionerDebug>().visible);
         app.world_mut()
             .resource_mut::<ButtonInput<KeyCode>>()
@@ -263,7 +220,7 @@ mod tests {
             .resource_mut::<ButtonInput<KeyCode>>()
             .press(KeyCode::F3);
         app.update();
-        assert!(!app.world().resource::<DiagnosticsOverlay>().visible);
+        assert!(!app.world().resource::<DebugUiState>().visible);
         assert!(app.world().resource::<ConditionerDebug>().visible);
     }
 }

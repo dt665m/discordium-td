@@ -4,6 +4,17 @@ The workspace uses Bevy 0.19.1. Use Bevy's ECS, geometry, transforms, timers,
 relationships, scheduling, rendering and app lifecycle directly. Engine plugins
 add gameplay and transport policy.
 
+## Native build profiles
+
+Ordinary native development uses optimization level 1 for workspace code and
+level 3 for dependencies, following [Bevy's setup guidance](https://bevy.org/learn/quick-start/getting-started/setup/#compile-with-performance-optimizations).
+This retains development assertions while avoiding an unoptimized ECS and
+renderer. Native network qualification uses captured release builds of both
+client and server; see [captured game-soak inputs](network-game-soak.md#captured-inputs).
+Record the build profile, replication radius, rendered window size and sampled
+frame durations together. A connection check with a small spatial fixture does
+not establish performance at the normal gameplay replication radius.
+
 ## State and lifecycle
 
 - Use `Mut`/`Changed` and `set_if_neq`; avoid dirtying idle components or maintaining
@@ -69,6 +80,8 @@ produces world coordinates. Graphics correction must not mutate gameplay state.
 World labels update after `CameraUpdateSystems` and before `UiSystems::Content`.
 Use `TransformHelper` to obtain the current camera transform, including ancestors,
 when transform propagation has not yet run.
+The engine's [client UI plugin](client-ui.md) exposes `UiSet::Billboards` and
+`UiSet::Widgets` for shared world projection and meter updates at this boundary.
 
 The server driver orders receive, bounded simulation steps, publication and send.
 Its `TickClock` runs an immediate first tick, caps catch-up at six steps, discards

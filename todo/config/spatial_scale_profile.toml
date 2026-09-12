@@ -1,0 +1,53 @@
+# Proposed benchmark overlays; merge explicitly with arena_profile.toml.
+# These are synthetic qualification workloads, not captured Fortnite layouts.
+[base]
+profile = "arena_profile.toml"
+
+[scale]
+connections = 100
+potential_replicated_actors = 50000
+replication_model = "epic_replication_graph"
+layout_seed = 20260909
+scenarios = ["sparse_distributed", "dense_hotspot", "mostly_dormant", "mass_wake", "observer_teleport"]
+report = ["prepare_cpu", "gather_cpu", "candidate_visits", "eligible_entities", "transmitted_entities", "membership_bytes", "scope_bytes", "wire_bytes", "critical_deadline_misses", "entry_progress"]
+
+[sparse_distributed]
+world_side_m = 8192.0
+spawn_edge_margin_m = 256.0
+require_local_candidate_visits = true
+allow_shared_dynamic_refresh = true
+
+[dense_hotspot]
+# Deliberately exceeds some default scope caps: qualification checks bounded
+# rejection/degradation as well as the admitted subset's correctness.
+expect_overload_detection = true
+allow_partial_required_group = false
+
+[mostly_dormant]
+dormant_actor_fraction = 0.95
+periodic_global_dormant_broadcast_allowed = false
+
+[mass_wake]
+actors_changed_in_burst = 10000
+require_pending_version_accounting = true
+
+[observer_teleport]
+simultaneous_observers = 100
+require_asset_and_scope_activation_gates = true
+
+# Actor classes vary bounds/radius to fit a realistic mixed potential population.
+# Counts sum to 50,000; dormant fraction and placement vary by scenario.
+[actor_classes.player]
+count = 100
+cull_radius_m = 80.0
+bound_radius_m = 1.0
+
+[actor_classes.dynamic]
+count = 900
+cull_radius_m = 32.0
+bound_radius_m = 2.0
+
+[actor_classes.prop]
+count = 49000
+cull_radius_m = 12.0
+bound_radius_m = 2.0

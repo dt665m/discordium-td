@@ -1,0 +1,1562 @@
+[
+  {
+    "id": "T001",
+    "family": "Clock",
+    "title": "Initial offset",
+    "setup_or_fault": "Inject four-timestamp probes with processing delay",
+    "pass_condition": "Processing time removed from RTT; no use of wall-clock calendar time",
+    "spec_sections": "6",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T002",
+    "family": "Clock",
+    "title": "Asymmetric uplink",
+    "setup_or_fault": "10 ms downlink and 90 ms uplink",
+    "pass_condition": "Arrival-slack feedback increases useful lead without claiming exact one-way measurement",
+    "spec_sections": "6",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T003",
+    "family": "Clock",
+    "title": "Asymmetric downlink",
+    "setup_or_fault": "90 ms downlink and 10 ms uplink",
+    "pass_condition": "No double-counted network age or unnecessary permanent input queue",
+    "spec_sections": "6",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T004",
+    "family": "Clock",
+    "title": "Clock drift",
+    "setup_or_fault": "Apply positive and negative clock drift for one hour",
+    "pass_condition": "Fixed dt maintained; predicted clock tracks server with bounded phase",
+    "spec_sections": "6",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T005",
+    "family": "Clock",
+    "title": "Lead decrease",
+    "setup_or_fault": "Lower RTT while commands are already pending",
+    "pass_condition": "Existing target ticks immutable; no command overwritten",
+    "spec_sections": "6",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T006",
+    "family": "Clock",
+    "title": "Long suspension",
+    "setup_or_fault": "Pause client for one second",
+    "pass_condition": "Controlled resync; no unbounded replay or stale firing",
+    "spec_sections": "6",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T007",
+    "family": "Clock",
+    "title": "Tick rounding",
+    "setup_or_fault": "Run 60 Hz for 24 hours",
+    "pass_condition": "Deadlines use rational period; no accumulated 16 ms rounding error",
+    "spec_sections": "6",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T008",
+    "family": "Clock",
+    "title": "Presentation cursor",
+    "setup_or_fault": "Deliver late older snapshot",
+    "pass_condition": "Normal presentation never runs backward",
+    "spec_sections": "6",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T009",
+    "family": "Input",
+    "title": "Received versus executed",
+    "setup_or_fault": "Deliver command 100 for future tick before earlier inputs",
+    "pass_condition": "Receipt does not imply earlier execution or authorize history deletion",
+    "spec_sections": "7",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T010",
+    "family": "Input",
+    "title": "Exact duplicate",
+    "setup_or_fault": "Deliver same command in eight bundles",
+    "pass_condition": "At most one authoritative action and one control sample",
+    "spec_sections": "7",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T011",
+    "family": "Input",
+    "title": "Equivocation",
+    "setup_or_fault": "Same sequence with modified aim or movement",
+    "pass_condition": "Reject conflicting payload and keep prior admitted state",
+    "spec_sections": "7",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T012",
+    "family": "Input",
+    "title": "Target replacement",
+    "setup_or_fault": "Different sequence attempts same target tick",
+    "pass_condition": "Reject replacement after admission",
+    "spec_sections": "7",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T013",
+    "family": "Input",
+    "title": "Late control",
+    "setup_or_fault": "Deliver input after substitute committed",
+    "pass_condition": "Past movement unchanged; terminal late verdict",
+    "spec_sections": "7",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T014",
+    "family": "Input",
+    "title": "Future control",
+    "setup_or_fault": "Submit thousands of future ticks",
+    "pass_condition": "Pending queue bounded to negotiated window",
+    "spec_sections": "7",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T015",
+    "family": "Input",
+    "title": "Speed hack",
+    "setup_or_fault": "Submit many valid commands in one server tick",
+    "pass_condition": "World advances only by scheduled fixed steps",
+    "spec_sections": "7",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T016",
+    "family": "Input",
+    "title": "Invalid numerics",
+    "setup_or_fault": "NaN infinity huge axes invalid enums",
+    "pass_condition": "Reject before simulation or expensive work",
+    "spec_sections": "7",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T017",
+    "family": "Input",
+    "title": "Held control expiry",
+    "setup_or_fault": "Drop input after movement begins",
+    "pass_condition": "Held intent follows grace then neutralizes; physical state still evolves legally",
+    "spec_sections": "7",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T018",
+    "family": "Input",
+    "title": "Lost edge",
+    "setup_or_fault": "Drop every packet containing one fire edge",
+    "pass_condition": "No fabricated late shot; explicit expiry/finalization",
+    "spec_sections": "7",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T019",
+    "family": "Input",
+    "title": "Edge redundancy",
+    "setup_or_fault": "Lose first packet but deliver redundant edge in time",
+    "pass_condition": "Edge executes once",
+    "spec_sections": "7",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T020",
+    "family": "Input",
+    "title": "Low FPS edges",
+    "setup_or_fault": "Press and release between 30 FPS render frames",
+    "pass_condition": "Both transitions preserved exactly once",
+    "spec_sections": "7",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T021",
+    "family": "Input",
+    "title": "Mouse delta reuse",
+    "setup_or_fault": "Generate two simulation ticks from one render frame",
+    "pass_condition": "Mouse delta not multiplied across ticks",
+    "spec_sections": "7",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T022",
+    "family": "Input",
+    "title": "Old epoch",
+    "setup_or_fault": "Replay old authenticated-session application frame",
+    "pass_condition": "Cannot control reconnected entity",
+    "spec_sections": "7",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T023",
+    "family": "Prediction",
+    "title": "Off-by-one",
+    "setup_or_fault": "Restore end-of-tick K checkpoint",
+    "pass_condition": "Replay begins with K+1",
+    "spec_sections": "9,12",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T024",
+    "family": "Prediction",
+    "title": "Equal pose different velocity",
+    "setup_or_fault": "Correction changes velocity but not position",
+    "pass_condition": "Correction replay occurs and future state converges",
+    "spec_sections": "9,12",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T025",
+    "family": "Prediction",
+    "title": "Cooldown drift",
+    "setup_or_fault": "Correction changes cooldown only",
+    "pass_condition": "Next shot timing matches authority",
+    "spec_sections": "9,12",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T026",
+    "family": "Prediction",
+    "title": "RNG drift",
+    "setup_or_fault": "Correction changes weapon random state",
+    "pass_condition": "Subsequent deterministic spread matches authority",
+    "spec_sections": "9,12",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T027",
+    "family": "Prediction",
+    "title": "Ground flag drift",
+    "setup_or_fault": "Correct grounded state on ledge",
+    "pass_condition": "Jump/fall transition converges",
+    "spec_sections": "9,12",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T028",
+    "family": "Prediction",
+    "title": "Dependency-only change",
+    "setup_or_fault": "Owner pose equal but base revision differs",
+    "pass_condition": "Dependent prediction invalidated",
+    "spec_sections": "9,12",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T029",
+    "family": "Prediction",
+    "title": "Unknown impulse",
+    "setup_or_fault": "Server enemy applies knockback client could not know",
+    "pass_condition": "Correct state and classify as new information rather than deterministic bug",
+    "spec_sections": "9,12",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T030",
+    "family": "Prediction",
+    "title": "Partial group",
+    "setup_or_fault": "Deliver rider without platform half",
+    "pass_condition": "No partial authoritative publication or mixed-time simulation",
+    "spec_sections": "9,12",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T031",
+    "family": "Prediction",
+    "title": "Group revision",
+    "setup_or_fault": "Mix chunks from old/new group versions",
+    "pass_condition": "Reject mixed group",
+    "spec_sections": "9,12",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T032",
+    "family": "Prediction",
+    "title": "Sparse history",
+    "setup_or_fault": "No history entry for unchanged component",
+    "pass_condition": "Unavailable is not treated as removed",
+    "spec_sections": "9,12",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T033",
+    "family": "Prediction",
+    "title": "Explicit removal",
+    "setup_or_fault": "Server removes predicted component at tick",
+    "pass_condition": "Removal replays once and is not resurrected",
+    "spec_sections": "9,12",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T034",
+    "family": "Prediction",
+    "title": "History exhaustion",
+    "setup_or_fault": "Correct beyond stored input horizon",
+    "pass_condition": "Resync; no invented command history",
+    "spec_sections": "9,12",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T035",
+    "family": "Prediction",
+    "title": "Replay budget",
+    "setup_or_fault": "Correction exceeds replay work cap",
+    "pass_condition": "Bounded recovery; no partially replayed published world",
+    "spec_sections": "9,12",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T036",
+    "family": "Prediction",
+    "title": "Stale correction",
+    "setup_or_fault": "Deliver older checkpoint after newer one applied",
+    "pass_condition": "No reversal to stale simulation state",
+    "spec_sections": "9,12",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T037",
+    "family": "Prediction",
+    "title": "Checkpoint ahead",
+    "setup_or_fault": "Server checkpoint ahead of local predictor",
+    "pass_condition": "Explicit resync/clock handling",
+    "spec_sections": "9,12",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T038",
+    "family": "Prediction",
+    "title": "Restore every tick",
+    "setup_or_fault": "Checkpoint and restore each tick of trace",
+    "pass_condition": "Same canonical final state",
+    "spec_sections": "9,12",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T039",
+    "family": "Prediction",
+    "title": "Input polling during replay",
+    "setup_or_fault": "Instrument live-input API calls",
+    "pass_condition": "Zero reads inside replay",
+    "spec_sections": "9,12",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T040",
+    "family": "Prediction",
+    "title": "Wall clock during replay",
+    "setup_or_fault": "Perturb external time between reruns",
+    "pass_condition": "Simulation output unchanged",
+    "spec_sections": "9,12",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T041",
+    "family": "Presentation",
+    "title": "Physics versus mesh",
+    "setup_or_fault": "Correct player by 0.5 m",
+    "pass_condition": "Physics correct immediately; only render offset decays",
+    "spec_sections": "10,13",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T042",
+    "family": "Presentation",
+    "title": "Camera through wall",
+    "setup_or_fault": "Correct camera next to solid wall",
+    "pass_condition": "Presentation constrained or snapped; no gameplay feedback loop",
+    "spec_sections": "10,13",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T043",
+    "family": "Presentation",
+    "title": "Teleport",
+    "setup_or_fault": "Snapshots straddle teleport",
+    "pass_condition": "No interpolated journey through intervening space",
+    "spec_sections": "10,13",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T044",
+    "family": "Presentation",
+    "title": "Extrapolation cap",
+    "setup_or_fault": "Stop remote updates for 500 ms",
+    "pass_condition": "Cap reached then explicit degraded behavior",
+    "spec_sections": "10,13",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T045",
+    "family": "Presentation",
+    "title": "Orientation wrap",
+    "setup_or_fault": "Interpolate yaw across 359 to 1 degrees",
+    "pass_condition": "Shortest valid orientation path",
+    "spec_sections": "10,13",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T046",
+    "family": "Presentation",
+    "title": "Hermite overshoot",
+    "setup_or_fault": "Sharp reversal near wall",
+    "pass_condition": "Bounded tangent/interpolation does not create unacceptable overshoot",
+    "spec_sections": "10,13",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T047",
+    "family": "Presentation",
+    "title": "Repeated replay VFX",
+    "setup_or_fault": "Same shot replayed ten times",
+    "pass_condition": "Muzzle flash/sound delivery not repeated",
+    "spec_sections": "10,13",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T048",
+    "family": "Presentation",
+    "title": "Rejected ability",
+    "setup_or_fault": "Server rejects locally predicted dash",
+    "pass_condition": "Resource corrected and reversible trail canceled",
+    "spec_sections": "10,13",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T049",
+    "family": "Movement",
+    "title": "Step boundary",
+    "setup_or_fault": "Sweep capsule at maximum/minimum step height",
+    "pass_condition": "Deterministic permitted step outcome",
+    "spec_sections": "11",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T050",
+    "family": "Movement",
+    "title": "Slope boundary",
+    "setup_or_fault": "Move on slopes around walkable threshold",
+    "pass_condition": "Identical ground classification on client/server",
+    "spec_sections": "11",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T051",
+    "family": "Movement",
+    "title": "Blocked stand",
+    "setup_or_fault": "Release crouch under low ceiling",
+    "pass_condition": "Remain crouched without capsule penetration",
+    "spec_sections": "11",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T052",
+    "family": "Movement",
+    "title": "Jump ground snap",
+    "setup_or_fault": "Jump on grounded tick",
+    "pass_condition": "Ground snap does not erase jump",
+    "spec_sections": "11",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T053",
+    "family": "Movement",
+    "title": "Rotating platform",
+    "setup_or_fault": "Stand and dismount from rotating base",
+    "pass_condition": "Historical base pose used; inherited velocity applied once",
+    "spec_sections": "11",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T054",
+    "family": "Movement",
+    "title": "Contact ties",
+    "setup_or_fault": "Hit two surfaces at identical sweep time",
+    "pass_condition": "Stable collider-ID tie-break produces same result",
+    "spec_sections": "11",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T055",
+    "family": "Movement",
+    "title": "Initial overlap",
+    "setup_or_fault": "Spawn capsule intersecting multiple blockers",
+    "pass_condition": "Bounded deterministic depenetration",
+    "spec_sections": "11",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T056",
+    "family": "Movement",
+    "title": "Remote collision",
+    "setup_or_fault": "Opponent render pose is delayed",
+    "pass_condition": "Gameplay collision uses declared proxy policy not rendered mesh",
+    "spec_sections": "11",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T057",
+    "family": "Movement",
+    "title": "Thin wall",
+    "setup_or_fault": "Dash/projectile crosses thin obstacle in one tick",
+    "pass_condition": "Sweep catches blocker; no endpoint-only tunneling",
+    "spec_sections": "11",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T058",
+    "family": "Lifecycle",
+    "title": "Predicted spawn accept",
+    "setup_or_fault": "Server accepts locally visible projectile",
+    "pass_condition": "Bind same visual by key without duplicate object",
+    "spec_sections": "15",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T059",
+    "family": "Lifecycle",
+    "title": "Predicted spawn reject",
+    "setup_or_fault": "Server rejects projectile due ammo",
+    "pass_condition": "Provisional state retired; no authoritative damage",
+    "spec_sections": "15",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T060",
+    "family": "Lifecycle",
+    "title": "Accept after local death",
+    "setup_or_fault": "Projectile locally despawned before acceptance arrives",
+    "pass_condition": "Binding recorded without resurrection",
+    "spec_sections": "15",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T061",
+    "family": "Lifecycle",
+    "title": "Conflicting terminal outcome",
+    "setup_or_fault": "Accept then reject same action ID",
+    "pass_condition": "Conflict rejected/reported; no silent result rewrite",
+    "spec_sections": "15",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T062",
+    "family": "Lifecycle",
+    "title": "Entity ID reuse",
+    "setup_or_fault": "Old packet refers to reused index with old generation",
+    "pass_condition": "New entity unaffected",
+    "spec_sections": "15",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T063",
+    "family": "Lifecycle",
+    "title": "Relevance exit",
+    "setup_or_fault": "Entity leaves client relevance but remains alive",
+    "pass_condition": "Only connection scope retires; no global death tombstone; unrelated connections and server simulation continue",
+    "spec_sections": "15,17",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T064",
+    "family": "Lifecycle",
+    "title": "Relevance re-entry",
+    "setup_or_fault": "Charging entity returns without original start RPC",
+    "pass_condition": "New scope epoch and full authorized state reconstruct current effect; old scope baseline is not reused",
+    "spec_sections": "15,17",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T065",
+    "family": "Lifecycle",
+    "title": "Ownership boundary",
+    "setup_or_fault": "Old/new owners submit around transfer tick",
+    "pass_condition": "Only tick-eligible owner accepted",
+    "spec_sections": "15",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T066",
+    "family": "Lifecycle",
+    "title": "Pool reset",
+    "setup_or_fault": "Reuse pooled visual after rejected spawn",
+    "pass_condition": "No stale smoothing event or ownership metadata",
+    "spec_sections": "15",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T067",
+    "family": "Lifecycle",
+    "title": "Parent change",
+    "setup_or_fault": "Reparent moving entity",
+    "pass_condition": "World/local coordinates converted at explicit effective tick",
+    "spec_sections": "15",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T068",
+    "family": "Combat",
+    "title": "Authoritative origin",
+    "setup_or_fault": "Client submits impossible muzzle location",
+    "pass_condition": "Server uses legal authoritative origin",
+    "spec_sections": "14",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T069",
+    "family": "Combat",
+    "title": "Forged damage",
+    "setup_or_fault": "Client sends target and excessive damage claim",
+    "pass_condition": "No authoritative damage from client claim",
+    "spec_sections": "14",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T070",
+    "family": "Combat",
+    "title": "Rewind cap",
+    "setup_or_fault": "Request very old view time",
+    "pass_condition": "Clamped/rejected under hard cap and policy",
+    "spec_sections": "14",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T071",
+    "family": "Combat",
+    "title": "Double RTT error",
+    "setup_or_fault": "E=1000 C=1050 R=925 ms",
+    "pass_condition": "Query remains validated 925 ms not R minus RTT again",
+    "spec_sections": "14",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T072",
+    "family": "Combat",
+    "title": "Missing history",
+    "setup_or_fault": "Requested history not retained",
+    "pass_condition": "Explicit failure/fallback reason; no guessed history",
+    "spec_sections": "14",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T073",
+    "family": "Combat",
+    "title": "Teleport history",
+    "setup_or_fault": "Interpolate target across teleport",
+    "pass_condition": "No cross-segment interpolation",
+    "spec_sections": "14",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T074",
+    "family": "Combat",
+    "title": "Respawn history",
+    "setup_or_fault": "Shot references previous generation",
+    "pass_condition": "Cannot damage current respawn via old identity",
+    "spec_sections": "14",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T075",
+    "family": "Combat",
+    "title": "Dynamic cover",
+    "setup_or_fault": "Door closes between historical/current time",
+    "pass_condition": "Result matches declared historical/current veto policy",
+    "spec_sections": "14",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T076",
+    "family": "Combat",
+    "title": "Shield boundary",
+    "setup_or_fault": "Shield activation matches attack interval",
+    "pass_condition": "Deterministic documented eligibility",
+    "spec_sections": "14",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T077",
+    "family": "Combat",
+    "title": "Equal-time trades",
+    "setup_or_fault": "Swap connection iteration order",
+    "pass_condition": "Equal-time outcome unchanged",
+    "spec_sections": "14",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T078",
+    "family": "Combat",
+    "title": "Headless pose",
+    "setup_or_fault": "Disable rendering and animate target",
+    "pass_condition": "Server hitboxes update normally",
+    "spec_sections": "14",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T079",
+    "family": "Combat",
+    "title": "Automatic fire",
+    "setup_or_fault": "Hold trigger with repeated packets",
+    "pass_condition": "Server fire rate and shot IDs remain bounded",
+    "spec_sections": "14",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T080",
+    "family": "Combat",
+    "title": "Melee repeat",
+    "setup_or_fault": "Sweep blade hits same target several samples",
+    "pass_condition": "Per-swing target hit policy enforced once",
+    "spec_sections": "14",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T081",
+    "family": "Combat",
+    "title": "Beam rate",
+    "setup_or_fault": "Render at 30 versus 240 FPS",
+    "pass_condition": "Same server damage schedule",
+    "spec_sections": "14",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T082",
+    "family": "Combat",
+    "title": "Projectile catch-up",
+    "setup_or_fault": "Historical bullet passes moving shield",
+    "pass_condition": "Every catch-up interval swept under selected defense policy",
+    "spec_sections": "14",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T083",
+    "family": "Replication",
+    "title": "Unknown baseline",
+    "setup_or_fault": "Delta names unavailable snapshot",
+    "pass_condition": "No partial publish and no decoded-success ACK",
+    "spec_sections": "16,17",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T084",
+    "family": "Replication",
+    "title": "Baseline equivocation",
+    "setup_or_fault": "Same snapshot ID different bytes",
+    "pass_condition": "Reject conflicting representation",
+    "spec_sections": "16,17",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T085",
+    "family": "Replication",
+    "title": "Baseline eviction",
+    "setup_or_fault": "Client storage fills while server references old baseline",
+    "pass_condition": "Negotiated retirement/reset before discard",
+    "spec_sections": "16,17",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T086",
+    "family": "Replication",
+    "title": "Dropped wake",
+    "setup_or_fault": "Lose dormancy wake event",
+    "pass_condition": "Pending authoritative version retries for entitled connection until decode; unrelated current dormant connections are not broadcast again",
+    "spec_sections": "16,17",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T087",
+    "family": "Replication",
+    "title": "Lost chunk",
+    "setup_or_fault": "Drop one group keyframe chunk",
+    "pass_condition": "Incomplete group expires and is never published",
+    "spec_sections": "16,17",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T088",
+    "family": "Replication",
+    "title": "Newer keyframe",
+    "setup_or_fault": "New full checkpoint arrives while old chunks incomplete",
+    "pass_condition": "New complete state supersedes old assembly safely",
+    "spec_sections": "16,17",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T089",
+    "family": "Replication",
+    "title": "Codec boundaries",
+    "setup_or_fault": "Min/max range rounding negative zero enums",
+    "pass_condition": "Canonical round-trip or explicit rejection",
+    "spec_sections": "16,17",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T090",
+    "family": "Replication",
+    "title": "Schema mismatch",
+    "setup_or_fault": "Connect incompatible ruleset/map/schema",
+    "pass_condition": "Fail synchronization before gameplay",
+    "spec_sections": "16,17",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T091",
+    "family": "Replication",
+    "title": "Priority starvation",
+    "setup_or_fault": "Thousands of low-priority dirty entities",
+    "pass_condition": "Owner budget protected; bounded age for eligible low-priority state",
+    "spec_sections": "16,17",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T092",
+    "family": "Replication",
+    "title": "Visibility leak",
+    "setup_or_fault": "Capture all traffic near hidden enemy",
+    "pass_condition": "No prohibited fields in state events observers dependencies proxies debug or cached shared payload; hard denial wins",
+    "spec_sections": "16,17",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T093",
+    "family": "Replication",
+    "title": "Bandwidth choke",
+    "setup_or_fault": "Cap downstream below desired snapshot volume",
+    "pass_condition": "Finite queues prioritize fresh useful state",
+    "spec_sections": "16,17",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T094",
+    "family": "Transport",
+    "title": "Malformed length",
+    "setup_or_fault": "Oversized or truncated field length",
+    "pass_condition": "Reject without unbounded allocation or panic",
+    "spec_sections": "18",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T095",
+    "family": "Transport",
+    "title": "Compression bomb",
+    "setup_or_fault": "Tiny encoded message requests huge decoded state",
+    "pass_condition": "Decoded size cap applied",
+    "spec_sections": "18",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T096",
+    "family": "Transport",
+    "title": "Unauthenticated amplification",
+    "setup_or_fault": "Spoof unauthenticated requests",
+    "pass_condition": "No large state response before validation",
+    "spec_sections": "18",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T097",
+    "family": "Transport",
+    "title": "Replayable early data",
+    "setup_or_fault": "Repeat early-data mutation request",
+    "pass_condition": "No duplicated gameplay/persistent transaction",
+    "spec_sections": "18",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T098",
+    "family": "Transport",
+    "title": "Reliable bulk HOL",
+    "setup_or_fault": "Transfer large data while playing under loss",
+    "pass_condition": "Match-state latency measured and budgeted; bulk cannot dominate",
+    "spec_sections": "18",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T099",
+    "family": "Transport",
+    "title": "Path MTU change",
+    "setup_or_fault": "Lower negotiated datagram limit",
+    "pass_condition": "Repack or reject safely; no assumed plaintext equals wire size",
+    "spec_sections": "18",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T100",
+    "family": "Transport",
+    "title": "Serial wrap",
+    "setup_or_fault": "Sequence crosses maximum u32",
+    "pass_condition": "New/old ordering correct within declared window",
+    "spec_sections": "18",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T101",
+    "family": "Transport",
+    "title": "Queue flooding",
+    "setup_or_fault": "Peer floods input/action/outcome requests",
+    "pass_condition": "Per-peer work/memory bounded; match stays responsive",
+    "spec_sections": "18",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T102",
+    "family": "Operations",
+    "title": "Server overload",
+    "setup_or_fault": "Simulation workload exceeds deadline",
+    "pass_condition": "Tick debt visible; bounded catch-up and admission shedding",
+    "spec_sections": "20,21,22",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T103",
+    "family": "Operations",
+    "title": "Trace failure",
+    "setup_or_fault": "Telemetry service unavailable",
+    "pass_condition": "Combat loop does not await or stall",
+    "spec_sections": "20,21,22",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T104",
+    "family": "Operations",
+    "title": "24h soak",
+    "setup_or_fault": "Bots and network impairment for 24 hours",
+    "pass_condition": "No unbounded memory or stale identity/baseline corruption",
+    "spec_sections": "20,21,22",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T105",
+    "family": "Operations",
+    "title": "Cross-platform",
+    "setup_or_fault": "Replay same fixture on supported x86 and ARM builds",
+    "pass_condition": "Declared canonical equality/tolerance contract met",
+    "spec_sections": "20,21,22",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T106",
+    "family": "Operations",
+    "title": "Replay version",
+    "setup_or_fault": "Replay captured under another ruleset",
+    "pass_condition": "Reject or use explicit tested migration",
+    "spec_sections": "20,21,22",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T107",
+    "family": "Operations",
+    "title": "Separate process",
+    "setup_or_fault": "Launch server and two clients outside editor",
+    "pass_condition": "Complete connect/play/reconcile/disconnect cycle works",
+    "spec_sections": "20,21,22",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T108",
+    "family": "Operations",
+    "title": "End-to-end latency",
+    "setup_or_fault": "Instrument input event through displayed response",
+    "pass_condition": "Report complete pipeline not just library timers",
+    "spec_sections": "20,21,22",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T109",
+    "family": "Advanced",
+    "title": "Sub-tick movement budget",
+    "setup_or_fault": "Flood many fractions in one tick",
+    "pass_condition": "Segment durations sum to fixed dt; capped work and speed",
+    "spec_sections": "11,12,14,17,19",
+    "tier": "Advanced",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T110",
+    "family": "Advanced",
+    "title": "Group merge/split",
+    "setup_or_fault": "Physics interactions change group topology",
+    "pass_condition": "Coherent authoritative boundary and valid new histories",
+    "spec_sections": "11,12,14,17,19",
+    "tier": "Advanced",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T112",
+    "family": "Advanced",
+    "title": "World origin shift",
+    "setup_or_fault": "Shift coordinate origin while history retained",
+    "pass_condition": "All historical queries use correct origin revision",
+    "spec_sections": "11,12,14,17,19",
+    "tier": "Advanced",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T113",
+    "family": "Advanced",
+    "title": "Browser degraded path",
+    "setup_or_fault": "Compare native DATAGRAM and browser fallback",
+    "pass_condition": "Report differences; no untested competitive parity claim",
+    "spec_sections": "11,12,14,17,19",
+    "tier": "Advanced",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T114",
+    "family": "Spatial",
+    "title": "Per-connection selectivity",
+    "setup_or_fault": "Place two approved observers in distant map regions",
+    "pass_condition": "Each receives only local eligible state plus explicit global owner semantic and authorized required state",
+    "spec_sections": "4,17",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T115",
+    "family": "Spatial",
+    "title": "No broadcast-first runtime path",
+    "setup_or_fault": "Run M3 sample with graph disabled or encoder fed raw world",
+    "pass_condition": "Configuration rejects bypass; real client cannot receive an unfiltered match snapshot",
+    "spec_sections": "4,17",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T116",
+    "family": "Spatial",
+    "title": "Negative-coordinate grid",
+    "setup_or_fault": "Cross zero and negative cell boundaries",
+    "pass_condition": "Floor-based coverage matches exact spatial oracle",
+    "spec_sections": "4,17",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T117",
+    "family": "Spatial",
+    "title": "Footprint changes inside center cell",
+    "setup_or_fault": "Move an entity without changing its center cell while expanded edge crosses another cell",
+    "pass_condition": "New eligible observers gather entity; cached coverage updates",
+    "spec_sections": "4,17",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T118",
+    "family": "Spatial",
+    "title": "Cull radius and bounds mutation",
+    "setup_or_fault": "Change radius or extents without moving center",
+    "pass_condition": "Old and new memberships update transactionally before gather",
+    "spec_sections": "4,17",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T119",
+    "family": "Spatial",
+    "title": "Vertical exact filtering",
+    "setup_or_fault": "Put entities on distant Z levels in same XY cells",
+    "pass_condition": "Broad phase may include candidates; exact policy excludes noneligible state",
+    "spec_sections": "4,17",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T120",
+    "family": "Spatial",
+    "title": "Multi-observer deduplication",
+    "setup_or_fault": "Grant two viewpoints covering same entity",
+    "pass_condition": "One scope publication and one candidate identity; grants remain capped",
+    "spec_sections": "4,17",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T121",
+    "family": "Spatial",
+    "title": "Unauthorized observer",
+    "setup_or_fault": "Client requests remote arbitrary camera or extra observer",
+    "pass_condition": "Server rejects before gather and sends no extra world state",
+    "spec_sections": "4,17",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T122",
+    "family": "Spatial",
+    "title": "Owner-only spatial isolation",
+    "setup_or_fault": "Place private inventory beside an opponent and its owner far away",
+    "pass_condition": "Only owner-approved fields go to owner; spatial node cannot expose inventory",
+    "spec_sections": "4,17",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T123",
+    "family": "Spatial",
+    "title": "Team and route transitions",
+    "setup_or_fault": "Change team ownership or class route at committed tick",
+    "pass_condition": "Old grants removed; valid alternate reasons persist; no duplicate identities",
+    "spec_sections": "4,17",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T124",
+    "family": "Spatial",
+    "title": "Global does not mean disclosed",
+    "setup_or_fault": "Mark actor global while policy denies it to one client",
+    "pass_condition": "Denied client receives neither actor nor prohibited fields",
+    "spec_sections": "4,17",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T125",
+    "family": "Spatial",
+    "title": "Prepare once and freeze",
+    "setup_or_fault": "Gather many connections around a concurrent routing update",
+    "pass_condition": "One shared prepare per graph frame; all gather views refer to consistent committed revision",
+    "spec_sections": "4,17",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T126",
+    "family": "Spatial",
+    "title": "Sparse population scaling",
+    "setup_or_fault": "Increase unrelated distant potential actors from 5000 to 50000",
+    "pass_condition": "Per-connection candidate visits remain local; shared maintenance cost reported separately",
+    "spec_sections": "4,17",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T127",
+    "family": "Spatial",
+    "title": "Dense hotspot saturation",
+    "setup_or_fault": "All clients and many active actors occupy same cell",
+    "pass_condition": "Bounded candidate/byte work and explicit overload; no claim of universal linear-in-changes cost",
+    "spec_sections": "4,17",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T128",
+    "family": "Spatial",
+    "title": "Registration coverage cap",
+    "setup_or_fault": "Request huge finite radius and nonfinite bounds",
+    "pass_condition": "Reject before oversized allocation; previous valid route remains unchanged",
+    "spec_sections": "4,17",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T129",
+    "family": "Spatial",
+    "title": "Hysteresis and hard revocation",
+    "setup_or_fault": "Oscillate near distance boundary then revoke entitlement",
+    "pass_condition": "Ordinary leave uses hysteresis; hard revocation is immediate and overrides it",
+    "spec_sections": "4,17",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T130",
+    "family": "Spatial",
+    "title": "Lookahead and fast crossing",
+    "setup_or_fault": "Cross relevance rapidly or teleport into unready scene",
+    "pass_condition": "Approved swept/event interest or readiness gate handles entry; prefetch never overrides privacy",
+    "spec_sections": "4,17",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T131",
+    "family": "Spatial",
+    "title": "Prediction dependency outside radius",
+    "setup_or_fault": "Predict owner on allowed distant/offscreen platform",
+    "pass_condition": "Required platform included before scheduler and complete checkpoint available",
+    "spec_sections": "4,17",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T132",
+    "family": "Spatial",
+    "title": "Denied dependency closure",
+    "setup_or_fault": "Prediction root depends on prohibited hidden enemy",
+    "pass_condition": "No hidden payload; affected group denied/proxied under approved policy rather than partly admitted",
+    "spec_sections": "4,17",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T133",
+    "family": "Spatial",
+    "title": "Cycle and closure cap",
+    "setup_or_fault": "Declare cyclic dependencies or closure beyond entity budget",
+    "pass_condition": "Visited-set work bounded; over-cap group not partly admitted",
+    "spec_sections": "4,17",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T134",
+    "family": "Spatial",
+    "title": "Missing declared dependency",
+    "setup_or_fault": "Remove required dependency before owner checkpoint",
+    "pass_condition": "Group cannot publish as complete; explicit prediction recovery",
+    "spec_sections": "4,17",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T135",
+    "family": "Spatial",
+    "title": "Replay retention after scope loss",
+    "setup_or_fault": "Dismount and leave platform while commands referencing its history remain buffered",
+    "pass_condition": "Historical immutable dependency samples survive within budget independently of render replica",
+    "spec_sections": "4,17",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T136",
+    "family": "Scope",
+    "title": "Entry decode before delta",
+    "setup_or_fault": "Lose full entry but deliver later state datagram",
+    "pass_condition": "No partial replica or delta apply; bounded full-state repair",
+    "spec_sections": "17,27",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T137",
+    "family": "Scope",
+    "title": "Old ready ACK",
+    "setup_or_fault": "Re-enter entity then deliver decode ACK from prior scope",
+    "pass_condition": "Old ACK cannot authorize new scope baseline",
+    "spec_sections": "17,27",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T138",
+    "family": "Scope",
+    "title": "Late old-scope exit",
+    "setup_or_fault": "Deliver new scope entry before previous scope exit",
+    "pass_condition": "New replica stays alive; old exit acknowledged or discarded safely",
+    "spec_sections": "17,27",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T139",
+    "family": "Scope",
+    "title": "Exit overtakes entry",
+    "setup_or_fault": "Deliver scope exit before delayed full entry of same scope",
+    "pass_condition": "Retirement fence prevents resurrection",
+    "spec_sections": "17,27",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T140",
+    "family": "Scope",
+    "title": "Lost exit eventual repair",
+    "setup_or_fault": "Drop first exit and stop ordinary updates",
+    "pass_condition": "Bounded retry/current-scope repair retires stale replica",
+    "spec_sections": "17,27",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T141",
+    "family": "Scope",
+    "title": "Representation changes",
+    "setup_or_fault": "Owner/private projection changes to narrower view while data queued",
+    "pass_condition": "New scope/full permitted state; old private payload and baselines not reused",
+    "spec_sections": "17,27",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T142",
+    "family": "Scope",
+    "title": "Group member scope changes",
+    "setup_or_fault": "Platform re-enters with new scope while owner group chunks are pending",
+    "pass_condition": "New group revision/full checkpoint; mixed member scopes rejected atomically",
+    "spec_sections": "17,27",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T143",
+    "family": "Scope",
+    "title": "Connection reset",
+    "setup_or_fault": "Reconnect and replay old scope traffic",
+    "pass_condition": "New connection epoch rejects every stale entry state exit and ACK",
+    "spec_sections": "17,27",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T144",
+    "family": "Scope",
+    "title": "Generation destruction versus scope exit",
+    "setup_or_fault": "Destroy known entity then reuse index with new generation",
+    "pass_condition": "Old generation cannot resurrect; new generation admits independent valid scope",
+    "spec_sections": "17,27",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T145",
+    "family": "Scope",
+    "title": "Entry storm progress",
+    "setup_or_fault": "Many large full entries compete with owner corrections under cap",
+    "pass_condition": "Finite staging and progress deadlines; old entries coalesce without starving required activation forever",
+    "spec_sections": "17,27",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T146",
+    "family": "Dormancy",
+    "title": "Connection-specific completion",
+    "setup_or_fault": "A decoded version 7 while B only decoded 6",
+    "pass_condition": "A can sleep while B retries 7; no shared known-delivered flag",
+    "spec_sections": "17,27",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T147",
+    "family": "Dormancy",
+    "title": "Flush-before-mutation",
+    "setup_or_fault": "Mutate dormant actor including subobject/container",
+    "pass_condition": "Dirty authoritative version scheduled and repaired for each eligible connection",
+    "spec_sections": "17,27",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T148",
+    "family": "Dormancy",
+    "title": "Late dormant join",
+    "setup_or_fault": "New observer enters range of unchanged dormant actor",
+    "pass_condition": "Full current state sent even though actor is globally dormant",
+    "spec_sections": "17,27",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T149",
+    "family": "Dormancy",
+    "title": "Stale or unsent version ACK",
+    "setup_or_fault": "ACK unknown future or prior-scope dirty version",
+    "pass_condition": "Cannot clear current pending update or authorize dormancy",
+    "spec_sections": "17,27",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T150",
+    "family": "Dormancy",
+    "title": "Retired map prop re-entry",
+    "setup_or_fault": "Destroyed map-placed prop was outside interest then region becomes ready",
+    "pass_condition": "Current region absence/destruction state prevents default prop resurrection",
+    "spec_sections": "17,27",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T151",
+    "family": "Spatial",
+    "title": "Scoped event privacy",
+    "setup_or_fault": "Allow sound of hidden actor but deny exact actor state",
+    "pass_condition": "Event uses approved coarse/proxy data; no hidden identity or exact transform leak",
+    "spec_sections": "4,17",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T152",
+    "family": "Spatial",
+    "title": "Attachment privacy",
+    "setup_or_fault": "Public carrier has private inventory and scoped visible attachment",
+    "pass_condition": "Attachment identity resolves safely; private inventory never inherits broad carrier visibility",
+    "spec_sections": "4,17",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T153",
+    "family": "Spatial",
+    "title": "Revocation encoding race",
+    "setup_or_fault": "Policy changes after worker gathered but before queued state transmits",
+    "pass_condition": "New policy barrier cancels unsent revoked payloads; already delivered bytes not claimed retractable",
+    "spec_sections": "4,17",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T154",
+    "family": "Spatial",
+    "title": "Scheduler feasibility and aging",
+    "setup_or_fault": "Feasible then infeasible traffic across importance classes",
+    "pass_condition": "Feasible low-priority age bounded; overload measured with controlled degradation and complete required groups",
+    "spec_sections": "4,17",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T155",
+    "family": "Spatial",
+    "title": "Shared encoding policy separation",
+    "setup_or_fault": "Two clients use different fields baselines or ownership projections",
+    "pass_condition": "Shared encode cache cannot reuse unauthorized fields or per-peer ciphertext",
+    "spec_sections": "4,17",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T156",
+    "family": "Spatial",
+    "title": "Scope metadata soak",
+    "setup_or_fault": "Repeated churn through many regions over 24 hours",
+    "pass_condition": "Known scope counters dormant cache pending transitions history and grid memberships remain bounded",
+    "spec_sections": "4,17",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  },
+  {
+    "id": "T157",
+    "family": "Spatial",
+    "title": "Inspector parity",
+    "setup_or_fault": "Compare server interest inspector with captured decoded client state",
+    "pass_condition": "Reasons field grants epochs versions and actual sends match; hidden details absent from ordinary client tooling",
+    "spec_sections": "4,17",
+    "tier": "Release gate",
+    "execution": "Required in production implementation; not claimed executed here"
+  }
+]

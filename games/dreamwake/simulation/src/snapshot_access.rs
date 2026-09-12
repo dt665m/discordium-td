@@ -13,6 +13,9 @@ impl DreamSimulation {
 }
 
 impl DreamSnapshot {
+    pub fn collision_manifest(&self) -> &crate::collision::CollisionManifest {
+        &self.state.collision
+    }
     /// Select an admitted recipient without capturing the world again. The saved
     /// heroes are sorted by identity when captured, and remain unchanged here.
     /// A missing player leaves this snapshot untouched and must not be sent as if

@@ -59,6 +59,7 @@ pub fn demonstrate() {
 
     // Stable presentation identity and its lifetime remain simulation-owned.
     let id = GraphicsId {
+        scope: None,
         match_epoch: 1,
         owner: 1,
         action_seq: 1,

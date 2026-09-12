@@ -6,9 +6,10 @@ crate, including through build, test, or transitive workspace dependencies.
 
 ## Ownership
 
-The engine owns generic mechanics, transport, input history, cameras and graphics
-contracts. Dreamwake owns characters, named abilities, balance, Essence mappings,
-encounters, XP awards and curves, rewards, menus, audio and art.
+The engine owns generic mechanics, transport, input history, cameras, graphics
+contracts and reusable client UI. Dreamwake owns characters, named abilities,
+balance, Essence mappings, encounters, XP awards and curves, rewards, menus, audio
+and art.
 
 Authoritative gameplay belongs in ECS components. Complete snapshots save those
 components alongside game payloads; views project this state rather than keeping
@@ -73,11 +74,15 @@ admission, validation, simulation and party policy. Dedicated and native-hosted
 servers use the same `dreamwake_server::build_app` composition. See
 [networking](netcode.md) for sequencing and snapshot rules.
 
-[Engine client plugins](../engine/client/src/plugins/mod.rs) group camera, graphics
-and network tools. [Game client plugins](../games/dreamwake/client/src/plugins/mod.rs)
+[Engine client plugins](../engine/client/src/plugins/mod.rs) group camera, graphics,
+UI and network tools. [Game client plugins](../games/dreamwake/client/src/plugins/mod.rs)
 group camera, graphics, input, audio, UI, network and diagnostics. Input owns one
-mapping into world space; camera framing is independent of art. UI owns typography;
-diagnostics owns telemetry, overlays and development controls.
+mapping into world space; camera framing is independent of art. The engine's
+client [UI plugin](client-ui.md) provides screen-facing world anchors, basic meter and label scenes,
+and an optional diagnostics panel with frame metrics. Games supply meter values,
+colors, typography, menus and extra diagnostics rows. These presentation features
+live in `engine_client`, keeping `engine_core` usable by headless simulations.
+Game diagnostics owns telemetry and development controls.
 
 `DreamGraphicsPlugin` adapts snapshots into `engine_client::graphics::GraphicsFrame`.
 The client's `build_app()` leaves the renderer selectable; `run()` installs

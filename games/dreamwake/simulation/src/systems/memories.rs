@@ -3,8 +3,10 @@ use super::*;
 pub(crate) fn execute_memory(
     commands: &mut Commands,
     run: &mut Run,
+    batch: &mut CombatBatch,
     hero: &mut HeroActorItem<'_, '_>,
     enemies: &mut Query<(Entity, EnemyActor), Without<Hero>>,
+    collision: &CollisionWorld,
     kind: MemoryKind,
     essence: Option<EssenceKind>,
     power: f32,
@@ -73,8 +75,15 @@ pub(crate) fn execute_memory(
                 MemoryKind::Crescent => (origin, 5.0 * vast, 48.0 * power),
                 MemoryKind::Nova => (origin, 5.0 * vast, 52.0 * power),
                 MemoryKind::Blink => {
-                    hero.motor.position =
-                        clamp(add(hero.motor.position, scale(direction, 6.0 * vast)));
+                    if let Err(error) = collision.blink(&mut hero.motion, direction, 6.0 * vast) {
+                        hero.motion_status.last_error = Some(error);
+                        return;
+                    }
+                    hero.charge.state.interrupt();
+                    if let Err(error) = hero.combat_identity.discontinuity(false) {
+                        batch.error = Some(error);
+                        return;
+                    }
                     hero.combat
                         .grant_invulnerability(0.36, engine_core::DurationPolicy::Reset);
                     action_effect(
@@ -86,7 +95,7 @@ pub(crate) fn execute_memory(
                         1.5,
                         24,
                     );
-                    (hero.motor.position, 2.8 * vast, 36.0 * power)
+                    (planar_position(&hero.motion), 2.8 * vast, 36.0 * power)
                 }
                 MemoryKind::Aegis => {
                     let amount = 55.0
@@ -135,8 +144,15 @@ pub(crate) fn execute_memory(
                 };
                 if in_area {
                     hit_enemy(
-                        commands,
-                        run,
+                        batch,
+                        CombatActionKey::new(
+                            run.tick,
+                            hero.view.id,
+                            hero.combat_identity.generation,
+                            1,
+                            u64::from(source.sequence),
+                            source.slot,
+                        ),
                         hero,
                         &mut enemy,
                         damage,
@@ -162,6 +178,7 @@ pub(crate) fn execute_memory(
                     DelayedCast::new(
                         0.18,
                         CastPayload {
+                            spawn: None,
                             action_sequence: source.sequence,
                             presentation_slot: source.repeat().slot,
                             owner: hero.view.id,
@@ -186,9 +203,11 @@ pub(crate) fn execute_memory(
 pub(crate) fn delayed_casts(
     mut commands: Commands,
     mut run: ResMut<Run>,
+    mut batch: ResMut<CombatBatch>,
     mut heroes: Query<HeroActor, Without<Enemy>>,
     mut enemies: Query<(Entity, EnemyActor), Without<Hero>>,
     delayed: Query<(Entity, &DelayedCast)>,
+    collision: Res<crate::platform::MotionEnvironment>,
 ) {
     let mut ordered: Vec<_> = delayed.iter().map(|(e, v)| (v.payload.id, e)).collect();
     ordered.sort_unstable();
@@ -202,21 +221,47 @@ pub(crate) fn delayed_casts(
                 .iter_mut()
                 .find(|h| h.view.id == cast.owner && h.health.hp > 0.0)
             {
-                execute_memory(
-                    &mut commands,
-                    &mut run,
-                    &mut hero,
-                    &mut enemies,
-                    cast.kind,
-                    cast.essence,
-                    cast.power,
-                    cast.origin,
-                    cast.direction,
-                    ActionEffect {
-                        sequence: cast.action_sequence,
-                        slot: cast.presentation_slot,
-                    },
-                );
+                if let Some((key, origin_tick)) = cast.spawn {
+                    let mut flight = crate::starfall::flight(
+                        key,
+                        origin_tick,
+                        cast.origin,
+                        cast.direction,
+                        None,
+                    );
+                    flight.authority_id = Some(cast.id);
+                    spawn_starfall(&mut commands, &mut run, flight, 38.0 * cast.power);
+                    action_effect(
+                        &mut commands,
+                        &run,
+                        cast.owner,
+                        ActionEffect {
+                            sequence: cast.action_sequence,
+                            slot: cast.presentation_slot,
+                        },
+                        add(cast.origin, scale(cast.direction, 0.9)),
+                        0.8,
+                        12,
+                    );
+                } else {
+                    execute_memory(
+                        &mut commands,
+                        &mut run,
+                        &mut batch,
+                        &mut hero,
+                        &mut enemies,
+                        collision.collision(),
+                        cast.kind,
+                        cast.essence,
+                        cast.power,
+                        cast.origin,
+                        cast.direction,
+                        ActionEffect {
+                            sequence: cast.action_sequence,
+                            slot: cast.presentation_slot,
+                        },
+                    );
+                }
             }
             commands.entity(entity).despawn();
         }

@@ -1,0 +1,2 @@
+# Tested HTML builder dependency; contract tests use only the standard library.
+mistune==3.2.1

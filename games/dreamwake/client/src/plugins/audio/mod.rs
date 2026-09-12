@@ -182,9 +182,18 @@ fn update_audio(
     prefs: Res<DreamPreferences>,
     bank: Res<SoundBank>,
     mut history: ResMut<AudioHistory>,
+    runtime: Option<NonSendMut<crate::plugins::network::Runtime>>,
     time: Res<Time<Real>>,
     mut sinks: Query<(&mut AudioSink, Option<&Music>), With<DreamSound>>,
 ) {
+    if let Some(mut runtime) = runtime
+        && let Some(session) = &mut runtime.prediction
+    {
+        let count = std::mem::take(&mut session.events.sounds);
+        for _ in 0..count {
+            play(&mut commands, &bank.cast, 0.5, prefs.muted);
+        }
+    }
     for (mut sink, music) in &mut sinks {
         if prefs.muted {
             sink.mute();
@@ -228,12 +237,10 @@ fn update_audio(
         if s.hero.hp < history.hp || s.kills > history.kills {
             play(&mut commands, &bank.hit, 0.4, prefs.muted);
         }
-        let cast = s
-            .hero
-            .memories
-            .iter()
-            .enumerate()
-            .any(|(i, m)| m.cooldown > history.cooldowns[i] + 0.15);
+        let cast = s.hero.memories.iter().enumerate().any(|(i, m)| {
+            m.kind != dreamwake_sim::MemoryKind::Starfall
+                && m.cooldown > history.cooldowns[i] + 0.15
+        });
         if cast {
             play(&mut commands, &bank.cast, 0.5, prefs.muted);
         }

@@ -57,6 +57,7 @@ pub(crate) fn action_effect(
         DreamOwned,
         engine_core::GraphicsInstance {
             id: engine_core::GraphicsId {
+                scope: None,
                 match_epoch: (run.seed ^ (run.seed >> 32)) as u32,
                 owner,
                 action_seq: source.sequence,

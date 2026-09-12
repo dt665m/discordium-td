@@ -15,9 +15,11 @@ default = ["debug-tools"]
 debug-tools = []
 
 [dependencies]
+serde.workspace = true
 bevy = { workspace = true, features = ["bevy_dev_tools", "audio", "wav"] }
 engine_client = { path = "../../../engine/client" }
 engine_core = { path = "../../../engine/core" }
+engine_net = { path = "../../../engine/net" }
 dreamwake_sim = { path = "../simulation" }
 dreamwake_protocol = { path = "../protocol" }
 log.workspace = true
@@ -38,4 +40,4 @@ getrandom = { version = "0.2.17", features = ["js"] }
 js-sys = "0.3.82"
 wasm-bindgen = "0.2.105"
 wasm-bindgen-futures = "0.4.55"
-web-sys = { version = "0.3.82", features = ["Window", "RequestInit", "Response", "AbortController", "AbortSignal"] }
+web-sys = { version = "0.3.82", features = ["Window", "Storage", "RequestInit", "Response", "AbortController", "AbortSignal"] }

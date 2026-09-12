@@ -1,0 +1,518 @@
+[
+  {
+    "id": "S01",
+    "publisher": "Valve",
+    "title": "Source SDK 2013 repository",
+    "url": "https://github.com/ValveSoftware/source-sdk-2013",
+    "version": "Repository reviewed 2026-09-09; moving master",
+    "scope": "Public HL2, HL2DM and TF2 game code; non-commercial SDK terms. Not Counter-Strike 2 source."
+  },
+  {
+    "id": "S02",
+    "publisher": "Valve",
+    "title": "Source SDK: client prediction.cpp",
+    "url": "https://raw.githubusercontent.com/ValveSoftware/source-sdk-2013/master/src/game/client/prediction.cpp",
+    "version": "Moving master reviewed 2026-09-09",
+    "scope": "Historical command comparison, simulation restoration and replay, prediction state."
+  },
+  {
+    "id": "S03",
+    "publisher": "Valve",
+    "title": "Source SDK: player_lagcompensation.cpp",
+    "url": "https://raw.githubusercontent.com/ValveSoftware/source-sdk-2013/master/src/game/server/player_lagcompensation.cpp",
+    "version": "Moving master reviewed 2026-09-09",
+    "scope": "Historical hitbox/animation state, bounded rewind and restore. Source-era implementation, not proof of current CS2 behavior."
+  },
+  {
+    "id": "S04",
+    "publisher": "Valve",
+    "title": "Source SDK: usercmd.h",
+    "url": "https://raw.githubusercontent.com/ValveSoftware/source-sdk-2013/master/src/game/shared/usercmd.h",
+    "version": "Moving master reviewed 2026-09-09",
+    "scope": "Command fields, sequence, tick and input representation."
+  },
+  {
+    "id": "S05",
+    "publisher": "Valve",
+    "title": "Source SDK: gamemovement.cpp",
+    "url": "https://raw.githubusercontent.com/ValveSoftware/source-sdk-2013/master/src/game/shared/gamemovement.cpp",
+    "version": "Moving master reviewed 2026-09-09",
+    "scope": "Shared movement implementation as an architectural reference."
+  },
+  {
+    "id": "S06",
+    "publisher": "Valve",
+    "title": "Counter-Strike 2: official announcement and feature description",
+    "url": "https://www.counter-strike.net/cs2",
+    "version": "Official product page reviewed 2026-09-09",
+    "scope": "Sub-tick action timing claim. Does not publish the production implementation or establish that tick rate is irrelevant."
+  },
+  {
+    "id": "S07",
+    "publisher": "Blizzard / GDC",
+    "title": "Timothy Ford: Overwatch Gameplay Architecture and Netcode",
+    "url": "https://www.gdcvault.com/play/1024001/-Overwatch-Gameplay-Architecture-and",
+    "version": "GDC 2017 session; official abstract reviewed",
+    "scope": "ECS and determinism in responsive networked gameplay. Full video/transcript was not available for verification; detailed proprietary algorithms remain unverified."
+  },
+  {
+    "id": "S08",
+    "publisher": "Epic Games",
+    "title": "Networked Movement in the Character Movement Component",
+    "url": "https://dev.epicgames.com/documentation/en-us/unreal-engine/understanding-networked-movement-in-the-character-movement-component-for-unreal-engine",
+    "version": "Live documentation reviewed 2026-09-09",
+    "scope": "Saved moves, move combining, unreliable ServerMove flow, server validation, replay and smoothing. Not an identical fixed-global-tick model."
+  },
+  {
+    "id": "S09",
+    "publisher": "Epic Games",
+    "title": "Replication Graph",
+    "url": "https://dev.epicgames.com/documentation/en-us/unreal-engine/replication-graph-in-unreal-engine",
+    "version": "Public documentation reverified 2026-09-09; historical Fortnite example",
+    "scope": "Primary architectural basis: persistent graph nodes and per-connection actor gathering; historical Fortnite 100-connection / approximately 50,000-actor motivating example. Not current deployment parameters.",
+    "evidence_role": "Primary spatial architecture reference"
+  },
+  {
+    "id": "S10",
+    "publisher": "Epic Games",
+    "title": "Introduction to Iris",
+    "url": "https://dev.epicgames.com/documentation/unreal-engine/introduction-to-iris-in-unreal-engine",
+    "version": "Live documentation reviewed 2026-09-09",
+    "scope": "Opt-in replication architecture developed from large-scale multiplayer experience; replication is distinct from prediction.",
+    "evidence_role": "Alternative backend comparison; not combined with native Replication Graph"
+  },
+  {
+    "id": "S11",
+    "publisher": "Epic Games",
+    "title": "FPredictionKey API and gameplay prediction design",
+    "url": "https://dev.epicgames.com/documentation/en-us/unreal-engine/API/Plugins/GameplayAbilities/FPredictionKey",
+    "version": "Live documentation reviewed 2026-09-09",
+    "scope": "Prediction keys, accepted/rejected predicted effects, cues and scoped prediction limitations."
+  },
+  {
+    "id": "S12",
+    "publisher": "Epic Games",
+    "title": "Networked Physics Overview",
+    "url": "https://dev.epicgames.com/documentation/en-us/unreal-engine/networked-physics-overview",
+    "version": "Live documentation reviewed 2026-09-09",
+    "scope": "Default replication, predictive interpolation and resimulation; history and performance tradeoffs."
+  },
+  {
+    "id": "S13",
+    "publisher": "Epic Games",
+    "title": "NetworkPrediction plugin API",
+    "url": "https://dev.epicgames.com/documentation/unreal-engine/API/Plugins/NetworkPrediction",
+    "version": "Live documentation reviewed 2026-09-09",
+    "scope": "Public API surface; source must be inspected in the exact licensed engine version before implementation."
+  },
+  {
+    "id": "S14",
+    "publisher": "Epic Games",
+    "title": "NetworkPredictionExtras plugin API",
+    "url": "https://dev.epicgames.com/documentation/unreal-engine/API/Plugins/NetworkPredictionExtras",
+    "version": "Live documentation reviewed 2026-09-09",
+    "scope": "Example input, sync and auxiliary model types; not a Fortnite source dump."
+  },
+  {
+    "id": "S15",
+    "publisher": "Epic Games",
+    "title": "Downloading Unreal Engine Source Code",
+    "url": "https://dev.epicgames.com/documentation/en-us/unreal-engine/downloading-source-code-in-unreal-engine",
+    "version": "Live documentation reviewed 2026-09-09",
+    "scope": "Engine source access subject to Epic account and license requirements."
+  },
+  {
+    "id": "S16",
+    "publisher": "Unity",
+    "title": "Introduction to prediction",
+    "url": "https://docs.unity3d.com/Packages/com.unity.netcode@1.5/manual/intro-to-prediction.html",
+    "version": "Netcode for Entities 1.5 documentation",
+    "scope": "Shared simulation, prediction ticks, slack and rollback cost.",
+    "evidence_role": "Supporting prediction/replication comparison; not the spatial architecture basis"
+  },
+  {
+    "id": "S17",
+    "publisher": "Unity",
+    "title": "Prediction details",
+    "url": "https://docs.unity3d.com/Packages/com.unity.netcode@1.5/manual/prediction-details.html",
+    "version": "Netcode for Entities 1.5 documentation",
+    "scope": "Partial snapshots, interacting entities at different replay ticks and grouping mitigation.",
+    "evidence_role": "Supporting prediction/replication comparison; not the spatial architecture basis"
+  },
+  {
+    "id": "S18",
+    "publisher": "Unity",
+    "title": "Time synchronization",
+    "url": "https://docs.unity3d.com/Packages/com.unity.netcode@1.5/manual/time-synchronization.html",
+    "version": "Netcode for Entities 1.5 documentation",
+    "scope": "Prediction/interpolation clocks, command-buffer feedback and gradual clock correction.",
+    "evidence_role": "Supporting prediction/replication comparison; not the spatial architecture basis"
+  },
+  {
+    "id": "S19",
+    "publisher": "Unity",
+    "title": "Use the command stream to handle inputs",
+    "url": "https://docs.unity3d.com/Packages/com.unity.netcode@1.5/manual/command-stream.html",
+    "version": "Netcode for Entities 1.5 documentation",
+    "scope": "Command redundancy, tick sampling and one-off input events.",
+    "evidence_role": "Supporting prediction/replication comparison; not the spatial architecture basis"
+  },
+  {
+    "id": "S20",
+    "publisher": "Unity",
+    "title": "Ghost snapshots",
+    "url": "https://docs.unity3d.com/Packages/com.unity.netcode@1.5/manual/ghost-snapshots.html",
+    "version": "Netcode for Entities 1.5 documentation",
+    "scope": "Snapshot replication and diagnostics reference.",
+    "evidence_role": "Supporting prediction/replication comparison; not the spatial architecture basis"
+  },
+  {
+    "id": "S21",
+    "publisher": "Unity",
+    "title": "Prediction smoothing",
+    "url": "https://docs.unity3d.com/Packages/com.unity.netcode@1.5/manual/prediction-smoothing.html",
+    "version": "Netcode for Entities 1.5 documentation",
+    "scope": "Separate handling of predicted state correction and visible smoothing.",
+    "evidence_role": "Supporting prediction/replication comparison; not the spatial architecture basis"
+  },
+  {
+    "id": "S22",
+    "publisher": "Unity",
+    "title": "Client anticipation",
+    "url": "https://mp-docs.dl.it.unity3d.com/netcode/2.2.0/advanced-topics/client-anticipation/",
+    "version": "Netcode for GameObjects 2.2.0 documentation; version-specific",
+    "scope": "Anticipation explicitly lacks a full rollback/replay loop. Do not equate it with Netcode for Entities."
+  },
+  {
+    "id": "S23",
+    "publisher": "Unity",
+    "title": "EntityComponentSystemSamples: Netcode samples README",
+    "url": "https://raw.githubusercontent.com/Unity-Technologies/EntityComponentSystemSamples/master/NetcodeSamples/README.md",
+    "version": "Moving master reviewed 2026-09-09",
+    "scope": "Official source examples including NetCube, Asteroids and prediction switching."
+  },
+  {
+    "id": "S24",
+    "publisher": "Unity",
+    "title": "CharacterControllerSamples: netcode character tutorial",
+    "url": "https://raw.githubusercontent.com/Unity-Technologies/CharacterControllerSamples/master/_Documentation/Tutorial/tutorial-netcodecharacters.md",
+    "version": "Moving master reviewed 2026-09-09",
+    "scope": "Official predicted-character integration walkthrough."
+  },
+  {
+    "id": "S25",
+    "publisher": "Unity",
+    "title": "EntityComponentSystemSamples license",
+    "url": "https://raw.githubusercontent.com/Unity-Technologies/EntityComponentSystemSamples/master/LICENSE.md",
+    "version": "Reviewed 2026-09-09",
+    "scope": "Unity Companion License for Unity-dependent projects."
+  },
+  {
+    "id": "S26",
+    "publisher": "Unity",
+    "title": "CharacterControllerSamples license",
+    "url": "https://raw.githubusercontent.com/Unity-Technologies/CharacterControllerSamples/master/LICENSE.md",
+    "version": "Reviewed 2026-09-09",
+    "scope": "Unity Companion License for Unity-dependent projects."
+  },
+  {
+    "id": "S27",
+    "publisher": "Lightyear maintainers",
+    "title": "Lightyear repository",
+    "url": "https://github.com/cBournhonesque/lightyear",
+    "version": "Moving main reviewed 2026-09-09",
+    "scope": "Rust/Bevy client prediction, interpolation, tick inputs and replication; candidate for reuse rather than assuming a new implementation is necessary."
+  },
+  {
+    "id": "S28",
+    "publisher": "Lightyear maintainers",
+    "title": "Prediction crate source",
+    "url": "https://raw.githubusercontent.com/cBournhonesque/lightyear/main/crates/replication/prediction/src/lib.rs",
+    "version": "Moving main reviewed 2026-09-09",
+    "scope": "Source entry point for prediction modules."
+  },
+  {
+    "id": "S29",
+    "publisher": "Lightyear maintainers",
+    "title": "Rollback module source",
+    "url": "https://raw.githubusercontent.com/cBournhonesque/lightyear/main/crates/replication/prediction/src/rollback.rs",
+    "version": "Moving main reviewed 2026-09-09",
+    "scope": "Source entry point for rollback structure; pin before deeper code audit."
+  },
+  {
+    "id": "S30",
+    "publisher": "Lightyear maintainers",
+    "title": "Issue 1511: sparse prediction history distinction",
+    "url": "https://github.com/cBournhonesque/lightyear/issues/1511",
+    "version": "June 2026 report, subsequently closed",
+    "scope": "Regression-test inspiration: unavailable/no-entry is not the same as an explicitly removed component."
+  },
+  {
+    "id": "S31",
+    "publisher": "Lightyear maintainers",
+    "title": "Issue 1602: unchanged-component prediction history",
+    "url": "https://github.com/cBournhonesque/lightyear/issues/1602",
+    "version": "July 2026 report, subsequently closed",
+    "scope": "Regression-test inspiration for unchanged components and baseline/history lifetime, not a claim of an unfixed bug."
+  },
+  {
+    "id": "S32",
+    "publisher": "Renet maintainers",
+    "title": "Renet repository",
+    "url": "https://github.com/lucaspoffo/renet",
+    "version": "Moving repository reviewed 2026-09-09",
+    "scope": "Rust networking and channel/transport building blocks; not by itself a gameplay prediction system."
+  },
+  {
+    "id": "S33",
+    "publisher": "Valve",
+    "title": "GameNetworkingSockets repository",
+    "url": "https://github.com/ValveSoftware/GameNetworkingSockets",
+    "version": "Moving repository reviewed 2026-09-09",
+    "scope": "Native reliable/unreliable networking transport. Hosted Steam services must not be assumed available through the standalone library."
+  },
+  {
+    "id": "S34",
+    "publisher": "Quinn maintainers",
+    "title": "Quinn repository",
+    "url": "https://github.com/quinn-rs/quinn",
+    "version": "Moving repository reviewed 2026-09-09",
+    "scope": "Rust QUIC transport option; benchmark datagrams and shared congestion for game workload."
+  },
+  {
+    "id": "S35",
+    "publisher": "IETF",
+    "title": "RFC 9221: An Unreliable Datagram Extension to QUIC",
+    "url": "https://www.rfc-editor.org/rfc/rfc9221.html",
+    "version": "March 2022",
+    "scope": "Unreliable QUIC datagrams, congestion control and separate reliable stream semantics."
+  },
+  {
+    "id": "S36",
+    "publisher": "IETF",
+    "title": "RFC 9000: QUIC, A UDP-Based Multiplexed and Secure Transport",
+    "url": "https://www.rfc-editor.org/rfc/rfc9000.html",
+    "version": "May 2021",
+    "scope": "Transport security, multiplexing, flow control and connection behavior."
+  },
+  {
+    "id": "S37",
+    "publisher": "id Software",
+    "title": "Quake III Arena source repository",
+    "url": "https://github.com/id-Software/Quake-III-Arena",
+    "version": "Official historical GPL source release",
+    "scope": "Inspectable historical client/server implementation; GPL reuse obligations require review."
+  },
+  {
+    "id": "S38",
+    "publisher": "id Software",
+    "title": "Quake III: cg_predict.c",
+    "url": "https://raw.githubusercontent.com/id-Software/Quake-III-Arena/master/code/cgame/cg_predict.c",
+    "version": "Historical source",
+    "scope": "Prediction from authoritative snapshots, buffered commands and correction handling."
+  },
+  {
+    "id": "S39",
+    "publisher": "id Software",
+    "title": "Quake III: msg.c",
+    "url": "https://raw.githubusercontent.com/id-Software/Quake-III-Arena/master/code/qcommon/msg.c",
+    "version": "Historical source",
+    "scope": "Explicit state fields and delta/bit-level message representation."
+  },
+  {
+    "id": "S40",
+    "publisher": "Riot Games",
+    "title": "Peeking into VALORANT's Netcode",
+    "url": "https://www.riotgames.com/en/news/peeking-valorants-netcode",
+    "version": "July 28, 2020",
+    "scope": "Published latency budget, buffering and responsiveness/fairness tradeoffs. Historical design explanation."
+  },
+  {
+    "id": "S41",
+    "publisher": "Riot Games",
+    "title": "Demolishing Wallhacks with VALORANT's Fog of War",
+    "url": "https://www.riotgames.com/en/news/demolishing-wallhacks-valorants-fog-war",
+    "version": "April 14, 2020",
+    "scope": "Withholding irrelevant information, conservative relevance, and reconstructing persistent effects when entities become visible."
+  },
+  {
+    "id": "S42",
+    "publisher": "Respawn / Electronic Arts",
+    "title": "What Makes Apex Tick: A Developer Deep Dive into Servers and Netcode",
+    "url": "https://www.ea.com/games/apex-legends/news/servers-netcode-developer-deep-dive",
+    "version": "April 28, 2021",
+    "scope": "Developer explanation of lag-compensation fairness, tick/load budgets and operational telemetry. Not a current tick-rate claim."
+  },
+  {
+    "id": "S43",
+    "publisher": "Mirror maintainers",
+    "title": "Client-Side Prediction",
+    "url": "https://mirror-networking.gitbook.io/docs/manual/general/client-side-prediction",
+    "version": "Live documentation reviewed 2026-09-09",
+    "scope": "Prediction/history correction in Unity physics; engine integration comparison, not a vetted production equivalence claim."
+  },
+  {
+    "id": "S44",
+    "publisher": "FirstGearGames",
+    "title": "FishNet license",
+    "url": "https://github.com/FirstGearGames/FishNet/blob/main/LICENSE.md",
+    "version": "Reviewed 2026-09-09",
+    "scope": "Restricts use in competing networking solutions; excluded from implementation derivation in this handoff."
+  },
+  {
+    "id": "S45",
+    "publisher": "FirstGearGames",
+    "title": "FishNet feature overview",
+    "url": "https://fish-networking.gitbook.io/docs/overview/readme/features",
+    "version": "Live documentation reviewed 2026-09-09",
+    "scope": "Capability comparison only; prediction and separately licensed/pro lag-compensation features."
+  },
+  {
+    "id": "S46",
+    "publisher": "Glenn Fiedler / Gaffer on Games",
+    "title": "Snapshot Interpolation",
+    "url": "https://gafferongames.com/post/snapshot_interpolation/",
+    "version": "Original author technical article",
+    "scope": "Snapshot buffering, interpolation and loss/smoothness tradeoffs."
+  },
+  {
+    "id": "S47",
+    "publisher": "Glenn Fiedler / Gaffer on Games",
+    "title": "Snapshot Compression",
+    "url": "https://gafferongames.com/post/snapshot_compression/",
+    "version": "Original author technical article",
+    "scope": "Quantization and snapshot delta/compression design."
+  },
+  {
+    "id": "S48",
+    "publisher": "Glenn Fiedler / Gaffer on Games",
+    "title": "State Synchronization",
+    "url": "https://gafferongames.com/post/state_synchronization/",
+    "version": "Original author technical article",
+    "scope": "Priority accumulation, jitter buffering and quantization consistency."
+  },
+  {
+    "id": "S49",
+    "publisher": "Dimforge / Rapier",
+    "title": "Determinism (Rust)",
+    "url": "https://rapier.rs/docs/user_guides/rust/determinism/",
+    "version": "Live documentation reviewed 2026-09-09",
+    "scope": "Local versus cross-platform determinism and explicit enhanced-determinism preconditions."
+  },
+  {
+    "id": "S50",
+    "publisher": "Unity",
+    "title": "Latency and performance",
+    "url": "https://docs.unity.cn/Packages/com.unity.netcode.gameobjects@2.13/manual/latency-performance.html",
+    "version": "Netcode for GameObjects 2.13 documentation, search-indexed primary page",
+    "scope": "Also distinguishes anticipation from full rollback/replay; corroborates the version-specific NGO comparison."
+  },
+  {
+    "id": "S51",
+    "publisher": "Epic Games",
+    "title": "Replication Graph: UReplicationGraphNode",
+    "url": "https://dev.epicgames.com/documentation/unreal-engine/API/Plugins/ReplicationGraph/UReplicationGraphNode?lang=en-US",
+    "version": "Public UE 5.8 documentation/API reviewed 2026-09-09; pin engine checkout before implementation",
+    "scope": "Persistent node lifecycle; prepare hook and per-connection gather API. Public API, not audited proprietary Fortnite code.",
+    "evidence_role": "Primary spatial architecture reference"
+  },
+  {
+    "id": "S52",
+    "publisher": "Epic Games",
+    "title": "Replication Graph: GridSpatialization2D",
+    "url": "https://dev.epicgames.com/documentation/en-us/unreal-engine/API/Plugins/ReplicationGraph/UReplicationGraphNode_GridSpatia-",
+    "version": "Public UE 5.8 documentation/API reviewed 2026-09-09; pin engine checkout before implementation",
+    "scope": "Static, dynamic and dormancy-driven spatial registration, cell configuration and prepare/gather hooks. Exact portable grid algorithm is derived.",
+    "evidence_role": "Primary spatial architecture reference"
+  },
+  {
+    "id": "S53",
+    "publisher": "Epic Games",
+    "title": "Replication Graph: AlwaysRelevant",
+    "url": "https://dev.epicgames.com/documentation/unreal-engine/API/Plugins/ReplicationGraph/UReplicationGraphNode_AlwaysRele-",
+    "version": "Public UE 5.8 documentation/API reviewed 2026-09-09; pin engine checkout before implementation",
+    "scope": "Global always-relevant node API. Does not establish application-specific disclosure policy.",
+    "evidence_role": "Primary spatial architecture reference"
+  },
+  {
+    "id": "S54",
+    "publisher": "Epic Games",
+    "title": "Replication Graph: AlwaysRelevant_ForConnection",
+    "url": "https://dev.epicgames.com/documentation/unreal-engine/API/Plugins/ReplicationGraph/UReplicationGraphNode_AlwaysRele-_1?lang=en-US",
+    "version": "Public UE 5.8 documentation/API reviewed 2026-09-09; pin engine checkout before implementation",
+    "scope": "Connection node adds controller and view target in the documented version; team/private inventory routing is an extension.",
+    "evidence_role": "Primary spatial architecture reference"
+  },
+  {
+    "id": "S55",
+    "publisher": "Epic Games",
+    "title": "Replication Graph: DormancyNode",
+    "url": "https://dev.epicgames.com/documentation/en-us/unreal-engine/API/Plugins/ReplicationGraph/UReplicationGraphNode_DormancyNo-",
+    "version": "Public UE 5.8 documentation/API reviewed 2026-09-09; pin engine checkout before implementation",
+    "scope": "Shared dormancy node and connection-specific dormant-list operations.",
+    "evidence_role": "Primary spatial architecture reference"
+  },
+  {
+    "id": "S56",
+    "publisher": "Epic Games",
+    "title": "Replication Graph: ConnectionDormancyNode",
+    "url": "https://dev.epicgames.com/documentation/en-us/unreal-engine/API/Plugins/ReplicationGraph/UReplicationGraphNode_Connection-",
+    "version": "Public UE 5.8 documentation/API reviewed 2026-09-09; pin engine checkout before implementation",
+    "scope": "Per-connection dormancy node API; portable state-version ACK semantics are a derived contract.",
+    "evidence_role": "Primary spatial architecture reference"
+  },
+  {
+    "id": "S57",
+    "publisher": "Epic Games",
+    "title": "Replication Graph: DynamicSpatialFrequency",
+    "url": "https://dev.epicgames.com/documentation/en-us/unreal-engine/API/Plugins/ReplicationGraph/UReplicationGraphNode_DynamicSpa-",
+    "version": "Public UE 5.8 documentation/API reviewed 2026-09-09; pin engine checkout before implementation",
+    "scope": "Distance-dependent frequency for moving actors; not an authorization mechanism or atomic prediction guarantee.",
+    "evidence_role": "Primary spatial architecture reference"
+  },
+  {
+    "id": "S58",
+    "publisher": "Epic Games",
+    "title": "Actor Network Dormancy",
+    "url": "https://dev.epicgames.com/documentation/en-us/unreal-engine/actor-network-dormancy-in-unreal-engine",
+    "version": "Public UE 5.8 documentation/API reviewed 2026-09-09; pin engine checkout before implementation",
+    "scope": "Wake/flush ordering, delivery completion, dormancy versus relevancy, and special grid handling. Defaults and console options must be checked against the pinned engine.",
+    "evidence_role": "Primary spatial architecture reference"
+  },
+  {
+    "id": "S59",
+    "publisher": "Epic Games",
+    "title": "Replication Graph: BasicReplicationGraph",
+    "url": "https://dev.epicgames.com/documentation/en-us/unreal-engine/API/Plugins/ReplicationGraph/UBasicReplicationGraph",
+    "version": "Public UE 5.8 documentation/API reviewed 2026-09-09; pin engine checkout before implementation",
+    "scope": "Example implementation and explicitly documented limitations on runtime per-actor policy changes.",
+    "evidence_role": "Primary spatial architecture reference"
+  },
+  {
+    "id": "S60",
+    "publisher": "Epic Games",
+    "title": "Migrate to Iris",
+    "url": "https://dev.epicgames.com/documentation/unreal-engine/migrate-to-iris-in-unreal-engine",
+    "version": "Public UE 5.8 documentation/API reviewed 2026-09-09; pin engine checkout before implementation",
+    "scope": "Iris and Replication Graph are separate systems; one network driver cannot use both. No claim about current Fortnite deployment choice.",
+    "evidence_role": "Alternative backend boundary"
+  },
+  {
+    "id": "S61",
+    "publisher": "Epic Games",
+    "title": "Replication Graph: FGlobalActorReplicationInfo",
+    "url": "https://dev.epicgames.com/documentation/en-us/unreal-engine/API/Plugins/ReplicationGraph/FGlobalActorReplicationInfo",
+    "version": "Public UE 5.8 documentation/API reviewed 2026-09-09; pin engine checkout before implementation",
+    "scope": "Shared per-actor metadata, dependent actor lists and level-visible dependent gathering; not atomic rollback semantics.",
+    "evidence_role": "Primary spatial architecture reference"
+  },
+  {
+    "id": "S62",
+    "publisher": "Epic Games",
+    "title": "Replication Graph: FConnectionReplicationActorInfo",
+    "url": "https://dev.epicgames.com/documentation/en-us/unreal-engine/API/Plugins/ReplicationGraph/FConnectionReplicationActorInfo",
+    "version": "Public UE 5.8 documentation/API reviewed 2026-09-09; pin engine checkout before implementation",
+    "scope": "Connection-local per-actor dormancy, last/next replication frames and cull metadata.",
+    "evidence_role": "Primary spatial architecture reference"
+  }
+]

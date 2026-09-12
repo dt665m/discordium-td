@@ -54,3 +54,13 @@ test:
 
 check-web:
     cargo check -p dreamwake_client --target wasm32-unknown-unknown
+
+# Contract evidence and the production acceptance matrix remain distinct.
+network-plan:
+    python3 scripts/qualify-network.py --list
+
+network-foundation:
+    python3 scripts/qualify-network.py --run foundation
+
+network-qualification:
+    python3 scripts/qualify-network.py --run workspace

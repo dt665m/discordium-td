@@ -108,6 +108,14 @@ This file defines project-specific guidance for coding agents working in this re
 
 ## Networking and Prediction
 
+- For every networking or prediction issue, consult the relevant Unreal Engine
+  designs before choosing a fix. Prefer Epic's official documentation, talks and
+  authorized source; distinguish established production systems from experimental
+  features. Record the source/version, applicable mechanism, local invariant and
+  deliberate differences in [the Epic design basis](docs/network-contracts.md#epic-design-basis).
+  Do not present local algorithms or tuning values as Unreal/Fortnite behavior
+  without direct evidence. Preserve these design notes as current guidance, not
+  an incident log, and test the actual packet resend, ordering and ACK semantics.
 - Authoritative state must originate from server simulation.
 - Client prediction may smooth movement/rotation, but must reconcile to server snapshots.
 - Keep predicted-only state isolated and reset safely when authoritative actor disappears/rejoins.
@@ -140,9 +148,28 @@ This file defines project-specific guidance for coding agents working in this re
 
 ## Validation Before Finishing
 
+- Run playtests in the built-in Codex browser when available, and inspect
+  screenshots there to verify visual changes.
 - For Rust changes, run formatting and the checks/tests covering the affected crates and behavior. Use `just check` when it covers the needed checks; do not duplicate equivalent commands.
 - Broaden to workspace checks/tests for cross-crate contracts or merge/release validation. Documentation-only edits need relevant link/example validation rather than a game build.
 - Fix failures caused by this change and rerun affected checks before finishing.
+
+## Long-running test handoff
+
+- For the engine/network revamp goal, finish implementation and integration
+  testing before preparing the final soak against a frozen release candidate.
+- Keep ordinary short checks automatic. Treat soak/endurance runs, extended
+  impairment matrices, and tests expected to exceed five minutes as user-run
+  validation unless the user explicitly authorizes the agent to run them.
+- Before a long-running test, prepare the exact command, frozen source/build
+  identity, expected duration, pass criteria, and result paths. Then stop work
+  and hand the test to the user; do not launch it or keep the goal running while
+  waiting for it.
+- Resume only when the user returns after the test and asks to continue. Read
+  the results, address failures, and continue from that checkpoint. Keep unrun
+  or interrupted acceptance checks explicitly unverified; do not mark the goal
+  complete merely to stop execution.
+
 ## Predicted mechanic graphics
 
 - New transient mechanic visuals must be simulation-owned `GraphicsInstance`

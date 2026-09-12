@@ -1,0 +1,59 @@
+{
+  "automated_checks": [
+    {
+      "file": "ENGINEERING_SPEC.html",
+      "viewport": "desktop",
+      "width": 1440,
+      "scrollWidth": 1440,
+      "headingCount": 28,
+      "brokenLocalAnchors": []
+    },
+    {
+      "file": "ENGINEERING_SPEC.html",
+      "viewport": "mobile",
+      "width": 390,
+      "scrollWidth": 390,
+      "headingCount": 28,
+      "brokenLocalAnchors": []
+    },
+    {
+      "file": "SPATIAL_REPLICATION.html",
+      "viewport": "desktop",
+      "width": 1440,
+      "scrollWidth": 1440,
+      "headingCount": 13,
+      "brokenLocalAnchors": []
+    },
+    {
+      "file": "SPATIAL_REPLICATION.html",
+      "viewport": "mobile",
+      "width": 390,
+      "scrollWidth": 390,
+      "headingCount": 13,
+      "brokenLocalAnchors": []
+    },
+    {
+      "file": "PROTOCOL_ADDENDUM.html",
+      "viewport": "desktop",
+      "width": 1440,
+      "scrollWidth": 1440,
+      "headingCount": 9,
+      "brokenLocalAnchors": []
+    },
+    {
+      "file": "PROTOCOL_ADDENDUM.html",
+      "viewport": "mobile",
+      "width": 390,
+      "scrollWidth": 390,
+      "headingCount": 9,
+      "brokenLocalAnchors": []
+    }
+  ],
+  "screenshots_visually_reviewed": [
+    "ENGINEERING_SPEC_desktop_top.png",
+    "SPATIAL_REPLICATION_desktop_top.png",
+    "SPATIAL_REPLICATION_mobile_top.png",
+    "core_architecture_desktop.png"
+  ],
+  "review_scope": "Desktop document header, source/provenance table and core architecture; mobile spatial introduction. Screenshot captures are QA-only, not packaged. All three pages checked at both viewport widths for overflow and local anchors."
+}

@@ -5,7 +5,12 @@ pub use engine_net::{
     decode_with_limit, encode, newer,
 };
 use serde::{Deserialize, Serialize};
-pub const PROTOCOL_ID: u64 = 0x4452_4541_4d00_0003;
+pub mod live;
+pub mod player;
+pub mod replication;
+pub const PROTOCOL_ID: u64 = 0x4452_4541_4d00_0015;
+pub const SESSION_SERVICE: &str = "dreamwake";
+pub const SESSION_MATCH: &str = "default";
 pub const DEFAULT_MAX_PLAYERS: usize = 8;
 pub const MAX_PLAYERS: usize = 1024;
 pub const MAX_INPUT_BYTES: usize = 2048;
@@ -15,15 +20,48 @@ const _: () = assert!(dreamwake_sim::TICK_HZ.is_multiple_of(SNAPSHOT_HZ));
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum DreamAction {
-    Start { lucid: bool },
-    Cast { slot: u8, aim: [f32; 2] },
-    Dash { direction: [f32; 2] },
-    Choose { choice: u8, slot: u8 },
+    Start {
+        lucid: bool,
+    },
+    Cast {
+        slot: u8,
+        aim: [f32; 2],
+    },
+    Dash {
+        direction: [f32; 2],
+    },
+    Dreamlance {
+        aim: [f32; 2],
+        view: live::CombatViewStamp,
+    },
+    BeamBegin {
+        aim: [f32; 2],
+        view: live::CombatViewStamp,
+    },
+    BeamStop,
+    ChargeBegin,
+    ChargeRelease {
+        episode: u64,
+    },
+    ChargeCancel {
+        episode: u64,
+    },
+    Choose {
+        choice: u8,
+        slot: u8,
+    },
     Continue,
-    Swap { a: u8, b: u8 },
-    BuyMemoryUpgrade { slot: u8 },
+    Swap {
+        a: u8,
+        b: u8,
+    },
+    BuyMemoryUpgrade {
+        slot: u8,
+    },
     Restart,
-    Pause { paused: bool },
+    Pause {
+        paused: bool,
+    },
 }
 
 pub type DreamClientMessage = engine_net::ClientMessage<DreamInput, DreamAction>;

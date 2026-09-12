@@ -8,4 +8,8 @@ license.workspace=true
 serde.workspace=true
 renet.workspace=true
 bincode.workspace=true
+blake3.workspace=true
 miniz_oxide="0.8"
+
+[build-dependencies]
+blake3.workspace = true

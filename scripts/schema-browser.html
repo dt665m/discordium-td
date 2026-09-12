@@ -1,0 +1,27 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dreamwake schema qualification</title>
+<style>
+body{font:16px system-ui,sans-serif;max-width:1150px;margin:40px auto;padding:0 20px;background:#111827;color:#e5e7eb}button{font:inherit;padding:10px 20px;border:0;border-radius:6px;background:#60a5fa;color:#111827;cursor:pointer}button:disabled{opacity:.5}table{width:100%;border-collapse:collapse;margin-top:20px}td,th{padding:10px;text-align:left;border-bottom:1px solid #374151}td:nth-child(2),td:nth-child(3){font:12px ui-monospace,monospace;overflow-wrap:anywhere;max-width:370px}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#1f2937;padding:15px;border-radius:6px}.pass{color:#86efac}.fail{color:#fca5a5}
+</style>
+<h1>Generated schema qualification</h1>
+<p>Compare the registry, twelve canonical codecs and nine compact public codecs between native and browser WebAssembly. Every fixture must round-trip exactly. This reports hashes only.</p>
+<button id="run">Run schema probe</button>
+<p id="status" role="status">Ready. The probe runs in a worker.</p>
+<table hidden id="results"><thead><tr><th>Root</th><th>Native digest</th><th>Browser WASM digest</th><th>Match</th></tr></thead><tbody></tbody></table>
+<pre hidden id="report"></pre>
+<script type="module">
+const button=document.querySelector('#run'),status=document.querySelector('#status'),table=document.querySelector('#results'),report=document.querySelector('#report');
+button.addEventListener('click',()=>{
+ button.disabled=true;status.textContent='Running native-fixture comparison in WebAssembly…';table.hidden=true;report.hidden=true;
+ const worker=new Worker('./schema-worker.js',{type:'module'});
+ const finish=result=>{
+  worker.terminate();button.disabled=false;status.textContent=result.passed?'PASS — registry, 12 canonical roots and 9 compact public roots match native.':'FAIL — '+(result.error||'one or more digests differ');status.className=result.passed?'pass':'fail';
+  const body=table.querySelector('tbody');body.replaceChildren();
+  for(const row of result.rows||[]){const tr=document.createElement('tr');for(const value of [row.root,row.expected,row.actual,row.matches?'PASS':'FAIL']){const td=document.createElement('td');td.textContent=value;tr.append(td)}body.append(tr)}
+  table.hidden=!result.rows;report.textContent=JSON.stringify(result,null,2);report.hidden=false;
+ };
+ worker.onmessage=event=>finish(event.data);worker.onerror=event=>finish({passed:false,error:event.message});worker.postMessage('run');
+});
+</script>

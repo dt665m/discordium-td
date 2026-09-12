@@ -4,6 +4,7 @@ use engine_core::{CompanionState, ProjectileState};
 #[derive(Component, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Projectile {
     pub damage: f32,
+    pub spawn: Option<(crate::starfall::SpawnKey, u32)>,
     pub essence: Option<EssenceKind>,
 }
 impl Projectile {

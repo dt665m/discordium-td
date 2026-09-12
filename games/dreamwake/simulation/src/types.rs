@@ -3,8 +3,81 @@ use serde::{Deserialize, Serialize};
 
 pub const TICK_HZ: u32 = 60;
 pub const DT: f32 = 1.0 / TICK_HZ as f32;
-pub const ARENA_RADIUS: f32 = 18.0;
+/// Spacious demo arena for movement, visibility and multiplayer exercises.
+pub const ARENA_RADIUS: f32 = 128.0;
+pub const ARENA_FLOOR_HALF_EXTENT: f32 = ARENA_RADIUS + 2.0;
+/// Demo survivability; ordinary damage, healing and death still apply.
+pub const STARTING_HEALTH: f32 = 10_000.0;
+/// Authored shutters populate spatial graph cells; the first is the central combat cover.
+pub const DEMO_COVER_POSITIONS: [[f32; 2]; 45] = [
+    [0.0, -6.0],
+    [-96.0, -64.0],
+    [-96.0, -32.0],
+    [-96.0, 0.0],
+    [-96.0, 32.0],
+    [-96.0, 64.0],
+    [-64.0, -96.0],
+    [-64.0, -64.0],
+    [-64.0, -32.0],
+    [-64.0, 0.0],
+    [-64.0, 32.0],
+    [-64.0, 64.0],
+    [-64.0, 96.0],
+    [-32.0, -96.0],
+    [-32.0, -64.0],
+    [-32.0, -32.0],
+    [-32.0, 0.0],
+    [-32.0, 32.0],
+    [-32.0, 64.0],
+    [-32.0, 96.0],
+    [0.0, -96.0],
+    [0.0, -64.0],
+    [0.0, -32.0],
+    [0.0, 32.0],
+    [0.0, 64.0],
+    [0.0, 96.0],
+    [32.0, -96.0],
+    [32.0, -64.0],
+    [32.0, -32.0],
+    [32.0, 0.0],
+    [32.0, 32.0],
+    [32.0, 64.0],
+    [32.0, 96.0],
+    [64.0, -96.0],
+    [64.0, -64.0],
+    [64.0, -32.0],
+    [64.0, 0.0],
+    [64.0, 32.0],
+    [64.0, 64.0],
+    [64.0, 96.0],
+    [96.0, -64.0],
+    [96.0, -32.0],
+    [96.0, 0.0],
+    [96.0, 32.0],
+    [96.0, 64.0],
+];
+/// Inclusive activation radius measured between authoritative ground positions.
+pub const ENEMY_AGGRO_RANGE: f32 = 24.0;
+/// Includes inactive/pending heroes because all retain authoritative combat poses.
+pub const MAX_HEROES: usize = 128;
+pub const MAX_ENCOUNTER_SPAWNS: usize = 32;
+/// Training enemies use the same public enemy roots as encounter enemies.
+pub const AMBIENT_ENEMY_POSITIONS: [[f32; 2]; 45] = {
+    let mut positions = DEMO_COVER_POSITIONS;
+    let mut i = 0;
+    while i < positions.len() {
+        positions[i][0] += 5.0;
+        positions[i][1] += 5.0;
+        i += 1;
+    }
+    positions[0] = [16.0, 16.0];
+    positions
+};
 pub const TOTAL_ROOMS: usize = 10;
+/// Dreamwake balance: stamina spent once when a valid charge releases.
+pub const CHARGE_STAMINA_COST: f32 = 30.0;
+/// Missing transport input holds movement/aim/attack briefly; edges never repeat.
+pub const HELD_INPUT_GRACE_TICKS: u8 = 3;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct DreamInput {
@@ -12,10 +85,21 @@ pub struct DreamInput {
     pub aim: [f32; 2],
     pub attack: bool,
     pub dash: bool,
+    pub charge: engine_core::ChargeCommand,
     pub casts: [bool; 4],
     /// Reliable action sequence: dash first, then the four Memory slots.
     /// Zero uses the simulation tick for deterministic offline callers.
     pub action_sequences: [u32; 5],
+}
+impl DreamInput {
+    pub fn held_only(&self) -> Self {
+        Self {
+            movement: self.movement,
+            aim: self.aim,
+            attack: self.attack,
+            ..Default::default()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,6 +183,8 @@ pub struct Reward {
 pub struct HeroView {
     pub id: u64,
     pub position: [f32; 2],
+    pub elevation: f32,
+    pub crouched: bool,
     pub facing: [f32; 2],
     pub velocity: [f32; 2],
     pub hp: f32,
@@ -111,6 +197,13 @@ pub struct HeroView {
     pub memories: [MemorySlot; 4],
     pub attack_cooldown: f32,
     pub dash_cooldown: f32,
+    pub stamina: f32,
+    pub max_stamina: f32,
+    pub charge_ticks: u16,
+    pub charge_executing: bool,
+    pub charge_cooldown_ticks: u16,
+    pub dreamlance_ammo: u8,
+    pub dreamlance_cooldown: f32,
     pub invulnerable: bool,
     pub dashing: bool,
     pub combo: u32,
@@ -187,6 +280,8 @@ pub struct DreamSnapshot {
     pub ready: bool,
     pub awaiting_party: bool,
     pub enemies: Vec<EnemyView>,
+    pub covers: Vec<crate::replication::PublicCoverView>,
+    pub platforms: Vec<crate::replication::PublicPlatformView>,
     pub projectiles: Vec<ProjectileView>,
     pub wisps: Vec<WispView>,
     /// Historical wire field name retained while graphics types are reorganized.

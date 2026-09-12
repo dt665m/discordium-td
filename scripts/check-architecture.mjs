@@ -17,7 +17,7 @@ const gameRoot = path.join(root, "games") + path.sep;
 // Require capability entry points, while leaving helper-file organization flexible.
 const pluginGroups = [
   ["engine/core", ["system", "abilities", "combat", "physics", "spawn", "progression", "graphics"]],
-  ["engine/client", ["camera", "graphics", "network_tools"]],
+  ["engine/client", ["camera", "graphics", "ui", "network_tools"]],
   ["games/dreamwake/client", ["camera", "graphics", "input", "audio", "ui", "network", "diagnostics"]],
   ["engine/server", ["server"]],
   ["games/dreamwake/server", ["server"]],

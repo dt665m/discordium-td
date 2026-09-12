@@ -89,7 +89,10 @@ F6; build with `--no-default-features` to omit those extras.
 | Move | WASD | Left stick |
 | Aim | Mouse cursor | Right stick |
 | Basic strike | Hold left mouse button | Hold right trigger |
+| Dreamlance | Right mouse button | Right bumper |
+| Channeled beam | Hold middle mouse button | Hold left trigger |
 | Dash | Space | Left bumper |
+| Charged surge | Hold G, then release | Hold left stick button, then release |
 | Memories, slots 1–4 | Q / E / R / F | A / X / Y / B |
 | Choose reward 1–3 | 1 / 2 / 3, or click a card | A / X / Y |
 | Select Memory target slot | Z / X / C / V, or click a slot | D-pad left / right in menus |
@@ -99,12 +102,36 @@ F6; build with `--no-default-features` to omit those extras.
 | Mute / unmute | M, or menu button | Menu button with pointer |
 | Zoom | + / − | — |
 | Performance metrics | F3 | — |
-| Network tools | F6; Gizmos/autoplay require `debug-tools` | — |
+| Network tools | F6; graph cells, Gizmos and autoplay require `debug-tools` | — |
 | Restart | F5 while paused or after an ending; Enter after an ending | A after an ending; menu button while paused |
 
 Basic strikes briefly lock movement, so aim before committing. Dash provides a
 brief invulnerability window. Enemy warning circles mark committed area attacks;
 leave the area before the warning ends.
+
+### Charged surge
+
+Hold the charge control for at least six simulation ticks, then release to surge
+in the release aim direction. Charge reaches its maximum after 36 ticks and
+stays held until release or cancellation. A valid release spends 30 of 100
+stamina, starts a 90-tick cooldown and consumes a versioned 12-tick movement
+curve spanning 3–7.5 metres. Idle stamina regenerates at 18 per second. Releasing
+before the minimum cancels without spending stamina. Pause and reward phases
+freeze charge timing, cooldown and regeneration.
+
+Stun, immediate dash, a successful Blink, death and loss of active ownership
+interrupt the charge. Interruption preserves any stamina already spent and the
+remaining cooldown. Reliable begin/release/cancel edges identify the same
+charge episode and ownership stream; an old stream cannot release a new charge.
+
+The shared simulation saves stamina, episode, phase, curve version, execution
+cursor and release direction in complete and owner checkpoints. Holding follows
+moving support; release detaches with the existing departure-velocity policy.
+Each curve sample goes through the same capsule sweep as ordinary motion.
+Blocking a sample consumes that sample, while a failed collision query preserves
+the prior motion, resource and phase state. Owner prediction restores and replays
+these fields; rendering reads the resulting actor state. Other players' public
+views do not disclose stamina or cooldown.
 
 ## Party flow
 
@@ -163,6 +190,35 @@ selected Memory by one rank before choosing a free blessing. Shared kills award
 shards and experience to each party member. Progression lasts for the current run.
 
 ## Encounters
+
+The demo arena has a 128-metre radius, with collision and visible floor dimensions
+supplied by the game simulation. Forty-five veil shutters and their scoped markers
+occupy a 32-metre grid across the arena, retaining the original central shutter.
+Their opening, removal and visibility use the normal replicated cover pipeline.
+Each shutter rests for 90 simulation ticks, then travels vertically for 30 ticks
+to the opposite endpoint. The same authoritative height drives display and shot
+collision; travelers and enemies can cross the magical surface.
+Forty-five training enemies occupy the surrounding grid. An enemy detects an
+active, living Traveler within 24 metres, including the boundary, and retains
+that target as they move farther away. It keeps chasing and attacking that
+Traveler without switching to a nearer distraction. Windup and recovery lock
+movement. When the target leaves, becomes inactive or is defeated, the enemy
+acquires the nearest eligible Traveler within the detection radius, breaking
+distance ties by stable Traveler ID, or waits for someone to approach.
+Training enemies do not hold encounters open or grant encounter rewards. Their
+role, home position, activation state and retained target remain private
+authoritative components and survive full checkpoint restore;
+visible enemies use the ordinary public enemy scopes independently of aggro.
+
+The game retains at most 128 heroes, including pending/inactive travelers, plus
+45 training enemies and at most 32 encounter spawns over each entire room. With
+45 covers, this bounds combat history to 250 poses per frame. This is a storage
+safety limit; the normal demo profile remains eight active players. Full snapshots
+keep their 8 MiB byte cap, with 524,288 structural nodes and 2 MiB of aggregate
+key/text data for the bounded population and 32 retained frames.
+Heroes start each new run with 10,000 health so movement and multiplayer testing
+can continue comfortably. Damage, healing,
+progression and defeat retain their normal rules.
 
 The ten-room route includes normal encounters, three elite challenges, two
 sanctuaries and the Somnarch's final arena. Seeds vary encounters, reinforcements,

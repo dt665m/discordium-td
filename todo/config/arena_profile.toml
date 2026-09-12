@@ -1,0 +1,127 @@
+# Proposed qualification defaults. Not measured commercial-game settings.
+# Integrators must validate ranges and cross-field constraints at load time.
+[simulation]
+hz = 60
+server_catchup_burst_ticks = 4
+
+[network]
+input_send_hz = 60
+owner_checkpoint_hz = 30
+remote_snapshot_target_hz = 30
+command_redundancy = 4
+command_redundancy_max = 8
+# This is an envelope, NOT permission to send 1200 application bytes.
+# Derive application payload from actual transport/path overhead and limit.
+conservative_datagram_envelope_bytes = 1200
+baseline_slots_per_scope = 8
+max_actions_per_command = 8
+provisional_downstream_budget_bytes_per_second = 60000
+
+[clock]
+command_target_slack_ticks = 1
+prediction_lead_min_ticks = 1
+prediction_lead_max_ticks = 12
+clock_slew_min = 0.98
+clock_slew_max = 1.02
+
+[prediction]
+history_ticks = 256
+max_replay_ticks_per_frame = 32
+missing_held_input_grace_ticks = 3
+# One-shot edges are NEVER copied into a substitute command.
+replay_overflow = "request_complete_resynchronization"
+
+[presentation]
+remote_extrapolation_cap_ms = 100
+local_error_half_life_ms = 50
+teleport_correction = "snap_discontinuity"
+
+[combat]
+max_rewind_ms = 150
+hit_history_ticks = 32
+subtick_enabled = false
+late_scheduled_action_policy = "reject_after_finalization"
+missing_hit_history_policy = "reject_compensated_validation"
+projectile_catchup_enabled = false
+# Historical targets/blockers; authoritative eligible shooter at execution time.
+hitscan_time_policy = "mixed_time_explicit"
+equal_time_damage_policy = "batch_and_allow_eligible_trades"
+
+[qualification]
+player_count = 12
+large_world_client_count = 100
+large_world_potential_actor_count = 50000
+soak_hours = 24
+server_tick_p99_target_ms = 8.0
+client_replay_p99_target_ms = 2.0
+static_movement_correction_p95_target_m = 0.02
+static_movement_correction_p99_target_m = 0.10
+
+[limits]
+max_predicted_groups = 8
+max_entities_per_prediction_group = 32
+max_total_predicted_entities = 128
+max_decoded_group_checkpoint_bytes = 16384
+max_prediction_history_bytes = 67108864
+max_replay_entity_steps_per_frame = 2048
+max_chunks_per_group_snapshot = 16
+max_incomplete_group_assemblies = 8
+max_reliable_application_queue_bytes_per_peer = 262144
+max_future_input_slots_per_owner = 12
+
+# First-class core subsystem. Names and values are derived library settings,
+# not Fortnite configuration or a claim of compatibility with Unreal's wire format.
+[interest]
+model = "epic_replication_graph"
+required_from_milestone = "M1"
+production_broadcast_fallback = false
+prepare_from_committed_world = true
+prepare_once_per_replication_frame = true
+max_approved_observers_per_connection = 2
+max_candidates_per_connection = 4096
+max_required_dependency_entities = 128
+max_known_scopes_per_connection = 8192
+max_pending_scope_transitions_per_connection = 1024
+required_dependencies_override_distance = true
+required_dependencies_override_disclosure = false
+unauthorized_dependency_policy = "deny_prediction_group"
+candidate_overflow_policy = "explicit_overload_no_partial_required_group"
+
+[interest.grid]
+kind = "sparse_xy_influence_cells"
+cell_size_m = 32.0
+base_cull_radius_m = 80.0
+leave_margin_m = 10.0
+prefetch_cap_m = 8.0
+exact_3d_filter = true
+max_cells_per_entity = 256
+max_active_cells = 65536
+max_total_memberships = 2000000
+oversized_registration_policy = "reject_transactionally_until_approved_coarse_node"
+
+[interest.scope]
+full_baseline_on_entry = true
+full_baseline_on_representation_change = true
+delta_requires_scope_ready_ack = true
+exit_is_authoritative_death = false
+retain_replay_dependencies_separately = true
+state_and_control_validate_scope_epoch = true
+max_entry_progress_age_ms = 2000
+entry_overload_policy = "gate_activation_or_resynchronize"
+
+[interest.dormancy]
+completion = "per_connection_decoded_state_version"
+mutation_requires_dirty_version = true
+late_join_requires_full_state = true
+repair = "retry_pending_version_or_scoped_full_state"
+periodic_broadcast_all_dormant = false
+
+[interest.scheduler]
+critical_budget_fraction = 0.40
+unused_critical_reserve_is_borrowable = true
+atomic_required_groups = true
+# Optional optimization; the base graph and bounded scheduler are already required.
+distance_frequency_enabled = false
+normal_remote_hz = 30
+far_optional_remote_hz = 5
+fairness_contract = "bounded_update_age_when_offered_load_is_feasible"

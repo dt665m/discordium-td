@@ -11,8 +11,9 @@ pub fn scale(a: [f32; 2], s: f32) -> [f32; 2] {
     (Vec2::from_array(a) * s).to_array()
 }
 pub fn length(a: [f32; 2]) -> f32 {
-    // Preserve the snapshot simulation's overflow-resistant norm and rounding.
-    a[0].hypot(a[1])
+    // Use Bevy's fixed multiply/add/sqrt path. Platform hypot implementations
+    // differ by an ULP between native and WASM, changing replay state.
+    Vec2::from_array(a).length()
 }
 pub fn normalize(a: [f32; 2]) -> [f32; 2] {
     let len = length(a);

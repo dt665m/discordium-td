@@ -5,6 +5,14 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub enum GraphicsKind {
     RadialPulse,
+    Orb {
+        elevation: f32,
+    },
+    Beam {
+        direction: [f32; 3],
+        elevation: f32,
+        length: f32,
+    },
 }
 #[derive(Component, Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct GraphicsInstance {

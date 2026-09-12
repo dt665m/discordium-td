@@ -133,6 +133,7 @@ sudo systemctl restart discordium-td
 sudo systemctl status discordium-td --no-pager
 sudo journalctl -u discordium-td -n 100 --no-pager
 curl --fail --silent --show-error https://dsdp.datab.fun/healthz
+curl --fail --silent --show-error https://dsdp.datab.fun/readyz
 ```
 
 ## Promote Pages and validate the pair

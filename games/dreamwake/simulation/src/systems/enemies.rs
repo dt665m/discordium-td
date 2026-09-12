@@ -1,8 +1,8 @@
 use super::*;
 
 pub(crate) fn hit_party_in_area(
-    commands: &mut Commands,
-    run: &mut Run,
+    batch: &mut CombatBatch,
+    action: CombatActionKey,
     heroes: &mut Query<HeroActor, Without<Enemy>>,
     center: [f32; 2],
     radius: f32,
@@ -10,9 +10,11 @@ pub(crate) fn hit_party_in_area(
 ) {
     let mut party: Vec<_> = heroes.iter_mut().collect();
     party.sort_by_key(|h| h.view.id);
-    for mut hero in party {
-        if engine_core::contains_circle(center, radius, hero.motor.position) {
-            hit_hero(commands, run, &mut hero, damage);
+    for hero in party {
+        if hero.active
+            && engine_core::contains_circle(center, radius, planar_position(&hero.motion))
+        {
+            hit_hero(batch, action, &hero, damage);
         }
     }
 }
@@ -20,6 +22,7 @@ pub(crate) fn hit_party_in_area(
 pub(crate) fn enemy_actions(
     mut commands: Commands,
     mut run: ResMut<Run>,
+    mut batch: ResMut<CombatBatch>,
     mut heroes: Query<HeroActor, Without<Enemy>>,
     mut enemies: Query<(Entity, EnemyActor), Without<Hero>>,
 ) {
@@ -33,21 +36,63 @@ pub(crate) fn enemy_actions(
         if enemy.health.hp <= 0.0 {
             continue;
         }
-        let Some(hero_position) = engine_core::nearest_target(
-            enemy.motor.position,
-            f32::INFINITY,
-            2,
-            heroes.iter().map(|h| engine_core::CollisionTarget {
-                id: h.view.id,
-                faction: 1,
-                position: h.motor.position,
-                radius: 0.48,
-                active: h.health.hp > 0.0,
-            }),
-        )
-        .map(|target| target.position) else {
+        // Detection only acquires a target. A living active target stays latched
+        // beyond detection range and is not replaced by a nearer party member.
+        let retained = enemy.ai.target.and_then(|id| {
+            heroes
+                .iter()
+                .find(|h| h.view.id == id && h.active && h.health.hp > 0.0)
+                .map(|h| (h.view.id, planar_position(&h.motion)))
+        });
+        let target = retained.or_else(|| {
+            engine_core::nearest_target(
+                enemy.motor.position,
+                f32::INFINITY,
+                2,
+                heroes.iter().map(|h| engine_core::CollisionTarget {
+                    id: h.view.id,
+                    faction: 1,
+                    position: planar_position(&h.motion),
+                    radius: 0.48,
+                    // Detection includes the exact boundary.
+                    active: h.active
+                        && h.health.hp > 0.0
+                        && Vec2::from_array(enemy.motor.position)
+                            .distance_squared(Vec2::from_array(planar_position(&h.motion)))
+                            <= ENEMY_AGGRO_RANGE * ENEMY_AGGRO_RANGE,
+                }),
+            )
+            .map(|target| (target.id, target.position))
+        });
+        let Some((target_id, hero_position)) = target else {
+            if enemy.ai.target.is_some() {
+                enemy.ai.target = None;
+            }
+            if enemy.ai.awake {
+                enemy.ai.awake = false;
+            }
+            if !enemy.action.idle() {
+                enemy.action.cancel();
+            }
+            if enemy.view.warn_radius != 0.0 {
+                enemy.view.warn_radius = 0.0;
+            }
+            if enemy.motor.velocity != [0.0; 2] {
+                enemy.motor.velocity = [0.0; 2];
+            }
             continue;
         };
+        if enemy.ai.target != Some(target_id) {
+            enemy.ai.target = Some(target_id);
+        }
+        if !enemy.ai.awake {
+            let delay = enemy.ai.wake_delay;
+            enemy.ai.awake = true;
+            enemy.ai.wake_delay = 0.0;
+            if delay > 0.0 && enemy.action.idle() {
+                enemy.action.begin_recovery(delay);
+            }
+        }
         let kind = enemy.view.kind;
         if kind == EnemyKind::Boss {
             let phase = if enemy.health.hp < enemy.health.max_hp * 0.34 {
@@ -118,8 +163,15 @@ pub(crate) fn enemy_actions(
                     }
                     EnemyKind::Support => {
                         hit_party_in_area(
-                            &mut commands,
-                            &mut run,
+                            &mut batch,
+                            CombatActionKey::new(
+                                run.tick,
+                                enemy.view.id,
+                                enemy.combat_identity.generation,
+                                2,
+                                u64::from(enemy.attack_index),
+                                0,
+                            ),
                             &mut heroes,
                             target,
                             enemy.view.warn_radius,
@@ -141,8 +193,15 @@ pub(crate) fn enemy_actions(
                     }
                     EnemyKind::Boss => {
                         hit_party_in_area(
-                            &mut commands,
-                            &mut run,
+                            &mut batch,
+                            CombatActionKey::new(
+                                run.tick,
+                                enemy.view.id,
+                                enemy.combat_identity.generation,
+                                2,
+                                u64::from(enemy.attack_index),
+                                0,
+                            ),
                             &mut heroes,
                             target,
                             enemy.view.warn_radius,
@@ -191,6 +250,10 @@ pub(crate) fn enemy_actions(
                     }
                     _ => {
                         if kind == EnemyKind::Ambusher || kind == EnemyKind::Elite {
+                            if let Err(error) = enemy.combat_identity.discontinuity(false) {
+                                batch.error = Some(error);
+                                continue;
+                            }
                             enemy.motor.position = clamp(target);
                         }
                         let damage = match kind {
@@ -199,8 +262,15 @@ pub(crate) fn enemy_actions(
                             _ => 17.0,
                         };
                         hit_party_in_area(
-                            &mut commands,
-                            &mut run,
+                            &mut batch,
+                            CombatActionKey::new(
+                                run.tick,
+                                enemy.view.id,
+                                enemy.combat_identity.generation,
+                                2,
+                                u64::from(enemy.attack_index),
+                                0,
+                            ),
                             &mut heroes,
                             target,
                             enemy.view.warn_radius + 0.25,
@@ -248,6 +318,9 @@ pub(crate) fn enemy_actions(
                 };
                 enemy.action.begin_recovery(recovery);
             }
+            continue;
+        }
+        if enemy.action.recovery > 0.0 {
             continue;
         }
         let to_hero = sub(hero_position, enemy.motor.position);

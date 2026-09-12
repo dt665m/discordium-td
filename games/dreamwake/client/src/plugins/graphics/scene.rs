@@ -1,4 +1,6 @@
 //! Procedural game graphics for Dreamwake. Gameplay lifetimes remain in the simulation.
+mod collision;
+
 use std::{
     collections::HashSet,
     f32::consts::{FRAC_PI_2, PI, TAU},
@@ -14,8 +16,8 @@ use bevy::{
 };
 
 use crate::DreamView;
-use dreamwake_sim::{DreamSnapshot, EnemyKind, EssenceKind, RunPhase, TICK_HZ};
-use engine_core::GraphicsId;
+use dreamwake_sim::{DreamPresentation, EnemyKind, EssenceKind, RunPhase};
+use engine_core::{GraphicsId, GraphicsKind};
 
 /// Roots owned by the game renderer; hiding them also hides their mesh children.
 #[derive(Component, Clone, Default)]
@@ -28,6 +30,16 @@ impl Plugin for DreamScenePlugin {
             Update,
             (sync_scene, animate_scene)
                 .chain()
+                .in_set(engine_client::graphics::GraphicsSet::Render),
+        );
+        app.add_systems(
+            Update,
+            (
+                collision::sync,
+                collision::sync_covers,
+                collision::sync_cover_markers,
+                collision::sync_platforms,
+            )
                 .in_set(engine_client::graphics::GraphicsSet::Render),
         );
         add_label_placement_systems(app);
@@ -80,6 +92,7 @@ struct SceneArt {
     shadow: Handle<StandardMaterial>,
     warning_fill: Handle<StandardMaterial>,
     friendly_fill: Handle<StandardMaterial>,
+    anonymous_fill: Handle<StandardMaterial>,
     realm: usize,
 }
 
@@ -218,6 +231,7 @@ fn setup_scene(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
+    let arena_radius = dreamwake_sim::ARENA_RADIUS;
     let art = SceneArt {
         cube: meshes.add(Cuboid::default()),
         sphere: meshes.add(Sphere::new(1.0).mesh().ico(2).unwrap()),
@@ -248,6 +262,7 @@ fn setup_scene(
         shadow: transparent(&mut materials, [0.012, 0.021, 0.034, 0.44]),
         warning_fill: transparent(&mut materials, [0.95, 0.07, 0.12, 0.18]),
         friendly_fill: transparent(&mut materials, [0.15, 0.95, 0.72, 0.12]),
+        anonymous_fill: transparent(&mut materials, [0.65, 0.72, 0.76, 0.22]),
         realm: usize::MAX,
     };
     commands.insert_resource(ClearColor(Color::srgb(0.016, 0.025, 0.055)));
@@ -293,7 +308,7 @@ fn setup_scene(
         &art.cylinder,
         &art.ground,
         Vec3::new(0.0, -0.42, 0.0),
-        Vec3::new(20.5, 0.85, 20.5),
+        Vec3::new(arena_radius + 2.3, 0.85, arena_radius + 2.3),
         Quat::IDENTITY,
     );
     piece(
@@ -301,7 +316,7 @@ fn setup_scene(
         &art.cylinder,
         &art.cliff,
         Vec3::new(0.0, -1.3, 0.0),
-        Vec3::new(19.9, 1.4, 19.9),
+        Vec3::new(arena_radius + 1.7, 1.4, arena_radius + 1.7),
         Quat::IDENTITY,
     );
     piece(
@@ -309,7 +324,7 @@ fn setup_scene(
         &art.cone,
         &art.cliff,
         Vec3::new(0.0, -4.0, 0.0),
-        Vec3::new(19.3, 5.0, 19.3),
+        Vec3::new(arena_radius + 1.1, 5.0, arena_radius + 1.1),
         Quat::from_rotation_z(PI),
     );
     for i in 0..56 {
@@ -320,15 +335,15 @@ fn setup_scene(
             &mut commands,
             &art.cube,
             &art.stone,
-            radial * 20.0 + Vec3::Y * -0.5,
-            Vec3::new(1.8, 1.0, 0.75),
+            radial * (arena_radius + 1.8) + Vec3::Y * -0.5,
+            Vec3::new(TAU * arena_radius / 56.0 * 0.8, 1.0, 0.75),
             Quat::from_rotation_y(-a + FRAC_PI_2),
         );
         piece(
             &mut commands,
             &art.crystal,
             &art.cliff,
-            radial * 19.5 + Vec3::Y * -2.0,
+            radial * (arena_radius + 1.3) + Vec3::Y * -2.0,
             Vec3::new(2.3, height, 1.8),
             Quat::from_rotation_y(a),
         );
@@ -379,7 +394,7 @@ fn setup_scene(
         );
     }
 
-    // Impossible moon gate: a gilded broken halo over the far edge of the island.
+    // The moon gate and central rings mark the original encounter hub.
     for side in [-1.0, 1.0] {
         let base = Vec3::new(side * 5.4, 0.0, -15.8);
         for k in 0..3 {
@@ -463,7 +478,7 @@ fn setup_scene(
 
     for i in 0..14 {
         let a = i as f32 / 14.0 * TAU + 0.11;
-        let r = 18.0 + noise(i * 47) * 1.2;
+        let r = arena_radius - 0.2 + noise(i * 47) * 1.2;
         crystal_garden(
             &mut commands,
             &art,
@@ -473,7 +488,11 @@ fn setup_scene(
     }
     // Wind-sculpted dream trees stay at the boundary, outside the playable radius.
     for (i, a) in [-2.8_f32, -0.4, 0.45, 2.50].into_iter().enumerate() {
-        let base = Vec3::new(a.cos() * 19.1, 0.0, a.sin() * 19.1);
+        let base = Vec3::new(
+            a.cos() * (arena_radius + 0.9),
+            0.0,
+            a.sin() * (arena_radius + 0.9),
+        );
         piece(
             &mut commands,
             &art.cone,
@@ -680,7 +699,7 @@ struct ActorVisual {
     last_position: Vec3,
     last_tick: u32,
     sample_age: Timer,
-    seed: u64,
+    match_epoch: u32,
     room: usize,
     windup: f32,
     hit: f32,
@@ -692,20 +711,20 @@ struct ActorVisual {
 }
 
 impl ActorVisual {
-    /// Sample simulation motion, never the renderer's remaining correction distance.
+    /// Sample the presented target at display frequency, before correction smoothing.
     fn sample_target(
         &mut self,
         position: Vec3,
-        seed: u64,
+        match_epoch: u32,
         room: usize,
         tick: u32,
         dt: Duration,
     ) -> bool {
-        let reset = self.seed != seed
+        let reset = self.match_epoch != match_epoch
             || self.room != room
             || (tick == 0 && self.last_tick > 0)
             || self.last_position.distance_squared(position) > 16.0;
-        if reset || tick != self.last_tick {
+        if reset || tick != self.last_tick || position != self.last_position {
             self.sample_age.reset();
         } else {
             self.sample_age.tick(dt);
@@ -718,20 +737,21 @@ impl ActorVisual {
             self.hit = 0.0;
             self.windup = 0.0;
             self.dash = 0.0;
-        } else if tick < self.last_tick {
-            // Reconciliation can move back a few ticks without changing rooms.
-            // Rebase the velocity sample, but retain the continuous visual pose.
+        } else if self.kind.is_none() && tick < self.last_tick {
+            // Rebase a corrected hero without treating its correction as travel.
             self.target_motion = 0.0;
-        } else if tick > self.last_tick {
-            self.target_motion = self.last_position.distance(position) * TICK_HZ as f32
-                / (tick - self.last_tick) as f32;
+        } else if !dt.is_zero() {
+            // Remote positions already interpolate each display frame. The
+            // owner's integer prediction tick can repeat or jump independently;
+            // dividing one display frame's travel by that tick gap loses motion.
+            self.target_motion = self.last_position.distance(position) / dt.as_secs_f32();
         }
         if self.sample_age.is_finished() {
             self.target_motion = 0.0;
         }
         self.last_position = position;
         self.last_tick = tick;
-        self.seed = seed;
+        self.match_epoch = match_epoch;
         self.room = room;
         reset
     }
@@ -774,7 +794,6 @@ enum PartKind {
     RightLeg,
     Blade,
     Halo,
-    Health,
     Shield,
     Slow,
     Eye,
@@ -841,13 +860,14 @@ fn spawn_actor(
     kind: Option<EnemyKind>,
     position: Vec3,
     local: bool,
-    snapshot: &DreamSnapshot,
+    snapshot: &DreamPresentation,
 ) {
     let parent = commands
         .spawn((
             SceneGraphic,
             Transform::from_translation(position),
             Visibility::default(),
+            crate::plugins::ui::overhead::OverheadAnchor(id),
             ActorVisual {
                 id,
                 kind,
@@ -858,7 +878,7 @@ fn spawn_actor(
                 last_position: position,
                 last_tick: snapshot.tick,
                 sample_age: Timer::from_seconds(ACTOR_SAMPLE_GRACE_SECS, TimerMode::Once),
-                seed: snapshot.seed,
+                match_epoch: snapshot.stamp.match_epoch,
                 room: snapshot.room,
                 windup: 0.0,
                 hit: 0.0,
@@ -1310,31 +1330,6 @@ fn spawn_actor(
             Vec3::splat(0.8 * size),
             Quat::from_rotation_x(-FRAC_PI_2),
         );
-        let height = if kind == Some(EnemyKind::Boss) {
-            5.8
-        } else {
-            2.4 * size
-        };
-        fixed_part(
-            commands,
-            parent,
-            &art.cube,
-            &art.dark,
-            Vec3::Y * height,
-            Vec3::new(1.07 * size, 0.08, 0.10),
-            Quat::IDENTITY,
-        );
-        part(
-            commands,
-            parent,
-            art,
-            PartKind::Health,
-            &art.cube,
-            &art.coral,
-            Vec3::new(0.0, height, 0.02),
-            Vec3::new(size, 0.065, 0.10),
-            Quat::IDENTITY,
-        );
     }
 }
 
@@ -1357,12 +1352,16 @@ fn ground_child_ring(
     );
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum VisualKey {
     Projectile(u64),
     Wisp(u64),
     Warning(u64),
     Effect(GraphicsId),
+    HostilePulse(GraphicsId),
+    AnonymousPulse(GraphicsId),
+    Beam(GraphicsId),
+    Orb(GraphicsId),
 }
 #[derive(Component)]
 struct EffectVisual(VisualKey);
@@ -1403,6 +1402,28 @@ fn spawn_effect(
         ))
         .id();
     match key {
+        VisualKey::Beam(_) => {
+            fixed_part(
+                commands,
+                parent,
+                &art.cube,
+                mat,
+                Vec3::ZERO,
+                Vec3::ONE,
+                Quat::IDENTITY,
+            );
+        }
+        VisualKey::Orb(_) => {
+            fixed_part(
+                commands,
+                parent,
+                &art.sphere,
+                mat,
+                Vec3::ZERO,
+                Vec3::ONE,
+                Quat::IDENTITY,
+            );
+        }
         VisualKey::Projectile(_) => {
             fixed_part(
                 commands,
@@ -1478,6 +1499,49 @@ fn spawn_effect(
                 );
             }
         }
+        VisualKey::HostilePulse(_) => {
+            // A ground impact flashes at the warning footprint, then contracts.
+            // It has no floating crystals or expanding player-ability rings.
+            fixed_part(
+                commands,
+                parent,
+                &art.disk,
+                &art.warning_fill,
+                Vec3::ZERO,
+                Vec3::ONE,
+                Quat::from_rotation_x(-FRAC_PI_2),
+            );
+            for i in 0..4 {
+                fixed_part(
+                    commands,
+                    parent,
+                    &art.cube,
+                    &art.coral,
+                    Vec3::Y * 0.015,
+                    Vec3::new(0.045, 0.012, 1.8),
+                    Quat::from_rotation_y(i as f32 * PI / 4.0),
+                );
+            }
+        }
+        VisualKey::AnonymousPulse(_) => {
+            // A coarse event reveals activity in a region, not an attack center
+            // or damage radius. Use neutral rising motes, never tactical rings.
+            for (position, size) in [
+                (Vec3::new(-0.22, 0.0, 0.08), 0.14),
+                (Vec3::new(0.18, 0.22, -0.12), 0.18),
+                (Vec3::new(0.02, 0.48, 0.04), 0.11),
+            ] {
+                fixed_part(
+                    commands,
+                    parent,
+                    &art.sphere,
+                    &art.anonymous_fill,
+                    position,
+                    Vec3::splat(size),
+                    Quat::IDENTITY,
+                );
+            }
+        }
         VisualKey::Effect(_) => {
             fixed_part(
                 commands,
@@ -1492,7 +1556,7 @@ fn spawn_effect(
                 commands,
                 parent,
                 &art.ring,
-                if friendly { &art.gold_glow } else { &art.coral },
+                &art.gold_glow,
                 Vec3::Y * 0.08,
                 Vec3::splat(0.76),
                 Quat::from_rotation_x(-FRAC_PI_2),
@@ -1501,11 +1565,7 @@ fn spawn_effect(
                 commands,
                 parent,
                 &art.disk,
-                if friendly {
-                    &art.friendly_fill
-                } else {
-                    &art.warning_fill
-                },
+                &art.friendly_fill,
                 Vec3::NEG_Y * 0.01,
                 Vec3::ONE,
                 Quat::from_rotation_x(-FRAC_PI_2),
@@ -1532,6 +1592,30 @@ fn world(p: [f32; 2], height: f32) -> Vec3 {
 }
 fn facing(p: [f32; 2]) -> Quat {
     Quat::from_rotation_y((-p[0]).atan2(-p[1]))
+}
+
+fn radial_visual(pulse: &engine_core::GraphicsInstance) -> (VisualKey, Transform) {
+    let age = (pulse.age_ticks as f32 / pulse.duration_ticks.max(1) as f32).clamp(0.0, 1.0);
+    if pulse.id.owner == 0 {
+        (
+            VisualKey::AnonymousPulse(pulse.id),
+            Transform::from_translation(world(pulse.pos, 0.7 + age * 0.9))
+                .with_scale(Vec3::splat(1.0 - age)),
+        )
+    } else if pulse.id.owner >= (1_u64 << 63) {
+        let radius = pulse.radius * (1.0 - age).sqrt();
+        (
+            VisualKey::HostilePulse(pulse.id),
+            Transform::from_translation(world(pulse.pos, 0.075))
+                .with_scale(Vec3::new(radius, 1.0, radius)),
+        )
+    } else {
+        (
+            VisualKey::Effect(pulse.id),
+            Transform::from_translation(world(pulse.pos, 0.10 + age * 0.08))
+                .with_scale(Vec3::splat(pulse.radius * (0.5 + age * 0.5))),
+        )
+    }
 }
 
 /// Reconcile render identities to the simulation snapshot. No receive-event spawning.
@@ -1589,43 +1673,48 @@ fn sync_scene(
     let dt = time.delta_secs().min(0.1);
     for (entity, mut actor, mut transform) in &mut actors {
         existing.insert(actor.id);
-        let (position, direction, speed, attack, windup, hit, dash) = if actor.kind.is_none() {
-            let Some(h) = snapshot.heroes.iter().find(|hero| hero.id == actor.id) else {
+        let (position, elevation, crouched, direction, speed, attack, windup, hit, dash) =
+            if actor.kind.is_none() {
+                let Some(h) = snapshot.heroes.iter().find(|hero| hero.id == actor.id) else {
+                    commands.entity(entity).despawn();
+                    continue;
+                };
+                actor.shield = h.hp > 0.0 && (h.shield > 0.0 || h.invulnerable);
+                actor.hp = h.hp / h.max_hp.max(1.0);
+                (
+                    h.position,
+                    h.elevation,
+                    h.crouched,
+                    h.facing,
+                    Some(Vec2::from_array(h.velocity).length()),
+                    h.attack_flash,
+                    0.0,
+                    h.hit_flash,
+                    f32::from(h.dashing),
+                )
+            } else if let Some(e) = snapshot.enemies.iter().find(|e| e.id == actor.id) {
+                actor.hp = e.hp / e.max_hp;
+                actor.slowed = e.slowed;
+                (
+                    e.position,
+                    0.0,
+                    false,
+                    e.facing,
+                    None,
+                    0.0,
+                    e.windup.min(0.6),
+                    e.hit_flash,
+                    0.0,
+                )
+            } else {
                 commands.entity(entity).despawn();
                 continue;
             };
-            actor.shield = h.hp > 0.0 && (h.shield > 0.0 || h.invulnerable);
-            actor.hp = h.hp / h.max_hp.max(1.0);
-            (
-                h.position,
-                h.facing,
-                Some(Vec2::from_array(h.velocity).length()),
-                h.attack_flash,
-                0.0,
-                h.hit_flash,
-                f32::from(h.dashing),
-            )
-        } else if let Some(e) = snapshot.enemies.iter().find(|e| e.id == actor.id) {
-            actor.hp = e.hp / e.max_hp;
-            actor.slowed = e.slowed;
-            (
-                e.position,
-                e.facing,
-                None,
-                0.0,
-                e.windup.min(0.6),
-                e.hit_flash,
-                0.0,
-            )
-        } else {
-            commands.entity(entity).despawn();
-            continue;
-        };
         let downed = actor.kind.is_none() && actor.hp <= 0.0;
-        let target = world(position, 0.0);
+        let target = world(position, elevation);
         let reset = actor.sample_target(
             target,
-            snapshot.seed,
+            snapshot.stamp.match_epoch,
             snapshot.room,
             snapshot.tick,
             time.delta(),
@@ -1663,6 +1752,8 @@ fn sync_scene(
         }
         transform.scale = if downed {
             Vec3::new(0.90, 0.27, 0.90)
+        } else if crouched {
+            Vec3::new(1.0, 6.0 / 7.0, 1.0)
         } else {
             Vec3::ONE
         };
@@ -1674,7 +1765,7 @@ fn sync_scene(
                 &art,
                 hero.id,
                 None,
-                world(hero.position, 0.0),
+                world(hero.position, hero.elevation),
                 hero.id == snapshot.hero.id,
                 snapshot,
             );
@@ -1755,14 +1846,33 @@ fn sync_scene(
         }
     }
     for p in &snapshot.presentations {
-        let age = p.age_ticks as f32 / p.duration_ticks.max(1) as f32;
-        desired.push((
-            VisualKey::Effect(p.id),
-            Transform::from_translation(world(p.pos, 0.10 + age * 0.08))
-                .with_scale(Vec3::splat(p.radius * (0.5 + age * 0.5))),
-            p.id.owner < (1_u64 << 63),
-            None,
-        ));
+        let (key, transform) = match p.kind {
+            GraphicsKind::Orb { elevation } => (
+                VisualKey::Orb(p.id),
+                Transform::from_translation(world(p.pos, elevation))
+                    .with_scale(Vec3::splat(p.radius)),
+            ),
+            GraphicsKind::RadialPulse => radial_visual(p),
+            GraphicsKind::Beam {
+                direction,
+                elevation,
+                length,
+            } => {
+                let direction = Vec3::from_array(direction).normalize_or_zero();
+                let rotation = if direction == Vec3::ZERO {
+                    Quat::IDENTITY
+                } else {
+                    Quat::from_rotation_arc(Vec3::Z, direction)
+                };
+                (
+                    VisualKey::Beam(p.id),
+                    Transform::from_translation(world(p.pos, elevation) + direction * length * 0.5)
+                        .with_rotation(rotation)
+                        .with_scale(Vec3::new(p.radius * 2.0, p.radius * 2.0, length)),
+                )
+            }
+        };
+        desired.push((key, transform, p.id.owner < (1_u64 << 63), None));
     }
     let mut effect_ids = HashSet::new();
     for (entity, effect, mut transform) in &mut effects {
@@ -1827,7 +1937,7 @@ fn sync_scene(
 
 fn animate_scene(
     time: Res<Time>,
-    actors: Query<(&ActorVisual, &Transform), Without<ArtPart>>,
+    actors: Query<&ActorVisual, Without<ArtPart>>,
     mut parts: Query<(&ArtPart, &mut Transform, &mut Visibility), Without<ActorVisual>>,
     mut drifters: Query<(&Drift, &mut Transform), (Without<ArtPart>, Without<ActorVisual>)>,
     mut gates: Query<
@@ -1842,7 +1952,7 @@ fn animate_scene(
 ) {
     let t = time.elapsed_secs();
     for (part, mut transform, mut visibility) in &mut parts {
-        let Ok((actor, parent)) = actors.get(part.actor) else {
+        let Ok(actor) = actors.get(part.actor) else {
             continue;
         };
         let mut next = part.base;
@@ -1889,15 +1999,6 @@ fn animate_scene(
                 next.rotation *= Quat::from_rotation_z(t * 0.5);
                 next.translation.y += bob;
             }
-            PartKind::Health => {
-                next.scale.x *= actor.hp.clamp(0.0, 1.0);
-                next.rotation = parent.rotation.inverse();
-                *visibility = if actor.hp < 0.999 {
-                    Visibility::Inherited
-                } else {
-                    Visibility::Hidden
-                };
-            }
             PartKind::Shield => {
                 next.rotation *= Quat::from_rotation_y(t * 1.7);
                 *visibility = if actor.shield {
@@ -1917,7 +2018,7 @@ fn animate_scene(
                 next.translation.y += bob + breath;
             }
         }
-        if actor.hit > 0.0 && !matches!(part.kind, PartKind::Health | PartKind::Shield) {
+        if actor.hit > 0.0 && !matches!(part.kind, PartKind::Shield) {
             next.scale *= Vec3::new(
                 1.0 + actor.hit * 0.9,
                 1.0 - actor.hit * 0.5,
@@ -2022,10 +2123,16 @@ fn place_traveler_labels(
             .iter()
             .find(|(actor, _)| actor.id == hero.id)
             .map(|(_, transform)| transform.translation)
-            .unwrap_or_else(|| world(hero.position, 0.0));
+            .unwrap_or_else(|| world(hero.position, hero.elevation));
         if let Ok(screen) = camera.world_to_viewport(
             &camera_transform,
-            origin + Vec3::Y * if hero.hp > 0.0 { 2.3 } else { 0.6 },
+            origin
+                + Vec3::Y
+                    * if hero.hp > 0.0 {
+                        if hero.crouched { 2.6 } else { 3.0 }
+                    } else {
+                        1.0
+                    },
         ) {
             node.display = if view.0.phase == RunPhase::Intro {
                 Display::None
@@ -2043,7 +2150,7 @@ fn place_traveler_labels(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dreamwake_sim::DreamSimulation;
+    use dreamwake_sim::{DreamSimulation, TICK_HZ};
 
     fn actor_pose() -> ActorVisual {
         ActorVisual {
@@ -2056,7 +2163,7 @@ mod tests {
             last_position: Vec3::ZERO,
             last_tick: 0,
             sample_age: Timer::from_seconds(ACTOR_SAMPLE_GRACE_SECS, TimerMode::Once),
-            seed: 7,
+            match_epoch: 7,
             room: 0,
             windup: 0.0,
             hit: 0.0,
@@ -2070,7 +2177,7 @@ mod tests {
 
     #[test]
     fn stalled_snapshot_gait_settles_and_recovers_without_between_tick_flicker() {
-        let mut snapshot = DreamSimulation::new(7, false).snapshot();
+        let mut snapshot = crate::offline_presentation(DreamSimulation::new(7, false).snapshot());
         snapshot.phase = RunPhase::Combat;
         snapshot.hero.velocity = [7.0, 0.0];
         snapshot.heroes[0] = snapshot.hero.clone();
@@ -2113,16 +2220,16 @@ mod tests {
         // Enemy samples use the same grace period and recover their measured
         // speed from the next tick rather than preserving stale render motion.
         let mut enemy = actor_pose();
-        enemy.sample_target(Vec3::X, 7, 0, TICK_HZ, Duration::ZERO);
+        enemy.sample_target(Vec3::X, 7, 0, TICK_HZ, Duration::from_secs(1));
         assert_eq!(enemy.target_motion, 1.0);
         enemy.sample_target(Vec3::X, 7, 0, TICK_HZ, Duration::from_secs(1));
         assert_eq!(enemy.target_motion, 0.0);
-        enemy.sample_target(Vec3::X * 2.0, 7, 0, TICK_HZ * 2, Duration::ZERO);
+        enemy.sample_target(Vec3::X * 2.0, 7, 0, TICK_HZ * 2, Duration::from_secs(1));
         assert!(!enemy.sample_age.is_finished());
         assert_eq!(enemy.target_motion, 1.0);
     }
 
-    fn actor_scene_app(snapshot: DreamSnapshot) -> App {
+    fn actor_scene_app(snapshot: DreamPresentation) -> App {
         let mut app = App::new();
         app.add_plugins((
             MinimalPlugins,
@@ -2141,18 +2248,164 @@ mod tests {
     }
 
     #[test]
-    fn enemy_gait_uses_snapshot_motion_not_render_correction() {
-        let mut actor = actor_pose();
-        actor.sample_target(Vec3::X, 7, 0, TICK_HZ, Duration::ZERO);
-        assert_eq!(actor.target_motion, 1.0);
-        // Display frames between simulation ticks retain the sampled speed.
-        actor.sample_target(Vec3::X, 7, 0, TICK_HZ, Duration::ZERO);
-        assert_eq!(actor.target_motion, 1.0);
-        // The target stopped. A renderer still catching up must not imply walking.
-        actor.sample_target(Vec3::X, 7, 0, TICK_HZ + 1, Duration::ZERO);
-        assert_eq!(actor.target_motion, 0.0);
-        actor.sample_target(Vec3::X, 7, 0, TICK_HZ + 1, Duration::ZERO);
-        assert_eq!(actor.target_motion, 0.0);
+    fn enemy_pulses_keep_the_committed_target_and_use_a_distinct_impact_animation() {
+        let mut snapshot = crate::offline_presentation(DreamSimulation::new(7, false).snapshot());
+        let friendly = engine_core::GraphicsInstance {
+            id: GraphicsId {
+                scope: None,
+                match_epoch: 7,
+                owner: snapshot.hero.id,
+                action_seq: 1,
+                slot: 0x8000,
+            },
+            kind: GraphicsKind::RadialPulse,
+            pos: [-3.0, 2.0],
+            radius: 1.4,
+            age_ticks: 0,
+            duration_ticks: 20,
+        };
+        let hostile = engine_core::GraphicsInstance {
+            id: GraphicsId {
+                owner: 1_u64 << 63,
+                slot: 0xc200,
+                ..friendly.id
+            },
+            pos: [2.75, -3.25],
+            radius: 1.9,
+            ..friendly
+        };
+        snapshot.presentations = vec![friendly, hostile];
+        let mut app = actor_scene_app(snapshot);
+        app.update();
+        let roots: Vec<_> = app
+            .world_mut()
+            .query::<(Entity, &EffectVisual, &Transform)>()
+            .iter(app.world())
+            .map(|(entity, effect, transform)| (entity, effect.0, *transform))
+            .collect();
+        let (enemy_root, _, enemy_start) = *roots
+            .iter()
+            .find(|(_, key, _)| *key == VisualKey::HostilePulse(hostile.id))
+            .expect("enemy impact has its own visual kind");
+        let (player_root, _, player_start) = *roots
+            .iter()
+            .find(|(_, key, _)| *key == VisualKey::Effect(friendly.id))
+            .unwrap();
+        assert_eq!(enemy_start.translation.xz().to_array(), hostile.pos);
+        assert_eq!(enemy_start.scale.x, hostile.radius);
+        assert_eq!(enemy_start.scale.z, hostile.radius);
+        let world = app.world();
+        let art = world.resource::<SceneArt>();
+        let mut enemy_children = Vec::new();
+        for child in world.get::<Children>(enemy_root).unwrap().iter() {
+            enemy_children.push(child);
+            let mesh = &world.get::<Mesh3d>(child).unwrap().0;
+            assert_ne!(mesh, &art.ring, "enemy burst must not reuse player rings");
+            assert_ne!(
+                mesh, &art.crystal,
+                "enemy burst must not reuse player crystals"
+            );
+            let material = &world
+                .get::<MeshMaterial3d<StandardMaterial>>(child)
+                .unwrap()
+                .0;
+            assert!(material == &art.coral || material == &art.warning_fill);
+        }
+        assert!(!enemy_children.is_empty());
+        {
+            let mut view = app.world_mut().resource_mut::<DreamView>();
+            // Actor motion after the attack must not drag its committed footprint.
+            view.0.hero.position = [11.0, 9.0];
+            view.0.heroes[0].position = view.0.hero.position;
+            for pulse in &mut view.0.presentations {
+                pulse.age_ticks = 10;
+            }
+        }
+        app.update();
+        let enemy_later = app.world().get::<Transform>(enemy_root).unwrap();
+        let player_later = app.world().get::<Transform>(player_root).unwrap();
+        assert_eq!(enemy_later.translation, enemy_start.translation);
+        assert!(enemy_later.scale.x < enemy_start.scale.x);
+        assert!(player_later.scale.x > player_start.scale.x);
+        // Authoritative expiry removes the same roots and their mesh descendants.
+        app.world_mut()
+            .resource_mut::<DreamView>()
+            .0
+            .presentations
+            .clear();
+        app.update();
+        assert!(app.world().get_entity(enemy_root).is_err());
+        assert!(app.world().get_entity(player_root).is_err());
+        for child in enemy_children {
+            assert!(app.world().get_entity(child).is_err());
+        }
+    }
+
+    #[test]
+    fn anonymous_cell_activity_has_no_friendly_material_or_attack_footprint() {
+        let mut snapshot = crate::offline_presentation(DreamSimulation::new(7, false).snapshot());
+        let proxy = engine_core::GraphicsInstance {
+            id: GraphicsId {
+                scope: None,
+                match_epoch: 7,
+                owner: 0,
+                action_seq: 3,
+                slot: u16::MAX,
+            },
+            kind: GraphicsKind::RadialPulse,
+            pos: [4.0, -4.0],
+            radius: 8.0,
+            age_ticks: 0,
+            duration_ticks: 20,
+        };
+        snapshot.presentations.push(proxy);
+        let mut app = actor_scene_app(snapshot);
+        app.update();
+        let (entity, key, transform) = app
+            .world_mut()
+            .query::<(Entity, &EffectVisual, &Transform)>()
+            .iter(app.world())
+            .map(|(entity, effect, transform)| (entity, effect.0, *transform))
+            .next()
+            .unwrap();
+        assert_eq!(key, VisualKey::AnonymousPulse(proxy.id));
+        assert!(transform.scale.max_element() <= 1.0);
+        assert!(transform.translation.y > 0.5);
+        let world = app.world();
+        let art = world.resource::<SceneArt>();
+        for child in world.get::<Children>(entity).unwrap().iter() {
+            assert_eq!(&world.get::<Mesh3d>(child).unwrap().0, &art.sphere);
+            assert_eq!(
+                &world
+                    .get::<MeshMaterial3d<StandardMaterial>>(child)
+                    .unwrap()
+                    .0,
+                &art.anonymous_fill,
+            );
+        }
+    }
+
+    #[test]
+    fn enemy_gait_tracks_fractional_motion_independently_of_owner_tick_cadence() {
+        for hz in [30, 60, 120, 144] {
+            let mut actor = actor_pose();
+            let dt = Duration::from_secs_f64(1.0 / f64::from(hz));
+            let mut elapsed = 0.0;
+            for frame in 1..=hz {
+                elapsed += dt.as_secs_f32();
+                // Owner prediction advances in batches, independently of the
+                // remote enemy's continuously interpolated presentation.
+                let tick = (frame / 4) * 4 * TICK_HZ / hz;
+                actor.sample_target(Vec3::X * elapsed * 3.0, 7, 0, tick, dt);
+                assert!((actor.target_motion - 3.0).abs() < 0.001);
+                actor.advance_pose(actor.target_motion, 0.0, 0.0, 0.0, 0.0, dt.as_secs_f32());
+            }
+            assert!((actor.motion - 3.0).abs() < 0.001);
+            // A frozen target stops gait even while the renderer is catching up
+            // and the owner's prediction keeps advancing.
+            actor.sample_target(actor.last_position, 7, 0, TICK_HZ + 1, dt);
+            assert_eq!(actor.target_motion, 0.0);
+        }
     }
 
     #[test]
@@ -2221,7 +2474,7 @@ mod tests {
 
     #[test]
     fn small_reconciliation_rebases_motion_without_snapping_the_render_root() {
-        let mut snapshot = DreamSimulation::new(7, false).snapshot();
+        let mut snapshot = crate::offline_presentation(DreamSimulation::new(7, false).snapshot());
         snapshot.phase = RunPhase::Combat;
         snapshot.tick = 100;
         snapshot.hero.position = [0.0, 0.0];
@@ -2276,7 +2529,7 @@ mod tests {
         use bevy::ui::UiSystems;
         #[derive(Resource, Default)]
         struct ContentPosition(Option<(Val, Val)>);
-        let mut snapshot = DreamSimulation::new(7, false).snapshot();
+        let mut snapshot = crate::offline_presentation(DreamSimulation::new(7, false).snapshot());
         snapshot.phase = RunPhase::Combat;
         snapshot.hero.position = [0.0, 0.0];
         snapshot.heroes[0] = snapshot.hero.clone();
@@ -2344,7 +2597,7 @@ mod tests {
         let expected = camera
             .world_to_viewport(
                 &GlobalTransform::from(Transform::from_xyz(5.0, 0.0, 10.0)),
-                Vec3::Y * 2.3,
+                Vec3::Y * 3.0,
             )
             .unwrap();
         assert_eq!(
@@ -2363,7 +2616,7 @@ mod tests {
 
     #[test]
     fn scene_tracks_every_authoritative_hero_and_cleans_up_departures() {
-        let mut snapshot = DreamSimulation::new(7, false).snapshot();
+        let mut snapshot = crate::offline_presentation(DreamSimulation::new(7, false).snapshot());
         snapshot.phase = RunPhase::Combat;
         let mut companion = snapshot.hero.clone();
         companion.id = snapshot.hero.id + 1;

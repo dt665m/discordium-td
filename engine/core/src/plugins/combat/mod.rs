@@ -3,6 +3,7 @@ pub mod companions;
 mod damage;
 mod effects;
 mod health;
+pub mod history;
 mod meters;
 pub mod projectiles;
 mod shields;

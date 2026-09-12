@@ -23,6 +23,9 @@ pub enum DebugMetric {
     Interpolation,
     InputBuffer,
     Correction,
+    DecodeIssue,
+    RecoveryIssue,
+    TransportIssue,
 }
 
 pub fn spawn(commands: &mut Commands) {
@@ -192,6 +195,25 @@ pub fn spawn(commands: &mut Commands) {
                     });
                 }
             });
+            for (label, metric) in [
+                ("Last decode issue: --", DebugMetric::DecodeIssue),
+                ("Last recovery issue: --", DebugMetric::RecoveryIssue),
+                ("Last transport issue: --", DebugMetric::TransportIssue),
+            ] {
+                p.spawn((
+                    metric,
+                    Text::new(label),
+                    TextFont {
+                        font_size: FontSize::Px(10.0),
+                        ..default()
+                    },
+                    TextColor(Color::srgb(0.89, 0.94, 1.0)),
+                    Node {
+                        width: Val::Percent(100.0),
+                        ..default()
+                    },
+                ));
+            }
         });
 }
 

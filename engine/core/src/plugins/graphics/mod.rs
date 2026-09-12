@@ -5,7 +5,7 @@ mod identity;
 pub mod systems;
 use bevy::{ecs::schedule::ScheduleLabel, prelude::*};
 pub use components::{GraphicsInstance, GraphicsKind};
-pub use identity::GraphicsId;
+pub use identity::{GraphicsId, GraphicsScope};
 pub use systems::age_graphics;
 
 #[derive(SystemSet, Clone, Debug, PartialEq, Eq, Hash)]

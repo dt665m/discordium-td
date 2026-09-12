@@ -1,10 +1,31 @@
 //! Game-neutral bounded messages, sequence ordering and channel configuration.
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
+include!(concat!(env!("OUT_DIR"), "/source_identity.rs"));
 pub mod clock;
+pub mod codec;
+pub mod combat_timing;
+pub mod commands;
+pub mod delivery;
+pub mod events;
+pub mod input;
+pub mod interest;
+pub mod interpolation;
+pub mod outcomes;
+pub mod ownership;
+pub mod prediction;
+pub mod replication;
+pub mod scheduling;
+pub mod schema;
 pub mod session;
+pub mod synchronization;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod trace;
+pub mod types;
 pub mod wire;
-pub use wire::{decode, decode_with_limit, encode};
+pub use wire::{
+    CompressionMode, CompressionPolicy, decode, decode_with_limit, encode, encode_with_compression,
+};
 pub const INPUT_CHANNEL: u8 = 0;
 pub const ACTION_CHANNEL: u8 = 2;
 pub const STATE_CHANNEL: u8 = 0;

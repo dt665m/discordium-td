@@ -41,6 +41,17 @@ pub fn draw_gizmos(
     }
     for v in &frame.visuals {
         match v.primitive {
+            Primitive::Beam { direction } => {
+                let direction = direction.normalize_or_zero();
+                if direction != Vec3::ZERO && v.scale.z > 0.0 {
+                    gizmos.cube(
+                        Transform::from_translation(v.position + direction * v.scale.z * 0.5)
+                            .with_rotation(Quat::from_rotation_arc(Vec3::Z, direction))
+                            .with_scale(v.scale),
+                        v.color,
+                    );
+                }
+            }
             Primitive::Arrow { direction } => {
                 gizmos.arrow(
                     v.position,
@@ -54,6 +65,14 @@ pub fn draw_gizmos(
             Primitive::Box => {
                 gizmos.cube(
                     Transform::from_translation(v.position).with_scale(v.scale),
+                    v.color,
+                );
+            }
+            Primitive::OrientedBox { rotation } => {
+                gizmos.cube(
+                    Transform::from_translation(v.position)
+                        .with_rotation(rotation)
+                        .with_scale(v.scale),
                     v.color,
                 );
             }

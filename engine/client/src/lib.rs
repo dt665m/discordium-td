@@ -1,4 +1,4 @@
-//! Reusable client graphics, camera and network diagnostics.
+//! Reusable client graphics, camera, UI and network diagnostics.
 pub mod plugins;
 pub mod prediction;
-pub use plugins::{camera, graphics, network_tools};
+pub use plugins::{camera, graphics, network_tools, ui};

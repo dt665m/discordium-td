@@ -1374,7 +1374,7 @@ dependencies = [
  "arrayvec",
  "bevy_reflect",
  "derive_more",
- "glam",
+ "glam 0.32.1",
  "itertools",
  "libm",
  "rand 0.10.2",
@@ -1404,7 +1404,7 @@ dependencies = [
  "bytemuck",
  "derive_more",
  "encase",
- "glam",
+ "glam 0.32.1",
  "half",
  "hexasphere",
  "thiserror 2.0.20",
@@ -1554,7 +1554,7 @@ dependencies = [
  "downcast-rs 2.0.2",
  "erased-serde",
  "foldhash 0.2.0",
- "glam",
+ "glam 0.32.1",
  "indexmap",
  "inventory",
  "petgraph",
@@ -1616,7 +1616,7 @@ dependencies = [
  "derive_more",
  "downcast-rs 2.0.2",
  "encase",
- "glam",
+ "glam 0.32.1",
  "image",
  "indexmap",
  "itertools",
@@ -1801,7 +1801,7 @@ dependencies = [
  "crossbeam-queue",
  "derive_more",
  "futures-lite",
- "heapless",
+ "heapless 0.9.3",
  "web-task",
 ]
 
@@ -2896,11 +2896,13 @@ dependencies = [
  "dreamwake_sim",
  "engine_client",
  "engine_core",
+ "engine_net",
  "getrandom 0.2.17",
  "js-sys",
  "log",
  "renet",
  "renet-cross",
+ "serde",
  "serde_json",
  "ureq",
  "wasm-bindgen",
@@ -2922,15 +2924,19 @@ name = "dreamwake_server"
 version = "0.1.0"
 dependencies = [
  "bevy",
+ "blake3",
  "clap",
  "dreamwake_protocol",
  "dreamwake_sim",
+ "engine_core",
  "engine_net",
  "engine_server",
  "env_logger",
  "log",
  "renet",
  "renet-cross",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -2938,9 +2944,12 @@ name = "dreamwake_sim"
 version = "0.1.0"
 dependencies = [
  "bevy",
+ "blake3",
  "engine_core",
+ "engine_net",
  "serde",
  "serde_json",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -2954,6 +2963,15 @@ name = "either"
 version = "1.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "252afb9ae5eaa683babdc6a068b3f5726eb19e05070c731f9b2a23a7c3e8ed34"
+
+[[package]]
+name = "ena"
+version = "0.14.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eabffdaee24bd1bf95c5ef7cec31260444317e72ea56c4c91750e8b7ee58d5f1"
+dependencies = [
+ "log",
+]
 
 [[package]]
 name = "encase"
@@ -3001,6 +3019,8 @@ name = "engine_core"
 version = "0.1.0"
 dependencies = [
  "bevy",
+ "blake3",
+ "parry3d",
  "serde",
  "serde_json",
 ]
@@ -3010,6 +3030,7 @@ name = "engine_net"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "blake3",
  "miniz_oxide 0.8.9",
  "renet",
  "serde",
@@ -3027,7 +3048,9 @@ dependencies = [
  "log",
  "renet",
  "renet-cross",
+ "serde",
  "tokio",
+ "tower",
  "tower-http",
 ]
 
@@ -3454,6 +3477,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "glam"
+version = "0.33.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e762b9b188634fc508d4ec54b62ea3d352c43fd431d18d05d46f559f217f4725"
+dependencies = [
+ "approx",
+ "libm",
+]
+
+[[package]]
+name = "glamx"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9847f980afb0628849bcd6a406cdffd29eb9d53fca83e1646005901a9acd4c5c"
+dependencies = [
+ "approx",
+ "glam 0.33.7",
+ "num-traits",
+ "simba",
+]
+
+[[package]]
 name = "gloo-net"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3693,6 +3738,16 @@ dependencies = [
 
 [[package]]
 name = "heapless"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0bfb9eb618601c89945a70e254898da93b13be0388091d42117462b265bb3fad"
+dependencies = [
+ "hash32",
+ "stable_deref_trait",
+]
+
+[[package]]
+name = "heapless"
 version = "0.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "25ba4bd83f9415b58b4ed8dc5714c76e626a105be4646c02630ad730ad3b5aa4"
@@ -3721,7 +3776,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "177ea6330876de4ef08e184f827b98acc037614a4ce409902c5b0d53a9c2e951"
 dependencies = [
  "constgebra",
- "glam",
+ "glam 0.32.1",
  "tinyvec",
 ]
 
@@ -4069,7 +4124,7 @@ checksum = "6a756c3fac73139e83f14c2d742155dd2b78d3ee56597b419a0579b7bdd6dd78"
 [[package]]
 name = "is"
 version = "0.11.0"
-source = "git+https://github.com/dt665m/str0m.git?branch=feat%2Fdimpl-buffer-resize#591de71f4588b59e4850007414c6315a93943794"
+source = "git+https://github.com/dt665m/str0m.git?rev=591de71f4588b59e4850007414c6315a93943794#591de71f4588b59e4850007414c6315a93943794"
 dependencies = [
  "crc",
  "serde",
@@ -4596,6 +4651,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c89e69e7e0f03bea5ef08013795c25018e101932225a656383bd384495ecc367"
 dependencies = [
  "num-integer",
+ "num-traits",
+]
+
+[[package]]
+name = "num-complex"
+version = "0.4.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "73f88a1307638156682bada9d7604135552957b7818057dcef22705b4d509495"
+dependencies = [
  "num-traits",
 ]
 
@@ -5185,6 +5249,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "parry3d"
+version = "0.30.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "01b00bf3ea4e0961a3f44aeb666b7dc3b0e87027b629561bd8283a7f6b2e2ed1"
+dependencies = [
+ "approx",
+ "arrayvec",
+ "bitflags 2.13.1",
+ "downcast-rs 2.0.2",
+ "either",
+ "ena",
+ "foldhash 0.2.0",
+ "glamx",
+ "hashbrown 0.17.1",
+ "indexmap",
+ "log",
+ "num-derive",
+ "num-traits",
+ "ordered-float",
+ "rstar",
+ "simba",
+ "slab",
+ "smallvec",
+ "spade",
+ "static_assertions",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "pem-rfc7468"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5691,8 +5784,6 @@ checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
 [[package]]
 name = "renet"
 version = "2.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8535f2f4b5afe5e31fc37be4b8a1f167e61177f356b1c6ee8456b7045d6c74c0"
 dependencies = [
  "bytes",
  "log",
@@ -5702,10 +5793,9 @@ dependencies = [
 [[package]]
 name = "renet-cross"
 version = "0.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1da341a25eead0263fbc3f21d1d5c75818e39a436eb07956329942ada9d8f524"
 dependencies = [
  "axum",
+ "base64",
  "getrandom 0.2.17",
  "gloo-net",
  "gloo-timers",
@@ -5715,7 +5805,9 @@ dependencies = [
  "renetcode",
  "reqwest",
  "serde",
+ "serde_json",
  "str0m",
+ "subtle",
  "thiserror 2.0.20",
  "wasm-bindgen",
  "wasm-bindgen-futures",
@@ -5725,8 +5817,6 @@ dependencies = [
 [[package]]
 name = "renetcode"
 version = "2.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "76bed9d6d190d20804b5645511932fef803145520ef4eb76d5e4b5a841980eac"
 dependencies = [
  "chacha20poly1305",
  "log",
@@ -5786,6 +5876,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "robust"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4e27ee8bb91ca0adcf0ecb116293afa12d393f9c2b9b9cd54d33e8078fe19839"
+
+[[package]]
 name = "rodio"
 version = "0.22.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5812,6 +5908,17 @@ dependencies = [
  "serde_derive",
  "typeid",
  "unicode-ident",
+]
+
+[[package]]
+name = "rstar"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5912b862fa5ffb462607bfd1e35036c458c537921f508c8235a83d5f3987edfe"
+dependencies = [
+ "heapless 0.8.0",
+ "num-traits",
+ "smallvec",
 ]
 
 [[package]]
@@ -5976,6 +6083,15 @@ name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
+
+[[package]]
+name = "safe_arch"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "42c6efa15875e6ecb39ca61fb0b0c1a40b84fac5a5ffe71eef7d1000c8eb3f5f"
+dependencies = [
+ "bytemuck",
+]
 
 [[package]]
 name = "same-file"
@@ -6169,6 +6285,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77549399552de45a898a580c1b41d445bf730df867cc44e6c0233bbc4b8329de"
 
 [[package]]
+name = "simba"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f1a7200d82ff1c7b4235efd12f11e2537a402c91cf83a5cb97ce80eef787fde7"
+dependencies = [
+ "approx",
+ "libm",
+ "num-complex",
+ "num-traits",
+ "wide",
+]
+
+[[package]]
 name = "simd-adler32"
 version = "0.3.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6276,6 +6405,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "spade"
+version = "2.15.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9699399fd9349b00b184f5635b074f9ec93afffef30c853f8c875b32c0f8c7fa"
+dependencies = [
+ "hashbrown 0.16.1",
+ "num-traits",
+ "robust",
+ "smallvec",
+]
+
+[[package]]
 name = "spin"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6327,7 +6468,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 [[package]]
 name = "str0m"
 version = "0.23.1"
-source = "git+https://github.com/dt665m/str0m.git?branch=feat%2Fdimpl-buffer-resize#591de71f4588b59e4850007414c6315a93943794"
+source = "git+https://github.com/dt665m/str0m.git?rev=591de71f4588b59e4850007414c6315a93943794#591de71f4588b59e4850007414c6315a93943794"
 dependencies = [
  "arrayvec",
  "base64ct",
@@ -6347,7 +6488,7 @@ dependencies = [
 [[package]]
 name = "str0m-aws-lc-rs"
 version = "0.6.0"
-source = "git+https://github.com/dt665m/str0m.git?branch=feat%2Fdimpl-buffer-resize#591de71f4588b59e4850007414c6315a93943794"
+source = "git+https://github.com/dt665m/str0m.git?rev=591de71f4588b59e4850007414c6315a93943794#591de71f4588b59e4850007414c6315a93943794"
 dependencies = [
  "aws-lc-rs",
  "dimpl",
@@ -6358,7 +6499,7 @@ dependencies = [
 [[package]]
 name = "str0m-proto"
 version = "0.7.0"
-source = "git+https://github.com/dt665m/str0m.git?branch=feat%2Fdimpl-buffer-resize#591de71f4588b59e4850007414c6315a93943794"
+source = "git+https://github.com/dt665m/str0m.git?rev=591de71f4588b59e4850007414c6315a93943794#591de71f4588b59e4850007414c6315a93943794"
 dependencies = [
  "base64ct",
  "dimpl",
@@ -7432,6 +7573,16 @@ dependencies = [
  "raw-window-handle",
  "serde",
  "web-sys",
+]
+
+[[package]]
+name = "wide"
+version = "1.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8cf05ca94c9fba0c51316899caa1d1e74a064fc310a5efa7375e614343d415be"
+dependencies = [
+ "bytemuck",
+ "safe_arch",
 ]
 
 [[package]]

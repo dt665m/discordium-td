@@ -8,6 +8,7 @@ license.workspace=true
 name="game_server"
 path="src/main.rs"
 [dependencies]
+serde.workspace = true
 bevy={workspace=true,features=["std"]}
 engine_server={path="../../../engine/server"}
 engine_net={path="../../../engine/net"}
@@ -16,5 +17,11 @@ dreamwake_sim={path="../simulation"}
 clap.workspace=true
 env_logger.workspace=true
 log.workspace=true
+serde_json.workspace=true
 renet.workspace=true
 renet-cross.workspace=true
+
+blake3.workspace=true
+
+[dev-dependencies]
+engine_core={path="../../../engine/core"}

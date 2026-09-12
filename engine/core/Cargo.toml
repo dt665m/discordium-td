@@ -8,6 +8,11 @@ rust-version.workspace = true
 [dependencies]
 bevy = { workspace = true, features = ["std"] }
 serde.workspace = true
+parry3d = { workspace = true, features = ["alloc"] }
+blake3.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
+
+[build-dependencies]
+blake3.workspace = true

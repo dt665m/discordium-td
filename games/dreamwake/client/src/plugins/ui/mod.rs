@@ -1,10 +1,13 @@
 //! Dreamwake's interface: scene-composed panels with snapshot-driven HUD data.
 use crate::{DreamConnection, DreamPreferences, DreamView};
+pub(crate) mod identity;
+pub(crate) mod overhead;
 mod typography;
 use bevy::{prelude::*, ui::FocusPolicy, window::PrimaryWindow};
 use dreamwake_sim::{
     EnemyKind, MemoryKind, Rarity, Reward, RewardKind, RunPhase, TOTAL_ROOMS, UpgradeKind,
 };
+pub use overhead::OverheadAnchor;
 
 const INK: Color = Color::srgb(0.028, 0.044, 0.077);
 const PANEL: Color = Color::srgba(0.025, 0.041, 0.071, 0.95);
@@ -44,7 +47,17 @@ pub struct UiActions(pub Vec<UiAction>);
 pub struct DreamUiPlugin;
 impl Plugin for DreamUiPlugin {
     fn build(&self, app: &mut App) {
-        app.add_plugins(typography::DreamTypographyPlugin);
+        if !app.is_plugin_added::<engine_client::ui::EngineUiPlugin>() {
+            app.add_plugins(engine_client::ui::EngineUiPlugin);
+        }
+        app.add_plugins((
+            typography::DreamTypographyPlugin,
+            identity::TravelerIdentityPlugin,
+        ));
+        app.add_systems(
+            Update,
+            overhead::sync_health_bars.after(engine_client::graphics::GraphicsSet::Render),
+        );
         app.init_resource::<UiActions>()
             .add_systems(Startup, spawn_hud)
             .add_systems(
@@ -97,6 +110,8 @@ enum HudText {
     Progress,
     Boss,
     Dash,
+    Charge,
+    Dreamlance,
     Combo,
     MemoryName(usize),
     MemoryEssence(usize),
@@ -119,13 +134,7 @@ enum Fill {
 
 /// Scene functions keep typography and interaction styling consistent across screens.
 fn label(value: impl Into<String>, size: f32, color: Color) -> impl Scene {
-    let value: String = value.into();
-    bsn! {
-        Text(value)
-        TextFont { font_size: px(size) }
-        TextColor(color)
-        template_value(FocusPolicy::Pass)
-    }
+    engine_client::ui::label(value, size, color)
 }
 
 fn button(action: UiAction, value: impl Into<String>, emphasis: bool) -> impl Scene {
@@ -153,15 +162,14 @@ fn button(action: UiAction, value: impl Into<String>, emphasis: bool) -> impl Sc
 }
 
 fn meter(kind: Fill, color: Color, height: f32) -> impl Scene {
-    bsn! {
-        Node { width: percent(100), height: px(height), border_radius: BorderRadius::all(px(3)), overflow: Overflow::clip() }
-        BackgroundColor(Color::srgba(0.3, 0.43, 0.5, 0.18))
-        Children [(
-            template_value(kind)
-            Node { width: percent(100), height: percent(100), border_radius: BorderRadius::all(px(3)) }
-            BackgroundColor(color)
-        )]
-    }
+    engine_client::ui::meter_with_marker(
+        percent(100),
+        height,
+        1.0,
+        color,
+        Color::srgba(0.3, 0.43, 0.5, 0.18),
+        kind,
+    )
 }
 
 fn memory_slot(index: usize) -> impl Scene {
@@ -313,10 +321,12 @@ fn spawn_hud(mut commands: Commands) {
                         Children [
                             label("W A S D   Move", 11.0, MUTED),
                             label("LMB   Slash", 11.0, MUTED),
+                            (label("RMB / MMB   Lance / Beam", 11.0, TEAL) template_value(HudText::Dreamlance)),
                             (label("SPACE   Dash ready", 11.0, TEAL) template_value(HudText::Dash)),
                             label("TAB   Build  /  ESC   Pause  /  F3   Metrics", 11.0, MUTED),
                         ]
                     ),
+                    (label("HOLD G   Charge  /  RELEASE   Surge", 11.0, TEAL) template_value(HudText::Charge)),
                 ]
             ),
         ]
@@ -396,7 +406,14 @@ fn sync_hud(
     preferences: Res<DreamPreferences>,
     mut roots: Query<&mut Visibility, With<HudRoot>>,
     mut texts: Query<(&HudText, &mut Text, &mut TextColor)>,
-    mut fills: Query<(&Fill, &mut Node, &mut BackgroundColor), Without<MemoryFrame>>,
+    mut fills: Query<
+        (
+            &Fill,
+            &mut engine_client::ui::MeterFraction,
+            &mut BackgroundColor,
+        ),
+        Without<MemoryFrame>,
+    >,
     mut bosses: Query<&mut Node, (With<BossPanel>, Without<Fill>)>,
     mut memory_frames: Query<(
         &MemoryFrame,
@@ -481,6 +498,49 @@ fn sync_hud(
                     "SPACE   Dash ready".into()
                 }
             }
+            HudText::Dreamlance => {
+                color.0 = if hero.dreamlance_ammo > 0 && hero.dreamlance_cooldown <= 0.0 {
+                    TEAL
+                } else {
+                    MUTED
+                };
+                if hero.dreamlance_cooldown > 0.0 {
+                    format!(
+                        "RMB / MMB   Lance / Beam {}  ·  {:.1}s",
+                        hero.dreamlance_ammo, hero.dreamlance_cooldown
+                    )
+                } else {
+                    format!("RMB / MMB   Lance / Beam {}", hero.dreamlance_ammo)
+                }
+            }
+            HudText::Charge => {
+                color.0 = if hero.charge_cooldown_ticks == 0
+                    && hero.stamina >= dreamwake_sim::CHARGE_STAMINA_COST
+                {
+                    TEAL
+                } else {
+                    MUTED
+                };
+                let state = if hero.charge_executing {
+                    "SURGING".into()
+                } else if hero.charge_ticks > 0 {
+                    format!(
+                        "RELEASE G   Surge  ·  Charging {:.1}s",
+                        f32::from(hero.charge_ticks) / dreamwake_sim::TICK_HZ as f32
+                    )
+                } else if hero.charge_cooldown_ticks > 0 {
+                    format!(
+                        "G   Surge {:.1}s",
+                        f32::from(hero.charge_cooldown_ticks) / dreamwake_sim::TICK_HZ as f32
+                    )
+                } else {
+                    "HOLD G   Charge  /  RELEASE   Surge".into()
+                };
+                format!(
+                    "{state}  ·  Stamina {:.0} / {:.0}",
+                    hero.stamina, hero.max_stamina
+                )
+            }
             HudText::Combo => format!(
                 "MOONBOUND  ·  {} / 3  ·  THIRD STRIKE RESTORES",
                 hero.combo % 3
@@ -553,7 +613,7 @@ fn sync_hud(
             text.0 = value;
         }
     }
-    for (kind, mut node, mut background) in &mut fills {
+    for (kind, mut meter, mut background) in &mut fills {
         let fraction = match *kind {
             Fill::Health => {
                 background.0 = if hero.hp < hero.max_hp * 0.30 {
@@ -578,7 +638,7 @@ fn sync_hud(
                 1.0 - hero.memories[i].cooldown / hero.memories[i].max_cooldown.max(0.01)
             }
         };
-        node.width = percent(fraction.clamp(0.0, 1.0) * 100.0);
+        meter.set_if_neq(engine_client::ui::MeterFraction(fraction));
     }
     for (frame, interaction, mut border, mut background, mut pulse) in &mut memory_frames {
         let ready = hero.memories[frame.0].ready();
@@ -803,7 +863,7 @@ fn sync_overlay(
         "{key}:{}:{}:{}:{}:{}:{}:{}:{}",
         connection.connected,
         connection.status,
-        connection.client_id,
+        connection.player_id,
         connection.party_size,
         snap.ready,
         snap.awaiting_party,
@@ -888,7 +948,7 @@ fn intro_panel(
     commands: &mut Commands,
     root: Entity,
     connection: &DreamConnection,
-    _snap: &dreamwake_sim::DreamSnapshot,
+    _snap: &dreamwake_sim::DreamPresentation,
 ) {
     let card = panel(commands, root, 560.0);
     add_label(
@@ -907,6 +967,7 @@ fn intro_panel(
         17.0,
         MUTED,
     );
+    identity::add_launcher(commands, card);
     let traveler = commands
         .spawn((
             Node {
@@ -938,7 +999,7 @@ fn intro_panel(
     add_label(
         commands,
         card,
-        "WASD to move  ·  Mouse to aim  ·  LMB to strike\nSpace to dash  ·  Q / E / R / F to cast Memories",
+        "WASD to move  ·  Mouse to aim  ·  LMB to strike  ·  RMB Lance / hold MMB Beam\nSpace to dash  ·  Hold G to charge, release to surge\nQ / E / R / F to cast Memories",
         14.0,
         WHITE,
     );
@@ -1021,6 +1082,7 @@ fn pause_panel(commands: &mut Commands, root: Entity, muted: bool, connection: &
     let card = panel(commands, root, 470.0);
     add_label(commands, card, "THE DREAM CAN WAIT", 12.0, GOLD);
     add_label(commands, card, "A moment between.", 33.0, WHITE);
+    identity::add_launcher(commands, card);
     add_label(
         commands,
         card,
@@ -1074,7 +1136,7 @@ fn pause_panel(commands: &mut Commands, root: Entity, muted: bool, connection: &
     add_label(
         commands,
         card,
-        "WASD Move  ·  LMB Strike  ·  Space Dash\nQ E R F Memories  ·  + / - Zoom\n1 2 3 Choose reward  ·  Z X C V Target slot\nCONTROLLER\nLeft / right stick Move / aim · RT Slash · LB Dash\nA / X / Y / B Memories · Start Pause · Back Build\nD-pad left / right Target · A / X / Y Reward choices",
+        "WASD Move  ·  LMB Strike  ·  RMB Lance · Hold MMB Beam\nSpace Dash  ·  Hold G Charge / release Surge\nQ E R F Memories  ·  + / - Zoom\n1 2 3 Choose reward  ·  Z X C V Target slot\nCONTROLLER\nLeft / right stick Move / aim · RT Slash · RB Lance · Hold LT Beam · LB Dash\nHold left stick button Charge / release Surge\nA / X / Y / B Memories · Start Pause · Back Build\nD-pad left / right Target · A / X / Y Reward choices",
         13.0,
         MUTED,
     );
@@ -1084,6 +1146,7 @@ fn connection_panel(commands: &mut Commands, root: Entity, connection: &DreamCon
     let card = panel(commands, root, 510.0);
     add_label(commands, card, "A THREAD BETWEEN WORLDS", 12.0, GOLD);
     add_label(commands, card, "Rejoin the dream.", 37.0, WHITE);
+    identity::add_launcher(commands, card);
     add_label(commands, card, &connection.status, 16.0, MUTED);
     add_label(commands, card, &connection.http_base, 13.0, TEAL);
     add_button(commands, card, UiAction::Connect, "RETRY CONNECTION", true);
@@ -1120,7 +1183,7 @@ fn waiting_panel(commands: &mut Commands, root: Entity) {
 fn reward_panel(
     commands: &mut Commands,
     root: Entity,
-    snap: &dreamwake_sim::DreamSnapshot,
+    snap: &dreamwake_sim::DreamPresentation,
     selected: usize,
 ) {
     // Leave the always-visible Memory tray unobscured and interactive beneath rewards.
@@ -1327,7 +1390,11 @@ fn reward_panel(
     }
 }
 
-fn reward_comparison(reward: &Reward, snap: &dreamwake_sim::DreamSnapshot, slot: usize) -> String {
+fn reward_comparison(
+    reward: &Reward,
+    snap: &dreamwake_sim::DreamPresentation,
+    slot: usize,
+) -> String {
     let hero = &snap.hero;
     match reward.kind {
         RewardKind::Upgrade(kind) => match kind {
@@ -1376,7 +1443,7 @@ fn reward_comparison(reward: &Reward, snap: &dreamwake_sim::DreamSnapshot, slot:
 fn build_panel(
     commands: &mut Commands,
     root: Entity,
-    snap: &dreamwake_sim::DreamSnapshot,
+    snap: &dreamwake_sim::DreamPresentation,
     selected: usize,
     connection: &DreamConnection,
 ) {
@@ -1505,7 +1572,11 @@ fn build_panel(
     );
 }
 
-fn transition_panel(commands: &mut Commands, root: Entity, snap: &dreamwake_sim::DreamSnapshot) {
+fn transition_panel(
+    commands: &mut Commands,
+    root: Entity,
+    snap: &dreamwake_sim::DreamPresentation,
+) {
     let card = panel(commands, root, 530.0);
     add_label(commands, card, "A FRAGMENT RECLAIMED", 12.0, GOLD);
     add_label(commands, card, "The way opens.", 38.0, WHITE);
@@ -1559,7 +1630,7 @@ fn transition_panel(commands: &mut Commands, root: Entity, snap: &dreamwake_sim:
 fn end_panel(
     commands: &mut Commands,
     root: Entity,
-    snap: &dreamwake_sim::DreamSnapshot,
+    snap: &dreamwake_sim::DreamPresentation,
     _connection: &DreamConnection,
 ) {
     let victory = snap.phase == RunPhase::Victory;
@@ -1659,11 +1730,11 @@ mod tests {
     fn current_frame_ui_focus_routes_click_and_blocks_attack_before_prediction() {
         use crate::plugins::diagnostics::Playtest;
         use crate::plugins::input::{
-            CapturedInput, DreamInputSystems,
+            CapturedActions, CapturedBeam, CapturedCharge, CapturedInput, DreamInputSystems,
             capture::{apply_ui_actions, capture_input},
             configure_input_schedule,
         };
-        let mut snapshot = DreamSimulation::new(42, false).snapshot();
+        let mut snapshot = crate::offline_presentation(DreamSimulation::new(42, false).snapshot());
         snapshot.phase = RunPhase::Combat;
         let mut app = App::new();
         configure_input_schedule(&mut app);
@@ -1671,6 +1742,11 @@ mod tests {
             .init_resource::<DreamPreferences>()
             .init_resource::<UiActions>()
             .init_resource::<CapturedInput>()
+            .init_resource::<CapturedActions>()
+            .init_resource::<CapturedBeam>()
+            .init_resource::<CapturedCharge>()
+            .init_resource::<DreamConnection>()
+            .init_resource::<Time<Real>>()
             .init_resource::<Playtest>()
             .init_resource::<ButtonInput<KeyCode>>()
             .init_resource::<ButtonInput<MouseButton>>()
@@ -1712,11 +1788,14 @@ mod tests {
             bevy::asset::AssetPlugin::default(),
             bevy::scene::ScenePlugin,
         ))
-        .insert_resource(DreamView(DreamSimulation::new(42, false).snapshot()))
+        .insert_resource(DreamView(crate::offline_presentation(
+            DreamSimulation::new(42, false).snapshot(),
+        )))
         .insert_resource(DreamConnection {
             status: "Connected".into(),
             connected: true,
             client_id: 1,
+            player_id: 1,
             http_base: "http://127.0.0.1:8080".into(),
             share_url: String::new(),
             rtt_ms: 0.0,
@@ -1789,7 +1868,7 @@ mod tests {
         let mut app = ui_app();
         {
             let mut connection = app.world_mut().resource_mut::<DreamConnection>();
-            connection.client_id = 2;
+            connection.player_id = 2;
             connection.party_size = 2;
         }
         app.update();
@@ -1842,7 +1921,7 @@ mod tests {
 
     #[test]
     fn upgrade_comparisons_show_caps_and_actual_result() {
-        let mut snapshot = DreamSimulation::new(42, false).snapshot();
+        let mut snapshot = crate::offline_presentation(DreamSimulation::new(42, false).snapshot());
         snapshot.hero.critical_chance = 0.8;
         let reward = Reward {
             kind: RewardKind::Upgrade(UpgradeKind::Critical),

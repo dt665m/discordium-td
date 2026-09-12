@@ -3032,6 +3032,7 @@ dependencies = [
  "bincode",
  "blake3",
  "miniz_oxide 0.8.9",
+ "octets",
  "renet",
  "serde",
 ]

@@ -48,6 +48,7 @@ build time. Browser clients use WebRTC; native clients use UDP.
 - [Architecture](docs/architecture.md): ownership, plugin composition and adding a game.
 - [Bevy integration](docs/bevy-integration.md): ECS and scheduling contracts.
 - [Networking](docs/netcode.md): authority, transport, snapshots and reconciliation.
+- [Snapshot delivery qualification](docs/network-delivery-qualification.md): A/C experiments, results, limits and simplification rationale.
 - [Predicted graphics](docs/predicted-graphics.md): simulation-owned effect lifecycles.
 - [Deployment](docs/deployment.md): dedicated server operations and browser releases.
 

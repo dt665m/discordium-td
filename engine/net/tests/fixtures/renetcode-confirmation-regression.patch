@@ -1,0 +1,69 @@
+diff --git a/src/server.rs b/src/server.rs
+--- a/src/server.rs
++++ b/src/server.rs
+@@ -838,3 +838,65 @@
+     #[test]
++    fn lost_initial_keepalive_recovers_during_continuous_payloads() {
++        let mut server = new_server();
++        let client_id = 4;
++        let client_addr = "127.0.0.1:3000".parse().unwrap();
++        let connect_token = ConnectToken::generate(
++            Duration::ZERO,
++            TEST_PROTOCOL_ID,
++            30,
++            client_id,
++            5,
++            server.addresses(),
++            None,
++            TEST_KEY,
++        )
++        .unwrap();
++        let mut client = NetcodeClient::new(Duration::ZERO, ClientAuthentication::Secure { connect_token }).unwrap();
++        let (request, _) = client.update(Duration::ZERO).unwrap();
++        match server.process_packet(client_addr, request) {
++            ServerResult::PacketToSend { payload, .. } => {
++                client.process_packet(payload);
++            }
++            result => panic!("expected challenge, got {result:?}"),
++        }
++        let (response, _) = client.update(Duration::ZERO).unwrap();
++        // Lose precisely the initial server handshake KeepAlive.
++        assert!(matches!(
++            server.process_packet(client_addr, response),
++            ServerResult::ClientConnected { .. }
++        ));
++        assert!(!client.is_connected());
++        let mut retries = 0;
++        // Two seconds of simulated time, with application packets every 50 ms.
++        for _ in 0..40 {
++            let delta = Duration::from_millis(50);
++            server.update(delta);
++            if let Some((packet, _)) = client.update(delta) {
++                assert!(matches!(server.process_packet(client_addr, packet), ServerResult::None));
++            }
++            let (_, packet) = server.generate_payload_packet(client_id, b"welcome").unwrap();
++            client.process_packet(packet);
++            match server.update_client(client_id) {
++                ServerResult::PacketToSend { payload, .. } => {
++                    retries += 1;
++                    client.process_packet(payload);
++                }
++                ServerResult::None => {}
++                result => panic!("unexpected server update: {result:?}"),
++            }
++        }
++        assert!(client.is_connected(), "continuous payloads suppressed handshake KeepAlive retries");
++        assert!(retries > 0);
++        let (_, packet) = client.generate_payload_packet(b"ready").unwrap();
++        assert!(matches!(server.process_packet(client_addr, packet), ServerResult::Payload { .. }));
++        let (_, packet) = server.generate_payload_packet(client_id, b"snapshot").unwrap();
++        assert_eq!(client.process_packet(packet), Some(b"snapshot".as_slice()));
++        // Once confirmed, payload activity suppresses redundant keepalives again.
++        server.update(Duration::from_millis(50));
++        server.generate_payload_packet(client_id, b"snapshot").unwrap();
++        assert_eq!(server.update_client(client_id), ServerResult::None);
++    }
++
++    #[test]
+     fn connect_token_already_used() {
+         let mut server = new_server();

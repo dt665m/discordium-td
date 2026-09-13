@@ -55,7 +55,7 @@ impl<A: Authority> ServerDriver<A> {
         );
         Self {
             authority,
-            server: RenetServer::new_with_packet_config(config, shared.packet_config),
+            server: RenetServer::new(config),
             shared,
             clock,
             previous: Duration::ZERO,

@@ -45,6 +45,16 @@ export GAME_SOAK_MANIFEST_SHA=the_64_character_sha256_from_the_candidate_handoff
 cd "$GAME_SOAK_CAPTURE/sources/discordium-td"
 ```
 
+To assemble a new candidate, capture the current workspace and local dependencies
+without starting a build or test:
+
+```sh
+python3 scripts/qualify-soak.py --output /absolute/path/to/new-candidate --prepare-only
+```
+
+Use the reported manifest hash and captured workspace for subsequent builds.
+Preparation alone does not qualify the candidate.
+
 When assembling a new candidate, build its native pair once:
 
 ```sh
@@ -115,7 +125,10 @@ Select three unused ports with `--http-port`, `--udp-port` and `--webrtc-port` i
 necessary; the runner does not modify another listener or machine network policy.
 A POSIX desktop with `ps`, a functioning display/GPU, an awake session and sufficient
 free disk is required. Keep the render/hardware configuration stable and record
-it with the handoff. Root/server privileges are not required.
+it with the handoff. On a Mac laptop, keep it connected to power with the lid
+open and both game windows visible throughout the run. An idle-sleep assertion
+does not make a closed-lid or suspended run valid. Root/server privileges are
+not required.
 
 The server uses the normal 80 m base replication distance. Bots use ordinary
 spatial-playtest input and normal authority admission, alternating every 12
@@ -227,6 +240,11 @@ into the game's clock estimator.
 status, PIDs, cleanup, source/binary integrity, complete trace hashes, aggregate
 counters and failure reasons. Preserve both even on failure. `resources.jsonl`
 contains raw per-process RSS/start identity observations every five seconds.
+The supervisor saves the runtime failure and measurement cutoff before cleanup.
+It records cleanup errors for each owned process and continues stopping the
+remaining children; a signaling or wait error cannot erase the original failure
+or turn incomplete cleanup into a pass. If report writing itself fails, retain
+the console error and the last saved report as incomplete evidence.
 `intervals.jsonl` contains client resource/lifecycle/activity/clock measurements,
 server egress counters, trace/log byte counts and rolling quantiles each minute.
 Raw client chunks and the server/client stdout/stderr logs remain available for

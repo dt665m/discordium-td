@@ -650,68 +650,8 @@ fn server_death_is_retryable_and_distinct_from_revocation() {
     assert!(server.pending_destroys().next().is_none());
 }
 
-fn byte_limits() -> ByteLimits {
-    ByteLimits {
-        fragment_payload_bytes: 1100,
-        group_bytes: 16384,
-        fragments: 16,
-        incomplete: 8,
-        known_groups: 8,
-        staging_bytes: 8 * 16384,
-        max_age_ms: 2000,
-    }
-}
 #[test]
-fn sixteen_kib_bytes_fit_bounded_frames_and_reassemble_under_reordering() {
-    let limits = byte_limits();
-    let key = chunks()[0].publication;
-    let original: Vec<u8> = (0..16384).map(|i| (i % 251) as u8).collect();
-    let fragments = fragment_group(key, &original, limits).unwrap();
-    assert_eq!(fragments.len(), 15);
-    let mut assembler = ByteAssembler::new(ConnectionEpoch(1), limits).unwrap();
-    let mut complete = None;
-    for (i, fragment) in fragments.into_iter().rev().enumerate() {
-        let wire = fragment.encode(limits).unwrap();
-        assert!(wire.len() <= 1139); // 1100 + fixed39; transport overhead is additional.
-        let decoded = ByteFragment::decode(&wire, limits).unwrap();
-        assert_eq!(decoded, fragment);
-        complete = assembler.receive(decoded, i as u64).unwrap().or(complete);
-    }
-    assert_eq!(complete.unwrap().as_bytes(), original.as_slice());
-    assert_eq!(assembler.staged_bytes(), 0);
-}
-#[test]
-fn byte_decode_rejects_lengths_before_allocating_and_assembly_expires() {
-    let limits = byte_limits();
-    let fragments = fragment_group(chunks()[0].publication, &vec![7; 3000], limits).unwrap();
-    let wire = fragments[0].encode(limits).unwrap();
-    for length in 0..wire.len() {
-        assert!(ByteFragment::decode(&wire[..length], limits).is_err());
-    }
-    let mut malicious = wire.clone();
-    malicious[29..33].copy_from_slice(&u32::MAX.to_le_bytes());
-    assert!(ByteFragment::decode(&malicious, limits).is_err());
-    malicious = wire.clone();
-    malicious[33..35].copy_from_slice(&u16::MAX.to_le_bytes());
-    assert!(ByteFragment::decode(&malicious, limits).is_err());
-    let mut assembler = ByteAssembler::new(ConnectionEpoch(1), limits).unwrap();
-    assembler.receive(fragments[0].clone(), 0).unwrap();
-    assembler.receive(fragments[0].clone(), 1000).unwrap();
-    let mut conflict = fragments[0].clone();
-    conflict.payload[0] ^= 1;
-    assert_eq!(
-        assembler.receive(conflict, 1001).unwrap_err(),
-        ReplicationError::Conflict
-    );
-    assert_eq!(assembler.expire(2000).unwrap(), 1);
-    assert_eq!(
-        assembler.receive(fragments[1].clone(), 2001).unwrap_err(),
-        ReplicationError::Expired
-    );
-    assert_eq!(assembler.staged_bytes(), 0);
-}
-#[test]
-fn complete_byte_group_decodes_and_publishes_transactionally() {
+fn complete_group_decodes_and_publishes_transactionally() {
     let mut group = chunks()[0].clone();
     group.count = 1;
     group.members.push(full(2, 1, 1));
@@ -722,25 +662,11 @@ fn complete_byte_group_decodes_and_publishes_transactionally() {
         decode_group(&bytes, limits, |p| Ok(p.to_vec())).unwrap(),
         group
     );
-    let mut bytes_assembler = ByteAssembler::new(ConnectionEpoch(1), byte_limits()).unwrap();
-    let fragments = fragment_group(group.publication, &bytes, byte_limits()).unwrap();
     let mut client = client();
     let mut groups = assembler();
-    let mut completed = None;
-    for fragment in fragments {
-        completed = bytes_assembler.receive(fragment, 0).unwrap().or(completed);
-    }
     assert!(client.state(entity(1)).is_none());
-    let result = completed
-        .unwrap()
-        .decode_and_publish(
-            &mut groups,
-            &mut client,
-            0,
-            |bytes| decode_group(bytes, limits, |p| Ok(p.to_vec())),
-            |_| true,
-        )
-        .unwrap();
+    let decoded = decode_group(&bytes, limits, |p| Ok(p.to_vec())).unwrap();
+    let result = groups.receive(decoded, 0, &mut client, |_| true).unwrap();
     assert!(matches!(result, GroupProgress::Published(r) if r.len() == 2));
     assert_eq!(client.state(entity(1)).unwrap().payload.len(), 4000);
     let mut corrupted = bytes.clone();
@@ -877,8 +803,7 @@ fn server_projection_requires_opaque_current_connection_grant() {
 }
 
 #[test]
-fn newer_same_topology_full_group_replaces_partial_bytes_and_publishes_atomically() {
-    let limits = byte_limits();
+fn newer_same_topology_whole_group_publishes_atomically_and_fences_late_messages() {
     let mut first = chunks()[0].clone();
     first.count = 1;
     first.members = vec![full(1, 1, 1), full(2, 1, 1)];
@@ -889,7 +814,6 @@ fn newer_same_topology_full_group_replaces_partial_bytes_and_publishes_atomicall
         |payload| Ok(payload.clone()),
     )
     .unwrap();
-    let old_fragments = fragment_group(first.publication, &first_bytes, limits).unwrap();
     let mut next = first.clone();
     next.publication.snapshot = SnapshotId(2);
     next.end_tick = ServerTick(2);
@@ -897,74 +821,28 @@ fn newer_same_topology_full_group_replaces_partial_bytes_and_publishes_atomicall
     next.members[0].payload = vec![2; 4000];
     let next_bytes =
         encode_group(&next, GroupLimits::default(), |payload| Ok(payload.clone())).unwrap();
-    let fragments = fragment_group(next.publication, &next_bytes, limits).unwrap();
-    let mut bytes = ByteAssembler::new(ConnectionEpoch(1), limits).unwrap();
     let mut client = client();
     let mut groups = assembler();
-    bytes.receive(old_fragments[0].clone(), 0).unwrap();
     assert!(client.state(entity(1)).is_none());
-    let mut complete = None;
-    for (i, fragment) in fragments.into_iter().enumerate() {
-        complete = bytes.receive(fragment, 10 + i as u64).unwrap().or(complete);
-        assert!(client.state(entity(1)).is_none());
-    }
+    let decoded = decode_group(&next_bytes, GroupLimits::default(), |payload| {
+        Ok(payload.to_vec())
+    })
+    .unwrap();
     assert!(matches!(
-        complete
-            .unwrap()
-            .decode_and_publish(
-                &mut groups,
-                &mut client,
-                100,
-                |raw| decode_group(raw, GroupLimits::default(), |payload| Ok(payload.to_vec())),
-                |_| true
-            )
-            .unwrap(),
+        groups.receive(decoded, 100, &mut client, |_| true).unwrap(),
         GroupProgress::Published(_)
     ));
     assert_eq!(client.state(entity(1)).unwrap().version, StateVersion(2));
     assert_eq!(client.state(entity(2)).unwrap().version, StateVersion(2));
+    let old = decode_group(&first_bytes, GroupLimits::default(), |payload| {
+        Ok(payload.to_vec())
+    })
+    .unwrap();
     assert_eq!(
-        bytes.receive(old_fragments[1].clone(), 101).unwrap_err(),
+        groups.receive(old, 101, &mut client, |_| true).unwrap_err(),
         ReplicationError::Obsolete(ObsoleteReason::Publication)
     );
-    assert_eq!(bytes.staged_bytes(), 0);
-}
-
-#[test]
-fn partial_byte_supersession_keeps_original_deadline_and_requires_reset_after_expiry() {
-    let limits = byte_limits();
-    let key = chunks()[0].publication;
-    let mut bytes = ByteAssembler::new(ConnectionEpoch(1), limits).unwrap();
-    for (snapshot, time) in [(1, 0), (2, 1000), (3, 1999)] {
-        let key = GroupPublication {
-            snapshot: SnapshotId(snapshot),
-            ..key
-        };
-        let fragments = fragment_group(key, &vec![snapshot as u8; 3000], limits).unwrap();
-        bytes.receive(fragments[0].clone(), time).unwrap();
-        assert_eq!(bytes.staged_bytes(), limits.fragment_payload_bytes);
-    }
-    assert_eq!(bytes.expire(2000).unwrap(), 1);
-    let newer = GroupPublication {
-        snapshot: SnapshotId(4),
-        ..key
-    };
-    let fragments = fragment_group(newer, &vec![4; 3000], limits).unwrap();
-    assert_eq!(
-        bytes.receive(fragments[0].clone(), 2001).unwrap_err(),
-        ReplicationError::Expired
-    );
-    assert_eq!(bytes.staged_bytes(), 0);
-    bytes.reset(ConnectionEpoch(2)).unwrap();
-    let reset_key = GroupPublication {
-        connection: ConnectionEpoch(2),
-        ..newer
-    };
-    let fragments = fragment_group(reset_key, &vec![4; 3000], limits).unwrap();
-    for fragment in fragments {
-        bytes.receive(fragment, 2002).unwrap();
-    }
-    assert_eq!(bytes.staged_bytes(), 0);
+    assert_eq!(groups.staged_bytes(), 0);
 }
 
 #[test]
@@ -1032,14 +910,7 @@ fn obsolete_full_requires_valid_payload_and_consistent_watermarks() {
 }
 
 #[test]
-fn byte_and_group_receive_clock_regression_remains_hard_stale() {
-    let fragments = fragment_group(chunks()[0].publication, &vec![1; 3000], byte_limits()).unwrap();
-    let mut bytes = ByteAssembler::new(ConnectionEpoch(1), byte_limits()).unwrap();
-    bytes.receive(fragments[0].clone(), 10).unwrap();
-    assert!(matches!(
-        bytes.receive(fragments[1].clone(), 9),
-        Err(ReplicationError::Stale)
-    ));
+fn group_receive_clock_regression_remains_hard_stale() {
     let mut groups = assembler();
     let mut client = client();
     groups

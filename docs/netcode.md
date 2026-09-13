@@ -81,7 +81,8 @@ already queued. The owned dependency correction is recorded in the
 
 Dreamwake paces each connection at 160,000 bytes per second with a 16,000-byte
 burst; 2,400 bytes of that burst are reserved for transport control. Its graph
-scheduler uses the same rate. The reusable engine's generic defaults remain
+scheduler uses the same rate with 36 KiB of admission credit so one bounded
+owner message can enter Renet and be sent across multiple flushes. The reusable engine's generic defaults remain
 60,000 bytes per second and a 6,000-byte burst.
 The `--egress-bytes-per-second`, `--egress-burst-bytes` and
 `--egress-control-reserve-bytes` flags override these values. Pacing uses monotonic
@@ -92,8 +93,9 @@ equivalent physical-byte guarantee. `SharedNet::egress_stats` and
 `peer_egress_stats` expose these two bases separately. These transport limits are
 independent of the graph scheduler's estimated wire-byte allowance.
 
-Dreamwake orders its reliable control channel before unreliable state in Renet's
-packetizer. The transport reserve protects netcode control packets; application
+Dreamwake orders reliable controls first, unreliable remote actors second, and
+reliable-unordered owner groups last in stock Renet's packetizer. The transport
+reserve protects netcode control packets; application
 control messages are still charged as encrypted payload. At each 20 Hz
 publication, `Finalized` includes only committed receipts not already queued on
 the reliable channel, in batches of at most 32. Finalization and action outcomes
@@ -111,21 +113,34 @@ most 64 admitted messages per peer per tick and leaves excess reliable messages
 queued for the next tick, so a legal burst of decode receipts cannot disconnect
 the peer.
 
-State publication reserves bytes for unsent control and timer-due retransmissions,
-plus ACK work. Reliable messages already sent and awaiting acknowledgement do
-not consume a fresh reservation every frame. Final egress still charges every
-physical send, including retransmissions, under the hard transport pacer.
-Owner-group fragment prefixes fit both transport allowance and the graph
-scheduler's current refilled credit. This prevents optional traffic from
-repeatedly consuming credit needed by an oversized frozen-group candidate.
+Whole owner messages are admitted only when the graph scheduler and Renet's
+32 KiB sender queue have capacity. Unpublished state coalesces to the latest
+committed capture. Each accepted identity is enqueued once; stock Renet owns all
+slicing, packet acknowledgements and retransmission. Packetization allows 7,000
+payload bytes per flush, accommodating the 20 Hz remote publication burst.
+Final egress independently charges every encrypted send, including retries and
+ACKs, under the transport pacer. No application fragment prefix or retransmission
+preflight remains.
+
+Owner receive memory is 128 KiB, separately sized from the sender's 32 KiB because
+Renet rounds incomplete slices up to its 1,200-byte stride. Reliable controls use
+128 KiB per direction. Bootstrap/reset retains only exact expected receipts,
+referenced bases and a two-second deadline; ordinary owner messages need no
+application receipt admission window. Receipt and identity checks still govern
+baseline use, activation and recovery.
+
+Stock Renet's serialized packet bound is 1,300 bytes. Netcode adds at most 25
+bytes and base IPv6/UDP adds 48, for a 1,373-byte native data-packet allowance.
+This replaces the former 1,200-byte IP policy. WebRTC counts encrypted logical
+messages; its physical packet sizes remain browser/SCTP managed.
 
 The server's once-per-second `Dreamwake egress` log reports cumulative application
 bytes/messages for control and state, finalization batches/receipts/deferred
-publications, Renet queued message counts and retained payload bytes, and the
+publications, Renet retained payload bytes per channel, and the
 transport's independent native UDP/IP or WebRTC logical-byte counters. Healthy
 samples use info level; new pacing drops or a full finalization control window
-use warn level. Renet queue statistics include sent reliable messages awaiting
-transport ACKs and unsent unreliable messages; they are not delivery proofs.
+use warn level. Queued bytes come from Renet's public available-memory API and
+include sent reliable messages awaiting transport ACKs. They are not decode proofs.
 
 ## Input and acknowledgement invariants
 
@@ -238,6 +253,16 @@ old stream proofs cannot activate the replacement stream. This retires the old
 audit namespace rather than skipping missing receipts. Already participating
 owners retain strict finalization continuity and cannot use this initial retry.
 
+An already active owner whose frozen baseline-reset checkpoint expires receives
+a fresh stream through the same bounded resynchronization path. The server keeps
+the authoritative hero and participation, closes the old command/outcome
+namespace, and requires fresh Welcome, Ready and decoded checkpoint proofs.
+Old queued messages remain transport-owned and cannot satisfy the new epoch.
+This recovery applies only to an active baseline reset; expired finalization
+audits and expired replacement bootstrap checkpoints retain their existing
+failure behavior. The two-second checkpoint deadline and three-per-thirty-second
+resynchronization cap remain unchanged.
+
 ### Stable Traveler IDs
 
 Open **Traveler ID / Settings** from the lobby or pause menu. Disconnect before
@@ -295,12 +320,17 @@ Public actor views contain approved presentation data. Private loadouts,
 progression and latent owner state appear only in that owner's checkpoint.
 World RNG, allocation state, future encounters and complete server state are
 absent from live public/global payloads. The owner, global summary, collision
-scene and any required rotating base form one group, transferred in bounded
-application fragments and published
-atomically. Each member uses a bounded full or delta encoding against an exact
+scene and any required rotating base form one bounded message of at most 32 KiB
+on a dedicated reliable-unordered channel, published atomically. Each member
+uses a bounded full or delta encoding against an exact
 retained decode receipt in the same scope and baseline generation. All
 reconstructed payloads and group identities must validate before any replica or
-baseline is published and before a combined receipt is sent. Remote actors use
+baseline is published and before a combined receipt is sent. A complete validated
+group may precede its baseline reset on the independent control channel. The
+client retains one such message, applies it when the reset arrives, and requests
+recovery if the original two-second deadline expires. Newer pending messages
+cannot extend that deadline; malformed replacements cannot evict valid data.
+Remote actors use
 complete scoped states with compact headers: canonical variable-length integers
 preserve every identity and tick, and the authenticated frame supplies the
 connection epoch. Public actor fields use their agreed schema order without

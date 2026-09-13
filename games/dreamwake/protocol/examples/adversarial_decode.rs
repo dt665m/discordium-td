@@ -40,7 +40,7 @@ const NAMES: [&str; 19] = [
     "private_forgery",
     "full_scope",
     "group_manifest",
-    "byte_fragments",
+    "whole_group_frame",
     "baseline_delta",
     "compression",
     "nonfinite",
@@ -212,10 +212,13 @@ fn unchanged(client: &ClientScopes<Vec<u8>>, c: &Corpus) {
 }
 fn decode_owner_group(bytes: &[u8], c: &Corpus) -> Result<GroupChunk<Vec<u8>>, ReplicationError> {
     // Same positive binding constraints as the live owner's three-member group.
-    let group = decode_group(bytes, group_limits(), |p| {
-        decode_replica(p, Some(c.expected)).map_err(|_| ReplicationError::InvalidPayload)?;
-        Ok(p.to_vec())
-    })?;
+    let group = decode_group(bytes, group_limits(), |p| Ok(p.to_vec()))?;
+    validate_decoded_group(group, c)
+}
+fn validate_decoded_group(
+    group: GroupChunk<Vec<u8>>,
+    c: &Corpus,
+) -> Result<GroupChunk<Vec<u8>>, ReplicationError> {
     if group.publication.group != live::OWNER_GROUP || group.members.len() != 3 {
         return Err(ReplicationError::InvalidPayload);
     }
@@ -348,60 +351,29 @@ fn run(family: usize, bytes: &[u8], case: usize, c: &Corpus) -> Outcome {
         8 => {
             let mut client = client(c);
             let mut groups = GroupAssembler::new(EPOCH, group_limits()).unwrap();
-            let limits = live::byte_limits(limit()).unwrap();
-            let mut assembler = ByteAssembler::new(EPOCH, limits).unwrap();
             let mut published = false;
             let decoded = live::decode_state(bytes, EPOCH, limit());
             let result = match decoded {
-                Ok(live::StateFrame::Fragment(fragment)) => {
-                    let selected = case % c.fragments.len();
-                    let mut fragments = vec![fragment];
-                    for (i, encoded) in c.fragments.iter().enumerate() {
-                        if i != selected {
-                            let live::StateFrame::Fragment(f) =
-                                live::decode_state(encoded, EPOCH, limit()).unwrap()
-                            else {
-                                unreachable!()
-                            };
-                            fragments.push(f);
-                        }
-                    }
-                    let mut result = Ok(());
-                    for fragment in fragments {
-                        let next = assembler.receive(fragment, 0).and_then(|complete| {
-                            if let Some(complete) = complete {
-                                let progress = complete.decode_and_publish(
-                                    &mut groups,
-                                    &mut client,
-                                    0,
-                                    |b| decode_owner_group(b, c),
-                                    |p| decode_replica(p, Some(c.expected)).is_ok(),
-                                )?;
-                                published = matches!(progress, GroupProgress::Published(_));
-                            }
-                            Ok(())
-                        });
-                        if next.is_err() {
-                            result = next;
-                            break;
-                        }
-                    }
-                    result
+                Ok(live::StateFrame::Group(group)) => {
+                    validate_decoded_group(group, c).and_then(|group| {
+                        let progress = groups.receive(group, 0, &mut client, |_| true)?;
+                        published = matches!(progress, GroupProgress::Published(_));
+                        Ok(())
+                    })
                 }
                 _ => Err(ReplicationError::InvalidPayload),
             };
             if !published {
                 unchanged(&client, c);
             }
-            assert!(assembler.staged_bytes() <= limits.staging_bytes);
-            assert!(assembler.incomplete() <= limits.incomplete);
+            assert!(groups.staged_bytes() <= group_limits().staging_bytes);
             Outcome {
                 accepted: result.is_ok(),
                 published,
                 reason: if result.is_ok() {
                     "accepted"
                 } else {
-                    "fragment_rejected"
+                    "group_frame_rejected"
                 },
             }
         }
@@ -679,7 +651,7 @@ fn main() {
             5 => &c.owner,
             6 => &c.full,
             7 => &c.group,
-            8 => &c.fragments[case % c.fragments.len()],
+            8 => &c.group_message,
             9 => &c.delta,
             10 => &c.compressed,
             12 => &c.live_state,

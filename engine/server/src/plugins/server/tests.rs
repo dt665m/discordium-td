@@ -78,7 +78,6 @@ fn secure_driver_binds_two_udp_sessions_to_verified_game_grants() {
         }
     }
     let key = renet_cross::generate_random_bytes();
-    let profile = renet_cross::PacketProfile::ipv6_1200();
     let transport = MixedTransportBuilder::new(99)
         .udp_bind("127.0.0.1:0".parse().unwrap())
         .webrtc_bind("127.0.0.1:0".parse().unwrap())
@@ -94,9 +93,7 @@ fn secure_driver_binds_two_udp_sessions_to_verified_game_grants() {
             public_http_base: "http://127.0.0.1".into(),
         },
         MonotonicClientIdAllocator::new(21),
-        SecureSessionAuthPolicy::new(Tickets, key)
-            .with_packet_profile(profile)
-            .unwrap(),
+        SecureSessionAuthPolicy::new(Tickets, key),
     ));
     let mut clients = Vec::new();
     for credential in ["one", "two"] {
@@ -106,7 +103,6 @@ fn secure_driver_binds_two_udp_sessions_to_verified_game_grants() {
             match_id: "match".into(),
             credential: credential.into(),
             require_secure: true,
-            packet_profile: profile,
         };
         let session = bootstrap.create_session_with_request(&request).unwrap();
         assert!(
@@ -120,7 +116,6 @@ fn secure_driver_binds_two_udp_sessions_to_verified_game_grants() {
                 session_request: request,
                 require_secure: true,
                 connection_config: engine_net::connection_config(),
-                packet_config: profile.packet_config().unwrap(),
                 ..Default::default()
             },
         )
@@ -130,7 +125,6 @@ fn secure_driver_binds_two_udp_sessions_to_verified_game_grants() {
     let shared = SharedNet {
         health: Default::default(),
         max_clients: 8,
-        packet_config: profile.packet_config().unwrap(),
         transport: Arc::new(Mutex::new(transport)),
         bootstrap,
     };
@@ -176,7 +170,6 @@ fn shared_net() -> SharedNet {
     SharedNet {
         health: Default::default(),
         max_clients: 8,
-        packet_config: renet::PacketConfig::default(),
         transport: Arc::new(Mutex::new(
             MixedTransportBuilder::new(99)
                 .udp_bind(address)

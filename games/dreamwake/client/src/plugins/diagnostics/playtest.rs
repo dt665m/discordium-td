@@ -163,7 +163,7 @@ fn record_trace(
         "predicted_tick": session.and_then(|s| s.predicted_tick).map(|t| t.0),
         "history_bytes": session.map(|s| s.prediction_bytes),
         "scope_bytes": session.map(|s| s.scope_bytes),
-        "staging_bytes": session.map(|s| s.fragment_bytes + s.group_bytes),
+        "staging_bytes": session.map(|s| s.group_bytes),
         "baseline_bytes": session.map(|s| s.baseline_bytes),
         "baseline_repairs": session.map(|s| s.baseline_repairs),
         "decode_errors": telemetry.decode_errors,

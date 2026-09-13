@@ -66,13 +66,19 @@ pub(super) fn disconnect_failed(server: &mut RenetServer, authority: &mut DreamA
         authority.disconnect(id);
     }
 }
-fn frozen(
+struct PreparedGroup {
+    publication: GroupPublication,
+    members: Vec<FullState<Vec<u8>>>,
+    baseline_packets: Vec<engine_net::replication::baselines::BaselinePacket>,
+    bytes: Vec<u8>,
+}
+
+fn prepare_group(
     peer: &mut Peer,
     scopes: &mut ServerScopes<Vec<u8>>,
-    now: Duration,
-) -> Result<(), String> {
+) -> Result<Option<PreparedGroup>, String> {
     if peer.frozen.is_some() {
-        return Ok(());
+        return Ok(None);
     }
     let mut members = Vec::with_capacity(live::baselines::MEMBERS);
     for id in peer.owner_group_entities() {
@@ -104,8 +110,11 @@ fn frozen(
             .ok_or("Missing owner")?
             .snapshot,
     };
+    if peer.last_owner_publication == Some(publication) {
+        return Ok(None);
+    }
     let Some(baseline_packets) = peer.baselines.prepare(&members, publication)? else {
-        return Ok(());
+        return Ok(None);
     };
     let mut encoded_members = members.clone();
     for (state, packet) in encoded_members.iter_mut().zip(&baseline_packets) {
@@ -119,25 +128,20 @@ fn frozen(
         count: 1,
         members: encoded_members,
     };
-    let bytes = encode_group(&chunk, live::group_limits(), |payload| Ok(payload.clone()))
-        .map_err(failure)?;
-    let fragments = fragment_group(
-        publication,
-        &bytes,
-        live::byte_limits(peer.limit()).map_err(failure)?,
+    let sequence = peer.next_frame()?;
+    let bytes = live::encode_state(
+        &live::StateFrame::Group(chunk),
+        peer.welcome.stream.epoch,
+        sequence,
+        peer.limit(),
     )
     .map_err(failure)?;
-    peer.frozen = Some(FrozenGroup {
+    Ok(Some(PreparedGroup {
+        publication,
         members,
-        fragments,
-        next_fragment: 0,
-        sent_once: false,
-        decoded: BTreeSet::new(),
-        started: now,
-        active_state: peer.activation_committed,
         baseline_packets,
-    });
-    Ok(())
+        bytes,
+    }))
 }
 // Limit this delivery class, not unrelated reliable controls. Clock replies and
 // scope fences must not consume finalization's four-batch progress window.
@@ -205,34 +209,27 @@ fn peer_state(
     outcomes: &mut outcomes::Outcomes,
     now: Duration,
     tick: ServerTick,
-    transport: Option<&engine_server::SharedNet>,
 ) -> Result<(), String> {
     welcome(server, id, peer)?;
     if !peer.active && now >= peer.initial_deadline {
         return Err("Initial scene synchronization expired".into());
     }
     finalized(server, id, peer, tick)?;
-    // Queue all new controls before sampling due-work reservation for state.
-    // Finalization remains first; later outcome controls must not surprise the
-    // physical packetizer after state has already spent the remaining credit.
+    // Controls have first use of each Renet packetization pass.
     action_outcomes(server, id, peer, outcomes)?;
     if !peer.ready {
         return Ok(());
     }
-    // Bootstrap retains its exact advertised dependency closure until decoded.
-    // Normally active groups coalesce. A negotiated reset retains one complete
-    // full repair group until its exact new-generation proof arrives, avoiding
-    // an endless reset-generation loop when feedback or state is lost.
-    if peer.active
-        && peer.baselines.reset_pending.is_none()
-        && peer.frozen.as_ref().is_none_or(|group| group.sent_once)
-    {
+    // Only bootstrap/reset keeps an exact pending proof. Ordinary publications
+    // never wait for application receipts before admitting newer state.
+    if peer.active && peer.baselines.reset_pending.is_none() {
         peer.frozen = None;
     }
-    if peer.frozen.as_ref().is_some_and(|group| {
-        (!peer.active || !group.sent_once)
-            && now.saturating_sub(group.started) >= Duration::from_secs(2)
-    }) {
+    if peer
+        .frozen
+        .as_ref()
+        .is_some_and(|group| now.saturating_sub(group.started) >= Duration::from_secs(2))
+    {
         return Err("Frozen owner group synchronization expired".into());
     }
     let members = replication
@@ -247,9 +244,8 @@ fn peer_state(
         })
         .collect();
     if bases != peer.owner_bases {
-        // A partial transfer from the previous topology cannot be completed
-        // against a new dependency closure. The next manifest gets a new
-        // revision and full baseline contexts as one atomic publication.
+        // Already queued old topology remains transport-owned. Its identities
+        // cannot satisfy the new closure's atomic publication or decode proof.
         peer.frozen = None;
         peer.baselines.close();
         peer.owner_bases = bases;
@@ -285,7 +281,7 @@ fn peer_state(
     let scopes = replication
         .scopes_mut(id)
         .ok_or("Uncommitted scope barrier")?;
-    frozen(peer, scopes, now)?;
+    let group = prepare_group(peer, scopes)?;
     if !peer.baselines.reset_queued
         && let Some(resets) = peer.baselines.reset_pending.clone()
     {
@@ -299,44 +295,15 @@ fn peer_state(
         )?;
         peer.baselines.reset_queued = true;
     }
-    if peer.frozen.is_none() {
-        return Ok(());
-    }
     lifecycle(server, id, peer, scopes)?;
-    let mut packets: BTreeMap<UnitId, Vec<Vec<u8>>> = BTreeMap::new();
-    let group = peer.frozen.as_ref().unwrap();
-    let fragments = group.fragments[group.next_fragment..].to_vec();
-    let group_end_tick = group.members[0].end_tick;
-    let mut group_packets = Vec::with_capacity(fragments.len());
-    for fragment in fragments {
-        let sequence = peer.next_frame()?;
-        group_packets.push(
-            live::encode_state(
-                &live::StateFrame::Fragment(fragment),
-                peer.welcome.stream.epoch,
-                sequence,
-                peer.limit(),
-            )
-            .map_err(failure)?,
-        );
-    }
-    let mut budget = match transport {
-        Some(transport) => transport
-            .publication_budget(server, id, &[wire::CONTROL_CHANNEL, wire::STATE_CHANNEL])
-            .map_err(failure)?
-            .ok_or("Missing transport publication allowance")?,
-        // Transport-free deterministic authority tests have no physical pacer.
-        None => engine_server::PublicationBudget {
-            available_wire_bytes: 16_384,
-            maximum_atomic_wire_bytes: 16_384,
-            message_overhead_bytes: 0,
-        },
+    let mut packets = BTreeMap::new();
+    // This is admission credit, not a promise to emit the whole group this
+    // flush. Renet schedules its own slices/retries under transport pacing.
+    let budget = TransportBudget {
+        available_wire_bytes: peer.scheduler.available_wire_bytes(now),
+        maximum_atomic_wire_bytes: 36 * 1024,
     };
-    budget.available_wire_bytes = budget
-        .available_wire_bytes
-        .min(peer.scheduler.available_wire_bytes(now));
-    // Keep every eligible remote unit in the scheduler even during a partial
-    // owner transfer. Omitting it discards its accumulated deadline history.
+    // Keep remote cadence independent of owner queue backpressure.
     let mut requests = Vec::new();
     for entry in eligible.entries() {
         let entity = entry.entity();
@@ -359,7 +326,7 @@ fn peer_state(
         .map_err(failure)?;
         requests.push(UnitRequest::entity(
             entity,
-            budget.message_wire_bytes(bytes.len()),
+            admission_cost(bytes.len()),
             Cadence {
                 period_ticks: 3,
                 maximum_age_ticks: 12,
@@ -367,106 +334,59 @@ fn peer_state(
                 critical: false,
             },
         ));
-        packets.insert(UnitId::Entity(entity), vec![bytes]);
+        packets.insert(entity, bytes);
     }
-    let owner_age = tick.0.saturating_sub(group_end_tick.0);
-    let owner_critical = !peer.active || peer.baselines.reset_pending.is_some() || owner_age >= 6;
-    // During steady state, share prefix credit with currently due remote work.
-    // Preserve at least half for owner progress; unused remote share is borrowed.
-    // This reservation must not include actors still inside their cadence period.
-    // If both cannot fit, overdue remote units can win
-    // the normal age ordering until the owner's existing deadline is reached.
-    let remote_reserve = if owner_critical {
-        0
-    } else {
-        requests
-            .iter()
-            .filter(|request| {
-                let UnitId::Entity(_) = request.id() else {
-                    return false;
-                };
-                peer.scheduler
-                    .last_transmitted(request.id())
-                    .is_none_or(|sent| tick.0.saturating_sub(sent.0) >= 3)
-            })
-            .map(UnitRequest::wire_bytes)
-            .sum::<usize>()
-            .min(budget.available_wire_bytes / 2)
-    };
-    let prefix_budget = engine_server::PublicationBudget {
-        available_wire_bytes: budget.available_wire_bytes.saturating_sub(remote_reserve),
-        ..budget
-    };
-    // Transfer prefixes are staging only; all member proofs remain atomic until
-    // the entire owner unit has arrived and decoded.
-    let (fragment_count, group_cost) =
-        prefix_budget.transfer_prefix(group_packets.iter().map(Vec::len));
-    peer.egress.publication_credit = budget.available_wire_bytes;
-    peer.egress.group_age_ticks = owner_age;
-    peer.egress.maximum_group_age_ticks = peer.egress.maximum_group_age_ticks.max(owner_age);
-    peer.egress.control_due_messages = server
-        .channel_send_due(id, wire::CONTROL_CHANNEL)
-        .map_or(0, |q| q.messages);
-    peer.egress.control_due_payload_bytes = server
-        .channel_send_due(id, wire::CONTROL_CHANNEL)
-        .map_or(0, |q| q.payload_bytes);
-    peer.egress.publication_prefix = if group_cost <= budget.available_wire_bytes {
-        fragment_count
-    } else {
-        0
-    };
-    group_packets.truncate(fragment_count);
-    requests.push(
-        UnitRequest::prediction_group(
-            &eligible,
-            live::OWNER_GROUP,
-            group_cost,
-            Cadence {
-                period_ticks: 2,
-                maximum_age_ticks: 6,
-                priority: 255,
-                critical: owner_critical,
-            },
-        )
-        .map_err(failure)?,
-    );
-    packets.insert(UnitId::PredictionGroup(live::OWNER_GROUP), group_packets);
+    if let Some(group) = &group {
+        let owner_age = tick.0.saturating_sub(group.members[0].end_tick.0);
+        peer.egress.group_age_ticks = owner_age;
+        peer.egress.maximum_group_age_ticks = peer.egress.maximum_group_age_ticks.max(owner_age);
+        requests.push(
+            UnitRequest::prediction_group(
+                &eligible,
+                live::OWNER_GROUP,
+                admission_cost(group.bytes.len()),
+                Cadence {
+                    period_ticks: 2,
+                    maximum_age_ticks: 6,
+                    priority: 255,
+                    critical: !peer.active
+                        || peer.baselines.reset_pending.is_some()
+                        || owner_age >= 6,
+                },
+            )
+            .map_err(failure)?,
+        );
+    }
     let plan = peer
         .scheduler
-        .schedule(
-            &eligible,
-            &requests,
-            now,
-            TransportBudget {
-                available_wire_bytes: budget.available_wire_bytes,
-                maximum_atomic_wire_bytes: budget.maximum_atomic_wire_bytes,
-            },
-        )
+        .schedule(&eligible, &requests, now, budget)
         .map_err(failure)?;
-    let group = peer.frozen.as_mut().unwrap();
+    let mut group = group;
     peer.scheduler
         .transmit(plan, world, policy, |unit| {
-            let Some(frames) = packets.remove(&unit.id()) else {
-                return false;
-            };
-            let bytes: usize = frames.iter().map(Vec::len).sum();
-            if !server.can_send_message(id, wire::STATE_CHANNEL, bytes) {
-                return false;
-            }
             match unit.id() {
-                UnitId::Entity(entity) => scopes
+                UnitId::Entity(entity) => {
+                    let Some(bytes) = packets.remove(&entity) else { return false; };
+                    if !server.can_send_message(id, wire::STATE_CHANNEL, bytes.len()) {
+                        return false;
+                    }
+                    scopes
                     .transmit_pending(entity, |_| {
-                        for bytes in frames {
                             peer.egress.state_messages += 1;
                             peer.egress.state_bytes += bytes.len() as u64;
                             server.send_message(id, wire::STATE_CHANNEL, bytes);
-                        }
                         true
                     })
-                    .unwrap_or(false),
+                    .unwrap_or(false)
+                },
                 UnitId::PredictionGroup(_) => {
-                    // Revalidate every member before each staged prefix. The
-                    // complete graph closure is required even for one fragment.
+                    let Some(group) = group.take() else { return false; };
+                    if !server.can_send_message(id, wire::OWNER_GROUP_CHANNEL, group.bytes.len()) {
+                        peer.egress.group_queue_deferred += 1;
+                        return false;
+                    }
+                    // No source payload or send proof advances before the
+                    // complete authorized unit is accepted by Renet.
                     if group.members.iter().any(|state| {
                         scopes
                             .pending(state.scope.entity)
@@ -475,22 +395,11 @@ fn peer_state(
                     }) {
                         return false;
                     }
-                    for bytes in frames {
-                        peer.egress.state_messages += 1;
-                        peer.egress.state_bytes += bytes.len() as u64;
-                        server.send_message(id, wire::STATE_CHANNEL, bytes);
-                    }
-                    peer.egress.group_fragments = peer
-                        .egress
-                        .group_fragments
-                        .saturating_add(fragment_count as u64);
-                    group.next_fragment += fragment_count;
-                    if group.next_fragment < group.fragments.len() {
-                        return true;
-                    }
-                    group.next_fragment = 0;
-                    group.sent_once = true;
-                    peer.egress.group_passes = peer.egress.group_passes.saturating_add(1);
+                    peer.egress.state_messages += 1;
+                    peer.egress.state_bytes += group.bytes.len() as u64;
+                    server.send_message(id, wire::OWNER_GROUP_CHANNEL, group.bytes);
+                    peer.last_owner_publication = Some(group.publication);
+                    peer.egress.group_messages += 1;
                     for state in &group.members {
                         if state.scope.entity == peer.welcome.owner_entity {
                             peer.combat.sent(state.receipt(), state.end_tick, tick);
@@ -508,12 +417,32 @@ fn peer_state(
                     {
                         return false;
                     }
+                    if !peer.active || peer.baselines.reset_pending.is_some() {
+                        peer.frozen = Some(FrozenGroup {
+                            receipts: group.members.iter().map(FullState::receipt).collect(),
+                            bases: group.baseline_packets.iter().filter_map(|packet| {
+                                match packet.encoding {
+                                    engine_net::replication::baselines::BaselineEncoding::Delta { base } => Some(base),
+                                    _ => None,
+                                }
+                            }).collect(),
+                            decoded: BTreeSet::new(),
+                            started: now,
+                            active_state: peer.activation_committed,
+                        });
+                    }
                     true
                 }
             }
         })
         .map_err(failure)?;
     Ok(())
+}
+
+/// Conservative initial-send cost for admission. This does not reserve ACKs or
+/// predict retries; final encrypted bytes are measured/enforced by the adapter.
+fn admission_cost(bytes: usize) -> usize {
+    bytes + bytes.div_ceil(1200) * 100
 }
 fn outcome_batch(
     server: &mut RenetServer,
@@ -634,6 +563,29 @@ pub(super) fn states(server: &mut RenetServer, authority: &mut DreamAuthority) {
             authority.failed.insert(id);
         }
     }
+    // A participating client can suspend beyond an immutable baseline reset's
+    // proof deadline. Retire that stream through the existing bounded recovery
+    // handshake, preserving its actor and transport queues. This does not relax
+    // finalization-audit continuity or restart a replacement bootstrap.
+    let reset_retries: Vec<_> = authority
+        .peers
+        .iter()
+        .filter_map(|(&id, peer)| {
+            (peer.active
+                && peer.activation_committed
+                && peer.baselines.reset_pending.is_some()
+                && peer.frozen.as_ref().is_some_and(|group| {
+                    authority.now.saturating_sub(group.started) >= Duration::from_secs(2)
+                }))
+            .then_some(id)
+        })
+        .collect();
+    for id in reset_retries {
+        if let Err(reason) = authority.resync(id) {
+            log::warn!("Dreamwake baseline reset synchronization peer {id}: {reason}");
+            authority.failed.insert(id);
+        }
+    }
     disconnect_failed(server, authority);
     let Some(revision) = authority.revision.checked_add(1) else {
         authority.failed.extend(authority.peers.keys());
@@ -679,7 +631,6 @@ pub(super) fn states(server: &mut RenetServer, authority: &mut DreamAuthority) {
                     &mut authority.outcomes,
                     authority.now,
                     authority.tick,
-                    authority.transport_diagnostics.as_ref(),
                 ) {
                     log::warn!("Dreamwake replication peer {id}: {reason}");
                     authority.failed.insert(id);
@@ -708,19 +659,19 @@ fn report_egress(
         return;
     }
     peer.next_egress_report = now + Duration::from_secs(1);
-    let control = server
-        .channel_send_queue(id, wire::CONTROL_CHANNEL)
-        .unwrap_or_default();
-    let state = server
-        .channel_send_queue(id, wire::STATE_CHANNEL)
-        .unwrap_or_default();
+    let control_bytes = wire::CONTROL_MEMORY_BYTES
+        .saturating_sub(server.channel_available_memory(id, wire::CONTROL_CHANNEL));
+    let group_bytes = wire::OWNER_GROUP_SEND_BYTES
+        .saturating_sub(server.channel_available_memory(id, wire::OWNER_GROUP_CHANNEL));
+    let remote_bytes = wire::REMOTE_STATE_MEMORY_BYTES
+        .saturating_sub(server.channel_available_memory(id, wire::STATE_CHANNEL));
     let stats = transport.and_then(|transport| transport.peer_egress_stats(id).ok());
     let native = stats.and_then(|stats| stats.native_udp_ip);
     let web = stats.and_then(|stats| stats.webrtc_logical);
     let pacing_drops =
         native.map_or(0, |stats| stats.pacing_drops) + web.map_or(0, |stats| stats.pacing_drops);
     let line = format!(
-        "Dreamwake egress peer={id} at_ms={} finalized_through={} control_messages_total={} control_bytes_total={} finalized_messages_total={} finalized_bytes_total={} finalized_receipts_total={} finalized_deferred_total={} state_messages_total={} state_bytes_total={} control_queue_messages={} control_queue_payload_bytes={} state_queue_messages={} state_queue_payload_bytes={} native_udp_ip={native:?} webrtc_logical={web:?}",
+        "Dreamwake egress peer={id} at_ms={} finalized_through={} control_messages_total={} control_bytes_total={} finalized_messages_total={} finalized_bytes_total={} finalized_receipts_total={} finalized_deferred_total={} state_messages_total={} state_bytes_total={} control_queue_payload_bytes={} state_queue_payload_bytes={} group_queue_payload_bytes={} native_udp_ip={native:?} webrtc_logical={web:?}",
         now.as_millis(),
         peer.finalized_sent_through.0,
         peer.egress.control_messages,
@@ -731,23 +682,18 @@ fn report_egress(
         peer.egress.finalized_deferred,
         peer.egress.state_messages,
         peer.egress.state_bytes,
-        control.messages,
-        control.payload_bytes,
-        state.messages,
-        state.payload_bytes
+        control_bytes,
+        group_bytes + remote_bytes,
+        group_bytes,
     );
     let line = format!(
-        "{line} group_passes={} group_fragments={} group_age_ticks={} maximum_group_age_ticks={} publication_credit={} publication_prefix={} control_due_messages={} control_due_payload_bytes={}",
-        peer.egress.group_passes,
-        peer.egress.group_fragments,
+        "{line} group_messages={} group_queue_deferred={} group_age_ticks={} maximum_group_age_ticks={}",
+        peer.egress.group_messages,
+        peer.egress.group_queue_deferred,
         peer.egress.group_age_ticks,
         peer.egress.maximum_group_age_ticks,
-        peer.egress.publication_credit,
-        peer.egress.publication_prefix,
-        peer.egress.control_due_messages,
-        peer.egress.control_due_payload_bytes
     );
-    if pacing_drops > peer.last_pacing_drops || control.messages >= FINALIZED_CONTROL_WINDOW {
+    if pacing_drops > peer.last_pacing_drops || control_bytes >= wire::CONTROL_MEMORY_BYTES / 2 {
         log::warn!("{line}");
     } else {
         log::info!("{line}");

@@ -10,8 +10,7 @@ pub fn valid_member_count(count: usize) -> bool {
 }
 pub const PAYLOAD_BYTES: usize = 16_384;
 pub const MEMBER_BYTES: usize = PAYLOAD_BYTES + 256;
-pub const GROUP_BYTES: usize = 32 * 1024;
-pub const GROUP_FRAGMENT_COUNT: usize = 32;
+pub const GROUP_BYTES: usize = OWNER_GROUP_MESSAGE_BYTES - codec::HEADER_BYTES - 1;
 pub const GROUP_INCOMPLETE: usize = 8;
 pub const GROUP_STAGING_BYTES: usize = GROUP_BYTES * GROUP_INCOMPLETE;
 pub const GROUP_RESIDENT_BYTES: usize = MEMBERS * 160 * 1024;
@@ -119,6 +118,8 @@ fn validate_base(target: BaselineReceipt, base: Option<BaselineReceipt>) -> Resu
             || base.context != target.context
             || base.generation != target.generation
             || base.snapshot >= target.snapshot
+            || base.version > target.version
+            || base.end_tick > target.end_tick
     }) {
         return Err(invalid("baseline dependency differs from target context"));
     }
@@ -148,4 +149,66 @@ pub fn decode_member(
             }),
         bytes: member.bytes.as_slice().to_vec(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delta_base_cannot_advance_beyond_target_version_or_tick() {
+        let state = FullState {
+            scope: ScopeIdentity {
+                connection: ConnectionEpoch(1),
+                entity: EntityId {
+                    index: 1,
+                    generation: 1,
+                },
+                scope: ScopeEpoch(1),
+                representation: RepresentationRevision(1),
+            },
+            baseline_generation: BaselineGeneration(1),
+            snapshot: SnapshotId(2),
+            version: StateVersion(2),
+            end_tick: ServerTick(11),
+            payload: vec![],
+        };
+        let publication = GroupPublication {
+            connection: ConnectionEpoch(1),
+            group: OWNER_GROUP,
+            revision: GroupRevision(1),
+            snapshot: SnapshotId(2),
+        };
+        let target = target(&state, publication, BaselineGeneration(1));
+        for bad_version in [false, true] {
+            let mut base = BaselineReceipt {
+                snapshot: SnapshotId(1),
+                ..target
+            };
+            if bad_version {
+                base.version = StateVersion(3);
+            } else {
+                base.end_tick = ServerTick(12);
+            }
+            assert!(
+                encode_member(&BaselinePacket {
+                    target,
+                    encoding: BaselineEncoding::Delta { base },
+                    bytes: vec![],
+                })
+                .is_err()
+            );
+            // Encode only the bounded wrapper to exercise the hostile wire path.
+            let bytes = codec::encode_payload(
+                &Member {
+                    generation: BaselineGeneration(1),
+                    base: Some(base),
+                    bytes: BoundedVec::new(vec![]).unwrap(),
+                },
+                MEMBER_BYTES,
+            )
+            .unwrap();
+            assert!(decode_member(&bytes, &state, publication).is_err());
+        }
+    }
 }

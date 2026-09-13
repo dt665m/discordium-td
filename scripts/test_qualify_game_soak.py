@@ -1,6 +1,7 @@
 """Fake files/processes only. Never launches a game, soak, socket or build."""
 import copy
 import contextlib
+import errno
 import io
 import hashlib
 import json
@@ -11,7 +12,7 @@ import signal
 import subprocess
 import tempfile
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, call, patch
 
 MODULE = runpy.run_path(str(Path(__file__).with_name('qualify-game-soak.py')))
 Failure = MODULE['Failure']
@@ -524,6 +525,153 @@ class PreparationTests(unittest.TestCase):
         kill.assert_called_once_with(123, signal.SIGINT)
         self.assertTrue(result['left']['stopped'])
         self.assertFalse(result['left']['forced_kill'])
+
+    def test_denied_group_interrupt_falls_back_to_owned_child_and_continues(self):
+        children = {name: Mock(pid=pid) for name, pid in [('left', 123), ('right', 124)]}
+        for child in children.values():
+            child.poll.side_effect = [None, -signal.SIGINT]
+            child.wait.return_value = -signal.SIGINT
+        with patch('os.killpg', side_effect=[PermissionError(errno.EPERM, 'group denied'), None]) as kill:
+            result = MODULE['cleanup'](children)
+        self.assertEqual(kill.call_args_list, [call(123, signal.SIGINT), call(124, signal.SIGINT)])
+        children['left'].send_signal.assert_called_once_with(signal.SIGINT)
+        children['right'].send_signal.assert_not_called()
+        self.assertTrue(all(value['stopped'] for value in result.values()))
+        self.assertFalse(any(value['forced_kill'] for value in result.values()))
+        self.assertEqual(result['left']['errors'], [{
+            'phase': 'signal owned process group SIGINT', 'type': 'PermissionError',
+            'message': '[Errno 1] group denied'}])
+        self.assertEqual(result['right']['errors'], [])
+
+    def test_signal_and_wait_failures_remain_bounded_and_do_not_skip_other_children(self):
+        denied, healthy = Mock(pid=123), Mock(pid=124)
+        denied.poll.return_value = None
+        denied.send_signal.side_effect = PermissionError(errno.EPERM, 'child denied')
+        denied.wait.side_effect = [PermissionError(errno.EPERM, 'wait denied'),
+                                   subprocess.TimeoutExpired('owned child', 5)]
+        healthy.poll.side_effect = [None, -signal.SIGINT]
+        healthy.wait.return_value = -signal.SIGINT
+        with patch('os.killpg', side_effect=[PermissionError(errno.EPERM, 'group denied'),
+                                            None, PermissionError(errno.EPERM, 'group denied')]) as kill:
+            result = MODULE['cleanup']({'left': denied, 'right': healthy})
+        self.assertEqual(kill.call_args_list, [call(123, signal.SIGINT), call(124, signal.SIGINT),
+                                              call(123, signal.SIGKILL)])
+        self.assertEqual(denied.wait.call_args_list, [call(timeout=15), call(timeout=5)])
+        healthy.wait.assert_called_once_with(timeout=15)
+        self.assertEqual(denied.send_signal.call_args_list, [call(signal.SIGINT), call(signal.SIGKILL)])
+        self.assertFalse(result['left']['stopped'])
+        self.assertTrue(result['left']['forced_kill'])
+        self.assertIsNone(result['left']['exit_code'])
+        self.assertEqual([error['phase'] for error in result['left']['errors']], [
+            'signal owned process group SIGINT', 'signal owned child SIGINT', 'wait after SIGINT',
+            'signal owned process group SIGKILL', 'signal owned child SIGKILL', 'wait after SIGKILL'])
+        self.assertEqual(result['left']['errors'][-1]['type'], 'TimeoutExpired')
+        self.assertTrue(result['right']['stopped'])
+
+    def test_runtime_cleanup_and_close_errors_preserve_original_failure_and_report(self):
+        supervise = MODULE['supervise']
+        save, close = MODULE['save'], MODULE['BoundedFile'].close
+        for deny_final_save in (False, True):
+            with self.subTest(deny_final_save=deny_final_save):
+                self.args.output = self.root / f'supervised-{deny_final_save}'
+                self.args.output.mkdir()
+                self.args.preflight = True
+                children = [Mock(pid=pid, returncode=None) for pid in (123, 124, 125)]
+                for child in children:
+                    child.poll.return_value = None
+                    def stopped(timeout, child=child):
+                        child.poll.return_value = -signal.SIGINT
+                        return -signal.SIGINT
+                    child.wait.side_effect = stopped
+                selector = Mock()
+                selector.select.side_effect = [[], PermissionError(errno.EPERM, 'runtime polling denied')]
+                selector.get_map.return_value = {}
+                selector.close.side_effect = PermissionError(errno.EPERM, 'selector close denied')
+                before_cleanup = []
+                def signal_group(pid, sig):
+                    before_cleanup.append(json.loads((self.args.output / 'report.json').read_text()))
+                    if pid == 123:
+                        raise PermissionError(errno.EPERM, 'group denied')
+                def close_output(output):
+                    close(output)
+                    if output.path.name == 'resources.jsonl':
+                        raise PermissionError(errno.EPERM, 'output close denied')
+                def save_report(path, report):
+                    if deny_final_save and report['status'] == 'failed_or_incomplete':
+                        raise PermissionError(errno.EPERM, 'final save denied')
+                    save(path, report)
+                stderr = io.StringIO()
+                with patch('subprocess.Popen', side_effect=children), patch('os.set_blocking'), \
+                        patch('shutil.disk_usage', return_value=Mock(free=10**12)), \
+                        patch('socket.socket'), patch('socket.create_connection', return_value=MagicMock()), \
+                        patch('selectors.DefaultSelector', return_value=selector), \
+                        patch('os.killpg', side_effect=signal_group) as kill, \
+                        patch.dict(supervise.__globals__, {'save': save_report}), \
+                        patch.object(MODULE['BoundedFile'], 'close', close_output), \
+                        contextlib.redirect_stderr(stderr):
+                    result = supervise(self.args, {'commands': {name: ['FAKE; NEVER EXECUTE']
+                                                               for name in ('server', 'left', 'right')}}, lambda: True)
+                original = 'workload clock/log monitoring: PermissionError: [Errno 1] runtime polling denied'
+                self.assertEqual(before_cleanup[0]['status'], 'stopping_after_failure')
+                self.assertEqual(before_cleanup[0]['failures'][0], original)
+                self.assertIn('measurement_cutoff_monotonic', before_cleanup[0])
+                self.assertEqual(result['status'], 'failed_or_incomplete')
+                self.assertFalse(result['preflight_passed'])
+                self.assertFalse(result['real_udp_24h_passed'])
+                self.assertEqual(result['failures'][0], original)
+                self.assertIn('cleanup server: signal owned process group SIGINT: PermissionError: [Errno 1] group denied', result['failures'])
+                self.assertIn('close resources output: PermissionError: [Errno 1] output close denied', result['failures'])
+                self.assertIn('close log selector: PermissionError: [Errno 1] selector close denied', result['failures'])
+                self.assertEqual(kill.call_count, 3)
+                self.assertTrue(all(child['stopped'] for child in result['cleanup'].values()))
+                for child in children:
+                    child.stdout.close.assert_called_once_with()
+                saved = json.loads((self.args.output / 'report.json').read_text())
+                if deny_final_save:
+                    self.assertEqual(saved, before_cleanup[0])
+                    self.assertIn(original, stderr.getvalue())
+                    self.assertIn('save final report: PermissionError', stderr.getvalue())
+                else:
+                    self.assertEqual(saved, result)
+
+    def test_supervision_oserror_is_not_mislabeled_preparation(self):
+        main, input_provenance = MODULE['main'], MODULE['input_provenance']
+        argv = ['qualify-game-soak.py', '--source-manifest', str(self.manifest),
+                '--expected-source-sha256', self.manifest_sha, '--binary-dir', str(self.root / 'binaries'),
+                '--output', str(self.root / 'output')]
+        stderr = io.StringIO()
+        with patch.dict(main.__globals__, {
+                'input_provenance': lambda args: input_provenance(args, self.workspace),
+                'supervise': Mock(side_effect=PermissionError(errno.EPERM, 'runtime denied'))}), \
+                patch('sys.argv', argv), patch('signal.signal'), \
+                patch('subprocess.Popen', side_effect=AssertionError('no process')), \
+                patch('socket.socket', side_effect=AssertionError('no socket')), \
+                contextlib.redirect_stderr(stderr):
+            self.assertEqual(main(), 1)
+        self.assertIn('Game soak supervision failed: PermissionError: [Errno 1] runtime denied', stderr.getvalue())
+        self.assertNotIn('preparation failed', stderr.getvalue())
+
+    def test_pipe_setup_denial_after_spawn_still_cleans_child_and_saves_report(self):
+        self.args.output.mkdir()
+        child = Mock(pid=123)
+        child.poll.side_effect = [None, None, -signal.SIGINT]
+        child.wait.return_value = -signal.SIGINT
+        selector = Mock()
+        selector.register.side_effect = PermissionError(errno.EPERM, 'pipe registration denied')
+        selector.get_map.return_value = {}
+        with patch('subprocess.Popen', return_value=child) as launch, patch('os.set_blocking'), \
+                patch('shutil.disk_usage', return_value=Mock(free=10**12)), \
+                patch('socket.socket'), patch('selectors.DefaultSelector', return_value=selector), \
+                patch('os.killpg') as kill:
+            result = MODULE['supervise'](self.args, {'commands': {'server': ['FAKE; NEVER EXECUTE']}}, lambda: True)
+        launch.assert_called_once()
+        kill.assert_called_once_with(123, signal.SIGINT)
+        self.assertEqual(result['failures'][0],
+                         'launch server: PermissionError: [Errno 1] pipe registration denied')
+        self.assertEqual(result['pids'], {'server': 123})
+        self.assertEqual(result['status'], 'failed_or_incomplete')
+        self.assertTrue(result['cleanup']['server']['stopped'])
+        self.assertEqual(json.loads((self.args.output / 'report.json').read_text()), result)
 
     def test_bounded_output_never_silently_discards(self):
         output = MODULE['BoundedFile'](self.root / 'bounded.log', 4)

@@ -57,6 +57,10 @@ the [admission and readiness contract](netcode.md#admission-and-readiness): it
 retires an expired startup stream within the existing deadline and retry cap,
 without skipping receipts or changing participation. Only fresh stream proofs
 can activate it; already participating owners do not use this initial retry.
+An active owner's expired baseline-reset checkpoint instead retires its stream
+through bounded resynchronization, preserving authoritative participation and
+requiring fresh proofs. This does not relax finalization-audit continuity or
+extend checkpoint deadlines; see the same admission and readiness contract.
 
 Retirement fences stop new use before a baseline is evicted. Old control and
 state lanes may reorder independently. A delayed owner-group retirement may
@@ -66,6 +70,19 @@ the removed member's exact entity generation and connection are covered by a
 bounded scope fence. Validate every control in the batch before classifying it:
 unrelated, malformed and conflicting identities remain hard errors. Rejection
 must preserve current caches and pending retirements atomically.
+Owner publications use one bounded reliable-unordered message; stock Renet owns
+its slices and retries. Game decode receipts remain separate from transport ACKs.
+A complete, validated future baseline generation can wait for its control-lane
+reset in one 32 KiB slot, with the original two-second deadline. Applying the
+reset retries local publication without requiring another message from the server.
+A validated older owner-group context is obsolete after a newer topology reset
+or publication. Its delayed deltas cannot replace the current baseline cache or
+request a repair. Check every baseline envelope before considering age, using
+the original caches before pruning the manifest. Removed or reentered delta
+members require a covering scope fence; a changed manifest within one topology
+revision remains a conflict. Full members still undergo schema, role and session
+validation before being discarded, with complete group validation when all
+members are Full. Delta dependency versions and ticks must not exceed their target.
 Interest exit retires a replica without
 signaling death; authoritative destruction ends its entity generation. Dormancy
 completion is each connection's decoded state version, not a global sleep flag.
@@ -174,6 +191,10 @@ specific contracts; they do not establish undocumented control algorithms.
 
 | Concern | Epic reference and mechanism | Local application and difference |
 |---|---|---|
+| Whole group delivery and cross-channel dependencies | [Reliable RPCs](https://dev.epicgames.com/documentation/en-us/unreal-engine/remote-procedure-calls-in-unreal-engine#reliability) separate reliable retransmission from application execution; [replicated object execution order](https://dev.epicgames.com/documentation/en-us/unreal-engine/replicated-object-execution-order-in-unreal-engine) recommends retaining dependent values until usable and limits ordering guarantees to specific scopes. | Enqueue each owner publication once on stock Renet reliable-unordered transport. Validate the complete group and retain exact decoded receipts independently of packet ACKs. Stage one complete message if its baseline reset has not arrived; reject valid older topology contexts without replacing current caches when the newer reset or publication arrives first. The generic synthetic harness counts validated superseded standalone states and groups without acknowledging or republishing them; malformed states and conflicting watermarks remain failures. Its whole-message workload does not require partial-group delivery. Channel selection, 32/128 KiB memory budgets, the two-second deadline and atomic owner-group protocol are local decisions, not Epic wire behavior or tuning. |
+| Handshake confirmation retries | [StatelessConnectHandlerComponent](https://dev.epicgames.com/documentation/unreal-engine/API/Runtime/Engine/StatelessConnectHandlerComponent?lang=en-US) exposes handshake-specific send timestamps and explicit challenge completion. | Keep handshake retry timing in renetcode: before authenticated client confirmation, outgoing application payloads cannot reset the KeepAlive retry timestamp. Both UDP and WebRTC exercise loss of the initial KeepAlive under continuous payload sends. This is a correction to renetcode's existing protocol, not an Unreal handshake algorithm or retry setting; no transport pacing workaround or Renet packet configuration extension is required. |
+| Client identity replacement | [Actor relevancy](https://dev.epicgames.com/documentation/en-us/unreal-engine/actor-relevancy-in-unreal-engine) ties client actor lifetimes to the connection's current relevant set; [replicated object execution order](https://dev.epicgames.com/documentation/en-us/unreal-engine/replicated-object-execution-order-in-unreal-engine) does not guarantee relative reliable/unreliable order. | After a standalone state or complete atomic group publishes a newer entity generation, retire older generations at that index from client membership and combat-pose bookkeeping. Delayed old Exit/Destroy controls retain the replacement. Rejected or incomplete publications cannot retire it. The numeric generation fence and combat cohort are local contracts, not Epic identity or wire formats. |
+| Recovery request ownership | [Reliable RPCs](https://dev.epicgames.com/documentation/en-us/unreal-engine/remote-procedure-calls-in-unreal-engine#reliability) retransmit until acknowledged, and their send policy separates enqueue from network dispatch. [Networked character movement](https://dev.epicgames.com/documentation/unreal-engine/understanding-networked-movement-in-the-character-movement-component-for-unreal-engine) distinguishes server acknowledgements/corrections from saved client moves and warns about reliable buffer overflow. | Recovery retains one pending resync request until control encoding and reliable enqueue succeed. Poll services it while prediction is stopped; an enqueued request waits for replacement Welcome while Renet owns retransmission. The server may also retire an expired active baseline-reset stream through the same capped resynchronization path, preserving authoritative participation and requiring fresh proofs. Old queued controls/state remain transport-owned and are fenced by epoch. Finalization-audit expiry remains strict. The one-second request throttle, two-second checkpoint deadline, three-per-thirty-second cap and Welcome handshake are local mechanisms, not an Epic recovery algorithm or tuning. |
 | Effect bindings across delivery lanes | [Replicated object execution order](https://dev.epicgames.com/documentation/en-us/unreal-engine/replicated-object-execution-order-in-unreal-engine) does not guarantee relative reliable/unreliable execution order; [Network Prediction cue dispatch](https://dev.epicgames.com/documentation/unreal-engine/API/Plugins/NetworkPrediction/TNetSimCueDispatcher) separates saved cue delivery, pruning and rollback. | A validated binding for a strictly newer entity generation retires the older journal token atomically, even if its removal checkpoint has not arrived. Cancel the old presentation without creating the replacement from receive; retain its tombstone through replay. Same-generation conflicts and lower-generation bindings for different events remain errors. Generation reuse and this journal transition are our contract, not an Epic cue algorithm or Fortnite behavior. |
 | Retired optional group members | [Replication Graph](https://dev.epicgames.com/documentation/en-us/unreal-engine/replication-graph-in-unreal-engine) builds changing actor lists per connection; [actor relevancy](https://dev.epicgames.com/documentation/en-us/unreal-engine/actor-relevancy-in-unreal-engine) removes client replicas when actors cease to be relevant. | Keep bounded scope fences after local replica removal so delayed controls can be checked against connection, entity generation, scope and group revision. A proven old owner-group retirement is obsolete and cannot mutate current caches; an unknown member without that proof remains a hard failure. The atomic baseline-retirement protocol and proof rule are our design, not an Epic wire contract. |
 | Effect source visibility | [Actor relevancy](https://dev.epicgames.com/documentation/unreal-engine/actor-relevancy-in-unreal-engine) is decided per connection, and [Replication Graph](https://dev.epicgames.com/documentation/unreal-engine/replication-graph-in-unreal-engine) builds per-connection actor lists for players and AI-controlled actors. | Independently eligible heroes and enemies both authorize their public source references. A visible projectile or effect never grants visibility to its source. Source visibility changes replace only that source's projectile/wisp/effect scopes, even when publication cadence would otherwise freeze them. Separate event-origin approval and anonymous 8 m proxies are Dreamwake policy, not an Unreal projection mechanism. |
@@ -420,9 +441,11 @@ shield/invulnerability at that same query time, and an authoritative eligible
 shooter at execution time. No interpolation crosses teleport, respawn or
 ownership/lifecycle discontinuities. Equal-time eligible damage is batched and
 allows trades. Maximum rewind is 150 ms; missing history rejects compensated
-validation explicitly. Late finalized actions reject; sub-tick processing and
-projectile catch-up are disabled. Dreamwake's ray and beam path implements this
-policy; melee, area attacks and projectile flight use committed simulation time.
+validation explicitly. Late finalized actions reject. Movement and beam cadence
+remain fixed-step; rays and beams accept validated fractional combat timestamps
+under the [input and acknowledgement invariants](netcode.md#input-and-acknowledgement-invariants).
+Projectile catch-up is disabled. Melee, area attacks and projectile flight use
+committed simulation time.
 The ruleset identity automatically fingerprints the complete engine and simulation
 sources, Cargo manifests, lockfile and compiler version. Target paths and build
 timestamps are excluded so supported native/WASM build profiles can agree.

@@ -132,11 +132,22 @@ def rss_bytes(pid: int) -> int | None:
     return int(result.stdout.strip()) * 1024 if result.returncode == 0 and result.stdout.strip() else None
 
 
+def workload_coverage(final: dict | None) -> bool:
+    # Owner publications are whole messages; partial application groups are not
+    # a path exercised by this synthetic fixture. Renet delivery has separate tests.
+    return bool(final and all(final.get(name, 0) > 0 for name in [
+        "scope_exits", "destroyed_generations", "dormant_offers", "dropped",
+        "reordered", "groups_published", "baseline_retirements", "event_records",
+        "full_history_windows", "retired_history_checks",
+    ]))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--source-manifest", type=Path, help="reuse this verified capture, without Git discovery")
     parser.add_argument("--source-root", type=Path, help="captured tree root; defaults to manifest sibling sources")
+    parser.add_argument("--prepare-only", action="store_true", help="capture/verify immutable sources only; no build or workload")
     parser.add_argument("--seconds", type=int, default=86400)
     parser.add_argument("--report-seconds", type=int, default=3600)
     parser.add_argument("--rss-sample-seconds", type=float, default=5)
@@ -169,6 +180,17 @@ def main() -> int:
         captured, files, manifest = capture_sources(output, helpers)
         source_base = output / "sources"
         manifest_hash = digest(manifest)
+    if args.prepare_only:
+        if not unchanged(source_base, files) or digest(manifest) != manifest_hash:
+            raise ValueError("source capture changed during preparation")
+        write_json(output / "capture.json", {
+            "source_manifest": str(manifest), "source_manifest_sha256": manifest_hash,
+            "captured_workspace": str(captured), "source_files": len(files),
+            "prepared_only": True, "workload_launched": False,
+        })
+        print(f"Sources prepared without a build or workload: {manifest}", flush=True)
+        print(f"Source manifest SHA-256: {manifest_hash}", flush=True)
+        return 0
     env = dict(os.environ, CARGO_TARGET_DIR=str(output / "build"))
     provenance = {"kind": "persistent_generic_network_wall_clock_soak", "machine": helpers["machine"](),
                   "source_manifest_sha256": manifest_hash, "captured_workspace": str(captured),
@@ -276,8 +298,7 @@ def main() -> int:
     growth = None if trend.first is None else trend.last - trend.first
     trend_ok = (trend.n >= 2 and growth <= args.max_rss_growth_mib * 1024**2
                 and rss_trend["linear_bytes_per_hour"] <= args.max_rss_trend_mib_per_hour * 1024**2)
-    coverage = bool(final and all(final.get(name, 0) > 0 for name in ["scope_exits", "destroyed_generations", "dormant_offers",
-                        "dropped", "reordered", "groups_published", "partial_groups", "baseline_retirements", "event_records", "full_history_windows", "retired_history_checks"]))
+    coverage = workload_coverage(final)
     actual_24h = bool(final and final["elapsed_seconds"] >= 86400 and elapsed >= 86400 and args.seconds >= 86400)
     tick_rate_ok = bool(final and final["ticks"] / final["elapsed_seconds"] >= 27)
     complete = bool(code == 0 and not interrupted and not deadline_exceeded and final and final["elapsed_seconds"] >= args.seconds and stable and not rss_limit_exceeded)

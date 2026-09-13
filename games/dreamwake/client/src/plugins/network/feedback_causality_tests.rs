@@ -188,6 +188,9 @@ fn delayed_initial_owner(frame_millis: u64) -> Trace {
     runtime.renet.set_connected();
     let mut server = RenetServer::new(connection_config());
     server.add_connection(runtime.client_id);
+    // Count actual decoded input messages through the public Renet API.
+    let mut observer = RenetServer::new(connection_config());
+    observer.add_connection(runtime.client_id);
     assert!(matches!(
         server.get_event(),
         Some(ServerEvent::ClientConnected { .. })
@@ -213,7 +216,7 @@ fn delayed_initial_owner(frame_millis: u64) -> Trace {
     // publication crosses a 50 ms downlink, then its decoded proof crosses the
     // same uplink before Active is sent. No clock estimate is injected directly.
     for frame in owner_frames {
-        server.send_message(runtime.client_id, STATE_CHANNEL, frame);
+        server.send_message(runtime.client_id, OWNER_GROUP_CHANNEL, frame);
     }
     downlink.insert(217, server.get_packets_to_send(runtime.client_id).unwrap());
     runtime
@@ -404,7 +407,7 @@ fn delayed_initial_owner(frame_millis: u64) -> Trace {
                 runtime.renet.process_packet(&packet);
             }
             // The production receive pass drains reliable control before state.
-            for channel in [CONTROL_CHANNEL, STATE_CHANNEL] {
+            for channel in [CONTROL_CHANNEL, STATE_CHANNEL, OWNER_GROUP_CHANNEL] {
                 while let Some(bytes) = runtime.renet.receive_message(channel) {
                     receive_message(
                         &mut runtime,
@@ -451,10 +454,22 @@ fn delayed_initial_owner(frame_millis: u64) -> Trace {
                     }),
             );
             trace.clock_replies = runtime.prediction.as_ref().unwrap().clock.sample_count();
-            let queued = runtime.renet.channel_send_queue(INPUT_CHANNEL).messages;
             let packets = runtime.renet.get_packets_to_send();
-            let remaining = runtime.renet.channel_send_queue(INPUT_CHANNEL).messages;
-            *input_bundles_due.entry(millis + 50).or_default() += queued - remaining;
+            for packet in &packets {
+                observer
+                    .process_packet_from(packet, runtime.client_id)
+                    .unwrap();
+            }
+            while observer
+                .receive_message(runtime.client_id, INPUT_CHANNEL)
+                .is_some()
+            {
+                *input_bundles_due.entry(millis + 50).or_default() += 1;
+            }
+            while observer
+                .receive_message(runtime.client_id, CONTROL_CHANNEL)
+                .is_some()
+            {}
             uplink.entry(millis + 50).or_default().extend(packets);
         }
     }

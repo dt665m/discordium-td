@@ -45,6 +45,408 @@ fn assert_hard(error: &ReceiveRejection) {
 }
 
 #[test]
+fn delayed_owner_topology_preserves_new_reset_and_publication() {
+    use dreamwake_protocol::live::baselines as wire;
+    use engine_net::replication::baselines::{
+        BaselineCodec, BaselineEncoding, BaselinePacket, BaselineReset, BytePatch,
+    };
+    for published in [false, true] {
+        for delta in [false, true] {
+            let (mut session, initial) = fixture();
+            session
+                .receive_state(&initial[0], Duration::from_millis(1))
+                .unwrap();
+            let base = super::tests::published_group_chunk(&session);
+            let (mut older, frames) = super::tests::fixture_publication(11, 2, 1);
+            older
+                .receive_state(&frames[0], Duration::from_millis(1))
+                .unwrap();
+            let mut delayed = super::tests::published_group_chunk(&older);
+            for (state, base) in delayed.members.iter_mut().zip(&base.members) {
+                let target = wire::target(state, delayed.publication, BaselineGeneration(1));
+                let (encoding, bytes) = if delta {
+                    (
+                        BaselineEncoding::Delta {
+                            base: wire::target(base, delayed.publication, BaselineGeneration(1)),
+                        },
+                        BytePatch
+                            .encode_delta(&base.payload, &state.payload, wire::MEMBER_BYTES)
+                            .unwrap(),
+                    )
+                } else {
+                    (BaselineEncoding::Full, state.payload.clone())
+                };
+                state.payload = wire::encode_member(&BaselinePacket {
+                    target,
+                    encoding,
+                    bytes,
+                })
+                .unwrap();
+            }
+            let (mut newer, frames) = super::tests::fixture_publication(12, 3, 2);
+            newer
+                .receive_state(&frames[0], Duration::from_millis(1))
+                .unwrap();
+            let group = super::tests::published_group_chunk(&newer);
+            let resets = group
+                .members
+                .iter()
+                .map(|state| BaselineReset {
+                    context: wire::context(state, group.publication),
+                    generation: BaselineGeneration(1),
+                })
+                .collect::<Vec<_>>();
+            session.baselines.apply_resets(&resets).unwrap();
+            if published {
+                session
+                    .receive_state(&frames[0], Duration::from_millis(2))
+                    .unwrap();
+            }
+            let identities = group
+                .manifest
+                .iter()
+                .map(|scope| session.baselines.identity(scope.entity))
+                .collect::<Vec<_>>();
+            let publication = session.groups.publication(OWNER_GROUP);
+            let baseline_bytes = session.baselines.retained_bytes();
+            let scopes = group
+                .manifest
+                .iter()
+                .map(|scope| session.scopes.state(scope.entity).cloned())
+                .collect::<Vec<_>>();
+            let bytes = super::tests::encoded_group_frame(&session.model.welcome, delayed.clone());
+            let error = session
+                .receive_state(&bytes, Duration::from_millis(3))
+                .unwrap_err();
+            assert_obsolete(&error, ObsoleteReason::Publication);
+            assert_eq!(session.groups.publication(OWNER_GROUP), publication);
+            assert_eq!(session.baselines.retained_bytes(), baseline_bytes);
+            assert_eq!(session.metrics().baseline_repairs, 0);
+            assert_eq!(session.metrics().incomplete_groups, 0);
+            assert!(session.take_decoded_receipts().is_none());
+            for ((scope, identity), state) in group.manifest.iter().zip(identities).zip(scopes) {
+                assert_eq!(session.baselines.identity(scope.entity), identity);
+                assert_eq!(session.scopes.state(scope.entity), state.as_ref());
+            }
+            if !delta {
+                // Age cannot hide a malformed full DTO in a later member.
+                let state = delayed.members.last_mut().unwrap();
+                let mut packet =
+                    wire::decode_member(&state.payload, state, delayed.publication).unwrap();
+                packet.bytes.pop();
+                state.payload = wire::encode_member(&packet).unwrap();
+                let bytes = super::tests::encoded_group_frame(&session.model.welcome, delayed);
+                assert_hard(
+                    &session
+                        .receive_state(&bytes, Duration::from_millis(4))
+                        .unwrap_err(),
+                );
+            }
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+mod topology_members {
+    use super::*;
+    use crate::plugins::network::tests::{
+        encoded_group_frame, fixture_from_sim, group_frames, published_group_chunk,
+        receipt_runtime, wrap_full_baseline,
+    };
+    use dreamwake_protocol::live::baselines as wire;
+    use dreamwake_protocol::replication::{ReplicaPayload, decode_replica, encode_replica};
+    use engine_net::replication::baselines::{
+        BaselineCodec, BaselineEncoding, BaselinePacket, BaselineReset, BytePatch,
+    };
+
+    fn receive_group(session: &mut Session, frames: Vec<Vec<u8>>, millis: u64) {
+        for frame in frames {
+            session
+                .receive_state(&frame, Duration::from_millis(millis))
+                .unwrap();
+        }
+    }
+
+    fn capture_group(
+        sim: &DreamSimulation,
+        tick: u64,
+        snapshot: u64,
+        topology: u64,
+    ) -> GroupChunk<Vec<u8>> {
+        let (mut session, frames) = fixture_from_sim(sim, tick, snapshot, topology);
+        receive_group(&mut session, frames, 1);
+        published_group_chunk(&session)
+    }
+
+    fn reset_group(session: &mut Session, group: &GroupChunk<Vec<u8>>) {
+        let resets = group
+            .members
+            .iter()
+            .map(|state| BaselineReset {
+                context: wire::context(state, group.publication),
+                generation: BaselineGeneration(1),
+            })
+            .collect::<Vec<_>>();
+        session.baselines.apply_resets(&resets).unwrap();
+    }
+
+    fn delayed_platform(published: bool, reentered: bool) -> (Runtime, GroupChunk<Vec<u8>>) {
+        let mut sim = DreamSimulation::new(71, false);
+        sim.continue_run_for(1);
+        let (mut session, frames) = fixture_from_sim(&sim, 10, 1, 4);
+        receive_group(&mut session, frames, 1);
+        let base = published_group_chunk(&session);
+        assert_eq!(base.members.len(), 4);
+        let platform = base.members[3].scope.entity;
+        let mut delayed = capture_group(&sim, 11, 2, 4);
+        for (state, base_state) in delayed.members.iter_mut().zip(&base.members) {
+            let (encoding, bytes) = if state.scope.entity == platform {
+                (
+                    BaselineEncoding::Delta {
+                        base: wire::target(base_state, base.publication, BaselineGeneration(1)),
+                    },
+                    BytePatch
+                        .encode_delta(&base_state.payload, &state.payload, wire::MEMBER_BYTES)
+                        .unwrap(),
+                )
+            } else {
+                (BaselineEncoding::Full, state.payload.clone())
+            };
+            state.payload = wire::encode_member(&BaselinePacket {
+                target: wire::target(state, delayed.publication, BaselineGeneration(1)),
+                encoding,
+                bytes,
+            })
+            .unwrap();
+        }
+        {
+            let world = sim.world_mut();
+            *world
+                .query::<&mut engine_core::KinematicState>()
+                .single_mut(world)
+                .unwrap() = engine_core::KinematicState::new([0.0, 0.0, 15.0], 1);
+        }
+        sim.step(DreamInput::default());
+        let removed = capture_group(&sim, 12, 3, 5);
+        assert_eq!(removed.members.len(), 3);
+        reset_group(&mut session, &removed);
+        assert!(session.baselines.identity(platform).is_none());
+        if published {
+            let frames = group_frames(&session.model.welcome, removed);
+            receive_group(&mut session, frames, 2);
+        }
+        if reentered {
+            assert!(published);
+            {
+                let world = sim.world_mut();
+                *world
+                    .query::<&mut engine_core::KinematicState>()
+                    .single_mut(world)
+                    .unwrap() = engine_core::KinematicState::new([1.0, 0.25, -10.0], 1);
+            }
+            sim.step(DreamInput::default());
+            let mut reentry = capture_group(&sim, 13, 4, 6);
+            assert_eq!(reentry.members.len(), 4);
+            let state = reentry
+                .members
+                .iter_mut()
+                .find(|s| s.scope.entity == platform)
+                .unwrap();
+            state.scope.scope = ScopeEpoch(2);
+            state.scope.representation = RepresentationRevision(2);
+            reentry.manifest = reentry.members.iter().map(|s| s.scope).collect();
+            reset_group(&mut session, &reentry);
+            let frames = group_frames(&session.model.welcome, reentry);
+            receive_group(&mut session, frames, 3);
+            assert_eq!(
+                session.baselines.identity(platform).unwrap().0.scope.scope,
+                ScopeEpoch(2)
+            );
+        }
+        let mut runtime = receipt_runtime(session);
+        runtime.last_received = 0.25;
+        (runtime, delayed)
+    }
+
+    fn reject_unchanged(runtime: &mut Runtime, group: GroupChunk<Vec<u8>>) -> ReceiveRejection {
+        let session = runtime.prediction.as_ref().unwrap();
+        let before = session.metrics();
+        let current = published_group_chunk(session);
+        let decoded = session.decoded_groups.clone();
+        let entities = session.entities.clone();
+        let scopes = group
+            .manifest
+            .iter()
+            .map(|scope| {
+                (
+                    scope.entity,
+                    session.baselines.identity(scope.entity),
+                    session.scopes.state(scope.entity).cloned(),
+                    session.scopes.fence(scope.entity.index),
+                )
+            })
+            .collect::<Vec<_>>();
+        let bytes = encoded_group_frame(&session.model.welcome, group);
+        let mut world = World::new();
+        world.init_resource::<diagnostics::Telemetry>();
+        let error = receive_message(
+            runtime,
+            OWNER_GROUP_CHANNEL,
+            &bytes,
+            Duration::from_secs(1),
+            &mut world,
+        )
+        .unwrap_err();
+        assert_eq!(runtime.last_received, 0.25);
+        assert!(runtime.last_snapshot.is_none());
+        assert_eq!(world.resource::<diagnostics::Telemetry>().snapshots, 0);
+        let session = runtime.prediction.as_mut().unwrap();
+        let after = session.metrics();
+        assert_eq!(after.baseline_bytes, before.baseline_bytes);
+        assert_eq!(after.scope_bytes, before.scope_bytes);
+        assert_eq!(after.group_bytes, before.group_bytes);
+        assert_eq!(after.baseline_repairs, before.baseline_repairs);
+        assert_eq!(after.incomplete_groups, before.incomplete_groups);
+        assert_eq!(after.committed_server_tick, before.committed_server_tick);
+        assert_eq!(
+            after.interpolation.retained_samples,
+            before.interpolation.retained_samples
+        );
+        assert_eq!(after.interpolation.cursor, before.interpolation.cursor);
+        assert_eq!(published_group_chunk(session), current);
+        assert_eq!(session.decoded_groups, decoded);
+        assert_eq!(session.entities, entities);
+        assert!(session.take_decoded_receipts().is_none());
+        assert!(
+            session
+                .receive_pending_reset_group(Duration::from_secs(1))
+                .unwrap()
+                .is_none()
+        );
+        for (entity, identity, state, fence) in scopes {
+            assert_eq!(session.baselines.identity(entity), identity);
+            assert_eq!(session.scopes.state(entity), state.as_ref());
+            assert_eq!(session.scopes.fence(entity.index), fence);
+        }
+        error
+    }
+
+    #[test]
+    fn mixed_old_topology_with_removed_platform_delta_is_obsolete() {
+        for published in [false, true] {
+            let (mut runtime, delayed) = delayed_platform(published, false);
+            assert_obsolete(
+                &reject_unchanged(&mut runtime, delayed),
+                ObsoleteReason::Publication,
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_old_topology_preserves_reentered_platform_scope() {
+        let (mut runtime, delayed) = delayed_platform(true, true);
+        assert_obsolete(
+            &reject_unchanged(&mut runtime, delayed),
+            ObsoleteReason::Publication,
+        );
+    }
+
+    #[test]
+    fn changed_scope_in_same_topology_remains_a_hard_conflict() {
+        let (mut runtime, delayed) = delayed_platform(true, true);
+        let mut conflicting = published_group_chunk(runtime.prediction.as_ref().unwrap());
+        conflicting.members.last_mut().unwrap().scope = delayed.members.last().unwrap().scope;
+        conflicting.manifest = conflicting
+            .members
+            .iter()
+            .map(|state| state.scope)
+            .collect();
+        for state in &mut conflicting.members {
+            wrap_full_baseline(state, conflicting.publication);
+        }
+        assert_hard(&reject_unchanged(&mut runtime, conflicting));
+    }
+
+    #[test]
+    fn old_topology_with_lower_representation_in_current_scope_is_hard() {
+        let (mut runtime, mut delayed) = delayed_platform(true, true);
+        let state = delayed.members.last_mut().unwrap();
+        let mut packet = wire::decode_member(&state.payload, state, delayed.publication).unwrap();
+        state.scope.scope = ScopeEpoch(2);
+        state.scope.representation = RepresentationRevision(1);
+        packet.target.context.scope = state.scope;
+        let BaselineEncoding::Delta { base } = &mut packet.encoding else {
+            panic!("platform delta");
+        };
+        base.context.scope = state.scope;
+        state.payload = wire::encode_member(&packet).unwrap();
+        delayed.manifest = delayed.members.iter().map(|state| state.scope).collect();
+        assert_hard(&reject_unchanged(&mut runtime, delayed));
+    }
+
+    #[test]
+    fn old_platform_delta_cannot_hide_mismatched_global_epoch_or_scene() {
+        for published in [false, true] {
+            for changed_scene in [false, true] {
+                let (mut runtime, mut delayed) = delayed_platform(published, false);
+                let state = &mut delayed.members[0];
+                let mut packet =
+                    wire::decode_member(&state.payload, state, delayed.publication).unwrap();
+                assert!(matches!(packet.encoding, BaselineEncoding::Full));
+                let ReplicaPayload::Global(mut global) =
+                    decode_replica(&packet.bytes, None).unwrap()
+                else {
+                    panic!("global full member");
+                };
+                if changed_scene {
+                    global.stamp.scene_revision += 1;
+                } else {
+                    global.stamp.match_epoch += 1;
+                }
+                packet.bytes = encode_replica(&ReplicaPayload::Global(global)).unwrap();
+                state.payload = wire::encode_member(&packet).unwrap();
+                assert_hard(&reject_unchanged(&mut runtime, delayed));
+            }
+        }
+    }
+
+    #[test]
+    fn old_delta_cannot_hide_malformed_later_full_member() {
+        let mut sim = DreamSimulation::new(71, false);
+        sim.continue_run_for(1);
+        let base = capture_group(&sim, 10, 1, 4);
+        for published in [false, true] {
+            for malformed_wrapper in [false, true] {
+                let (mut runtime, mut delayed) = delayed_platform(published, false);
+                // The wire follows manifest order. Make its first mandatory member
+                // a real Delta so an early stale return would hide the later bad Full.
+                let state = &mut delayed.members[0];
+                let mut packet =
+                    wire::decode_member(&state.payload, state, delayed.publication).unwrap();
+                packet.encoding = BaselineEncoding::Delta {
+                    base: wire::target(&base.members[0], base.publication, BaselineGeneration(1)),
+                };
+                packet.bytes = BytePatch
+                    .encode_delta(&base.members[0].payload, &packet.bytes, wire::MEMBER_BYTES)
+                    .unwrap();
+                state.payload = wire::encode_member(&packet).unwrap();
+                let state = &mut delayed.members[2];
+                if malformed_wrapper {
+                    state.payload.pop();
+                } else {
+                    let mut packet =
+                        wire::decode_member(&state.payload, state, delayed.publication).unwrap();
+                    assert!(matches!(packet.encoding, BaselineEncoding::Full));
+                    packet.bytes.pop();
+                    state.payload = wire::encode_member(&packet).unwrap();
+                }
+                assert_hard(&reject_unchanged(&mut runtime, delayed));
+            }
+        }
+    }
+}
+
+#[test]
 fn delayed_public_full_preserves_state_pose_and_receipts() {
     let (mut session, _) = fixture();
     let current = public_full_state(&session, 100, 2);
@@ -148,17 +550,14 @@ fn malformed_and_conflicting_public_states_remain_hard_errors() {
 }
 
 #[test]
-fn fragment_local_time_regression_is_hard_stale() {
+fn whole_group_local_time_regression_is_hard_stale() {
     let (mut session, frames) = fixture();
-    assert!(
-        frames.len() > 1,
-        "fixture must exercise incomplete fragment assembly"
-    );
+    assert_eq!(frames.len(), 1);
     session
         .receive_state(&frames[0], Duration::from_millis(10))
         .unwrap();
     let error = session
-        .receive_state(&frames[1], Duration::from_millis(9))
+        .receive_state(&frames[0], Duration::from_millis(9))
         .unwrap_err();
     assert!(
         matches!(

@@ -16,11 +16,14 @@
 //! burst because the stock unreliable channel has no paced-slice API. This is
 //! a transport policy difference under test, not an application-frame cap.
 
+#[path = "fixtures/application_fragments.rs"]
+mod application_fragments;
+use application_fragments::{ByteAssembler, ByteFragment, ByteLimits, fragment_group};
 use engine_net::{
     CompressionMode, CompressionPolicy,
     codec::{FrameHeader, FrameLimit, Lane, decode_frame, encode_frame},
     decode, encode_with_compression,
-    replication::{ByteAssembler, ByteFragment, ByteLimits, GroupPublication, fragment_group},
+    replication::GroupPublication,
     types::{ConnectionEpoch, GroupId, GroupRevision, SnapshotId},
 };
 use octets::Octets;
@@ -41,7 +44,7 @@ const STATE_QUEUE_CAPACITY: usize = 128 * 1024;
 const FRAME_LIMIT: usize = 1_100;
 const APPLICATION_FRAGMENT_PAYLOAD: usize = FRAME_LIMIT
     - engine_net::codec::HEADER_BYTES
-    - engine_net::replication::BYTE_FRAGMENT_HEADER_BYTES;
+    - application_fragments::BYTE_FRAGMENT_HEADER_BYTES;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DeliveryPath {

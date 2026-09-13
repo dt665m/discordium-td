@@ -5,6 +5,8 @@ repository into an independent source tree, records the file hashes, makes that
 tree read-only, and builds a release executable from it. Each output directory
 must be new or empty. Run final qualification only after implementation and
 short integration checks are finished, against a frozen release candidate.
+`--prepare-only` captures or verifies the sources and writes their identity
+without building or launching a workload; see [candidate preparation](network-game-soak.md#captured-inputs).
 
 Soaks, endurance tests and extended matrices are manual handoffs. Before one is
 launched, prepare the exact command, frozen source/build identity, expected
@@ -41,6 +43,13 @@ loss and up to two ticks of reordering use capped synthetic queues. Prediction
 history periodically fills its 256-tick window before reconciliation resumes;
 baseline and event history are reclaimed through their production retirement
 APIs. The harness never periodically recreates its population to clear memory.
+Owner groups enter the codec as whole bounded messages. This synthetic workload
+does not model Renet slices, ACKs or retries; transport tests qualify those paths.
+Valid superseded standalone states and groups increment the stale-rejection
+counter without replacing current state or generating a decoded receipt.
+Malformed payloads and conflicting watermarks still fail the workload. Coverage
+requires complete group publications, not partial groups: each synthetic owner
+publication is delivered or dropped as one complete message.
 
 At most 1,024 interval reports are allowed per run.
 `metrics.jsonl` contains bounded interval and final component counters, retained

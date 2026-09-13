@@ -715,26 +715,59 @@ def commands(args: argparse.Namespace, identity: dict) -> dict[str, list[str]]:
 
 
 def cleanup(processes: dict[str, subprocess.Popen]) -> dict:
-    result = {}
-    for process in processes.values():
-        if process.poll() is None:
-            try:
-                os.killpg(process.pid, signal.SIGINT)
-            except ProcessLookupError:
-                pass
-    for name, process in processes.items():
-        forced = False
+    result = {name: {'pid': process.pid, 'exit_code': None, 'forced_kill': False,
+                     'stopped': False, 'errors': []} for name, process in processes.items()}
+
+    def failed(name: str, phase: str, error: Exception) -> None:
+        result[name]['errors'].append({'phase': phase, 'type': type(error).__name__,
+                                      'message': str(error)})
+
+    def poll(name: str) -> int | None:
         try:
-            code = process.wait(timeout=15)
-        except subprocess.TimeoutExpired:
-            forced = True
+            return processes[name].poll()
+        except OSError as error:
+            failed(name, 'poll owned child', error)
+            return None
+
+    def send(name: str, sig: signal.Signals) -> None:
+        process = processes[name]
+        if poll(name) is None:
             try:
-                os.killpg(process.pid, signal.SIGKILL)
+                os.killpg(process.pid, sig)
             except ProcessLookupError:
                 pass
-            code = process.wait(timeout=5)
-        result[name] = {'pid': process.pid, 'exit_code': code, 'forced_kill': forced,
-                        'stopped': process.poll() is not None}
+            except OSError as error:
+                failed(name, f'signal owned process group {sig.name}', error)
+                # Popen retains child ownership and checks its exit status before
+                # signaling. Never search for a replacement process by name/PID.
+                try:
+                    process.send_signal(sig)
+                except ProcessLookupError:
+                    pass
+                except OSError as child_error:
+                    failed(name, f'signal owned child {sig.name}', child_error)
+
+    # One denied group must not prevent other children receiving their interrupt.
+    for name in processes:
+        send(name, signal.SIGINT)
+    for name, process in processes.items():
+        try:
+            result[name]['exit_code'] = process.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            result[name]['forced_kill'] = True
+        except OSError as error:
+            failed(name, 'wait after SIGINT', error)
+            result[name]['forced_kill'] = True
+        if result[name]['forced_kill']:
+            send(name, signal.SIGKILL)
+            try:
+                result[name]['exit_code'] = process.wait(timeout=5)
+            except (OSError, subprocess.TimeoutExpired) as error:
+                failed(name, 'wait after SIGKILL', error)
+        code = poll(name)
+        result[name]['stopped'] = code is not None
+        if code is not None:
+            result[name]['exit_code'] = code
     return result
 
 
@@ -761,6 +794,17 @@ def supervise(args: argparse.Namespace, plan: dict, unchanged: callable) -> dict
     raw_log_bytes = 0
     environment = dict(os.environ, RUST_LOG='info', NO_COLOR='1')
 
+    def failed(phase: str, error: Exception) -> None:
+        report['failures'].append(f'{phase}: {type(error).__name__}: {error}')
+
+    def persist(phase: str) -> bool:
+        try:
+            save(output / 'report.json', report)
+            return True
+        except (OSError, ValueError, TypeError) as error:
+            failed(phase, error)
+            return False
+
     def launch(name: str) -> None:
         logs[name] = BoundedFile(output / f'{name}.log', args.max_log_mib * MIB)
         log_partial[name] = b''
@@ -768,13 +812,13 @@ def supervise(args: argparse.Namespace, plan: dict, unchanged: callable) -> dict
                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                    stderr=subprocess.STDOUT, start_new_session=True)
         processes[name] = process
+        rss_series[name], rss_trends[name] = Distribution(), Trend()
+        report['pids'] = {key: child.pid for key, child in processes.items()}
         os.set_blocking(process.stdout.fileno(), False)
         selector.register(process.stdout, selectors.EVENT_READ, name)
         if name in PLAYERS:
             readers[name] = TraceReader(output / f'{name}.ndjson', args.trace_chunks)
             audits[name] = ClientAudit(name, process.pid, PLAYERS[name], limits)
-        rss_series[name], rss_trends[name] = Distribution(), Trend()
-        report['pids'] = {key: child.pid for key, child in processes.items()}
         save(output / 'report.json', report)
 
     def drain_logs(timeout: float = 0) -> None:
@@ -796,6 +840,7 @@ def supervise(args: argparse.Namespace, plan: dict, unchanged: callable) -> dict
             if len(log_partial[name]) > LINE_BYTES:
                 raise Failure('unterminated process log line exceeded bound')
 
+    phase = 'startup disk/port reservation'
     try:
         required_free = 2 * args.trace_chunks * SEGMENT_BYTES + 3 * args.max_log_mib * MIB + 2 * REPORT_BYTES + args.disk_reserve_mib * MIB
         if shutil.disk_usage(output).free < required_free:
@@ -810,8 +855,10 @@ def supervise(args: argparse.Namespace, plan: dict, unchanged: callable) -> dict
         finally:
             for sock in reservations:
                 sock.close()
+        phase = 'launch server'
         launch('server')
         ready = False
+        phase = 'server bootstrap'
         while not ready:
             now = time.monotonic()
             continuity.observe(now, reference_clock())
@@ -826,15 +873,19 @@ def supervise(args: argparse.Namespace, plan: dict, unchanged: callable) -> dict
             except OSError:
                 pass
         for name in PLAYERS:
+            phase = f'launch {name}'
             launch(name)
         while True:
+            phase = 'workload clock/log monitoring'
             now = time.monotonic()
             continuity.observe(now, reference_clock())
             drain_logs(.1)
+            phase = 'workload process check'
             for name, process in processes.items():
                 if process.poll() is not None:
                     raise Failure(f'{name}: process exited before measurement deadline ({process.returncode})')
             if now >= next_poll:
+                phase = 'workload trace audit'
                 next_poll = now + 1
                 measurement_elapsed = now - measurement_start if measurement_start is not None else None
                 for name, reader in readers.items():
@@ -857,6 +908,7 @@ def supervise(args: argparse.Namespace, plan: dict, unchanged: callable) -> dict
                 if measurement_start is not None:
                     server_audit.check_liveness(now)
             if now >= next_resource:
+                phase = 'workload resource sample'
                 next_resource = now + 5
                 if shutil.disk_usage(output).free < args.disk_reserve_mib * MIB:
                     raise Failure('disk reserve exhausted')
@@ -876,12 +928,14 @@ def supervise(args: argparse.Namespace, plan: dict, unchanged: callable) -> dict
                     sample['processes'][name] = {'pid': process.pid, 'identity': process_identity, 'rss_bytes': rss}
                 resources.row(sample)
             if now >= next_report:
+                phase = 'workload interval report'
                 next_report = now + args.report_seconds
                 intervals.row({'supervisor_elapsed_seconds': now - start, 'measurement_elapsed_seconds': measurement_elapsed,
                                'clients': {name: audit.summary(measurement_elapsed) for name, audit in audits.items()},
                                'server_egress': {'samples': server_audit.samples, 'latest_peers': server_audit.peers},
                                'rss': {name: {'distribution': rss_series[name].result(), 'after_warmup': rss_trends[name].result()} for name in processes},
                                'trace_bytes': {name: reader.total for name, reader in readers.items()}, 'process_log_bytes': raw_log_bytes})
+            phase = 'workload deadline check'
             now = observed_time(continuity, reference_clock)
             if measurement_start is not None and now - measurement_start >= args.seconds:
                 measurement_elapsed = now - measurement_start
@@ -890,7 +944,7 @@ def supervise(args: argparse.Namespace, plan: dict, unchanged: callable) -> dict
                 report['status'] = 'stopping_at_monotonic_deadline'
                 break
     except Exception as error:
-        report['failures'].append(str(error))
+        failed(phase, error)
     except KeyboardInterrupt:
         report['failures'].append('operator interruption; run is incomplete')
     finally:
@@ -900,7 +954,7 @@ def supervise(args: argparse.Namespace, plan: dict, unchanged: callable) -> dict
                 if process.poll() is not None:
                     raise Failure(f'{name}: process exited before pre-cleanup cutoff ({process.returncode})')
         except Exception as error:
-            report['failures'].append(str(error))
+            failed('measurement cutoff', error)
             trace_cutoffs = {name: reader.total for name, reader in readers.items()}
             cutoff_monotonic = time.monotonic()
         if measurement_start is not None:
@@ -908,7 +962,17 @@ def supervise(args: argparse.Namespace, plan: dict, unchanged: callable) -> dict
         report['measurement_cutoff_monotonic'] = cutoff_monotonic
         report['measurement_trace_cutoff_bytes'] = trace_cutoffs
         report['native_egress_fresh_at_cutoff'] = server_audit.ready(cutoff_monotonic)
-        report['cleanup'] = cleanup(processes)
+        report['measurement_elapsed_seconds'] = measurement_elapsed
+        report['status'] = 'stopping_after_failure' if report['failures'] else 'stopping_at_monotonic_deadline'
+        # Preserve the original cause before cleanup can encounter another error.
+        persist('save before cleanup')
+        try:
+            report['cleanup'] = cleanup(processes)
+            for name, result in report['cleanup'].items():
+                for error in result['errors']:
+                    report['failures'].append(f'cleanup {name}: {error["phase"]}: {error["type"]}: {error["message"]}')
+        except Exception as error:
+            failed('cleanup owned processes', error)
         try:
             # Drain finite remaining pipes and trace writes after owned processes stop.
             drain_deadline = time.monotonic() + 5
@@ -916,21 +980,26 @@ def supervise(args: argparse.Namespace, plan: dict, unchanged: callable) -> dict
                 drain_logs(.1)
             if selector.get_map():
                 raise Failure('owned process log pipes did not close after cleanup')
-            for name, reader in readers.items():
+        except Exception as error:
+            failed('drain process logs after cleanup', error)
+        for name, reader in readers.items():
+            try:
                 report['trace_integrity'][name] = finish_trace(
                     reader, audits[name], trace_cutoffs[name], cutoff_monotonic,
                     measurement_elapsed, args.warmup_seconds)
-
-        except Exception as error:
-            report['failures'].append(str(error))
-        for log in logs.values():
-            log.close()
-        resources.close()
-        intervals.close()
-        selector.close()
-        for process in processes.values():
+            except Exception as error:
+                failed(f'finish {name} trace', error)
+        closeables = {**{f'{name} log': log for name, log in logs.items()},
+                      'resources output': resources, 'intervals output': intervals,
+                      'log selector': selector}
+        for name, process in processes.items():
             if process.stdout:
-                process.stdout.close()
+                closeables[f'{name} stdout'] = process.stdout
+        for name, closeable in closeables.items():
+            try:
+                closeable.close()
+            except Exception as error:
+                failed(f'close {name}', error)
     report['clock_continuity'] = continuity.result()
     report['measurement_elapsed_seconds'] = measurement_elapsed
     report['supervisor_elapsed_seconds'] = time.monotonic() - start
@@ -969,13 +1038,16 @@ def supervise(args: argparse.Namespace, plan: dict, unchanged: callable) -> dict
     report['preflight_passed'] = bool(passed and args.preflight)
     report['real_udp_24h_passed'] = bool(passed and not args.preflight and measurement_elapsed >= 86400)
     report['status'] = 'preflight_passed_unqualified' if report['preflight_passed'] else 'real_udp_24h_scoped_pass' if report['real_udp_24h_passed'] else 'failed_or_incomplete'
-    save(output / 'report.json', report)
+    if not persist('save final report'):
+        report.update(status='failed_or_incomplete', preflight_passed=False, real_udp_24h_passed=False)
+        print('Game soak final report could not be saved: ' + '; '.join(report['failures']), file=sys.stderr)
     return report
 
 
 def main() -> int:
     cli = parser()
     args = cli.parse_args()
+    phase = 'preparation'
     try:
         validate_args(args)
         identity, unchanged = input_provenance(args)
@@ -1012,11 +1084,12 @@ def main() -> int:
         def interrupted(_signum, _frame):
             raise KeyboardInterrupt
         signal.signal(signal.SIGTERM, interrupted)
+        phase = 'supervision'
         report = supervise(args, plan, unchanged)
         print(f'{report["status"]}: {output / "report.json"}')
         return 0 if report['preflight_passed'] or report['real_udp_24h_passed'] else 1
     except (Failure, OSError, ValueError, KeyError, TypeError) as error:
-        print(f'Game soak preparation failed: {error}', file=sys.stderr)
+        print(f'Game soak {phase} failed: {type(error).__name__}: {error}', file=sys.stderr)
         return 1
 
 

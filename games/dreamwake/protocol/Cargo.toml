@@ -7,4 +7,5 @@ license.workspace=true
 [dependencies]
 dreamwake_sim={path="../simulation"}
 engine_net={path="../../../engine/net"}
+renet.workspace=true
 serde.workspace=true

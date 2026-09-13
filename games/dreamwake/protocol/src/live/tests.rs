@@ -260,8 +260,9 @@ fn welcome_binds_authenticated_client_content_protocol_and_usable_frame_limit() 
         }
         assert!(encode_welcome(&bad).is_err(), "mutation {change}");
     }
-    assert!(byte_limits(FrameLimit::new(1087).unwrap()).is_err());
-    assert!(byte_limits(FrameLimit::new(1088).unwrap()).is_ok());
+    let mut minimum = good.clone();
+    minimum.application_frame_bytes = 1088;
+    assert!(minimum.validate().is_ok());
     let mut wrong_protocol = encode_welcome(&good).unwrap();
     wrong_protocol[4] ^= 1;
     assert!(decode_welcome(&wrong_protocol).is_err());
@@ -449,7 +450,7 @@ fn complete_scope_rejects_malformed_lengths_and_stale_scope_without_mutating_cli
 }
 
 #[test]
-fn fragmented_atomic_group_fits_1100_bytes_and_publishes_only_after_valid_complete_decode() {
+fn whole_atomic_group_has_independent_bound_and_requires_valid_complete_decode() {
     let members = vec![state(1, 1, 1, vec![3; 7000]), state(2, 1, 1, vec![5; 7000])];
     let group = GroupChunk {
         publication: GroupPublication {
@@ -466,52 +467,36 @@ fn fragmented_atomic_group_fits_1100_bytes_and_publishes_only_after_valid_comple
     };
     let groups = group_limits();
     let original = encode_group(&group, groups, |p| Ok(p.clone())).unwrap();
-    let mut assembler =
-        ByteAssembler::new(ConnectionEpoch(2), byte_limits(limit()).unwrap()).unwrap();
     let mut client =
         ClientScopes::<Vec<u8>>::new(ConnectionEpoch(2), ScopeLimits::default()).unwrap();
-    let mut completed = None;
-    for (i, fragment) in fragment_group(group.publication, &original, byte_limits(limit()).unwrap())
-        .unwrap()
-        .into_iter()
-        .rev()
-        .enumerate()
-    {
-        let wire = encode_state(
-            &StateFrame::Fragment(fragment.clone()),
-            ConnectionEpoch(2),
-            i as u32,
-            limit(),
-        )
-        .unwrap();
-        assert!(wire.len() <= 1100);
-        let StateFrame::Fragment(decoded) =
-            decode_state(&wire, ConnectionEpoch(2), limit()).unwrap()
-        else {
-            panic!("fragment expected")
-        };
-        assert_eq!(decoded, fragment);
-        let mut malformed = wire.clone();
-        let header_start = codec::HEADER_BYTES + 1;
-        malformed[header_start + 29..header_start + 33].copy_from_slice(&u32::MAX.to_le_bytes());
-        assert!(decode_state(&malformed, ConnectionEpoch(2), limit()).is_err());
-        let mut malformed = wire.clone();
-        malformed[header_start + 33..header_start + 35].copy_from_slice(&u16::MAX.to_le_bytes());
-        assert!(decode_state(&malformed, ConnectionEpoch(2), limit()).is_err());
-        assert!(decode_state(&wire, ConnectionEpoch(3), limit()).is_err());
-        completed = assembler.receive(decoded, i as u64).unwrap().or(completed);
-        assert!(client.state(entity(1)).is_none() && client.state(entity(2)).is_none());
+    let wire = encode_state(
+        &StateFrame::Group(group.clone()),
+        ConnectionEpoch(2),
+        1,
+        limit(),
+    )
+    .unwrap();
+    assert!(wire.len() > 1100 && wire.len() <= OWNER_GROUP_MESSAGE_BYTES);
+    let StateFrame::Group(decoded) = decode_state(&wire, ConnectionEpoch(2), limit()).unwrap()
+    else {
+        panic!("whole group expected")
+    };
+    assert_eq!(decoded, group);
+    let mut malformed = wire.clone();
+    let header_start = codec::HEADER_BYTES + 1;
+    malformed[header_start + 37..header_start + 39].copy_from_slice(&u16::MAX.to_le_bytes());
+    assert!(decode_state(&malformed, ConnectionEpoch(2), limit()).is_err());
+    assert!(decode_state(&wire, ConnectionEpoch(3), limit()).is_err());
+    for length in 0..wire.len() {
+        assert!(decode_state(&wire[..length], ConnectionEpoch(2), limit()).is_err());
     }
+    let mut oversized = wire.clone();
+    oversized.resize(OWNER_GROUP_MESSAGE_BYTES + 1, 0);
+    assert!(decode_state(&oversized, ConnectionEpoch(2), limit()).is_err());
+    assert!(client.state(entity(1)).is_none() && client.state(entity(2)).is_none());
     let mut group_assembler = GroupAssembler::new(ConnectionEpoch(2), groups).unwrap();
-    let result = completed
-        .unwrap()
-        .decode_and_publish(
-            &mut group_assembler,
-            &mut client,
-            100,
-            |bytes| decode_group(bytes, groups, |p| Ok(p.to_vec())),
-            |_| true,
-        )
+    let result = group_assembler
+        .receive(decoded, 100, &mut client, |_| true)
         .unwrap();
     assert!(matches!(result, GroupProgress::Published(receipts) if receipts.len() == 2));
     assert_eq!(client.state(entity(1)).unwrap().payload, vec![3; 7000]);
@@ -730,102 +715,116 @@ fn maximum_declared_schema_envelopes_roundtrip_without_compression() {
     assert_eq!(encoded.len(), 29_216);
     assert!(encoded.len() > 16 * 1024);
     assert!(encoded.len() <= baselines::GROUP_BYTES);
-    let fragments = fragment_group(publication, &encoded, byte_limits(limit()).unwrap()).unwrap();
-    assert!(fragments.len() <= baselines::GROUP_FRAGMENT_COUNT);
+    let message = encode_state(
+        &StateFrame::Group(group.clone()),
+        publication.connection,
+        1,
+        limit(),
+    )
+    .unwrap();
     for loss_percent in [0u64, 3] {
-        let mut assembler =
-            ByteAssembler::new(publication.connection, byte_limits(limit()).unwrap()).unwrap();
-        let mut delayed = std::collections::BTreeMap::<(u64, u64), Vec<u8>>::new();
-        let mut cursor = 0;
+        let mut server = renet::RenetServer::new(crate::server_connection_config());
+        server.add_connection(41);
+        let mut client = renet::RenetClient::new(crate::connection_config());
+        client.set_connected();
+        server.send_message(41, crate::OWNER_GROUP_CHANNEL, message.clone());
+        let mut delayed = std::collections::BTreeMap::<(u64, u64), (bool, Vec<u8>)>::new();
         let mut serial = 0u64;
+        let mut last_flush = 0;
+        let mut maximum_packet = 0;
         let mut completed_at = None;
-        let mut result = None;
-        // Conservative two application fragments per50ms paced prefix. A stable
-        // bootstrap repeats its exact missing-byte transfer under loss; delivery
-        // is75ms each direction and no partial group becomes visible.
-        for millis in (0u64..2000).step_by(5) {
-            if millis % 50 == 0 {
-                for _ in 0..2 {
-                    let frame = encode_state(
-                        &StateFrame::Fragment(fragments[cursor].clone()),
-                        publication.connection,
-                        serial as u32,
-                        limit(),
-                    )
-                    .unwrap();
-                    cursor = (cursor + 1) % fragments.len();
-                    serial += 1;
-                    if loss_percent == 0 || ![7, 41, 83].contains(&(serial % 100)) {
-                        delayed.insert((millis + 75, serial), frame);
-                    }
-                }
-            }
+        let mut scopes =
+            ClientScopes::<Vec<u8>>::new(publication.connection, ScopeLimits::default()).unwrap();
+        let mut groups = GroupAssembler::new(publication.connection, group_limits()).unwrap();
+        // One whole-message enqueue; stock Renet alone owns slicing and retry.
+        // The game flushes at 60 Hz and the link delays each direction by 75 ms.
+        for millis in (5u64..2000).step_by(5) {
+            server.update(std::time::Duration::from_millis(5));
+            client.update(std::time::Duration::from_millis(5));
             while delayed
                 .first_key_value()
                 .is_some_and(|((at, _), _)| *at <= millis)
             {
-                let (_, frame) = delayed.pop_first().unwrap();
-                let StateFrame::Fragment(fragment) =
+                let (_, (downstream, packet)) = delayed.pop_first().unwrap();
+                if downstream {
+                    client.process_packet(&packet);
+                } else {
+                    server.process_packet_from(&packet, 41).unwrap();
+                }
+            }
+            if let Some(frame) = client.receive_message(crate::OWNER_GROUP_CHANNEL) {
+                let StateFrame::Group(mut decoded) =
                     decode_state(&frame, publication.connection, limit()).unwrap()
                 else {
                     unreachable!()
                 };
-                if let Some(complete) = assembler.receive(fragment, millis).unwrap() {
-                    let mut scopes = ClientScopes::<Vec<u8>>::new(
-                        publication.connection,
-                        ScopeLimits::default(),
-                    )
-                    .unwrap();
-                    let mut groups =
-                        GroupAssembler::new(publication.connection, group_limits()).unwrap();
-                    complete
-                        .decode_and_publish(
-                            &mut groups,
-                            &mut scopes,
-                            millis,
-                            |bytes| {
-                                let mut decoded = decode_group(bytes, group_limits(), |payload| {
-                                    Ok(payload.to_vec())
-                                })?;
-                                for state in &mut decoded.members {
-                                    state.payload = baselines::decode_member(
-                                        &state.payload,
-                                        state,
-                                        decoded.publication,
-                                    )
-                                    .map_err(|_| ReplicationError::InvalidPayload)?
-                                    .bytes;
-                                }
-                                Ok(decoded)
-                            },
-                            |_| true,
-                        )
-                        .unwrap();
-                    assert!(
-                        group
-                            .manifest
-                            .iter()
-                            .enumerate()
-                            .all(|(index, scope)| scopes.state(scope.entity).unwrap().payload
-                                == original_payloads[index])
-                    );
-                    result = Some(scopes);
-                    completed_at = Some(millis + 75); // exact decode receipt reaches authority
-                    break;
+                let mut proofs = Vec::new();
+                for state in &mut decoded.members {
+                    let packet =
+                        baselines::decode_member(&state.payload, state, decoded.publication)
+                            .unwrap();
+                    proofs.push(baselines::proof(state, packet.target));
+                    state.payload = packet.bytes;
                 }
+                groups
+                    .receive(decoded, millis, &mut scopes, |_| true)
+                    .unwrap();
+                assert!(
+                    group
+                        .manifest
+                        .iter()
+                        .enumerate()
+                        .all(|(index, scope)| scopes.state(scope.entity).unwrap().payload
+                            == original_payloads[index])
+                );
+                client.send_message(
+                    crate::CONTROL_CHANNEL,
+                    encode_control(
+                        &ClientControl::OwnerDecoded {
+                            proofs: BoundedVec::new(proofs).unwrap(),
+                        },
+                        publication.connection,
+                        1,
+                        limit(),
+                    )
+                    .unwrap(),
+                );
             }
-            if result.is_some() {
+            if let Some(receipt) = server.receive_message(41, crate::CONTROL_CHANNEL) {
+                assert!(
+                    matches!(decode_control::<ClientControl>(&receipt, publication.connection, limit()).unwrap(), ClientControl::OwnerDecoded { proofs } if proofs.len() == baselines::MEMBERS)
+                );
+                completed_at = Some(millis);
                 break;
             }
+            let wall_tick = millis * 60 / 1000;
+            if wall_tick > last_flush {
+                last_flush = wall_tick;
+                for (downstream, packet) in server
+                    .get_packets_to_send(41)
+                    .unwrap()
+                    .into_iter()
+                    .map(|p| (true, p))
+                    .chain(client.get_packets_to_send().into_iter().map(|p| (false, p)))
+                {
+                    maximum_packet = maximum_packet.max(packet.len());
+                    assert!(packet.len() <= 1300, "stock Renet must fit netcode payload");
+                    serial += 1;
+                    if loss_percent == 0 || ![7, 41, 83].contains(&(serial % 100)) {
+                        delayed.insert((millis + 75, serial), (downstream, packet));
+                    }
+                }
+            }
+            assert!(server.is_connected(41) && client.is_connected());
         }
         assert!(
             completed_at.is_some_and(|millis| millis < 2000),
             "bounded entry at {loss_percent}% loss: {completed_at:?}"
         );
         eprintln!(
-            "maximum uncompressed group={} fragments={} RTT150 loss={loss_percent}% decoded+ack_ms={}",
+            "maximum uncompressed group={} largest_renet_packet={} RTT150 loss={loss_percent}% decoded+ack_ms={}",
             encoded.len(),
-            fragments.len(),
+            maximum_packet,
             completed_at.unwrap()
         );
     }

@@ -1,9 +1,12 @@
 //! Real-wall-clock persistent resource soak of production generic net components.
-//! Synthetic delivery does not qualify game, UDP, or browser workloads.
+//! Synthetic whole-message delivery does not qualify Renet, game, UDP, or browser workloads.
 #[path = "scope_soak/model.rs"]
 mod model;
 #[path = "scope_soak/retirement.rs"]
 mod retirement;
+#[cfg(test)]
+#[path = "scope_soak/tests.rs"]
+mod tests;
 use engine_net::{
     commands::OwnerStream, interest::*, prediction::*, replication::*, scheduling::*, types::*,
 };
@@ -23,17 +26,6 @@ const SCENE: SceneRevision = SceneRevision(1);
 const QUEUE_PACKETS: usize = 512;
 const QUEUE_BYTES: usize = 256 * 1024;
 const GROUP: GroupId = GroupId(1);
-fn byte_limits() -> ByteLimits {
-    ByteLimits {
-        fragment_payload_bytes: 256,
-        group_bytes: 16384,
-        fragments: 64,
-        incomplete: 8,
-        known_groups: 8,
-        staging_bytes: 128 * 1024,
-        max_age_ms: 2000,
-    }
-}
 fn id(index: u64) -> EntityId {
     EntityId {
         index,
@@ -153,7 +145,6 @@ struct Peer {
     server: ServerScopes<Vec<u8>>,
     client: ClientScopes<Vec<u8>>,
     groups: GroupAssembler<Vec<u8>>,
-    byte_groups: ByteAssembler,
     scheduler: Scheduler,
     predictor: PredictionManager<Model>,
     model: Model,
@@ -172,7 +163,6 @@ impl Peer {
                 .unwrap(),
             client: ClientScopes::new(EPOCH, ScopeLimits::default()).unwrap(),
             groups: GroupAssembler::new(EPOCH, GroupLimits::default()).unwrap(),
-            byte_groups: ByteAssembler::new(EPOCH, byte_limits()).unwrap(),
             scheduler: Scheduler::new(connection, SchedulerLimits::default()).unwrap(),
             predictor: PredictionManager::new(EPOCH, PredictionLimits::default()).unwrap(),
             model: Model {
@@ -226,26 +216,12 @@ impl Peer {
             }
             self.queue_bytes -= packet.bytes.capacity();
             if packet.group {
-                let fragment = ByteFragment::decode(&packet.bytes, byte_limits()).unwrap();
-                let complete = match self.byte_groups.receive(fragment, tick * 1000 / 30) {
-                    Ok(Some(complete)) => complete,
-                    Ok(None) => {
-                        metrics.partial += 1;
-                        continue;
-                    }
-                    Err(ReplicationError::Stale | ReplicationError::Expired) => {
-                        metrics.stale += 1;
-                        continue;
-                    }
-                    error => panic!("group fragment: {error:?}"),
-                };
-                match complete.decode_and_publish(
-                    &mut self.groups,
-                    &mut self.client,
-                    tick * 1000 / 30,
-                    |bytes| decode_group(bytes, GroupLimits::default(), |p| Ok(p.to_vec())),
-                    |p| p.len() == 64,
-                ) {
+                let group = decode_group(&packet.bytes, GroupLimits::default(), |p| Ok(p.to_vec()))
+                    .unwrap();
+                match self
+                    .groups
+                    .receive(group, tick * 1000 / 30, &mut self.client, |p| p.len() == 64)
+                {
                     Ok(GroupProgress::Published(receipts)) => {
                         for receipt in receipts {
                             acknowledge(&mut self.server, receipt, metrics);
@@ -271,21 +247,25 @@ impl Peer {
                         self.predict_through(tick + 2);
                         metrics.groups += 1;
                     }
-                    Ok(GroupProgress::Staged) => metrics.partial += 1,
-                    Err(ReplicationError::Stale | ReplicationError::Expired) => metrics.stale += 1,
+                    Err(
+                        ReplicationError::Stale
+                        | ReplicationError::Expired
+                        | ReplicationError::Obsolete(_),
+                    ) => metrics.stale += 1,
                     other => panic!("group receive: {other:?}"),
                 }
             } else {
                 let state = decode_full_state(&packet.bytes, EPOCH, 16384).unwrap();
                 match self.client.apply_full(state, |p| p.len() == 64) {
                     Ok(receipt) => acknowledge(&mut self.server, receipt, metrics),
-                    Err(ReplicationError::Stale) => metrics.stale += 1,
+                    Err(ReplicationError::Stale | ReplicationError::Obsolete(_)) => {
+                        metrics.stale += 1;
+                    }
                     other => panic!("state receive: {other:?}"),
                 }
             }
         }
         self.groups.expire(tick * 1000 / 30).unwrap();
-        self.byte_groups.expire(tick * 1000 / 30).unwrap();
     }
 }
 fn acknowledge(server: &mut ServerScopes<Vec<u8>>, receipt: StateReceipt, metrics: &mut Metrics) {
@@ -303,7 +283,6 @@ struct Metrics {
     stale: u64,
     decoded: u64,
     groups: u64,
-    partial: u64,
     exits: u64,
     destroyed: u64,
     dormant_offers: u64,
@@ -340,15 +319,14 @@ fn report(
                 + p.predictor.retained_bytes()
                 + p.retirement.bytes()
                 + p.groups.staged_bytes()
-                + p.byte_groups.staged_bytes()
                 + p.queue_bytes
         })
         .sum();
     let baseline_states: usize = peers.iter().map(|p| p.retirement.states()).sum();
     let events: usize = peers.iter().map(|p| p.retirement.events()).sum();
-    writeln!(file, "{{\"phase\":\"{phase}\",\"elapsed_seconds\":{:.6},\"ticks\":{tick},\"entities\":{},\"connections\":{},\"observers\":{},\"cells\":{},\"memberships\":{},\"world_revision\":{},\"sent\":{},\"dropped\":{},\"reordered\":{},\"stale_rejected\":{},\"decoded\":{},\"groups_published\":{},\"partial_groups\":{},\"scope_exits\":{},\"destroyed_generations\":{},\"dormant_offers\":{},\"deferred_units\":{},\"peak_queue_packets_per_peer\":{},\"peak_queue_bytes_per_peer\":{},\"peak_scope_bytes_per_peer\":{},\"peak_prediction_bytes_per_peer\":{},\"peak_retirement_bytes_per_peer\":{},\"peak_known_entities_per_peer\":{},\"peak_scheduler_units_per_peer\":{},\"retained_payload_and_accounted_history_bytes\":{retained},\"baseline_retirements\":{retirement_count},\"baseline_packet_or_receipt_loss\":{baseline_loss},\"baseline_retained_states\":{baseline_states},\"event_records\":{events},\"full_history_windows\":{},\"retired_history_checks\":{},\"max_tick_micros\":{},\"late_ticks\":{},\"production_game_or_transport_soak\":false}}",
+    writeln!(file, "{{\"phase\":\"{phase}\",\"elapsed_seconds\":{:.6},\"ticks\":{tick},\"entities\":{},\"connections\":{},\"observers\":{},\"cells\":{},\"memberships\":{},\"world_revision\":{},\"sent\":{},\"dropped\":{},\"reordered\":{},\"stale_rejected\":{},\"decoded\":{},\"groups_published\":{},\"scope_exits\":{},\"destroyed_generations\":{},\"dormant_offers\":{},\"deferred_units\":{},\"peak_queue_packets_per_peer\":{},\"peak_queue_bytes_per_peer\":{},\"peak_scope_bytes_per_peer\":{},\"peak_prediction_bytes_per_peer\":{},\"peak_retirement_bytes_per_peer\":{},\"peak_known_entities_per_peer\":{},\"peak_scheduler_units_per_peer\":{},\"retained_payload_and_accounted_history_bytes\":{retained},\"baseline_retirements\":{retirement_count},\"baseline_packet_or_receipt_loss\":{baseline_loss},\"baseline_retained_states\":{baseline_states},\"event_records\":{events},\"full_history_windows\":{},\"retired_history_checks\":{},\"max_tick_micros\":{},\"late_ticks\":{},\"production_game_or_transport_soak\":false}}",
         elapsed.as_secs_f64(), account.entities, account.connections, account.observers, account.cells, account.memberships,
-        account.world_revision, m.sent, m.dropped, m.reordered, m.stale, m.decoded, m.groups, m.partial,
+        account.world_revision, m.sent, m.dropped, m.reordered, m.stale, m.decoded, m.groups,
         m.exits, m.destroyed, m.dormant_offers, m.deferred, m.peak_queue, m.peak_queue_bytes,
         m.peak_scope_bytes, m.peak_prediction_bytes, m.peak_retirement_bytes, m.peak_known, m.peak_scheduler,
         m.full_history_windows, m.retired_history_checks, m.max_tick_micros, m.late_ticks).unwrap();
@@ -527,12 +505,7 @@ fn main() {
                 };
                 let group_bytes =
                     encode_group(&chunk, GroupLimits::default(), |p| Ok(p.clone())).unwrap();
-                let encoded: Vec<Vec<u8>> =
-                    fragment_group(chunk.publication, &group_bytes, byte_limits())
-                        .unwrap()
-                        .iter()
-                        .map(|fragment| fragment.encode(byte_limits()).unwrap())
-                        .collect();
+                let encoded = vec![group_bytes];
                 let cadence = Cadence {
                     period_ticks: 1,
                     maximum_age_ticks: 60,
@@ -594,7 +567,7 @@ fn main() {
                         }
                         for (part, bytes) in batch.iter().enumerate() {
                             metrics.sent += 1;
-                            // Each part has independent bounded loss/delay; only complete groups publish.
+                            // This model drops/delays whole messages, not Renet packets.
                             let salt = match unit.id() {
                                 UnitId::Entity(entity) => entity.index,
                                 UnitId::PredictionGroup(_) => part as u64,
@@ -655,8 +628,6 @@ fn main() {
                     peer.predictor.retained_bytes() <= PredictionLimits::default().history_bytes
                 );
                 assert!(peer.groups.incomplete() <= GroupLimits::default().incomplete);
-                assert!(peer.byte_groups.incomplete() <= byte_limits().incomplete);
-                assert!(peer.byte_groups.staged_bytes() <= byte_limits().staging_bytes);
                 assert!(peer.scheduler.known_units() <= SchedulerLimits::default().units);
                 metrics.peak_known = metrics
                     .peak_known

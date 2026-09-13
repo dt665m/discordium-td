@@ -414,7 +414,6 @@ fn replacing_session_discards_pending_decoded_receipts() {
 fn eight_maximum_width_decoded_receipts_fit_smallest_admitted_frame() {
     let (mut session, _) = fixture();
     let limit = engine_net::codec::FrameLimit::new(1088).unwrap();
-    assert!(byte_limits(limit).is_ok());
     let mut batch = None;
     for index in 0..8 {
         let receipt = StateReceipt {
@@ -871,41 +870,23 @@ pub(super) fn fixture_from_sim(
         count: 1,
         members,
     };
-    let encoded = encode_group(&group, group_limits(), |p| Ok(p.clone())).unwrap();
-    let limit = welcome.frame_limit().unwrap();
-    let fragments = fragment_group(publication, &encoded, byte_limits(limit).unwrap()).unwrap();
-    let frames = fragments
-        .into_iter()
-        .enumerate()
-        .map(|(sequence, fragment)| {
-            encode_state(
-                &StateFrame::Fragment(fragment),
-                ConnectionEpoch(1),
-                sequence as u32,
-                limit,
-            )
-            .unwrap()
-        })
-        .collect();
+    let frames = vec![encoded_group_frame(&welcome, group)];
     (Session::new(welcome).unwrap(), frames)
 }
 #[test]
 fn live_owner_bootstrap_requires_complete_decoded_group_and_active_proof() {
-    let (mut session, mut frames) = fixture();
+    let (mut session, frames) = fixture();
     session.begin_frame().unwrap();
-    assert!(frames.len() > 1);
-    frames.reverse();
-    for frame in &frames[..frames.len() - 1] {
-        assert!(
-            session
-                .receive_state(frame, Duration::from_millis(1))
-                .unwrap()
-                .is_none()
-        );
-        session.reconcile().unwrap();
-        assert_eq!(session.predictor.group_count(), 0);
-        assert!(!session.active);
-    }
+    assert_eq!(frames.len(), 1);
+    let frame = &frames[0];
+    assert!(
+        session
+            .receive_state(&frame[..frame.len() - 1], Duration::from_millis(1))
+            .is_err()
+    );
+    session.reconcile().unwrap();
+    assert_eq!(session.predictor.group_count(), 0);
+    assert!(!session.active);
     let receipt = session
         .receive_state(frames.last().unwrap(), Duration::from_millis(2))
         .unwrap()
@@ -1388,7 +1369,7 @@ fn active_control_keeps_external_connection_playable_after_initial_proof_is_evic
     assert_eq!(metrics.predicted_tick, Some(ServerTick(49)));
     assert_eq!(metrics.gameplay_tick, Some(0));
     assert_eq!(metrics.live_scopes, 4);
-    assert_eq!(metrics.incomplete_fragments, 0);
+    assert_eq!(metrics.incomplete_groups, 0);
     assert!(metrics.prediction_bytes > 0 && metrics.scope_bytes > 0);
 
     session.recover();
@@ -1876,27 +1857,13 @@ fn collision_group_identity_is_validated_before_atomic_publication() {
         count: 1,
         members,
     };
-    let encoded = encode_group(&group, group_limits(), |p| Ok(p.clone())).unwrap();
-    let limit = welcome.frame_limit().unwrap();
+    let bytes = encoded_group_frame(&welcome, group);
     let mut empty = Session::new(welcome).unwrap();
-    let mut rejected = false;
-    for (index, fragment) in fragment_group(publication, &encoded, byte_limits(limit).unwrap())
-        .unwrap()
-        .into_iter()
-        .enumerate()
-    {
-        let bytes = encode_state(
-            &StateFrame::Fragment(fragment),
-            ConnectionEpoch(1),
-            index as u32,
-            limit,
-        )
-        .unwrap();
-        rejected |= empty
+    assert!(
+        empty
             .receive_state(&bytes, Duration::from_millis(1))
-            .is_err();
-    }
-    assert!(rejected);
+            .is_err()
+    );
     assert_eq!(empty.baselines.retained_bytes(), 0);
     assert_eq!(empty.scopes.known_entities(), 0);
     assert_eq!(empty.predictor.group_count(), 0);
@@ -1993,7 +1960,7 @@ fn moderate_join_gap_uses_budget_and_preserves_sample_deadlines() {
     assert_eq!(session.journal.pending_samples(), 0);
 }
 
-fn wrap_full_baseline(state: &mut FullState<Vec<u8>>, publication: GroupPublication) {
+pub(super) fn wrap_full_baseline(state: &mut FullState<Vec<u8>>, publication: GroupPublication) {
     use dreamwake_protocol::live::baselines as wire;
     use engine_net::replication::baselines::{BaselineEncoding, BaselinePacket};
     state.payload = wire::encode_member(&BaselinePacket {
@@ -2002,6 +1969,38 @@ fn wrap_full_baseline(state: &mut FullState<Vec<u8>>, publication: GroupPublicat
         bytes: state.payload.clone(),
     })
     .unwrap();
+}
+
+pub(super) fn published_group_chunk(session: &Session) -> GroupChunk<Vec<u8>> {
+    let proof = session
+        .groups
+        .published_group(OWNER_GROUP, &session.scopes)
+        .unwrap();
+    GroupChunk {
+        publication: proof.publication(),
+        end_tick: proof.end_tick(),
+        manifest: proof.manifest().to_vec(),
+        members: proof.states().cloned().collect(),
+        index: 0,
+        count: 1,
+    }
+}
+
+pub(super) fn group_frames(welcome: &Welcome, mut group: GroupChunk<Vec<u8>>) -> Vec<Vec<u8>> {
+    for state in &mut group.members {
+        wrap_full_baseline(state, group.publication);
+    }
+    vec![encoded_group_frame(welcome, group)]
+}
+
+pub(super) fn encoded_group_frame(welcome: &Welcome, group: GroupChunk<Vec<u8>>) -> Vec<u8> {
+    encode_state(
+        &StateFrame::Group(group),
+        welcome.stream.epoch,
+        0,
+        welcome.frame_limit().unwrap(),
+    )
+    .unwrap()
 }
 
 #[test]
@@ -2061,26 +2060,10 @@ fn delta_owner_group_commits_complete_proofs_and_retires_only_after_fence() {
         index: 0,
         count: 1,
     };
-    let bytes = encode_group(&chunk, group_limits(), |p| Ok(p.clone())).unwrap();
-    let limit = session.model.welcome.frame_limit().unwrap();
-    let mut fragments = fragment_group(publication, &bytes, byte_limits(limit).unwrap()).unwrap();
-    fragments.reverse();
-    let mut proof = None;
-    for (index, fragment) in fragments.into_iter().enumerate() {
-        let frame = encode_state(
-            &StateFrame::Fragment(fragment),
-            ConnectionEpoch(1),
-            index as u32,
-            limit,
-        )
+    let frame = encoded_group_frame(&session.model.welcome, chunk);
+    let proof = session
+        .receive_state(&frame, Duration::from_millis(2))
         .unwrap();
-        if let Some(value) = session
-            .receive_state(&frame, Duration::from_millis(2))
-            .unwrap()
-        {
-            proof = Some(value);
-        }
-    }
     let Some(ClientControl::OwnerDecoded { proofs }) = proof else {
         panic!("combined decoded proofs");
     };
@@ -2169,22 +2152,7 @@ fn full_baseline_before_reset_is_retried_and_reset_can_precede_first_group() {
         index: 0,
         count: 1,
     };
-    let bytes = encode_group(&chunk, group_limits(), |p| Ok(p.clone())).unwrap();
-    let limit = welcome.frame_limit().unwrap();
-    let frames = fragment_group(publication, &bytes, byte_limits(limit).unwrap())
-        .unwrap()
-        .into_iter()
-        .enumerate()
-        .map(|(index, fragment)| {
-            encode_state(
-                &StateFrame::Fragment(fragment),
-                ConnectionEpoch(1),
-                index as u32,
-                limit,
-            )
-            .unwrap()
-        })
-        .collect::<Vec<_>>();
+    let frames = vec![encoded_group_frame(&welcome, chunk)];
     for frame in &frames {
         assert!(
             session

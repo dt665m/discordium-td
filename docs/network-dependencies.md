@@ -18,9 +18,9 @@ assets, target-specific dependencies and notice files before release.
 | Component | Locked version / immutable source | Declared license | Role |
 |---|---|---|---|
 | Bevy | 0.19.1, crates.io checksum in lock | MIT OR Apache-2.0 | Existing ECS, schedules, headless simulation and presentation adapter |
-| renet | 2.0.0, workspace patch to `../renet-cross/vendor/renet` | MIT OR Apache-2.0 | Owned packet-budget extension of the exact upstream crate; legacy constructors preserve the original profile |
-| renetcode | 2.0.0, workspace patch to `../renet-cross/vendor/renetcode` | MIT OR Apache-2.0 | Owned handshake retry correction: application payload sends cannot postpone confirmation retries while the peer is unconfirmed |
-| renet-cross | 0.6.1, workspace patch to `../renet-cross` | MIT OR Apache-2.0 | Owned native/browser transport integration and secure session bootstrap; development source is not yet an immutable release pin |
+| renet | 2.0.0, stock crates.io checksum in lock | MIT OR Apache-2.0 | Upstream message delivery, fragmentation and retransmission with stock configuration |
+| renetcode | 2.0.0, `https://github.com/dt665m/renet.git`, branch `fix/confirmation-keepalive-starvation`, exact commit in lock | MIT OR Apache-2.0 | Minimal upstreamable handshake correction: application payload sends cannot postpone confirmation retries while the peer is unconfirmed |
+| renet-cross | 0.7.0, crates.io checksum in lock | MIT OR Apache-2.0 | Owned native/browser transport integration and secure session bootstrap; published from commit `b5dc558a3e851347225f8c7bc799028089a973ec` |
 | bincode | 1.3.3, crates.io checksum in lock | MIT | Existing binary serde codec; schema and bounds remain application responsibilities |
 | blake3 | 1.8.7, crates.io checksum in lock | CC0-1.0 OR Apache-2.0 OR Apache-2.0 WITH LLVM-exception | Canonical checkpoint and ruleset digests |
 | parry3d | 0.30.2, immutable registry version | Apache-2.0 | Capsule collision queries with enhanced determinism; continuation still requires qualification |
@@ -36,10 +36,21 @@ workspace declaration currently absent from Cargo.lock, not an integrated or
 license-reviewed selected dependency. If activated, record its exact resolution
 and inspect its license before claiming that gate complete.
 
-The sibling renet-cross checkout is required while developing this change. A
-release must replace its path patch with a published version or immutable Git
-revision and include that source identity in the qualification manifest. A Cargo
-lockfile does not pin the contents of a local path dependency.
+The game consumes the published renet-cross crate; a sibling checkout is not
+required. Cargo.lock records its registry checksum. Local transport development
+may temporarily use a path patch, but a lockfile does not pin local source bytes.
+
+The game patches only `renetcode` from the Renet fork. The renet-cross repository
+uses the same patch for its own tests. A crates.io package cannot retain a Git
+dependency, and Cargo does not inherit dependency-level patches, so the game's
+root override supplies the correction to the published renet-cross dependency.
+The branch contains only the confirmation retry correction and its regression
+test; packet-budget configuration extensions and vendored Renet copies are not
+part of the selected graph. Both lockfiles must resolve the same fix commit.
+Prefer stock upstream releases and remove the branch override when the fix is
+released. Future Renet changes require a demonstrated correctness need or a
+minimal feature suitable for upstream review; game and transport policy stay
+outside that repository.
 
 For a full release inventory, run `cargo metadata --locked --format-version 1`
 for the release feature/target set and account for every resolved package's

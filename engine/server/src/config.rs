@@ -183,7 +183,6 @@ pub fn start_development(
         ServerAuthentication::Unsecure,
         UnsecureDevAuthPolicy,
         false,
-        renet::PacketConfig::default(),
     )
 }
 
@@ -195,14 +194,12 @@ pub fn start_with_admission<V: SessionAdmission + 'static>(
     verifier: V,
 ) -> Result<SharedNet, Box<dyn std::error::Error>> {
     let private_key = renet_cross::generate_random_bytes();
-    let packet_profile = renet_cross::PacketProfile::ipv6_1200();
     start_configured(
         config,
         protocol_id,
         ServerAuthentication::Secure { private_key },
-        SecureSessionAuthPolicy::new(verifier, private_key).with_packet_profile(packet_profile)?,
+        SecureSessionAuthPolicy::new(verifier, private_key),
         true,
-        packet_profile.packet_config()?,
     )
 }
 
@@ -212,7 +209,6 @@ fn start_configured<P: SessionAuthPolicy + Send + Sync + 'static>(
     authentication: ServerAuthentication,
     auth_policy: P,
     secure: bool,
-    packet_config: renet::PacketConfig,
 ) -> Result<SharedNet, Box<dyn std::error::Error>> {
     let egress = config.egress.resolve(secure)?;
     let ServerConfig {
@@ -314,7 +310,6 @@ fn start_configured<P: SessionAuthPolicy + Send + Sync + 'static>(
     Ok(SharedNet {
         health,
         max_clients: usize::from(max_clients),
-        packet_config,
         transport: shared_transport,
         bootstrap,
     })
@@ -392,7 +387,6 @@ mod tests {
         let shared = SharedNet {
             health: Default::default(),
             max_clients: 8,
-            packet_config: renet::PacketConfig::default(),
             transport: Arc::new(Mutex::new(transport)),
             bootstrap: Arc::new(bootstrap),
         };

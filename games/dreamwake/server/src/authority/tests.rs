@@ -123,8 +123,8 @@ use engine_net::replication::*;
 use engine_server::{ServerDriver, SharedNet};
 use renet_cross::{
     BootstrapConfig, BootstrapService, MixedTransportBuilder, MonotonicClientIdAllocator,
-    NativeConnectOptions, PacketProfile, SecureSessionAuthPolicy, ServerAuthentication,
-    SessionCreateRequest, UdpNetcodeClientTransport,
+    NativeConnectOptions, SecureSessionAuthPolicy, ServerAuthentication, SessionCreateRequest,
+    UdpNetcodeClientTransport,
 };
 use std::sync::{Arc, Mutex};
 type TestBootstrap = BootstrapService<
@@ -146,7 +146,7 @@ struct TestClient {
     renet: RenetClient,
     transport: UdpNetcodeClientTransport,
     welcome: Option<live::Welcome>,
-    bytes: Option<ByteAssembler>,
+    pending_reset_group: Option<Vec<u8>>,
     groups: Option<GroupAssembler<Vec<u8>>>,
     scopes: Option<ClientScopes<Vec<u8>>>,
     known: BTreeSet<EntityId>,
@@ -170,6 +170,14 @@ struct TestClient {
     receive_application: bool,
 }
 impl TestClient {
+    fn resume_proofs(&mut self) {
+        self.send_proofs = true;
+        if !self.owner_proofs.is_empty() {
+            self.control(live::ClientControl::OwnerDecoded {
+                proofs: BoundedVec::new(self.owner_proofs.clone()).unwrap(),
+            });
+        }
+    }
     fn control(&mut self, value: live::ClientControl) {
         let Some(welcome) = &self.welcome else {
             return;
@@ -201,6 +209,7 @@ impl TestClient {
         let mut changed = false;
         let mut finalized_ack = None;
         let mut outcomes_ack = None;
+        let mut reset_received = false;
         while let Some(bytes) = self.renet.receive_message(wire::CONTROL_CHANNEL) {
             if live::is_welcome(&bytes) {
                 let welcome = live::decode_welcome(&bytes).unwrap();
@@ -212,13 +221,7 @@ impl TestClient {
                 {
                     continue;
                 }
-                self.bytes = Some(
-                    ByteAssembler::new(
-                        welcome.stream.epoch,
-                        live::byte_limits(welcome.frame_limit().unwrap()).unwrap(),
-                    )
-                    .unwrap(),
-                );
+                self.pending_reset_group = None;
                 self.groups =
                     Some(GroupAssembler::new(welcome.stream.epoch, live::group_limits()).unwrap());
                 self.scopes =
@@ -261,6 +264,7 @@ impl TestClient {
                     }
                 }
                 live::ServerControl::BaselineReset { resets } => {
+                    reset_received = true;
                     for reset in resets.as_slice() {
                         if let Some((context, cache)) =
                             self.baselines.get_mut(&reset.context.scope.entity)
@@ -324,11 +328,21 @@ impl TestClient {
         if let Some(through) = outcomes_ack {
             self.control(live::ClientControl::OutcomesAck { through });
         }
-        while let Some(bytes) = self.renet.receive_message(wire::STATE_CHANNEL) {
+        let mut pending = if reset_received {
+            self.pending_reset_group.take()
+        } else {
+            None
+        };
+        while !self.drop_states {
+            let Some(bytes) = pending
+                .take()
+                .map(Into::into)
+                .or_else(|| self.renet.receive_message(wire::STATE_CHANNEL))
+                .or_else(|| self.renet.receive_message(wire::OWNER_GROUP_CHANNEL))
+            else {
+                break;
+            };
             self.max_packet = self.max_packet.max(bytes.len());
-            if self.drop_states {
-                continue;
-            }
             let Some(welcome) = self.welcome.clone() else {
                 continue;
             };
@@ -365,108 +379,87 @@ impl TestClient {
                         Err(error) => panic!("public Full: {error:?}"),
                     }
                 }
-                live::StateFrame::Fragment(fragment) => {
-                    let complete = match self
-                        .bytes
-                        .as_mut()
-                        .unwrap()
-                        .receive(fragment, nanos(now) / 1_000_000)
-                    {
+                live::StateFrame::Group(mut group) => {
+                    let publication = group.publication;
+                    let mut staged_baselines = self.baselines.clone();
+                    let mut baseline_proofs = Vec::new();
+                    let mut retirements = Vec::new();
+                    let progress = (|| {
+                        for state in &mut group.members {
+                            use engine_net::replication::baselines::*;
+                            let packet =
+                                live::baselines::decode_member(&state.payload, state, publication)
+                                    .map_err(|_| ReplicationError::InvalidPayload)?;
+                            let context = packet.target.context;
+                            if staged_baselines
+                                .get(&state.scope.entity)
+                                .is_none_or(|(old, _)| *old != context)
+                            {
+                                staged_baselines.insert(
+                                    state.scope.entity,
+                                    (
+                                        context,
+                                        ClientBaselines::new(
+                                            context,
+                                            packet.target.generation,
+                                            live::baselines::limits(),
+                                        )?,
+                                    ),
+                                );
+                            }
+                            let (_, cache) = staged_baselines.get_mut(&state.scope.entity).unwrap();
+                            let previous = cache.current().map(|state| state.receipt.snapshot);
+                            let receipt = cache.receive(&packet, &BytePatch, |bytes| {
+                                decode_replica(bytes, Some(expected)).is_ok()
+                            })?;
+                            state.payload = cache.state(receipt)?.payload.clone();
+                            baseline_proofs.push(live::baselines::proof(state, receipt));
+                            if let Some(previous) =
+                                previous.filter(|previous| *previous < receipt.snapshot)
+                            {
+                                if let Ok(request) = cache.propose_retirement(previous) {
+                                    retirements.push(request);
+                                }
+                            }
+                        }
+                        self.groups.as_mut().unwrap().receive(
+                            group,
+                            nanos(now) / 1_000_000,
+                            self.scopes.as_mut().unwrap(),
+                            |payload| decode_replica(payload, Some(expected)).is_ok(),
+                        )
+                    })();
+                    let progress = match progress {
                         Ok(value) => value,
                         Err(ReplicationError::Obsolete(_)) => continue,
-                        Err(error) => panic!("fragment: {error:?}"),
-                    };
-                    if let Some(complete) = complete {
-                        let publication = complete.publication();
-                        let mut staged_baselines = self.baselines.clone();
-                        let mut baseline_proofs = Vec::new();
-                        let mut retirements = Vec::new();
-                        let progress = complete.decode_and_publish(
-                            self.groups.as_mut().unwrap(),
-                            self.scopes.as_mut().unwrap(),
-                            nanos(now) / 1_000_000,
-                            |bytes| {
-                                let mut group =
-                                    decode_group(bytes, live::group_limits(), |payload| {
-                                        Ok(payload.to_vec())
-                                    })?;
-                                for state in &mut group.members {
-                                    use engine_net::replication::baselines::*;
-                                    let packet = live::baselines::decode_member(
-                                        &state.payload,
-                                        state,
-                                        publication,
-                                    )
-                                    .map_err(|_| ReplicationError::InvalidPayload)?;
-                                    let context = packet.target.context;
-                                    if staged_baselines
-                                        .get(&state.scope.entity)
-                                        .is_none_or(|(old, _)| *old != context)
-                                    {
-                                        staged_baselines.insert(
-                                            state.scope.entity,
-                                            (
-                                                context,
-                                                ClientBaselines::new(
-                                                    context,
-                                                    packet.target.generation,
-                                                    live::baselines::limits(),
-                                                )?,
-                                            ),
-                                        );
-                                    }
-                                    let (_, cache) =
-                                        staged_baselines.get_mut(&state.scope.entity).unwrap();
-                                    let previous =
-                                        cache.current().map(|state| state.receipt.snapshot);
-                                    let receipt = cache.receive(&packet, &BytePatch, |bytes| {
-                                        decode_replica(bytes, Some(expected)).is_ok()
-                                    })?;
-                                    state.payload = cache.state(receipt)?.payload.clone();
-                                    baseline_proofs.push(live::baselines::proof(state, receipt));
-                                    if let Some(previous) =
-                                        previous.filter(|previous| *previous < receipt.snapshot)
-                                    {
-                                        if let Ok(request) = cache.propose_retirement(previous) {
-                                            retirements.push(request);
-                                        }
-                                    }
-                                }
-                                Ok(group)
-                            },
-                            |payload| decode_replica(payload, Some(expected)).is_ok(),
-                        );
-                        let progress = match progress {
-                            Ok(value) => value,
-                            Err(
-                                ReplicationError::Obsolete(_)
-                                | ReplicationError::BaselineResetPending,
-                            ) => continue,
-                            Err(error) => panic!(
-                                "group decode: {error:?}; incoming={publication:?}; current={:?}",
-                                self.groups.as_ref().unwrap().publication(publication.group)
-                            ),
-                        };
-                        match progress {
-                            GroupProgress::Published(values) => {
-                                changed = true;
-                                assert!(live::baselines::valid_member_count(values.len()));
-                                self.baselines = staged_baselines;
-                                self.owner_proofs = baseline_proofs.clone();
-                                if self.send_proofs {
-                                    self.control(live::ClientControl::OwnerDecoded {
-                                        proofs: BoundedVec::new(baseline_proofs).unwrap(),
-                                    });
-                                    if !retirements.is_empty() {
-                                        self.control(live::ClientControl::BaselineRetire {
-                                            requests: BoundedVec::new(retirements).unwrap(),
-                                        });
-                                    }
-                                }
-                                self.decoded_groups.insert(publication.snapshot);
-                            }
-                            GroupProgress::Staged => panic!("canonical whole group remains staged"),
+                        Err(ReplicationError::BaselineResetPending) => {
+                            self.pending_reset_group = Some(bytes.to_vec());
+                            continue;
                         }
+                        Err(error) => panic!(
+                            "group decode: {error:?}; incoming={publication:?}; current={:?}",
+                            self.groups.as_ref().unwrap().publication(publication.group)
+                        ),
+                    };
+                    match progress {
+                        GroupProgress::Published(values) => {
+                            changed = true;
+                            assert!(live::baselines::valid_member_count(values.len()));
+                            self.baselines = staged_baselines;
+                            self.owner_proofs = baseline_proofs.clone();
+                            if self.send_proofs {
+                                self.control(live::ClientControl::OwnerDecoded {
+                                    proofs: BoundedVec::new(baseline_proofs).unwrap(),
+                                });
+                                if !retirements.is_empty() {
+                                    self.control(live::ClientControl::BaselineRetire {
+                                        requests: BoundedVec::new(retirements).unwrap(),
+                                    });
+                                }
+                            }
+                            self.decoded_groups.insert(publication.snapshot);
+                        }
+                        GroupProgress::Staged => panic!("canonical whole group remains staged"),
                     }
                 }
             }
@@ -581,7 +574,6 @@ impl Harness {
             .filter_level(log::LevelFilter::Warn)
             .try_init();
         let private_key = renet_cross::generate_random_bytes();
-        let profile = PacketProfile::ipv6_1200();
         let transport = MixedTransportBuilder::new(wire::PROTOCOL_ID)
             .udp_bind("127.0.0.1:0".parse().unwrap())
             .webrtc_bind("127.0.0.1:0".parse().unwrap())
@@ -597,14 +589,11 @@ impl Harness {
                 public_http_base: "http://127.0.0.1".into(),
             },
             MonotonicClientIdAllocator::new(41),
-            SecureSessionAuthPolicy::new(crate::admission::GuestAdmission::default(), private_key)
-                .with_packet_profile(profile)
-                .unwrap(),
+            SecureSessionAuthPolicy::new(crate::admission::GuestAdmission::default(), private_key),
         ));
         let shared = SharedNet {
             health: Default::default(),
             max_clients: 8,
-            packet_config: profile.packet_config().unwrap(),
             transport: Arc::new(Mutex::new(transport)),
             bootstrap: bootstrap.clone(),
         };
@@ -634,7 +623,6 @@ impl Harness {
             service: wire::SESSION_SERVICE.into(),
             match_id: wire::SESSION_MATCH.into(),
             require_secure: true,
-            packet_profile: PacketProfile::ipv6_1200(),
             credential: format!("dw-player-v1:{player}:{}", "42".repeat(32)),
             ..Default::default()
         };
@@ -650,7 +638,6 @@ impl Harness {
                 session_request: request,
                 require_secure: true,
                 connection_config: wire::connection_config(),
-                packet_config: PacketProfile::ipv6_1200().packet_config().unwrap(),
                 ..Default::default()
             },
         )
@@ -663,7 +650,7 @@ impl Harness {
             renet,
             transport,
             welcome: None,
-            bytes: None,
+            pending_reset_group: None,
             groups: None,
             scopes: None,
             known: BTreeSet::new(),
@@ -846,7 +833,7 @@ fn production_udp_uses_two_stage_activation_and_distinct_command_finalization() 
     assert!(
         h.clients
             .iter()
-            .all(|client| client.max_packet <= usize::from(APPLICATION_FRAME_BYTES))
+            .all(|client| client.max_packet <= live::OWNER_GROUP_MESSAGE_BYTES)
     );
 }
 #[test]
@@ -864,7 +851,7 @@ fn initial_expiry_retires_stream_and_recovers_within_original_deadline() {
     assert_eq!(peer.initial_deadline, deadline);
     assert!(!peer.active && !peer.activation_committed);
     assert!(!h.driver.authority.sim.player_is_active(41));
-    h.clients[0].send_proofs = true;
+    h.clients[0].resume_proofs();
     h.pump(36);
     assert!(h.driver.authority.peers[&41].active);
     assert!(h.driver.authority.sim.player_is_active(41));
@@ -1011,16 +998,14 @@ fn withheld_decode_proof_never_activates_or_accepts_commands() {
         .frozen
         .as_ref()
         .unwrap()
-        .members[0]
-        .receipt();
+        .receipts[0];
     h.pump(30);
     assert_eq!(
         h.driver.authority.peers[&41]
             .frozen
             .as_ref()
             .unwrap()
-            .members[0]
-            .receipt(),
+            .receipts[0],
         original
     );
     h.pump(360);
@@ -1031,7 +1016,7 @@ fn withheld_decode_proof_never_activates_or_accepts_commands() {
     assert!(h.driver.authority.peers.is_empty());
 }
 #[test]
-fn transient_state_loss_recovers_without_unbounded_transfer_restart() {
+fn transient_application_stall_recovers_without_unbounded_transfer_restart() {
     let mut h = Harness::new();
     h.join();
     h.join();
@@ -1055,6 +1040,122 @@ fn transient_state_loss_recovers_without_unbounded_transfer_restart() {
     h.pump(36);
     assert!(h.clients[rejoined].active);
     assert_eq!(h.latest(rejoined).hero.id, 43);
+}
+
+#[test]
+fn active_reset_expiry_recovers_after_three_second_application_stall() {
+    let mut h = Harness::new();
+    h.join();
+    h.pump(36);
+    let original = h.clients[0].welcome.clone().unwrap();
+    let original_proofs = h.clients[0].owner_proofs.clone();
+    let original_hero = h.driver.authority.sim.snapshot_for(41).hero;
+    assert!(h.driver.authority.peers[&41].active);
+
+    // Renet still exchanges packets and transport ACKs, but the application
+    // cannot consume state or return decode/finalization receipts for 3 seconds.
+    h.clients[0].receive_application = false;
+    h.pump(180);
+    let peer = &h.driver.authority.peers[&41];
+    let replacement = peer.welcome.clone();
+    assert_eq!(peer.resyncs, 1);
+    assert_ne!(replacement.stream.epoch, original.stream.epoch);
+    assert_eq!(replacement.owner_entity, original.owner_entity);
+    assert!(peer.activation_committed);
+    assert!(!peer.ready && !peer.active);
+    assert!(h.driver.authority.sim.player_is_active(41));
+    let retained = h.driver.authority.sim.snapshot_for(41).hero;
+    assert_eq!(retained.hp, original_hero.hp);
+    assert_eq!(retained.stamina, original_hero.stamina);
+    assert!(h.clients[0].renet.disconnect_reason().is_none());
+
+    // The server won the suspension/recovery race. Both delayed messages use
+    // the old wire epoch, and must neither activate nor replace the fresh stream.
+    h.clients[0].control(live::ClientControl::OwnerDecoded {
+        proofs: BoundedVec::new(original_proofs).unwrap(),
+    });
+    h.clients[0].control(live::ClientControl::Resync {
+        reason: live::ResyncReason::ExpiredGroup,
+    });
+    h.pump(6);
+    let peer = &h.driver.authority.peers[&41];
+    assert_eq!(peer.welcome.stream, replacement.stream);
+    assert_eq!(peer.resyncs, 1);
+    assert!(!peer.active);
+
+    h.clients[0].receive_application = true;
+    h.clients[0].send_proofs = false;
+    h.pump(18);
+    let peer = &h.driver.authority.peers[&41];
+    assert!(peer.ready && !peer.active);
+    assert_eq!(
+        h.clients[0].welcome.as_ref().unwrap().stream,
+        replacement.stream
+    );
+    assert!(!h.clients[0].active);
+    assert!(h.driver.authority.sim.player_is_active(41));
+    h.clients[0].resume_proofs();
+    h.pump(24);
+    assert!(h.driver.authority.peers[&41].active);
+    assert!(h.clients[0].active);
+    assert!(h.clients[0].renet.disconnect_reason().is_none());
+    assert_eq!(h.driver.authority.peers[&41].resyncs, 1);
+    assert!(h.latest(0).stamp.server_tick > original.tick.0);
+    assert!(
+        h.driver.authority.peers[&41]
+            .inbox
+            .highest_received_sequence()
+            .is_some()
+    );
+}
+
+#[test]
+fn active_reset_expiry_uses_the_shared_sliding_recovery_cap() {
+    let mut h = Harness::new();
+    h.join();
+    h.pump(36);
+    let started = h.now;
+    for attempt in 1..=4 {
+        assert!(h.driver.authority.peers[&41].active);
+        let original = h.driver.authority.peers[&41].welcome.stream;
+        h.clients[0].receive_application = false;
+        h.pump(180);
+        if attempt == 4 {
+            assert!(!h.driver.authority.peers.contains_key(&41));
+            assert!(h.clients[0].renet.is_disconnected());
+            assert!(!h.driver.authority.sim.player_is_active(41));
+            break;
+        }
+        let peer = &h.driver.authority.peers[&41];
+        assert_eq!(peer.resyncs, attempt);
+        assert_eq!(peer.resync_attempts.len(), attempt as usize);
+        assert_ne!(peer.welcome.stream, original);
+        assert!(peer.activation_committed && !peer.active);
+        assert!(h.driver.authority.sim.player_is_active(41));
+        h.clients[0].receive_application = true;
+        h.pump(36);
+        assert!(h.clients[0].active);
+    }
+    assert!(h.now.saturating_sub(started) < Duration::from_secs(30));
+}
+
+#[test]
+fn active_reset_expiry_does_not_restart_an_unproven_replacement_bootstrap() {
+    let mut h = Harness::new();
+    h.join();
+    h.pump(36);
+    h.clients[0].receive_application = false;
+    h.pump(180);
+    assert_eq!(h.driver.authority.peers[&41].resyncs, 1);
+    h.clients[0].receive_application = true;
+    h.clients[0].send_proofs = false;
+    h.pump(18);
+    let peer = &h.driver.authority.peers[&41];
+    assert!(peer.ready && peer.activation_committed && !peer.active);
+    assert!(peer.frozen.is_some());
+    h.pump(130);
+    assert!(!h.driver.authority.peers.contains_key(&41));
+    assert!(h.clients[0].renet.is_disconnected());
 }
 #[derive(Default)]
 struct Pilot {
@@ -1277,7 +1378,7 @@ fn complete_cooperative_run_over_live_udp_reaches_every_realm_and_boss_victory()
     assert!(
         h.clients
             .iter()
-            .all(|client| client.max_packet <= usize::from(APPLICATION_FRAME_BYTES))
+            .all(|client| client.max_packet <= live::OWNER_GROUP_MESSAGE_BYTES)
     );
     h.pump(12);
     assert_eq!(h.latest(0).phase, RunPhase::Victory);
@@ -1434,8 +1535,19 @@ fn owner_baselines_bound_missing_proofs_and_resume_after_one_reset() {
     let old_proofs = h.clients[0].owner_proofs.clone();
     let topology = h.driver.authority.peers[&41].group_revision;
     // Missing feedback fills bounded retention and negotiates exactly one reset.
-    // Its full repair point remains retransmittable while finalization advances.
-    h.pump(150);
+    // Wait for that transition, then withhold its proof inside the two-second
+    // deadline; no application repeat is needed for already delivered bytes.
+    for _ in 0..30 {
+        if h.driver.authority.peers[&41]
+            .baselines
+            .reset_pending
+            .is_some()
+        {
+            break;
+        }
+        h.pump(3);
+    }
+    h.pump(6);
     assert!(h.driver.authority.peers[&41].active);
     assert!(h.latest(0).stamp.server_tick > initial);
     assert!(h.latest(0).stamp.server_tick < initial + 120);
@@ -1472,30 +1584,42 @@ fn owner_baselines_bound_missing_proofs_and_resume_after_one_reset() {
     let scopes = h.driver.authority.replication.scopes_mut(41).unwrap();
     assert!(scopes.decoded_current(owner).is_none());
     assert_eq!(h.driver.authority.peers[&41].group_revision, topology);
-    h.clients[0].send_proofs = true;
+    h.clients[0].resume_proofs();
     h.pump(12);
     assert!(h.clients[0].active);
-    assert!(h.latest(0).stamp.server_tick > initial + 150);
+    assert!(h.latest(0).stamp.server_tick > repair_tick);
 }
 
 #[test]
-fn lost_owner_groups_recover_from_retained_full_reset_without_generation_churn() {
+fn withheld_owner_messages_recover_from_retained_full_reset_without_generation_churn() {
     let mut h = Harness::new();
     h.join();
     h.pump(36);
     let before = h.latest(0).stamp.server_tick;
     h.clients[0].drop_states = true;
-    h.pump(150);
+    for _ in 0..30 {
+        if h.driver.authority.peers[&41]
+            .baselines
+            .reset_pending
+            .is_some()
+        {
+            break;
+        }
+        h.pump(3);
+    }
+    h.pump(30);
     assert_eq!(h.latest(0).stamp.server_tick, before);
     assert!(h.driver.authority.peers[&41].active);
-    let newest = h.driver.authority.peers[&41]
+    let peer = &h.driver.authority.peers[&41];
+    let snapshot = peer
         .frozen
         .as_ref()
         .unwrap()
-        .members[0]
-        .end_tick;
-    assert!(newest.0 > before);
-    assert!(newest.0 < before + 120);
+        .receipts
+        .iter()
+        .find(|receipt| receipt.scope.entity == peer.welcome.owner_entity)
+        .unwrap()
+        .snapshot;
     assert!(
         h.driver.authority.peers[&41]
             .baselines
@@ -1504,7 +1628,8 @@ fn lost_owner_groups_recover_from_retained_full_reset_without_generation_churn()
     );
     h.clients[0].drop_states = false;
     h.pump(12);
-    assert!(h.latest(0).stamp.server_tick >= newest.0);
+    assert!(h.latest(0).stamp.server_tick > before);
+    assert!(h.clients[0].decoded_groups.contains(&snapshot));
     let w = h.clients[0].welcome.as_ref().unwrap();
     let scopes = h.clients[0].scopes.as_ref().unwrap();
     assert_eq!(
@@ -1848,14 +1973,12 @@ fn finalized_queue_coalesces_unsent_ticks_and_recovers_after_ack_stall() {
             .unwrap();
         h.driver.poll(h.now).unwrap();
     }
-    let queue = h
-        .driver
-        .server
-        .channel_send_queue(41, wire::CONTROL_CHANNEL)
-        .unwrap();
+    let queue = wire::CONTROL_MEMORY_BYTES
+        - h.driver
+            .server
+            .channel_available_memory(41, wire::CONTROL_CHANNEL);
     // Four coalesced Finalized messages plus one reliable baseline-reset fence.
-    assert!(queue.messages <= 5, "coalesced Finalized queue: {queue:?}");
-    assert!(queue.payload_bytes < 1100);
+    assert!(queue < 1100, "coalesced Finalized queue bytes: {queue}");
     assert!(h.driver.authority.peers[&41].egress.finalized_deferred > 0);
     // Receive-only recovery isolates server finalization from client command-clock behavior.
     h.clients[0].active = false;
@@ -1886,18 +2009,16 @@ fn production_channel_priority_keeps_control_before_saturating_state() {
         &[2; 100]
     );
     assert!(client.receive_message(wire::STATE_CHANNEL).is_none());
-    let queue = server
-        .channel_send_queue(41, wire::CONTROL_CHANNEL)
-        .unwrap();
-    assert_eq!((queue.messages, queue.payload_bytes), (1, 100));
+    assert_eq!(
+        wire::CONTROL_MEMORY_BYTES - server.channel_available_memory(41, wire::CONTROL_CHANNEL),
+        100
+    );
     for packet in client.get_packets_to_send() {
         server.process_packet_from(&packet, 41).unwrap();
     }
     assert_eq!(
-        server
-            .channel_send_queue(41, wire::CONTROL_CHANNEL)
-            .unwrap(),
-        renet::SendQueueStats::default()
+        server.channel_available_memory(41, wire::CONTROL_CHANNEL),
+        wire::CONTROL_MEMORY_BYTES
     );
 }
 
@@ -1909,54 +2030,20 @@ fn collision_decode_proof_is_required_before_owner_activation() {
     h.pump(18);
     let peer = &h.driver.authority.peers[&41];
     let group = peer.frozen.as_ref().unwrap();
-    assert_eq!(group.members.len(), OWNER_GROUP_MEMBERS);
-    let encoded_group_bytes: usize = group
-        .fragments
-        .iter()
-        .enumerate()
-        .map(|(index, fragment)| {
-            live::encode_state(
-                &live::StateFrame::Fragment(fragment.clone()),
-                peer.welcome.stream.epoch,
-                index as u32 + 1,
-                peer.limit(),
-            )
-            .unwrap()
-            .len()
-        })
-        .sum();
-    eprintln!(
-        "N043 initial owner group: members={} fragments={} application_bytes={} full_group_bytes_per_second={} payload_bytes={:?}",
-        group.members.len(),
-        group.fragments.len(),
-        encoded_group_bytes,
-        encoded_group_bytes * wire::SNAPSHOT_HZ as usize,
-        group
-            .members
-            .iter()
-            .map(|state| (state.scope.entity, state.payload.len()))
-            .collect::<Vec<_>>()
-    );
-    assert!(
-        group
-            .members
-            .iter()
-            .all(|state| state.end_tick == group.members[0].end_tick)
-    );
+    assert_eq!(group.receipts.len(), OWNER_GROUP_MEMBERS);
     let collision = peer.welcome.collision_entity;
     let without_collision: Vec<_> = group
-        .members
+        .receipts
         .iter()
         .filter(|state| state.scope.entity != collision)
-        .map(|state| state.receipt())
+        .copied()
         .collect();
     assert_eq!(without_collision.len(), 2);
-    let collision_receipt = group
-        .members
+    let collision_receipt = *group
+        .receipts
         .iter()
         .find(|state| state.scope.entity == collision)
-        .unwrap()
-        .receipt();
+        .unwrap();
     h.clients[0].control(live::ClientControl::Decoded {
         receipts: BoundedVec::new(without_collision).unwrap(),
     });
@@ -2013,7 +2100,7 @@ fn wrong_collision_ready_identity_revokes_the_session() {
 }
 
 #[test]
-fn paced_owner_transfer_spans_flushes_without_partial_sent_proofs() {
+fn paced_owner_message_remains_queued_until_renet_delivers_it_completely() {
     let mut h = Harness::new();
     let shared = h.driver.authority.transport_diagnostics.clone().unwrap();
     shared
@@ -2040,24 +2127,25 @@ fn paced_owner_transfer_spans_flushes_without_partial_sent_proofs() {
         if let Some(peer) = h.driver.authority.peers.get(&41)
             && let Some(group) = &peer.frozen
             && !peer.active
-            && group.next_fragment != 0
-            && !group.sent_once
+            && !h.clients[0]
+                .decoded_groups
+                .contains(&group.receipts[0].snapshot)
         {
             staged = true;
-            let receipt = group.members[0].receipt();
+            let receipt = group.receipts[0];
             if let Some((active_state, previous)) = identity {
                 if active_state == group.active_state {
                     assert_eq!(receipt, previous);
                 }
             }
             identity = Some((group.active_state, receipt));
-            let proofs: Vec<_> = group
-                .members
-                .iter()
-                .zip(&group.baseline_packets)
-                .map(|(state, packet)| live::baselines::proof(state, packet.target))
-                .collect();
-            assert!(!peer.baselines.validate_proofs(&proofs).unwrap());
+            assert!(group.decoded.is_empty());
+            assert!(
+                h.driver
+                    .server
+                    .channel_available_memory(41, wire::OWNER_GROUP_CHANNEL)
+                    < wire::OWNER_GROUP_SEND_BYTES
+            );
             assert!(!h.clients[0].active);
         }
         if h.clients[0].active {
@@ -2072,7 +2160,6 @@ fn paced_owner_transfer_spans_flushes_without_partial_sent_proofs() {
     assert_eq!(h.driver.authority.peers[&41].resyncs, 0);
     let stats = shared.peer_egress_stats(41).unwrap().native_udp_ip.unwrap();
     assert_eq!(stats.cap_drops, 0);
-    assert_eq!(stats.pacing_drops, 0);
 }
 
 #[test]
@@ -2275,12 +2362,11 @@ fn lifecycle_fences_enqueue_once_during_ack_stall_and_allow_fresh_welcome() {
     assert_eq!(peer.egress.control_messages - before, 2);
     assert_eq!(scopes.pending_exits().collect::<Vec<_>>(), vec![exit]);
     assert_eq!(scopes.pending_destroys().collect::<Vec<_>>(), vec![destroy]);
-    let queue = h
-        .driver
-        .server
-        .channel_send_queue(41, wire::CONTROL_CHANNEL)
-        .unwrap();
-    assert!(queue.messages <= 7, "lifecycle queue: {queue:?}");
+    let queue = wire::CONTROL_MEMORY_BYTES
+        - h.driver
+            .server
+            .channel_available_memory(41, wire::CONTROL_CHANNEL);
+    assert!(queue < 2048, "lifecycle queue bytes: {queue}");
     h.driver.authority.resync(41).unwrap();
     h.clients[0].active = false;
     h.pump(60);

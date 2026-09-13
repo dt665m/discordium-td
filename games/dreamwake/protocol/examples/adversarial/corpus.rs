@@ -16,7 +16,7 @@ pub struct Corpus {
     pub full: Vec<u8>,
     pub live_state: Vec<u8>,
     pub group: Vec<u8>,
-    pub fragments: Vec<Vec<u8>>,
+    pub group_message: Vec<u8>,
     pub compressed: Vec<u8>,
     pub baseline: BaselinePacket,
     pub delta: Vec<u8>,
@@ -223,17 +223,15 @@ impl Corpus {
         )
         .unwrap();
         let dependency_cases = generated::dependency_cases(&global, &owner, &collision);
-        let publication = GroupPublication {
-            connection: EPOCH,
-            group: live::OWNER_GROUP,
-            revision: GroupRevision(1),
-            snapshot: SnapshotId(2),
-        };
-        let fragments = fragment_group(publication, &group, live::byte_limits(limit()).unwrap())
-            .unwrap()
-            .into_iter()
-            .map(|v| live::encode_state(&live::StateFrame::Fragment(v), EPOCH, 1, limit()).unwrap())
-            .collect();
+        let group_message = live::encode_state(
+            &live::StateFrame::Group(
+                decode_group(&group, group_limits(), |p| Ok(p.to_vec())).unwrap(),
+            ),
+            EPOCH,
+            1,
+            limit(),
+        )
+        .unwrap();
         let baseline = BaselinePacket {
             target: BaselineReceipt {
                 context: BaselineContext {
@@ -289,7 +287,7 @@ impl Corpus {
             full,
             live_state,
             group,
-            fragments,
+            group_message,
             compressed,
             baseline,
             delta,

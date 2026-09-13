@@ -2916,6 +2916,7 @@ version = "0.1.0"
 dependencies = [
  "dreamwake_sim",
  "engine_net",
+ "renet",
  "serde",
 ]
 
@@ -5785,6 +5786,8 @@ checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
 [[package]]
 name = "renet"
 version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8535f2f4b5afe5e31fc37be4b8a1f167e61177f356b1c6ee8456b7045d6c74c0"
 dependencies = [
  "bytes",
  "log",
@@ -5793,7 +5796,9 @@ dependencies = [
 
 [[package]]
 name = "renet-cross"
-version = "0.6.1"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1e28640498f0f09060e8fcb966405755822e35a5e93f7497f92ee44e4f138e6"
 dependencies = [
  "axum",
  "base64",
@@ -5818,6 +5823,7 @@ dependencies = [
 [[package]]
 name = "renetcode"
 version = "2.0.0"
+source = "git+https://github.com/dt665m/renet.git?branch=fix%2Fconfirmation-keepalive-starvation#af8d58971b3dbf4fa6832807504851170e9231d3"
 dependencies = [
  "chacha20poly1305",
  "log",

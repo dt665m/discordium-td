@@ -20,7 +20,11 @@ use engine_net::{
 use serde::{Deserialize, Serialize};
 
 pub const OWNER_GROUP: GroupId = GroupId(1);
-const WELCOME_MAGIC: &[u8; 4] = b"DW13";
+/// Whole-message allowance on the reliable-unordered owner channel.
+pub const OWNER_GROUP_MESSAGE_BYTES: usize = 32 * 1024;
+/// Public actors and controls remain small messages under stock Renet's slice size.
+pub const APPLICATION_FRAME_BYTES: usize = 1100;
+const WELCOME_MAGIC: &[u8; 4] = b"DW16";
 pub const WELCOME_BYTES: usize = 1024;
 
 /// A first effective command arrival, tied to the immutable command that caused
@@ -128,8 +132,10 @@ impl Validate for Welcome {
         {
             return Err(invalid("invalid session descriptor"));
         }
-        byte_limits(self.frame_limit()?)
-            .map_err(|_| invalid("unusable negotiated fragmentation allowance"))?;
+        self.frame_limit()?;
+        if !(1088..=1200).contains(&usize::from(self.application_frame_bytes)) {
+            return Err(invalid("unusable application frame allowance"));
+        }
         Ok(())
     }
 }
@@ -548,27 +554,9 @@ pub fn group_limits() -> GroupLimits {
     }
 }
 
-/// Limits are derived from the negotiated application frame allowance, including
-/// our state discriminator and byte-fragment header. Smaller unsupported paths
-/// fail admission instead of silently exceeding their allowance.
-pub fn byte_limits(frame: FrameLimit) -> Result<ByteLimits, ReplicationError> {
-    ByteLimits {
-        fragment_payload_bytes: frame
-            .payload_bytes()
-            .checked_sub(BYTE_FRAGMENT_HEADER_BYTES + 1)
-            .ok_or(ReplicationError::Capacity)?,
-        group_bytes: baselines::GROUP_BYTES,
-        fragments: baselines::GROUP_FRAGMENT_COUNT,
-        incomplete: baselines::GROUP_INCOMPLETE,
-        known_groups: 8,
-        staging_bytes: baselines::GROUP_STAGING_BYTES,
-        max_age_ms: 2000,
-    }
-    .validate()
-}
 pub enum StateFrame {
     Full(FullState<Vec<u8>>),
-    Fragment(ByteFragment),
+    Group(GroupChunk<Vec<u8>>),
 }
 pub fn encode_state(
     value: &StateFrame,
@@ -576,14 +564,16 @@ pub fn encode_state(
     sequence: u32,
     limit: FrameLimit,
 ) -> Result<Vec<u8>, CodecError> {
-    let (tag, bytes) = match value {
+    let (tag, bytes, limit) = match value {
         StateFrame::Full(state) if state.scope.connection == epoch => (
             0,
             encode_compact_full_state(state, limit.payload_bytes().saturating_sub(1)),
+            limit,
         ),
-        StateFrame::Fragment(fragment) if fragment.header.publication.connection == epoch => (
+        StateFrame::Group(group) if group.publication.connection == epoch => (
             1,
-            fragment.encode(byte_limits(limit).map_err(|_| invalid("fragment limit"))?),
+            encode_group(group, group_limits(), |payload| Ok(payload.clone())),
+            FrameLimit::new(OWNER_GROUP_MESSAGE_BYTES)?,
         ),
         _ => return Err(CodecError::WrongEpoch),
     };
@@ -606,21 +596,21 @@ pub fn decode_state(
     epoch: ConnectionEpoch,
     limit: FrameLimit,
 ) -> Result<StateFrame, CodecError> {
-    let (header, bytes) = codec::decode_frame(bytes, epoch, limit)?;
+    let frame_bytes = bytes.len();
+    let (header, bytes) =
+        codec::decode_frame(bytes, epoch, FrameLimit::new(OWNER_GROUP_MESSAGE_BYTES)?)?;
     if header.lane != Lane::State {
         return Err(CodecError::InvalidLane);
     }
     let (tag, body) = bytes.split_first().ok_or(CodecError::Truncated)?;
     match tag {
-        0 => decode_compact_full_state(body, epoch, limit.payload_bytes().saturating_sub(1))
-            .map(StateFrame::Full),
-        1 => ByteFragment::decode(
-            body,
-            byte_limits(limit).map_err(|_| invalid("fragment limit"))?,
-        )
-        .and_then(|fragment| {
-            if fragment.header.publication.connection == epoch {
-                Ok(StateFrame::Fragment(fragment))
+        0 if frame_bytes <= limit.payload_bytes() + codec::HEADER_BYTES => {
+            decode_compact_full_state(body, epoch, limit.payload_bytes().saturating_sub(1))
+                .map(StateFrame::Full)
+        }
+        1 => decode_group(body, group_limits(), |payload| Ok(payload.to_vec())).and_then(|group| {
+            if group.publication.connection == epoch {
+                Ok(StateFrame::Group(group))
             } else {
                 Err(ReplicationError::Stale)
             }

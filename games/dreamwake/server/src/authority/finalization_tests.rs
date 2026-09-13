@@ -77,7 +77,7 @@ fn sustained_small_control_messages_cannot_starve_finalization_or_outcomes_at_15
     let mut sequence = 0;
     let mut finalized = ServerTick(0);
     let mut outcome_keys = BTreeSet::new();
-    let mut maximum_messages = 0;
+    let mut maximum_queued_bytes = 0;
     let mut maximum_lag = 0;
     let rate = TickRate::new(dreamwake_sim::TICK_HZ).unwrap();
     let mut previous = Duration::ZERO;
@@ -178,11 +178,10 @@ fn sustained_small_control_messages_cannot_starve_finalization_or_outcomes_at_15
             .unwrap();
         }
         authority.publish(&mut server);
-        let queue = server
-            .channel_send_queue(41, wire::CONTROL_CHANNEL)
-            .unwrap();
-        maximum_messages = maximum_messages.max(queue.messages);
-        assert!(queue.payload_bytes < 32 * 1024);
+        let queued_bytes =
+            wire::CONTROL_MEMORY_BYTES - server.channel_available_memory(41, wire::CONTROL_CHANNEL);
+        maximum_queued_bytes = maximum_queued_bytes.max(queued_bytes);
+        assert!(queued_bytes < 32 * 1024);
         assert!(authority.peers[&41].finalized_batches.len() <= 4);
         assert!(authority.peers[&41].outcome_batches.len() <= 4);
         if tick > 60 {
@@ -196,8 +195,8 @@ fn sustained_small_control_messages_cannot_starve_finalization_or_outcomes_at_15
         }
     }
     assert!(
-        maximum_messages > 4,
-        "test must maintain unrelated controls above the old global gate"
+        maximum_queued_bytes > 256,
+        "test must maintain outstanding controls while finalization advances"
     );
     assert!(
         maximum_lag <= 24,

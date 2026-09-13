@@ -1,6 +1,6 @@
 //! Reproducible A/C transport comparison, not a production acceptance test.
 //!
-//! A uses the engine's actual byte fragmentation/assembly. C uses stock Renet
+//! A uses a test-only copy of the removed byte fragmentation/assembly. C uses stock Renet
 //! reliable-unordered messages. Both publish and flush at 20 Hz, with the same
 //! 7,000 B Renet payload allowance per flush (140,000 B/s), then pass through a
 //! 160,000 B/s, 16,000 B burst final egress bucket. State/remote packets preserve
@@ -43,9 +43,12 @@
 //! The test asserts integrity and bounds, while freshness/deadline failures are
 //! outputs to analyze, not silently treated as passing service-level objectives.
 
+#[path = "fixtures/application_fragments.rs"]
+mod application_fragments;
+use application_fragments::{ByteAssembler, ByteFragment, ByteLimits, fragment_group};
 use engine_net::{
     codec::{FrameHeader, FrameLimit, Lane, decode_frame, encode_frame},
-    replication::{ByteAssembler, ByteFragment, ByteLimits, GroupPublication, fragment_group},
+    replication::GroupPublication,
     types::{ConnectionEpoch, GroupId, GroupRevision, SnapshotId},
 };
 use octets::Octets;
@@ -277,7 +280,7 @@ fn byte_limits() -> ByteLimits {
     ByteLimits {
         fragment_payload_bytes: FRAME_LIMIT
             - engine_net::codec::HEADER_BYTES
-            - engine_net::replication::BYTE_FRAGMENT_HEADER_BYTES,
+            - application_fragments::BYTE_FRAGMENT_HEADER_BYTES,
         group_bytes: 32 * 1024,
         fragments: 32,
         incomplete: 2,

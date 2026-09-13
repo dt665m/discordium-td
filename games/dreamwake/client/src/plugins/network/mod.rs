@@ -203,9 +203,6 @@ pub fn connect(world: &mut World, attempts: u32) {
                         session_request: player_session_request(credential.clone()),
                         require_secure: true,
                         connection_config: connection_config(),
-                        packet_config: renet_cross::PacketProfile::ipv6_1200()
-                            .packet_config()
-                            .expect("static packet profile"),
                         transport: renet_cross::ClientTransportConfig {
                             conditioner: Some(conditioner.clone()),
                         },
@@ -240,9 +237,6 @@ pub fn connect(world: &mut World, attempts: u32) {
                         conditioner: Some(conditioner),
                     },
                     connection_config: connection_config(),
-                    packet_config: renet_cross::PacketProfile::ipv6_1200()
-                        .packet_config()
-                        .expect("static packet profile"),
                     ..Default::default()
                 },
             )
@@ -313,7 +307,6 @@ fn player_session_request(credential: String) -> renet_cross::SessionCreateReque
         protocol_id: Some(PROTOCOL_ID),
         service: SESSION_SERVICE.into(),
         match_id: SESSION_MATCH.into(),
-        packet_profile: renet_cross::PacketProfile::ipv6_1200(),
         require_secure: true,
         credential,
         ..Default::default()
@@ -414,17 +407,36 @@ fn request_resync(world: &mut World, runtime: &mut Runtime, now: Duration, reaso
     log::warn!("Scoped session requires resynchronization: {reason}");
     if let Some(session) = &mut runtime.prediction {
         session.recover();
-        if now.saturating_sub(session.last_resync) < Duration::from_secs(1) {
-            return;
-        }
-        session.last_resync = now;
     }
-    let _ = send_control(
-        runtime,
-        ClientControl::Resync {
-            reason: ResyncReason::InvalidCheckpoint,
-        },
-    );
+    service_pending_resync(runtime, now);
+}
+
+fn service_pending_resync(runtime: &mut Runtime, now: Duration) {
+    let Some(session) = &mut runtime.prediction else {
+        return;
+    };
+    if session.resync_request != session::ResyncRequest::PendingEnqueue
+        || session
+            .last_resync
+            .is_some_and(|last| now.saturating_sub(last) < Duration::from_secs(1))
+    {
+        return;
+    }
+    // Encoding/backpressure failure retains PendingEnqueue and its deadline.
+    let Ok(bytes) = session.control(&ClientControl::Resync {
+        reason: ResyncReason::InvalidCheckpoint,
+    }) else {
+        return;
+    };
+    if runtime.renet.is_disconnected()
+        || !runtime.renet.can_send_message(CONTROL_CHANNEL, bytes.len())
+    {
+        return;
+    }
+    runtime.renet.send_message(CONTROL_CHANNEL, bytes);
+    // Once queued, Renet owns retries; another fault must not queue duplicates.
+    session.last_resync = Some(now);
+    session.resync_request = session::ResyncRequest::AwaitingWelcome;
 }
 fn poll_network(world: &mut World) {
     let result = world
@@ -498,7 +510,7 @@ fn poll_network(world: &mut World) {
         let _ = session.begin_frame();
     }
     // Reliable readiness/control precedes the unordered state lane in this batch.
-    for channel in [CONTROL_CHANNEL, STATE_CHANNEL] {
+    for channel in [CONTROL_CHANNEL, OWNER_GROUP_CHANNEL, STATE_CHANNEL] {
         for _ in 0..128 {
             let Some(bytes) = runtime.renet.receive_message(channel) else {
                 break;
@@ -511,6 +523,9 @@ fn poll_network(world: &mut World) {
             }
         }
     }
+    // Recovery stops prediction/reconciliation, not request delivery. Give a
+    // pending resync the first available control space after processing receives.
+    service_pending_resync(&mut runtime, now);
     // Publish the final partial public-state ACK batch in this receive pass,
     // before PostUpdate can send transport packets. Owner/baseline proofs above
     // remain immediate and are never held in this queue.
@@ -586,11 +601,7 @@ fn poll_network(world: &mut World) {
             session.last_probe = now;
             probe = true;
         }
-        let expired = session
-            .fragments
-            .expire(now.as_millis() as u64)
-            .unwrap_or(1)
-            + session.groups.expire(now.as_millis() as u64).unwrap_or(1);
+        let expired = session.expire_groups(now).unwrap_or(1);
         if expired > 0 {
             request_resync(world, &mut runtime, now, "group assembly expired");
         }
@@ -795,35 +806,9 @@ fn receive_message(
         return Ok(());
     }
     let session = runtime.prediction.as_mut().ok_or("state before welcome")?;
-    if channel == STATE_CHANNEL {
+    if channel == STATE_CHANNEL || channel == OWNER_GROUP_CHANNEL {
         if let Some(receipt) = session.receive_state(bytes, now)? {
-            if let Some(checkpoint) = session.scopes.state(session.model.welcome.owner_entity) {
-                runtime.outcomes.observe(
-                    session.model.welcome.player.get(),
-                    session.model.welcome.stream.epoch,
-                    checkpoint.end_tick,
-                    now,
-                    false,
-                );
-            }
-            runtime.last_received = now.as_secs_f64();
-            world.resource_mut::<diagnostics::Telemetry>().snapshots += 1;
-            send_state_receipt(runtime, receipt)?;
-            let requests = runtime
-                .prediction
-                .as_mut()
-                .unwrap()
-                .baselines
-                .retirements()
-                .map_err(|e| e.to_string())?;
-            if !requests.is_empty() {
-                send_control(
-                    runtime,
-                    ClientControl::BaselineRetire {
-                        requests: BoundedVec::new(requests).map_err(|e| e.to_string())?,
-                    },
-                )?;
-            }
+            accept_state_receipt(runtime, receipt, now, world)?;
         }
         return Ok(());
     }
@@ -933,6 +918,9 @@ fn receive_message(
                         format!("BaselineReset incoming/context/generation/current={identities:?}")
                     })
                 })?;
+            if let Some((receipt, received_at)) = session.receive_pending_reset_group(now)? {
+                accept_state_receipt(runtime, receipt, received_at, world)?;
+            }
         }
         ServerControl::Active {
             owner_snapshot,
@@ -1043,6 +1031,42 @@ fn receive_message(
             world.resource_mut::<DreamConnection>().status =
                 String::from_utf8_lossy(utf8.as_slice()).into_owned()
         }
+    }
+    Ok(())
+}
+fn accept_state_receipt(
+    runtime: &mut Runtime,
+    receipt: ClientControl,
+    received_at: Duration,
+    world: &mut World,
+) -> Result<(), ReceiveRejection> {
+    let session = runtime.prediction.as_ref().unwrap();
+    if let Some(checkpoint) = session.scopes.state(session.model.welcome.owner_entity) {
+        runtime.outcomes.observe(
+            session.model.welcome.player.get(),
+            session.model.welcome.stream.epoch,
+            checkpoint.end_tick,
+            received_at,
+            false,
+        );
+    }
+    runtime.last_received = runtime.last_received.max(received_at.as_secs_f64());
+    world.resource_mut::<diagnostics::Telemetry>().snapshots += 1;
+    send_state_receipt(runtime, receipt)?;
+    let requests = runtime
+        .prediction
+        .as_mut()
+        .unwrap()
+        .baselines
+        .retirements()
+        .map_err(|e| e.to_string())?;
+    if !requests.is_empty() {
+        send_control(
+            runtime,
+            ClientControl::BaselineRetire {
+                requests: BoundedVec::new(requests).map_err(|e| e.to_string())?,
+            },
+        )?;
     }
     Ok(())
 }
@@ -1583,10 +1607,14 @@ mod arrival_policy_tests;
 mod bootstrap_topology_tests;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod feedback_causality_tests;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod generation_tests;
 #[cfg(test)]
 mod obsolete_tests;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod pending_retry_tests;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod recovery_tests;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod reset_pending_tests;
 #[cfg(all(test, not(target_arch = "wasm32")))]

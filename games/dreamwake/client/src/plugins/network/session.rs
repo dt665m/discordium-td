@@ -7,6 +7,7 @@ use dreamwake_protocol::{
     replication::{ReplicaPayload, decode_replica},
 };
 use dreamwake_sim::replication::DreamPresentation;
+use engine_net::replication::baselines::BaselineEncoding;
 use engine_net::{
     codec::BoundedVec,
     input::InputJournal,
@@ -25,9 +26,7 @@ use std::{
 
 #[derive(Debug, Clone, Copy, Default, serde::Serialize)]
 pub(crate) struct DeliveryMetrics {
-    pub fragment_messages: u64,
-    pub fragment_stale: u64,
-    pub partial_superseded: u64,
+    pub group_messages: u64,
     pub groups_completed: u64,
     pub baseline_stale: u64,
     pub baseline_reset_pending: u64,
@@ -57,7 +56,6 @@ pub(crate) struct SessionMetrics {
     pub combat_view_tick: Option<ServerTick>,
     pub known_scopes: usize,
     pub live_scopes: usize,
-    pub incomplete_fragments: usize,
     pub incomplete_groups: usize,
     pub prediction_groups: usize,
     pub lead_ticks: u8,
@@ -67,7 +65,6 @@ pub(crate) struct SessionMetrics {
     pub arrival_feedback_ignored: u64,
     pub lead_policy: u64,
     pub scope_bytes: usize,
-    pub fragment_bytes: usize,
     pub group_bytes: usize,
     pub baseline_bytes: usize,
     pub baseline_repairs: u64,
@@ -89,16 +86,32 @@ struct CommandIssuance {
     feedback_seen: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ResyncRequest {
+    Idle,
+    PendingEnqueue,
+    AwaitingWelcome,
+}
+
+/// A complete reliable message may precede its reset on the control channel.
+/// Renet has already acknowledged its bytes, so keep one validated message until
+/// that control arrives. This is not byte assembly or application retransmission.
+struct PendingResetGroup {
+    publication: GroupPublication,
+    bytes: Box<[u8]>,
+    received_at: Duration,
+    started_at: Duration,
+}
+
 pub(crate) struct Session {
     pub(super) model: OwnerModel,
     pub(super) baselines: super::baselines::OwnerBaselines,
     baseline_repairs: u64,
     delivery: DeliveryMetrics,
-    fragment_candidate: Option<GroupPublication>,
     pub(super) poses: super::presentation::RemotePoses,
     pub(super) scopes: ClientScopes<Vec<u8>>,
     pub(super) groups: GroupAssembler<Vec<u8>>,
-    pub(super) fragments: ByteAssembler,
+    pending_reset_group: Option<PendingResetGroup>,
     pub(super) predictor: PredictionManager<OwnerModel>,
     pub(crate) events: super::predicted_events::PredictedEvents,
     pub(super) journal: InputJournal<TickInput, DreamAction>,
@@ -134,7 +147,8 @@ pub(crate) struct Session {
     combat_references: std::collections::VecDeque<(StateReceipt, ServerTick)>,
     pub(super) acknowledged_active: Option<(SnapshotId, ServerTick)>,
     pub(super) last_probe: Duration,
-    pub(super) last_resync: Duration,
+    pub(super) last_resync: Option<Duration>,
+    pub(super) resync_request: ResyncRequest,
 }
 impl Session {
     #[cfg(not(target_arch = "wasm32"))]
@@ -202,8 +216,8 @@ impl Session {
                 .iter()
                 .filter(|entity| self.scopes.state(**entity).is_some())
                 .count(),
-            incomplete_fragments: self.fragments.incomplete(),
-            incomplete_groups: self.groups.incomplete(),
+            incomplete_groups: self.groups.incomplete()
+                + usize::from(self.pending_reset_group.is_some()),
             prediction_groups: self.predictor.group_count(),
             lead_ticks: self.lead.lead(),
             arrival_slack: self.arrival_slack,
@@ -212,8 +226,11 @@ impl Session {
             arrival_feedback_ignored: self.arrival_feedback_ignored,
             lead_policy: self.lead_policy,
             scope_bytes: self.scopes.retained_bytes(),
-            fragment_bytes: self.fragments.staged_bytes(),
-            group_bytes: self.groups.staged_bytes(),
+            group_bytes: self.groups.staged_bytes()
+                + self
+                    .pending_reset_group
+                    .as_ref()
+                    .map_or(0, |group| group.bytes.len()),
             baseline_bytes: self.baselines.retained_bytes(),
             baseline_repairs: self.baseline_repairs,
             delivery: self.delivery,
@@ -233,14 +250,9 @@ impl Session {
             baselines: Default::default(),
             baseline_repairs: 0,
             delivery: DeliveryMetrics::default(),
-            fragment_candidate: None,
             scopes: ClientScopes::new(epoch, ScopeLimits::default()).map_err(err)?,
             groups: GroupAssembler::new(epoch, group_limits()).map_err(err)?,
-            fragments: ByteAssembler::new(
-                epoch,
-                byte_limits(welcome.frame_limit().map_err(err)?).map_err(err)?,
-            )
-            .map_err(err)?,
+            pending_reset_group: None,
             predictor: new_predictor(epoch)?,
             events: super::predicted_events::PredictedEvents::new(
                 engine_net::events::JournalScope {
@@ -287,7 +299,8 @@ impl Session {
             combat_references: Default::default(),
             acknowledged_active: None,
             last_probe: Duration::ZERO,
-            last_resync: Duration::ZERO,
+            last_resync: None,
+            resync_request: ResyncRequest::Idle,
             poses: super::presentation::RemotePoses::new(epoch, welcome.content.scene_revision)
                 .map_err(|e| format!("remote presentation: {e:?}"))?,
             model: OwnerModel { welcome },
@@ -616,6 +629,51 @@ impl Session {
             .expect("eight receipts fit the protocol's twelve-receipt capacity"),
         })
     }
+    /// Call only after publication succeeds. In particular, a new attachment
+    /// has no pose sample but still retires the older generation's pose/history.
+    fn remember_published_entity(&mut self, entity: EntityId) {
+        let first = EntityId {
+            generation: 0,
+            ..entity
+        };
+        while let Some(old) = self.entities.range(first..entity).next().copied() {
+            self.entities.remove(&old);
+            self.poses.remove(old);
+        }
+        self.entities.insert(entity);
+    }
+    pub(super) fn expire_groups(&mut self, now: Duration) -> Result<usize, ReplicationError> {
+        let mut expired = self.groups.expire(now.as_millis() as u64)?;
+        if self.pending_reset_group.as_ref().is_some_and(|group| {
+            now.saturating_sub(group.started_at).as_millis()
+                >= u128::from(group_limits().max_age_ms)
+        }) {
+            self.pending_reset_group = None;
+            expired += 1;
+        }
+        Ok(expired)
+    }
+    pub(super) fn receive_pending_reset_group(
+        &mut self,
+        now: Duration,
+    ) -> Result<Option<(ClientControl, Duration)>, super::ReceiveRejection> {
+        let Some(pending) = &self.pending_reset_group else {
+            return Ok(None);
+        };
+        if now.saturating_sub(pending.started_at).as_millis()
+            >= u128::from(group_limits().max_age_ms)
+        {
+            return Err(super::ReceiveRejection::replication(
+                ReplicationError::Expired,
+                || "owner group awaiting baseline reset".into(),
+            ));
+        }
+        let bytes = pending.bytes.clone();
+        let received_at = pending.received_at;
+        Ok(self
+            .receive_state(&bytes, now)?
+            .map(|receipt| (receipt, received_at)))
+    }
     pub(super) fn receive_state(
         &mut self,
         bytes: &[u8],
@@ -651,7 +709,6 @@ impl Session {
                         format!("public Full incoming={incoming:?} current={current:?}")
                     })
                 })?;
-                self.entities.insert(entity);
                 if let Some(state) = self.scopes.state(entity) {
                     if let Ok(ReplicaPayload::Actor(actor)) =
                         decode_replica(&state.payload, Some(expected))
@@ -661,110 +718,157 @@ impl Session {
                             .map_err(|e| format!("remote presentation: {e:?}"))?;
                     }
                 }
+                self.remember_published_entity(entity);
                 vec![receipt]
             }
-            StateFrame::Fragment(fragment) => {
-                self.delivery.fragment_messages = self.delivery.fragment_messages.saturating_add(1);
-                let publication = fragment.header.publication;
-                let current_fragment = self.fragments.publication(publication.group);
-                let supersedes = self.fragment_candidate.is_some_and(|old| {
-                    publication.revision > old.revision
-                        || (publication.revision == old.revision
-                            && publication.snapshot > old.snapshot)
-                }) && self.fragments.incomplete() != 0;
-                let complete = match self.fragments.receive(fragment, now.as_millis() as u64) {
-                    Ok(value) => value,
-                    Err(error @ ReplicationError::Obsolete(_)) => {
-                        self.delivery.fragment_stale =
-                            self.delivery.fragment_stale.saturating_add(1);
-                        return Err(super::ReceiveRejection::replication(error, || {
-                            format!(
-                                "Fragment incoming={publication:?} current={current_fragment:?}"
-                            )
-                        }));
-                    }
-                    Err(error) => {
-                        return Err(super::ReceiveRejection::replication(error, || {
-                            format!(
-                                "Fragment incoming={publication:?} current={current_fragment:?} receive_ms={}",
-                                now.as_millis()
-                            )
-                        }));
-                    }
-                };
-                self.fragment_candidate = Some(publication);
-                if supersedes {
-                    self.delivery.partial_superseded =
-                        self.delivery.partial_superseded.saturating_add(1);
-                }
-                let Some(complete) = complete else {
-                    return Ok(None);
-                };
+            StateFrame::Group(group) => {
+                self.delivery.group_messages = self.delivery.group_messages.saturating_add(1);
+                let publication = group.publication;
                 let model = &self.model;
                 let current_group = self.groups.publication(publication.group);
                 let mut staged = self.baselines.stage().map_err(err)?;
                 let mut proofs = Vec::new();
-                let result = complete.decode_and_publish(
-                    &mut self.groups,
-                    &mut self.scopes,
-                    now.as_millis() as u64,
-                    |bytes| {
-                        let mut decoded =
-                            decode_group(bytes, group_limits(), |payload| Ok(payload.to_vec()))?;
-                        if !baseline_wire::valid_member_count(decoded.members.len()) {
-                            return Err(engine_net::replication::ReplicationError::InvalidPayload);
-                        }
-                        staged.retain_manifest(&decoded.manifest);
-                        let mut reset_pending = false;
-                        let mut obsolete_full = None;
-                        for state in &mut decoded.members {
-                            let packet = baseline_wire::decode_member(
-                                &state.payload,
-                                state,
-                                decoded.publication,
-                            )
-                            .map_err(|_| {
-                                engine_net::replication::ReplicationError::InvalidPayload
-                            })?;
-                            let rejected_seed = staged.rejected_full_seed(&packet);
-                            match staged.reconstruct(state, packet) {
-                                Ok(receipt) => proofs.push(baseline_wire::proof(state, receipt)),
-                                Err(ReplicationError::BaselineResetPending) => {
-                                    state.payload =
-                                        rejected_seed.ok_or(ReplicationError::InvalidIdentity)?;
-                                    reset_pending = true;
+                let result = (|| {
+                    let mut decoded = group;
+                    if !baseline_wire::valid_member_count(decoded.members.len())
+                        || [
+                            model.welcome.global_entity,
+                            model.welcome.owner_entity,
+                            model.welcome.collision_entity,
+                        ]
+                        .iter()
+                        .any(|entity| !decoded.manifest.iter().any(|scope| scope.entity == *entity))
+                    {
+                        return Err(engine_net::replication::ReplicationError::InvalidPayload);
+                    }
+                    if current_group.is_some_and(|current| current.revision == publication.revision)
+                        && self
+                            .groups
+                            .manifest(publication.group)
+                            .is_some_and(|manifest| manifest != decoded.manifest)
+                    {
+                        return Err(ReplicationError::Conflict);
+                    }
+                    // Decode every bounded envelope before using age evidence.
+                    // Inspect the original caches before manifest retention can
+                    // discard a removed or reentered platform's newer context.
+                    let packets = decoded
+                        .members
+                        .iter()
+                        .map(|state| {
+                            baseline_wire::decode_member(&state.payload, state, decoded.publication)
+                                .map_err(|_| ReplicationError::InvalidPayload)
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    if let Some(error) = packets
+                        .iter()
+                        .find_map(|packet| staged.obsolete_context(packet))
+                    {
+                        let all_full = packets
+                            .iter()
+                            .all(|packet| matches!(packet.encoding, BaselineEncoding::Full));
+                        for (state, packet) in decoded.members.iter_mut().zip(packets) {
+                            if matches!(packet.encoding, BaselineEncoding::Full) {
+                                state.payload = packet.bytes;
+                                if !all_full {
+                                    decode_owner_member(model, state, decoded.end_tick)
+                                        .map_err(|_| ReplicationError::InvalidPayload)?;
                                 }
-                                Err(error @ ReplicationError::Obsolete(_))
-                                    if rejected_seed.is_some() =>
+                            } else {
+                                // A Delta implies an earlier decoded scope. An
+                                // unrelated or future optional member cannot use
+                                // another member's older revision as age proof.
+                                let incoming = packet.target.context.scope;
+                                let known = self
+                                    .scopes
+                                    .fence(incoming.entity.index)
+                                    .ok_or(ReplicationError::InvalidIdentity)?
+                                    .scope;
+                                if known.connection != incoming.connection
+                                    || known.entity.generation < incoming.entity.generation
+                                    || (known.entity.generation == incoming.entity.generation
+                                        && (known.scope < incoming.scope
+                                            || known.representation < incoming.representation
+                                            || (known.scope == incoming.scope
+                                                && known.representation
+                                                    != incoming.representation)))
                                 {
-                                    state.payload = rejected_seed.unwrap();
-                                    obsolete_full = Some(error);
+                                    return Err(ReplicationError::Conflict);
                                 }
-                                Err(error) => return Err(error),
                             }
                         }
-                        validate_owner_group(
-                            model,
-                            decoded.publication.group,
-                            decoded.end_tick,
-                            decoded.members.iter(),
-                        )
-                        .map_err(|_| engine_net::replication::ReplicationError::InvalidPayload)?;
-                        if let Some(error) = obsolete_full {
-                            return Err(error);
+                        if all_full {
+                            validate_owner_group(
+                                model,
+                                decoded.publication.group,
+                                decoded.end_tick,
+                                decoded.members.iter(),
+                            )
+                            .map_err(|_| ReplicationError::InvalidPayload)?;
                         }
-                        if reset_pending {
-                            return Err(ReplicationError::BaselineResetPending);
+                        return Err(error);
+                    }
+                    staged.retain_manifest(&decoded.manifest);
+                    let mut reset_pending = false;
+                    let mut obsolete_full = None;
+                    for (state, packet) in decoded.members.iter_mut().zip(packets) {
+                        let rejected_seed = staged.rejected_full_seed(&packet);
+                        match staged.reconstruct(state, packet) {
+                            Ok(receipt) => proofs.push(baseline_wire::proof(state, receipt)),
+                            Err(ReplicationError::BaselineResetPending) => {
+                                state.payload =
+                                    rejected_seed.ok_or(ReplicationError::InvalidIdentity)?;
+                                reset_pending = true;
+                            }
+                            Err(error @ ReplicationError::Obsolete(_))
+                                if rejected_seed.is_some() =>
+                            {
+                                state.payload = rejected_seed.unwrap();
+                                obsolete_full = Some(error);
+                            }
+                            Err(error) => return Err(error),
                         }
-                        Ok(decoded)
-                    },
-                    |_| true,
-                );
+                    }
+                    validate_owner_group(
+                        model,
+                        decoded.publication.group,
+                        decoded.end_tick,
+                        decoded.members.iter(),
+                    )
+                    .map_err(|_| engine_net::replication::ReplicationError::InvalidPayload)?;
+                    if let Some(error) = obsolete_full {
+                        return Err(error);
+                    }
+                    if reset_pending {
+                        return Err(ReplicationError::BaselineResetPending);
+                    }
+                    self.groups
+                        .receive(decoded, now.as_millis() as u64, &mut self.scopes, |_| true)
+                })();
                 let progress = match result {
                     Ok(progress) => progress,
                     Err(ReplicationError::BaselineResetPending) => {
                         self.delivery.baseline_reset_pending =
                             self.delivery.baseline_reset_pending.saturating_add(1);
+                        // Only fully decoded and game-validated members reach here.
+                        // A later message can replace the bounded slot, but cannot
+                        // extend the deadline for the missing reliable reset.
+                        if self
+                            .pending_reset_group
+                            .as_ref()
+                            .is_none_or(|pending| publication > pending.publication)
+                        {
+                            let started_at = self
+                                .pending_reset_group
+                                .as_ref()
+                                .map_or(now, |pending| pending.started_at);
+                            self.pending_reset_group = Some(PendingResetGroup {
+                                publication,
+                                bytes: bytes.into(),
+                                received_at: now,
+                                started_at,
+                            });
+                        }
                         return Ok(None);
                     }
                     Err(
@@ -799,11 +903,17 @@ impl Session {
                 match progress {
                     GroupProgress::Staged => return Ok(None),
                     GroupProgress::Published(receipts) => {
+                        if self
+                            .pending_reset_group
+                            .as_ref()
+                            .is_some_and(|pending| publication >= pending.publication)
+                        {
+                            self.pending_reset_group = None;
+                        }
                         self.delivery.groups_completed =
                             self.delivery.groups_completed.saturating_add(1);
                         self.baselines = staged;
                         for receipt in &receipts {
-                            self.entities.insert(receipt.scope.entity);
                             if let Some(state) = self.scopes.state(receipt.scope.entity) {
                                 if let Ok(ReplicaPayload::Actor(actor)) =
                                     decode_replica(&state.payload, Some(self.model.expectation()))
@@ -815,6 +925,7 @@ impl Session {
                                         })?;
                                 }
                             }
+                            self.remember_published_entity(receipt.scope.entity);
                         }
                         if let Some(state) = self.scopes.state(self.model.welcome.owner_entity) {
                             self.simulation_clock.commit(state.end_tick);
@@ -1167,8 +1278,12 @@ impl Session {
         Ok(Some(presentation))
     }
     pub(super) fn recover(&mut self) {
+        self.pending_reset_group = None;
         self.active = false;
         self.recovering = true;
+        if self.resync_request == ResyncRequest::Idle {
+            self.resync_request = ResyncRequest::PendingEnqueue;
+        }
         self.last_input_retry_committed = None;
         self.issued_commands.clear();
         self.retired_issuance_through = self.retired_issuance_through.max(self.sequence);

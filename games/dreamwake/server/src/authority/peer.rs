@@ -25,16 +25,11 @@ impl CommandRules<live::TickInput, DreamAction> for Rules {
 }
 
 pub(super) struct FrozenGroup {
-    pub members: Vec<engine_net::replication::FullState<Vec<u8>>>,
-    pub fragments: Vec<engine_net::replication::ByteFragment>,
-    /// Cursor in the sole bounded immutable transfer. A complete pass is needed
-    /// before any member's sent receipt or baseline is committed.
-    pub next_fragment: usize,
-    pub sent_once: bool,
+    pub receipts: Vec<engine_net::replication::StateReceipt>,
+    pub bases: Vec<engine_net::replication::baselines::BaselineReceipt>,
     pub decoded: BTreeSet<EntityId>,
     pub started: Duration,
     pub active_state: bool,
-    pub baseline_packets: Vec<engine_net::replication::baselines::BaselinePacket>,
 }
 #[derive(Default)]
 pub(super) struct EgressCounters {
@@ -46,14 +41,10 @@ pub(super) struct EgressCounters {
     pub finalized_deferred: u64,
     pub state_messages: u64,
     pub state_bytes: u64,
-    pub group_passes: u64,
-    pub group_fragments: u64,
+    pub group_messages: u64,
+    pub group_queue_deferred: u64,
     pub group_age_ticks: u64,
     pub maximum_group_age_ticks: u64,
-    pub publication_credit: usize,
-    pub publication_prefix: usize,
-    pub control_due_messages: usize,
-    pub control_due_payload_bytes: usize,
 }
 
 pub(super) struct Peer {
@@ -78,9 +69,9 @@ pub(super) struct Peer {
     pub outcome_lookups: BTreeSet<ActionKey>,
     pub inbox: CommandInbox<live::TickInput, DreamAction>,
     pub scheduler: Scheduler,
-    /// Frozen through decode during bootstrap; after activation only the newest
-    /// complete publication is retained, independent of older decode receipts.
+    /// Exact bootstrap/reset proof only. Renet owns accepted message bytes.
     pub frozen: Option<FrozenGroup>,
+    pub last_owner_publication: Option<engine_net::replication::GroupPublication>,
     pub group_revision: GroupRevision,
     pub group_manifest: Vec<ScopeIdentity>,
     pub owner_bases: Vec<EntityId>,
@@ -118,6 +109,9 @@ impl Peer {
                 welcome.client,
                 SchedulerLimits {
                     bytes_per_second: crate::DEFAULT_EGRESS_BYTES_PER_SECOND,
+                    // Admission may enqueue one whole group which Renet sends
+                    // across multiple flushes under the separate egress ceiling.
+                    burst_bytes: 36 * 1024,
                     ..SchedulerLimits::default()
                 },
             )
@@ -138,6 +132,7 @@ impl Peer {
             next_outcome_batch: 0,
             outcome_lookups: BTreeSet::new(),
             frozen: None,
+            last_owner_publication: None,
             group_revision: GroupRevision(0),
             group_manifest: Vec::new(),
             owner_bases: Vec::new(),

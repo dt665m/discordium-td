@@ -11,7 +11,6 @@ use engine_net::{
     replication::{
         GroupChunk,
         baselines::{BaselineEncoding, BaselinePacket},
-        encode_group, fragment_group,
     },
 };
 
@@ -56,22 +55,7 @@ fn publication(snapshot: u64, continuity: InputContinuity<DreamInput>) -> (Sessi
         })
         .unwrap();
     }
-    let limit = source.model.welcome.frame_limit().unwrap();
-    let bytes = encode_group(&group, group_limits(), |payload| Ok(payload.clone())).unwrap();
-    let frames = fragment_group(group.publication, &bytes, byte_limits(limit).unwrap())
-        .unwrap()
-        .into_iter()
-        .enumerate()
-        .map(|(index, fragment)| {
-            encode_state(
-                &StateFrame::Fragment(fragment),
-                source.model.welcome.stream.epoch,
-                index as u32,
-                limit,
-            )
-            .unwrap()
-        })
-        .collect();
+    let frames = vec![tests::encoded_group_frame(&source.model.welcome, group)];
     (Session::new(source.model.welcome.clone()).unwrap(), frames)
 }
 

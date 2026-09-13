@@ -110,6 +110,12 @@ impl<P: Payload> GroupAssembler<P> {
     pub fn publication(&self, group: GroupId) -> Option<GroupPublication> {
         self.fences.get(&group).map(|fence| fence.publication)
     }
+    /// Retained topology fence, including when member state is no longer usable.
+    pub fn manifest(&self, group: GroupId) -> Option<&[ScopeIdentity]> {
+        self.fences
+            .get(&group)
+            .map(|fence| fence.manifest.as_slice())
+    }
     /// Expiration retains the publication fence, so late fragments cannot
     /// recreate an expired assembly under the same identity.
     pub fn expire(&mut self, now_ms: u64) -> Result<usize, ReplicationError> {

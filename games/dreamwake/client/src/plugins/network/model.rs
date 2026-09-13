@@ -49,6 +49,51 @@ impl Payload for CollisionDependency {
 // dependency record/map overhead. This is independent of wire group size.
 pub(super) const COLLISION_HISTORY_BYTES: usize = 4096 + 64 * 1024 + 2048;
 
+/// Validate every reconstructible member even when another member's old delta
+/// base has retired. Complete publications additionally require group validation.
+pub(super) fn decode_owner_member(
+    model: &OwnerModel,
+    state: &FullState<Vec<u8>>,
+    end_tick: ServerTick,
+) -> Result<ReplicaPayload, PredictionError> {
+    if state.end_tick != end_tick || state.scope.connection != model.welcome.stream.epoch {
+        return Err(PredictionError::InvalidState);
+    }
+    let payload = decode_replica(&state.payload, Some(model.expectation()))
+        .map_err(|_| PredictionError::InvalidState)?;
+    let entity = state.scope.entity;
+    let welcome = &model.welcome;
+    let valid = match &payload {
+        ReplicaPayload::Owner(value) => {
+            entity == welcome.owner_entity
+                && value.context().stamp.server_tick == end_tick.0
+                && value.collision_identity() == welcome.content.scene
+        }
+        ReplicaPayload::Global(value) => {
+            entity == welcome.global_entity
+                && value.stamp.server_tick == end_tick.0
+                && value.stamp.match_epoch == welcome.match_epoch
+                && value.stamp.scene_revision == u64::from(welcome.content.scene_revision.0)
+        }
+        ReplicaPayload::Collision(value) => {
+            entity == welcome.collision_entity
+                && value.scene_revision() == u64::from(welcome.content.scene_revision.0)
+                && value.identity() == welcome.content.scene
+        }
+        ReplicaPayload::Actor(dreamwake_sim::replication::PublicReplica::Platform(value)) => {
+            entity != welcome.owner_entity
+                && entity != welcome.global_entity
+                && entity != welcome.collision_entity
+                && value.scene_revision == u64::from(welcome.content.scene_revision.0)
+        }
+        _ => false,
+    };
+    if !valid {
+        return Err(PredictionError::InvalidIdentity);
+    }
+    Ok(payload)
+}
+
 pub(super) fn validate_owner_group<'a>(
     model: &OwnerModel,
     group: GroupId,
@@ -65,12 +110,7 @@ pub(super) fn validate_owner_group<'a>(
     let mut platform = None;
     for state in states {
         count += 1;
-        if state.end_tick != end_tick || state.scope.connection != model.welcome.stream.epoch {
-            return Err(PredictionError::InvalidState);
-        }
-        match decode_replica(&state.payload, Some(model.expectation()))
-            .map_err(|_| PredictionError::InvalidState)?
-        {
+        match decode_owner_member(model, state, end_tick)? {
             ReplicaPayload::Owner(value)
                 if state.scope.entity == model.welcome.owner_entity && owner.is_none() =>
             {

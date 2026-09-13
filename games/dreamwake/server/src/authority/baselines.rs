@@ -86,7 +86,7 @@ impl OwnerBaselines {
         publication: GroupPublication,
     ) -> Result<Option<Vec<BaselinePacket>>, String> {
         self.prepare_contexts(members, publication)?;
-        // Three projected/encoded payload copies, group codec + fragmentation,
+        // Three projected/encoded payload copies, group codec,
         // framed transport scratch, and per-codec single-packet scratch are all
         // charged before building the publication; no staging clone is unbounded.
         self.check_peak(6 * live::baselines::MEMBER_BYTES * members.len() + 2 * 65_536)?;
@@ -142,7 +142,7 @@ impl OwnerBaselines {
         }
         Ok(packets)
     }
-    /// Called only after all preflighted group fragments were queued successfully.
+    /// Called only after the complete group message was accepted by Renet.
     pub fn mark_sent(
         &mut self,
         members: &[FullState<Vec<u8>>],

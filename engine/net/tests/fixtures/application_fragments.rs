@@ -1,4 +1,7 @@
-use super::*;
+//! Historical A delivery fixture, retained only for reproducible characterization.
+//! Production owner delivery uses whole reliable-unordered Renet messages.
+#![allow(dead_code)]
+use engine_net::{replication::*, types::*};
 use std::collections::BTreeMap;
 
 /// Byte fragmentation covers the entire canonical group envelope, including its

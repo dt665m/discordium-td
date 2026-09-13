@@ -34,7 +34,7 @@ use std::{
 };
 const MAX_PENDING_ACTIONS: usize = 32;
 const MAX_MESSAGES_PER_TICK: usize = 64;
-const APPLICATION_FRAME_BYTES: u16 = 1100;
+const APPLICATION_FRAME_BYTES: u16 = live::APPLICATION_FRAME_BYTES as u16;
 #[cfg(test)]
 const OWNER_GROUP_MEMBERS: usize = live::baselines::MIN_MEMBERS;
 const SCENE: SceneRevision = SceneRevision(1);
@@ -71,15 +71,8 @@ pub(crate) struct DreamAuthority {
     outcomes: outcomes::Outcomes,
     overloaded: bool,
 }
-/// Control is emitted before fresh unreliable state when the transport has a
-/// bounded egress allowance. Channel identities and receive configuration remain
-/// identical to the shared protocol configuration.
 pub(crate) fn connection_config() -> renet::ConnectionConfig {
-    let mut config = wire::connection_config();
-    config
-        .server_channels_config
-        .sort_by_key(|channel| channel.channel_id != wire::CONTROL_CHANNEL);
-    config
+    wire::server_connection_config()
 }
 
 impl DreamAuthority {
@@ -377,11 +370,7 @@ impl DreamAuthority {
                             peer.combat.decoded(*receipt);
                         }
                         if let Some(group) = &mut peer.frozen {
-                            if group
-                                .members
-                                .iter()
-                                .any(|state| state.receipt() == *receipt)
-                            {
+                            if group.receipts.contains(receipt) {
                                 group.decoded.insert(receipt.scope.entity);
                             }
                         }
@@ -390,7 +379,7 @@ impl DreamAuthority {
                 if peer
                     .frozen
                     .as_ref()
-                    .is_some_and(|group| group.decoded.len() == group.members.len())
+                    .is_some_and(|group| group.decoded.len() == group.receipts.len())
                 {
                     let group = peer.frozen.take().expect("complete frozen group");
                     if !peer.active {
@@ -400,7 +389,7 @@ impl DreamAuthority {
                         }
                         peer.active = true;
                         let owner_snapshot = group
-                            .members
+                            .receipts
                             .iter()
                             .find(|state| state.scope.entity == peer.welcome.owner_entity)
                             .ok_or("Missing owner proof")?
@@ -423,19 +412,12 @@ impl DreamAuthority {
                     // A duplicate fence, or a fence unrelated to the retained
                     // transfer's bases, must not restart that transfer's deadline.
                     if peer.frozen.as_ref().is_some_and(|group| {
-                        group.baseline_packets.iter().any(|packet| {
-                            if let engine_net::replication::baselines::BaselineEncoding::Delta {
-                                base,
-                            } = packet.encoding
-                            {
-                                fences.iter().any(|fence| {
-                                    fence.context == base.context
-                                        && fence.generation == base.generation
-                                        && base.snapshot <= fence.through
-                                })
-                            } else {
-                                false
-                            }
+                        group.bases.iter().any(|base| {
+                            fences.iter().any(|fence| {
+                                fence.context == base.context
+                                    && fence.generation == base.generation
+                                    && base.snapshot <= fence.through
+                            })
                         })
                     }) {
                         peer.frozen = None;

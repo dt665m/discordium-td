@@ -193,6 +193,20 @@ impl RemotePoses {
             .latest(scope)
             .is_some_and(|latest| latest.tick == tick)
         {
+            // The buffer has accepted this identity and replaced its index's
+            // track. Old generation removals may never arrive on the control lane.
+            let first = EntityId {
+                generation: 0,
+                ..scope.entity
+            };
+            while let Some(old) = self
+                .combat_entities
+                .range(first..scope.entity)
+                .next()
+                .copied()
+            {
+                self.combat_entities.remove(&old);
+            }
             if matches!(actor, PublicReplica::Enemy(_))
                 || matches!(actor, PublicReplica::Cover(cover) if cover.present)
             {
@@ -300,6 +314,57 @@ impl RemotePoses {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn newer_generation_retires_combat_membership_without_old_destruction() {
+        for combat_replacement in [true, false] {
+            let mut poses = RemotePoses::new(ConnectionEpoch(1), SceneRevision(1)).unwrap();
+            for generation in 1..=32 {
+                let scope = ScopeIdentity {
+                    connection: ConnectionEpoch(1),
+                    entity: EntityId {
+                        index: 7,
+                        generation,
+                    },
+                    scope: ScopeEpoch(1),
+                    representation: RepresentationRevision(1),
+                };
+                let combat = generation == 1 || combat_replacement;
+                let actor = if combat {
+                    PublicReplica::Enemy(dreamwake_sim::replication::PublicEnemyView {
+                        id: 7,
+                        position: [0.0; 2],
+                        facing: [1.0, 0.0],
+                        hp: 10.0,
+                        max_hp: 10.0,
+                        kind: dreamwake_sim::EnemyKind::Melee,
+                        windup: 0.0,
+                        target: [0.0; 2],
+                        warn_radius: 0.0,
+                        phase: 0,
+                        slowed: false,
+                        hit_flash: 0.0,
+                    })
+                } else {
+                    actor(0.0)
+                };
+                poses.receive(scope, ServerTick(60), &actor).unwrap();
+                poses.receive(scope, ServerTick(66), &actor).unwrap();
+                poses.advance(ServerTick(69));
+                assert_eq!(poses.combat_entities.len(), usize::from(combat));
+                assert_eq!(poses.combat_view_tick(), Some(ServerTick(63)));
+                if generation > 1 {
+                    poses.remove(EntityId {
+                        generation: generation - 1,
+                        ..scope.entity
+                    });
+                    assert_eq!(poses.buffer.identity(scope.entity).unwrap().scope, scope);
+                    assert_eq!(poses.combat_view_tick(), Some(ServerTick(63)));
+                }
+                assert_eq!(poses.metrics().known_entities, 1);
+            }
+        }
+    }
+
     #[test]
     fn shutter_height_interpolates_each_frame_in_both_directions() {
         let scope = ScopeIdentity {

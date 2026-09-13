@@ -35,14 +35,43 @@ impl OwnerBaselines {
     /// Ordinary advancing states are reconstructed directly into the group.
     pub(super) fn rejected_full_seed(&self, packet: &BaselinePacket) -> Option<Vec<u8>> {
         let member = self.members.get(&packet.target.context.scope.entity)?;
-        (member.context == packet.target.context
+        let superseded_snapshot = member.context == packet.target.context
             && (member.cache.generation() != packet.target.generation
                 || member
                     .cache
                     .current()
-                    .is_some_and(|current| packet.target.snapshot <= current.receipt.snapshot))
+                    .is_some_and(|current| packet.target.snapshot <= current.receipt.snapshot));
+        ((superseded_snapshot || Self::obsolete_member_context(member, packet).is_some())
             && matches!(packet.encoding, BaselineEncoding::Full))
         .then(|| packet.bytes.clone())
+    }
+    pub(super) fn obsolete_context(&self, packet: &BaselinePacket) -> Option<ReplicationError> {
+        let member = self.members.get(&packet.target.context.scope.entity)?;
+        Self::obsolete_member_context(member, packet)
+    }
+    fn obsolete_member_context(
+        member: &Member,
+        packet: &BaselinePacket,
+    ) -> Option<ReplicationError> {
+        if !member
+            .context
+            .group
+            .zip(packet.target.context.group)
+            .is_some_and(|(current, incoming)| current.0 == incoming.0 && incoming.1 < current.1)
+        {
+            return None;
+        }
+        match Self::control_context(
+            member,
+            packet.target.context,
+            packet.target.generation,
+            false,
+        ) {
+            Err(ReplicationError::Obsolete(_)) => Some(ReplicationError::Obsolete(
+                engine_net::replication::ObsoleteReason::Publication,
+            )),
+            _ => None,
+        }
     }
     pub(super) fn retained_bytes(&self) -> usize {
         self.members
@@ -71,6 +100,12 @@ impl OwnerBaselines {
         packet: BaselinePacket,
     ) -> Result<BaselineReceipt, ReplicationError> {
         let entity = state.scope.entity;
+        // A reliable topology reset or newer unordered owner message may arrive
+        // before an old delta. Its retired context cannot replace the new cache
+        // or be treated as an unknown initial delta needing another repair.
+        if let Some(error) = self.obsolete_context(&packet) {
+            return Err(error);
+        }
         if self
             .members
             .get(&entity)
@@ -96,7 +131,7 @@ impl OwnerBaselines {
             );
         }
         let member = self.members.get_mut(&entity).unwrap();
-        // Reliable retirement fences may overtake older unreliable deltas. A
+        // Control-lane retirement fences may overtake older owner deltas. A
         // retired base is expected stale traffic: retain the usable replacement
         // and await the next publication instead of resetting every generation.
         let receipt = member.cache.receive(&packet, &BytePatch, |_| true)?;

@@ -6,7 +6,7 @@ Partial reliability is a legitimate, generalizable transport feature. The applic
 
 However, these measurements do **not yet justify implementing a cancellation fork for this game**. There are meaningful A/C freshness differences, but simple admission/queue policy changes account for substantial differences too. The narrower, immediately actionable obsolete-retry category is generally a few percent of modeled downstream bytes, not the dramatic “most old bytes are wasted” interpretation. An implemented cancellation policy was not benchmarked, so its net benefit remains unmeasured.
 
-The preferred simplification target is **C: bounded whole owner-group messages using default upstream Renet reliable-unordered delivery, without a new cancellation feature**. A has not demonstrated a consistent advantage sufficient to justify maintaining its custom delivery layer when simplicity is the priority. Successful production-shaped integration is the cutover condition, not a reason to maintain permanent A/C implementations. A's adverse reset triggers and C's control-buffer failure remain acceptance questions. This guide records evidence and migration reasoning; it does not claim that the production cutover has happened.
+The selected implementation is **C: bounded whole owner-group messages using stock Renet reliable-unordered delivery, without a new cancellation feature**. A did not demonstrate a consistent advantage sufficient to justify maintaining its custom delivery layer. The live game now has one owner-message path; A survives only in a historical comparison fixture. These measurements explain that choice. They do not qualify production endurance or replace the full-game acceptance workflow.
 
 ## What was actually tested
 
@@ -14,13 +14,13 @@ Source base: `8c5fb6e998ee29a1defb85395be380464a4b779a`.
 New harness: [renet_adverse_delivery.rs](../engine/net/tests/renet_adverse_delivery.rs).
 SHA-256: `5b28d77413bdc4ab968329016507bc73ad1dca24d0c85ce4a297ead2b6eb4dd9`.
 
-The isolated build uses crates.io **Renet 2.0.0**, checksum `8535f2f4b5afe5e31fc37be4b8a1f167e61177f356b1c6ee8456b7045d6c74c0`. Production path patches were disabled only in an isolated checkout for the stock experiment. Local path dependencies are not immutable source identities; the ordinary workspace configuration still uses the fork described in [the dependency register](network-dependencies.md).
+The isolated build used crates.io **Renet 2.0.0**, checksum `8535f2f4b5afe5e31fc37be4b8a1f167e61177f356b1c6ee8456b7045d6c74c0`. Production packetizer patches were disabled in that isolated experiment. The live workspace now also uses stock Renet; its distinct renetcode handshake correction and transport adapter are recorded in [the dependency register](network-dependencies.md). The source hash above identifies the measured harness before moving A's removed byte assembler into a test-only fixture.
 
 700 deterministic cases: seven profiles × four workloads × five policies × five seeds (7, 29, 101, 307, 997). Each generates snapshots for ten simulated seconds and allows three seconds for final recovery. The matrix itself runs in about four wall-clock seconds.
 
 Policies:
 
-- **A:** real engine ByteAssembler/fragment_group over unreliable Renet messages. Preserve an immutable first transmission pass, coalesce waiting state, permit topology replacement, and repair the final state after the chosen interval.
+- **A:** the former engine ByteAssembler/fragment_group over unreliable Renet messages, retained in [application_fragments.rs](../engine/net/tests/fixtures/application_fragments.rs). Preserve an immutable first transmission pass, coalesce waiting state, permit topology replacement, and repair the final state after the chosen interval.
 - **C4/C16:** whole messages over reliable-unordered Renet, with four/sixteen exact decoded-receipt admission slots and a 128 KiB sender queue. Receipts for obsolete decoded messages are included.
 - **C128** (log name CQ): same reliable transport, admission limited only by its 128 KiB sender queue; no decoded-receipt gate.
 - **C32** (CQ32): same queue-only policy with a 32 KiB sender queue. All variants retain a 128 KiB state receiver allowance.
@@ -35,7 +35,7 @@ Profiles: clean 80 ms base RTT; 150 ms RTT/3% loss with jitter/reorder/duplicate
 
 ## Important limits
 
-This is a real-Renet-packet simulation, **not an equal-MTU production A/C integration test**. Stock C has 1,200-byte slice payloads plus framing/overhead; production's bounded profile caps the entire IP packet at 1,200 bytes. Larger packets are allowed in this experiment, with no MTU-dependent loss. Some packet efficiency therefore includes this deliberate difference. The game's independent worker polling, variable publication budget and age-sensitive scheduling are also not reproduced.
+This is a real-Renet-packet simulation, **not an equal-MTU production A/C integration test**. Stock C has 1,200-byte slice payloads plus framing/overhead; the former production profile capped the entire IP packet at 1,200 bytes. Larger packets are allowed in this experiment, with no MTU-dependent loss. Some packet efficiency therefore includes this deliberate difference. The game's independent worker polling, variable publication budget and age-sensitive scheduling are also not reproduced. The current native packet allowance is documented in [netcode.md](netcode.md#server-execution).
 
 Freshness is sampled every 10 ms through the ten-second run, including blackouts. It is age of the newest applied state's generation timestamp, not latency conditioned on successful delivery. Numbers below are medians of the five per-run p95s; appendix brackets show the seed range, not statistical confidence intervals. Traffic totals cover generation plus settling, not a steady-state bytes/second measurement.
 
@@ -125,30 +125,30 @@ On this evidence, a new wire protocol is not justified by bandwidth savings alon
 
 ## Production corroboration and remaining gate
 
-Current production A, using the copied local fork and authenticated native UDP, passed:
+The former A implementation, using the copied local fork and authenticated native UDP, passed:
 
 - [collision decode-proof admission test](../games/dreamwake/server/src/authority/tests.rs): initial complete group was 2,867 application bytes, illustrating that 29,216 is a capacity stress size, not a universal normal update.
 - [moving-enemy cadence test](../games/dreamwake/server/src/authority/tests.rs): about eight measured seconds after setup, 1,017,773 native wire bytes (about 127 KB/s), maximum owner age three 60 Hz ticks and moving-remote gap six ticks; pacing/cap drops zero.
 
-These are clean-link A checks. Adverse full-game resync, equal production MTU, C game integration, browser WebRTC, delta/baseline replay and endurance acceptance remain unverified.
+These historical clean-link A checks do not validate the current whole-message path. Current protocol and integration tests exercise whole-group decode, actual Renet delivery, baseline/reset ordering, activation, rejoin and paced remote cadence. Browser and endurance acceptance must be tied to the frozen build being tested.
 
-### Clean-cutover scope
+### Production integration contract
 
-Use one complete bounded owner-group message on reliable-unordered transport. Keep remote actor updates on their existing unreliable path; changing the whole current state channel would also change those semantics. Coalesce the latest unpublished owner state before transport admission, enqueue each accepted group once, and let Renet own its slices and retries.
+The live game sends one complete bounded owner-group message on a dedicated reliable-unordered channel. Remote actors remain unreliable. Latest unpublished owner state coalesces before transport admission; each accepted group is enqueued once and Renet owns its slices and retries.
 
-Remove application byte fragmentation, fragment framing, client ByteAssembler and fragment staging, server fragment vectors/cursors/first-pass tracking, and manual prefix repair/repeat scheduling. Reduce FrozenGroup to the small bootstrap/reset record still required for exact decoded identity, activation and deadlines. Do not remove group manifests, scope/topology/epoch identities, transactional baseline reconstruction, atomic publication, input/action receipts, or correctness-related resync.
+Application byte fragmentation, client ByteAssembler, server fragment storage/cursors and manual prefix repair are removed. FrozenGroup keeps bootstrap/reset receipts, referenced bases and deadlines. Complete group manifests, scope/topology/epoch identities, transactional baseline reconstruction, atomic publication, input/action receipts and correctness-related resync remain game contracts.
 
-Default Renet migration must also replace the current publication preflight's unsliced-message assumptions in [engine/server/src/net.rs](../engine/server/src/net.rs). Resolve whole-message admission separately from per-flush packet pacing. Validate the actual default packet sizes rather than carrying forward a claim that stock 1,200-byte payload slices satisfy a 1,200-byte IP-packet cap.
+The removed publication preflight no longer assumes unsliced messages. Whole-message admission is separate from packet pacing. Sender owner memory is 32 KiB, receiver memory is 128 KiB, and controls use 128 KiB. A validated whole group that precedes its baseline reset occupies one bounded client slot until the control arrives or the original two-second deadline expires. Full settings and invariants belong in [netcode.md](netcode.md#scoped-state-and-prediction).
 
-The final target has one delivery implementation, not a permanent compatibility toggle. Bump the protocol identity, rebuild clients and servers together, qualify UDP/WebRTC and bootstrap/baseline/reset/rejoin behavior, then delete unused A paths and update the contracts. Preserve the reproducible historical comparison fixture as test evidence, clearly distinguished from production code.
+Protocol identity `0x445245414d000016` requires rebuilding clients and servers together. There is one production delivery implementation and no compatibility toggle. The historical comparison fixture is test evidence, not a runtime option.
 
-Removing the Renet fork and removing application A are related but not identical: workspace patches also supply transport/security integration and a separately demonstrated renetcode confirmation-retry correction. Do not silently remove those guarantees or describe a partial de-fork as “full default Renet.” Verify stock behavior, move only genuinely necessary application/session policy to its proper layer, and report any remaining upstream correctness blocker explicitly. Do not introduce cancellation to make the migration possible.
+Renet itself is stock crates.io 2.0.0. The separately pinned, minimal renetcode confirmation-retry correction preserves handshake progress under a lost initial KeepAlive; secure grants and backend transport services remain in renet-cross. Neither dependency adds cancellation or Renet packet configuration extensions. See the [dependency register](network-dependencies.md) for the exact pin and removal condition.
 
 ## Reproduction and validation
 
 ### Ordinary workspace run
 
-The workspace's existing sibling renet-cross checkout is required by its path patches. This run exercises the same fixture against the selected dependency, not necessarily stock Renet:
+The workspace uses stock Renet and the existing sibling renet-cross adapter. This short comparison runs with the selected lockfile:
 
 ```sh
 cargo test --locked -p engine_net --test renet_adverse_delivery -- --nocapture
@@ -157,7 +157,7 @@ cargo test --locked -p engine_net --lib
 
 ### Stock-Renet comparison
 
-Use a disposable clean checkout at a commit containing this guide and the tests. Do not edit the working game's dependency configuration merely to reproduce the experiment. In that checkout's root Cargo.toml, remove **only** the three `[patch.crates-io]` entries named `renet`, `renetcode`, and `renet-cross`; preserve the pinned sctp-proto and str0m entries. Allow Cargo.lock to resolve the registry replacements in the disposable checkout.
+No manifest edit is needed for the current workspace: the comparison uses Renet directly and does not exercise renetcode or renet-cross. For historical pre-cutover commits, use a disposable checkout and remove only the Renet packetizer override there before resolving its lockfile. Keep the working game's dependency configuration intact.
 
 ```sh
 cargo pkgid renet
@@ -165,7 +165,7 @@ cargo test -p engine_net --test renet_adverse_delivery -- --nocapture
 cargo test --locked -p engine_net --lib
 ```
 
-Verify that `cargo pkgid renet` reports crates.io Renet 2.0.0, not a local path. A different version is a new experiment. Record the checkout identity, edited manifest, resolved lockfile and test output. After initial resolution, add `--locked` to reruns; `--offline` is optional when all dependencies are already cached.
+Verify that `cargo pkgid renet` reports crates.io Renet 2.0.0, not a local path. A different version is a new experiment. Record the checkout identity, manifest, resolved lockfile and test output; use `--locked` for reproducible reruns.
 
 The matrix prints 700 `ADVERSE` JSON rows. To retain a result file in Bash or Zsh:
 

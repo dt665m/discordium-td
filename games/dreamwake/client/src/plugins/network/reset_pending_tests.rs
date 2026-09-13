@@ -63,22 +63,10 @@ fn wrap_next_generation(group: &mut GroupChunk<Vec<u8>>) {
 }
 
 fn frames(session: &Session, group: &GroupChunk<Vec<u8>>) -> Vec<Vec<u8>> {
-    let bytes = encode_group(group, group_limits(), |payload| Ok(payload.clone())).unwrap();
-    let limit = session.model.welcome.frame_limit().unwrap();
-    fragment_group(group.publication, &bytes, byte_limits(limit).unwrap())
-        .unwrap()
-        .into_iter()
-        .enumerate()
-        .map(|(index, fragment)| {
-            encode_state(
-                &StateFrame::Fragment(fragment),
-                session.model.welcome.stream.epoch,
-                index as u32,
-                limit,
-            )
-            .unwrap()
-        })
-        .collect()
+    vec![super::tests::encoded_group_frame(
+        &session.model.welcome,
+        group.clone(),
+    )]
 }
 
 #[test]
@@ -246,7 +234,7 @@ fn pending_full_receive_preserves_freshness_and_receipts_until_reliable_reset() 
     for frame in &frames {
         receive_message(
             &mut runtime,
-            STATE_CHANNEL,
+            OWNER_GROUP_CHANNEL,
             frame,
             Duration::from_millis(2),
             &mut world,
@@ -291,18 +279,38 @@ fn pending_full_receive_preserves_freshness_and_receipts_until_reliable_reset() 
     )
     .unwrap();
     let session = runtime.prediction.as_mut().unwrap();
+    assert!(
+        session.control_sequence > sequence,
+        "reset alone must enqueue the decoded proof"
+    );
+    assert_eq!(session.metrics().incomplete_groups, 0);
+    assert_eq!(session.metrics().group_bytes, 0);
+    assert_eq!(session.metrics().delivery.groups_completed, 2);
+    assert_eq!(session.scopes.state(owner).unwrap().snapshot, SnapshotId(2));
+    assert_eq!(session.metrics().delivery.baseline_reset_pending, 1);
+    assert_eq!(runtime.last_received, 0.002);
+    assert_eq!(world.resource::<diagnostics::Telemetry>().snapshots, 1);
+    runtime.renet.set_connected();
+    let mut server = renet::RenetServer::new(dreamwake_protocol::server_connection_config());
+    server.add_connection(runtime.client_id);
+    for packet in runtime.renet.get_packets_to_send() {
+        server
+            .process_packet_from(&packet, runtime.client_id)
+            .unwrap();
+    }
     let mut decoded = None;
-    for frame in &frames {
-        if let Some(receipt) = session
-            .receive_state(frame, Duration::from_millis(4))
-            .unwrap()
-        {
-            assert!(decoded.replace(receipt).is_none());
+    while let Some(bytes) = server.receive_message(runtime.client_id, CONTROL_CHANNEL) {
+        let control = decode_control::<ClientControl>(
+            &bytes,
+            ConnectionEpoch(1),
+            engine_net::codec::FrameLimit::new(1100).unwrap(),
+        )
+        .unwrap();
+        if let ClientControl::OwnerDecoded { proofs } = control {
+            assert!(decoded.replace(proofs).is_none());
         }
     }
-    let Some(ClientControl::OwnerDecoded { proofs }) = decoded else {
-        panic!("retry after reset must decode")
-    };
+    let proofs = decoded.expect("reset alone must deliver the exact decoded proof through Renet");
     assert_eq!(proofs.len(), group.members.len());
     assert!(
         proofs
@@ -311,6 +319,99 @@ fn pending_full_receive_preserves_freshness_and_receipts_until_reliable_reset() 
             .all(|proof| proof.baseline.generation == BaselineGeneration(2)
                 && proof.state.snapshot == SnapshotId(2))
     );
-    assert_eq!(session.scopes.state(owner).unwrap().snapshot, SnapshotId(2));
-    assert_eq!(session.metrics().delivery.baseline_reset_pending, 1);
+}
+
+#[test]
+fn malformed_newer_group_cannot_evict_a_valid_message_waiting_for_reset() {
+    let (mut session, mut group) = prepared();
+    let resets = group
+        .members
+        .iter()
+        .map(|state| BaselineReset {
+            context: wire::context(state, group.publication),
+            generation: BaselineGeneration(2),
+        })
+        .collect::<Vec<_>>();
+    wrap_next_generation(&mut group);
+    let frame = frames(&session, &group).pop().unwrap();
+    assert!(
+        session
+            .receive_state(&frame, Duration::from_millis(2))
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(session.metrics().incomplete_groups, 1);
+    assert_eq!(session.metrics().group_bytes, frame.len());
+    group.publication.snapshot = SnapshotId(3);
+    group.members.last_mut().unwrap().payload.pop();
+    let malformed = frames(&session, &group).pop().unwrap();
+    assert!(
+        session
+            .receive_state(&malformed, Duration::from_millis(3))
+            .is_err()
+    );
+    assert_eq!(session.metrics().group_bytes, frame.len());
+    session.baselines.apply_resets(&resets).unwrap();
+    let Some((ClientControl::OwnerDecoded { proofs }, received_at)) = session
+        .receive_pending_reset_group(Duration::from_millis(4))
+        .unwrap()
+    else {
+        panic!("valid pending message must survive malformed replacement");
+    };
+    assert!(
+        proofs
+            .as_slice()
+            .iter()
+            .all(|proof| proof.state.snapshot == SnapshotId(2))
+    );
+    assert_eq!(received_at, Duration::from_millis(2));
+    assert_eq!(session.metrics().group_bytes, 0);
+}
+
+#[test]
+fn newer_pending_message_cannot_extend_missing_reset_deadline() {
+    let (mut session, mut group) = prepared();
+    wrap_next_generation(&mut group);
+    let first = frames(&session, &group).pop().unwrap();
+    session
+        .receive_state(&first, Duration::from_millis(2))
+        .unwrap();
+    group.publication.snapshot = SnapshotId(3);
+    for state in &mut group.members {
+        let mut packet = wire::decode_member(
+            &state.payload,
+            state,
+            GroupPublication {
+                snapshot: SnapshotId(2),
+                ..group.publication
+            },
+        )
+        .unwrap();
+        state.snapshot = SnapshotId(3);
+        state.version = StateVersion(3);
+        packet.target = wire::target(state, group.publication, BaselineGeneration(2));
+        state.payload = wire::encode_member(&packet).unwrap();
+    }
+    let newer = frames(&session, &group).pop().unwrap();
+    session
+        .receive_state(&newer, Duration::from_millis(1000))
+        .unwrap();
+    assert_eq!(session.metrics().incomplete_groups, 1);
+    assert_eq!(session.metrics().group_bytes, newer.len());
+    assert_eq!(
+        session.expire_groups(Duration::from_millis(2001)).unwrap(),
+        0
+    );
+    assert_eq!(
+        session.expire_groups(Duration::from_millis(2002)).unwrap(),
+        1
+    );
+    assert_eq!(session.metrics().incomplete_groups, 0);
+    assert_eq!(session.metrics().group_bytes, 0);
+    assert!(
+        session
+            .receive_pending_reset_group(Duration::from_millis(2003))
+            .unwrap()
+            .is_none()
+    );
 }

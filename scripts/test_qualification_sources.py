@@ -5,6 +5,7 @@ from pathlib import Path
 import runpy
 import tempfile
 import unittest
+from unittest.mock import patch
 
 HELPERS = runpy.run_path(str(Path(__file__).with_name('qualify-soak.py')))
 
@@ -33,6 +34,22 @@ class FrozenSourcesTests(unittest.TestCase):
         files, digest = self.validate()
         self.assertEqual(files, self.files)
         self.assertEqual(digest, hashlib.sha256(self.manifest.read_bytes()).hexdigest())
+
+    def test_prepare_only_verifies_sources_without_building_or_launching(self):
+        output = self.root / 'prepared'
+        argv = ['qualify-soak.py', '--source-manifest', str(self.manifest),
+                '--source-root', str(self.base), '--output', str(output), '--prepare-only']
+        main = HELPERS['main']
+        with patch.dict(main.__globals__, ROOT=self.workspace), \
+                patch('sys.argv', argv), patch('runpy.run_path', return_value={}), \
+                patch('subprocess.run', side_effect=AssertionError('must not build')), \
+                patch('subprocess.Popen', side_effect=AssertionError('must not launch')):
+            self.assertEqual(main(), 0)
+        report = json.loads((output / 'capture.json').read_text())
+        self.assertTrue(report['prepared_only'])
+        self.assertFalse(report['workload_launched'])
+        self.assertEqual(report['source_manifest_sha256'], hashlib.sha256(self.manifest.read_bytes()).hexdigest())
+        self.assertFalse((output / 'build').exists())
 
     def test_changed_missing_and_added_sources_rejected(self):
         self.source.write_text('changed')
@@ -69,6 +86,23 @@ class FrozenSourcesTests(unittest.TestCase):
         self.assertTrue(HELPERS['unchanged'](self.base, files))
         self.source.write_text('changed')
         self.assertFalse(HELPERS['unchanged'](self.base, files))
+
+
+class WorkloadCoverageTests(unittest.TestCase):
+    def test_whole_message_delivery_requires_all_applicable_workload_paths(self):
+        counters = dict.fromkeys([
+            'scope_exits', 'destroyed_generations', 'dormant_offers', 'dropped',
+            'reordered', 'groups_published', 'baseline_retirements', 'event_records',
+            'full_history_windows', 'retired_history_checks',
+        ], 1)
+        self.assertTrue(HELPERS['workload_coverage'](counters))
+        self.assertTrue(HELPERS['workload_coverage']({**counters, 'partial_groups': 0}))
+        for name in counters:
+            with self.subTest(counter=name):
+                self.assertFalse(HELPERS['workload_coverage']({**counters, name: 0}))
+                self.assertFalse(HELPERS['workload_coverage']({key: value for key, value in counters.items() if key != name}))
+        self.assertFalse(HELPERS['workload_coverage'](None))
+        self.assertFalse(HELPERS['workload_coverage']({}))
 
 
 if __name__ == '__main__':

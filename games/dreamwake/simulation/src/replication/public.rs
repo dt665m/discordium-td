@@ -62,6 +62,7 @@ impl DreamGlobalView {
 #[serde(deny_unknown_fields)]
 pub struct PublicHeroView {
     pub id: u64,
+    pub color: [u8; 3],
     pub position: [f32; 2],
     pub elevation: f32,
     pub crouched: bool,

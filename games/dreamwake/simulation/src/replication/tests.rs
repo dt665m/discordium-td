@@ -166,6 +166,22 @@ fn owner_checkpoint_restores_exact_selected_latent_state_and_rng() {
 }
 
 #[test]
+fn owner_checkpoint_rejects_a_color_outside_the_authoritative_palette() {
+    let sim = party();
+    let mut checkpoint = sim
+        .capture_replication(stamp(&sim))
+        .unwrap()
+        .owner_checkpoint(1, 1)
+        .unwrap();
+    checkpoint.hero.view.color = [0; 3];
+    assert_eq!(
+        checkpoint.validate_for(checkpoint.expectation()),
+        Err(ReplicationError::InvalidState)
+    );
+    assert!(checkpoint.encode().is_err());
+}
+
+#[test]
 fn owner_checkpoint_roundtrips_only_valid_same_tick_input_continuity() {
     use engine_net::{commands::InputContinuity, types::ServerTick};
 
@@ -363,11 +379,82 @@ fn presentation_has_owner_data_and_explicit_remote_placeholders() {
     let shown = DreamPresentation::from_replicas(capture.global(), &owner, &replicas).unwrap();
     assert_eq!(shown.hero, sim.snapshot_for(1).hero);
     let remote = shown.heroes.iter().find(|v| v.id == 2).unwrap();
+    assert_eq!(remote.color, sim.snapshot_for(2).hero.color);
     assert!(remote.memories.iter().all(|v| v.level == 0));
     assert_eq!(remote.attack_power, 0.0);
     assert_eq!(shown.enemies_remaining, 0); // Does not reveal hidden/future enemy count.
     assert_eq!(shown.stamp.server_tick, 1000);
     assert_eq!(shown.tick, sim.snapshot().tick);
+}
+
+#[test]
+fn owner_and_public_wire_give_both_clients_the_same_player_colors() {
+    let sim = party();
+    let capture = sim.capture_replication(stamp(&sim)).unwrap();
+    let public_one = PublicReplica::Hero(capture.project_hero(1).unwrap());
+    let public_two = PublicReplica::Hero(capture.project_hero(2).unwrap());
+    let public_one = PublicReplica::decode(&public_one.encode().unwrap()).unwrap();
+    let public_two = PublicReplica::decode(&public_two.encode().unwrap()).unwrap();
+
+    let checkpoint_one = capture.owner_checkpoint(1, 1).unwrap();
+    let owner_one = OwnerPredictionState::from_checkpoint(
+        &OwnerCheckpoint::decode(
+            &checkpoint_one.encode().unwrap(),
+            checkpoint_one.expectation(),
+        )
+        .unwrap(),
+        checkpoint_one.expectation(),
+    )
+    .unwrap();
+    let checkpoint_two = capture.owner_checkpoint(2, 1).unwrap();
+    let owner_two = OwnerPredictionState::from_checkpoint(
+        &OwnerCheckpoint::decode(
+            &checkpoint_two.encode().unwrap(),
+            checkpoint_two.expectation(),
+        )
+        .unwrap(),
+        checkpoint_two.expectation(),
+    )
+    .unwrap();
+    let view_one = DreamPresentation::from_replicas(
+        capture.global(),
+        &owner_one,
+        std::slice::from_ref(&public_two),
+    )
+    .unwrap();
+    let view_two = DreamPresentation::from_replicas(
+        capture.global(),
+        &owner_two,
+        std::slice::from_ref(&public_one),
+    )
+    .unwrap();
+    for id in [1, 2] {
+        let expected = sim.snapshot_for(id).hero.color;
+        assert_eq!(
+            view_one
+                .heroes
+                .iter()
+                .find(|hero| hero.id == id)
+                .unwrap()
+                .color,
+            expected
+        );
+        assert_eq!(
+            view_two
+                .heroes
+                .iter()
+                .find(|hero| hero.id == id)
+                .unwrap()
+                .color,
+            expected
+        );
+    }
+    let mut invalid = capture.project_hero(2).unwrap();
+    invalid.color = [0; 3];
+    assert_eq!(
+        PublicReplica::Hero(invalid).validate(),
+        Err(ReplicationError::InvalidState)
+    );
 }
 
 #[test]

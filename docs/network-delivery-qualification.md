@@ -140,7 +140,7 @@ Application byte fragmentation, client ByteAssembler, server fragment storage/cu
 
 The removed publication preflight no longer assumes unsliced messages. Whole-message admission is separate from packet pacing. Sender owner memory is 32 KiB, receiver memory is 128 KiB, and controls use 128 KiB. A validated whole group that precedes its baseline reset occupies one bounded client slot until the control arrives or the original two-second deadline expires. Full settings and invariants belong in [netcode.md](netcode.md#scoped-state-and-prediction).
 
-Protocol identity `0x445245414d000016` requires rebuilding clients and servers together. There is one production delivery implementation and no compatibility toggle. The historical comparison fixture is test evidence, not a runtime option.
+The [game protocol identity](../games/dreamwake/protocol/src/lib.rs) requires rebuilding clients and servers together when it changes. There is one production delivery implementation and no compatibility toggle. The historical comparison fixture is test evidence, not a runtime option.
 
 Renet itself is stock crates.io 2.0.0. The separately pinned, minimal renetcode confirmation-retry correction preserves handshake progress under a lost initial KeepAlive; secure grants and backend transport services remain in renet-cross. Neither dependency adds cancellation or Renet packet configuration extensions. See the [dependency register](network-dependencies.md) for the exact pin and removal condition.
 

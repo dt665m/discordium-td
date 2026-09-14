@@ -20,6 +20,7 @@ pub(super) fn adapt(view: Res<DreamView>, mut frame: ResMut<GraphicsFrame>) {
     };
     for hero in &snap.heroes {
         let height = if hero.crouched { 1.2 } else { 1.4 };
+        let player_color = super::scene::player_color(hero.color);
         actor(
             0,
             hero.id,
@@ -29,7 +30,7 @@ pub(super) fn adapt(view: Res<DreamView>, mut frame: ResMut<GraphicsFrame>) {
             if hero.hit_flash > 0.0 {
                 Color::WHITE
             } else {
-                Color::srgb(0.3, 0.85, 1.0)
+                player_color
             },
         );
         actor(
@@ -43,7 +44,7 @@ pub(super) fn adapt(view: Res<DreamView>, mut frame: ResMut<GraphicsFrame>) {
             if hero.attack_flash > 0.0 {
                 Color::srgb(1.0, 0.9, 0.3)
             } else {
-                Color::srgb(0.6, 0.95, 1.0)
+                player_color
             },
         );
     }
@@ -229,6 +230,32 @@ mod tests {
             .clear();
         app.update();
         assert!(app.world().resource::<Observed>().0.is_empty());
+    }
+
+    #[test]
+    fn alternate_renderer_uses_the_same_authoritative_colors_from_both_player_views() {
+        fn player_colors(snapshot: dreamwake_sim::DreamSnapshot) -> Vec<(u64, Color)> {
+            let mut app = App::new();
+            app.insert_resource(DreamView(crate::offline_presentation(snapshot)))
+                .add_plugins((GraphicsPlugin, DreamGraphicsPlugin));
+            app.update();
+            app.world()
+                .resource::<GraphicsFrame>()
+                .visuals
+                .iter()
+                .filter_map(|visual| match visual.id {
+                    VisualId::Entity { namespace: 0, id } => Some((id, visual.color)),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        let mut sim = dreamwake_sim::DreamSimulation::new(7, false);
+        assert!(sim.add_player(5)); // Same remainder under the former id % 4 mapping.
+        let from_one = player_colors(sim.snapshot_for(1));
+        let from_five = player_colors(sim.snapshot_for(5));
+        assert_eq!(from_one, from_five);
+        assert_ne!(from_one[0].1, from_one[1].1);
     }
 
     #[test]

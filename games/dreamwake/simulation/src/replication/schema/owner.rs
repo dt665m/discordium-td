@@ -2,7 +2,7 @@
 use super::*;
 use crate::state;
 use engine_net::codec::BoundedVec;
-engine_net::schema! {pub(super) struct Body(SchemaId(0x120b),1,Representation::OwnerCheckpoint) {
+engine_net::schema! {pub(super) struct Body(SchemaId(0x120b),2,Representation::OwnerCheckpoint) {
 1=>id:u64=1=>o(Units::Unitless,U64),
 2=>shards:u32=0=>o(Units::Unitless,U32),
 3=>combo:u32=0=>o(Units::Unitless,U32),
@@ -14,11 +14,13 @@ engine_net::schema! {pub(super) struct Body(SchemaId(0x120b),1,Representation::O
 9=>critical_chance:f32=0.08=>o(Units::Unitless,NONNEG),
 10=>recovery:f32=1.0=>o(Units::Unitless,NONNEG),
 11=>defense:f32=0.0=>o(Units::Unitless,F),
+12=>color:[u8;3]=crate::player_color_for_slot(0)=>o(Units::Unitless,U8),
 }}
 impl From<&state::HeroBody> for Body {
     fn from(v: &state::HeroBody) -> Self {
         Self {
             id: v.id,
+            color: v.color,
             shards: v.shards,
             combo: v.combo,
             hit_flash: v.hit_flash,
@@ -36,6 +38,7 @@ impl From<Body> for state::HeroBody {
     fn from(v: Body) -> Self {
         Self {
             id: v.id,
+            color: v.color,
             shards: v.shards,
             combo: v.combo,
             hit_flash: v.hit_flash,
@@ -529,7 +532,7 @@ impl From<InputContinuity> for engine_net::commands::InputContinuity<crate::Drea
         }
     }
 }
-engine_net::schema! {pub(super) struct Owner(SchemaId(0x1102),4,Representation::OwnerCheckpoint) {
+engine_net::schema! {pub(super) struct Owner(SchemaId(0x1102),5,Representation::OwnerCheckpoint) {
 1=>schema_version:u32=crate::replication::OWNER_CHECKPOINT_SCHEMA=>o(Units::Unitless,U32),
 2=>ruleset:BoundedString<64>=BoundedString::new(crate::CheckpointIdentity::current(1).ruleset).unwrap()=>o(Units::Unitless,Range::None),
 3=>owner:u64=1=>o(Units::Unitless,U64),

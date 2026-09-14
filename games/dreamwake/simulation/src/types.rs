@@ -60,6 +60,32 @@ pub const DEMO_COVER_POSITIONS: [[f32; 2]; 45] = [
 pub const ENEMY_AGGRO_RANGE: f32 = 24.0;
 /// Includes inactive/pending heroes because all retain authoritative combat poses.
 pub const MAX_HEROES: usize = 128;
+const _: () = assert!(MAX_HEROES <= u8::MAX as usize + 1);
+
+/// Returns one of the match's distinct player colors in a join-friendly order.
+/// The simulation assigns and persists the resulting RGB value; clients do not
+/// infer an assignment from player identity or local ownership.
+pub(crate) fn player_color_for_slot(slot: usize) -> [u8; 3] {
+    assert!(slot < MAX_HEROES, "player color slot exceeds capacity");
+    // A coprime step spreads consecutive joins around the hue wheel while still
+    // visiting every one of the 128 distinct quantized hues exactly once.
+    let hue = ((slot * 79 + 64) % MAX_HEROES) as f32 / MAX_HEROES as f32 * 6.0;
+    let x = 1.0 - (hue.rem_euclid(2.0) - 1.0).abs();
+    let (r, g, b) = match hue as usize {
+        0 => (1.0, x, 0.0),
+        1 => (x, 1.0, 0.0),
+        2 => (0.0, 1.0, x),
+        3 => (0.0, x, 1.0),
+        4 => (x, 0.0, 1.0),
+        _ => (1.0, 0.0, x),
+    };
+    let channel = |value: f32| ((0.32 + value * 0.63) * 255.0).round() as u8;
+    [channel(r), channel(g), channel(b)]
+}
+
+pub(crate) fn valid_player_color(color: [u8; 3]) -> bool {
+    (0..MAX_HEROES).any(|slot| player_color_for_slot(slot) == color)
+}
 pub const MAX_ENCOUNTER_SPAWNS: usize = 32;
 /// Training enemies use the same public enemy roots as encounter enemies.
 pub const AMBIENT_ENEMY_POSITIONS: [[f32; 2]; 45] = {
@@ -182,6 +208,8 @@ pub struct Reward {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HeroView {
     pub id: u64,
+    /// Server-assigned sRGB identity, stable for this hero while it remains in the match.
+    pub color: [u8; 3],
     pub position: [f32; 2],
     pub elevation: f32,
     pub crouched: bool,

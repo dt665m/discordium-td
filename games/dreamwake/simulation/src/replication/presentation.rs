@@ -271,6 +271,7 @@ impl PublicHeroView {
     pub fn presentation(&self) -> HeroView {
         HeroView {
             id: self.id,
+            color: self.color,
             position: self.position,
             elevation: self.elevation,
             crouched: self.crouched,
@@ -323,6 +324,7 @@ pub(super) fn validate_replica(replica: &PublicReplica) -> Result<(), Replicatio
         PublicReplica::Hero(v) => {
             v.id == 0
                 || v.id >= 1 << 63
+                || !crate::valid_player_color(v.color)
                 || v.max_hp <= 0.0
                 || v.hp < 0.0
                 || v.hp > v.max_hp

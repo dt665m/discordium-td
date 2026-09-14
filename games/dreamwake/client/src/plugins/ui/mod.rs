@@ -592,7 +592,7 @@ fn sync_hud(
                     color.0 = if hero.hp <= 0.0 {
                         MUTED
                     } else {
-                        crate::plugins::graphics::scene::companion_color(hero.id)
+                        crate::plugins::graphics::scene::player_color(hero.color)
                     };
                     if hero.hp <= 0.0 {
                         format!("VESPER {:08X}  /  DOWNED", hero.id & 0xffff_ffff)
@@ -628,7 +628,7 @@ fn sync_hud(
             Fill::Companion(index) => companions
                 .get(index)
                 .map(|h| {
-                    background.0 = crate::plugins::graphics::scene::companion_color(h.id);
+                    background.0 = crate::plugins::graphics::scene::player_color(h.color);
                     h.hp / h.max_hp.max(1.0)
                 })
                 .unwrap_or(0.0),

@@ -89,6 +89,71 @@ fn admission_empty_roster_and_party_restart() {
 }
 
 #[test]
+fn player_colors_cover_capacity_and_survive_roster_changes_and_restart() {
+    let mut sim = DreamSimulation::new(33, false);
+    for index in 1..MAX_HEROES {
+        // Every ID deliberately collides under the former id % 4 assignment.
+        assert!(sim.add_player(1 + index as u64 * 4));
+    }
+    let full = sim.snapshot();
+    let colors = full
+        .heroes
+        .iter()
+        .map(|hero| hero.color)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(colors.len(), MAX_HEROES);
+
+    let survivor_ids = [1, 9, 17, 33, 65, 129, 257, 509];
+    let survivor_colors = survivor_ids
+        .into_iter()
+        .map(|id| {
+            (
+                id,
+                full.heroes.iter().find(|hero| hero.id == id).unwrap().color,
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let removed = full
+        .heroes
+        .iter()
+        .find(|hero| !survivor_colors.contains_key(&hero.id))
+        .unwrap();
+    let reusable_color = removed.color;
+    for hero in &full.heroes {
+        if !survivor_colors.contains_key(&hero.id) {
+            assert!(sim.remove_player(hero.id));
+        }
+    }
+    assert!(sim.add_player(777));
+    let changed = sim.snapshot();
+    for (id, color) in &survivor_colors {
+        assert_eq!(sim.snapshot_for(*id).hero.color, *color);
+    }
+    assert_eq!(sim.snapshot_for(777).hero.color, reusable_color);
+    assert_eq!(
+        changed
+            .heroes
+            .iter()
+            .map(|hero| hero.color)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        changed.heroes.len()
+    );
+
+    sim.restart_party(44, true);
+    for (id, color) in survivor_colors {
+        assert_eq!(sim.snapshot_for(id).hero.color, color);
+    }
+    assert_eq!(sim.snapshot_for(777).hero.color, reusable_color);
+
+    let checkpoint = DreamCheckpoint::new(sim.snapshot(), 1).unwrap();
+    let bytes = checkpoint.encode().unwrap();
+    let restored =
+        DreamSimulation::from_snapshot(&DreamCheckpoint::decode(&bytes, 1).unwrap().snapshot);
+    assert_eq!(restored.snapshot(), sim.snapshot());
+}
+
+#[test]
 fn late_join_clones_progression_loadout_and_stats_but_refreshes_combat() {
     let mut sim = party(39);
     edit_hero(&mut sim, 1, |h| {

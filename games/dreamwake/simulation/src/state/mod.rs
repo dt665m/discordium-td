@@ -118,6 +118,7 @@ impl Default for Hero {
             active: true,
             view: HeroBody {
                 id: 1,
+                color: player_color_for_slot(0),
                 shards: 0,
                 combo: 0,
                 hit_flash: 0.0,
@@ -231,6 +232,7 @@ impl SavedHero {
     pub fn snapshot(&self) -> HeroView {
         HeroView {
             id: self.view.id,
+            color: self.view.color,
             position: crate::collision::planar_position(&self.motion),
             elevation: self.motion.position[1],
             crouched: self.motion.stance == engine_core::Stance::Crouched,
@@ -376,6 +378,7 @@ pub(super) struct SavedState {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(super) struct HeroBody {
     pub id: u64,
+    pub color: [u8; 3],
     pub shards: u32,
     pub combo: u32,
     pub hit_flash: f32,

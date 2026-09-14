@@ -656,7 +656,7 @@ fn private_owner_payload_requires_authenticated_expectation_and_cannot_be_retagg
 #[test]
 fn maximum_declared_schema_envelopes_roundtrip_without_compression() {
     let maxima = dreamwake_sim::replication::owner_group_schema_maxima().unwrap();
-    assert_eq!(maxima, [988, 15_354, 11_980, 346]);
+    assert_eq!(maxima, [988, 15_379, 11_980, 346]);
     let publication = GroupPublication {
         connection: ConnectionEpoch(2),
         group: OWNER_GROUP,
@@ -712,7 +712,7 @@ fn maximum_declared_schema_envelopes_roundtrip_without_compression() {
         members,
     };
     let encoded = encode_group(&group, group_limits(), |payload| Ok(payload.clone())).unwrap();
-    assert_eq!(encoded.len(), 29_216);
+    assert_eq!(encoded.len(), 29_241);
     assert!(encoded.len() > 16 * 1024);
     assert!(encoded.len() <= baselines::GROUP_BYTES);
     let message = encode_state(

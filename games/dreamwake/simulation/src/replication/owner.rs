@@ -3,7 +3,7 @@ use crate::{CheckpointIdentity, HeroView, SavedHero};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
-pub const OWNER_CHECKPOINT_SCHEMA: u32 = 8;
+pub const OWNER_CHECKPOINT_SCHEMA: u32 = 9;
 /// Authenticated caller supplies every scope identity. Revision is a freshness
 /// floor; transport receipt alone must not advance it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -240,6 +240,7 @@ impl OwnerCheckpoint {
                 .iter()
                 .any(|v| v.title.len() > 128 || v.description.len() > 512)
             || hero.loadout.0.len() != 4
+            || !crate::valid_player_color(hero.view.color)
             || hero.rewards.len() > 8
             || hero.combat.statuses.len() > 64
             || hero.health.max_hp <= 0.0

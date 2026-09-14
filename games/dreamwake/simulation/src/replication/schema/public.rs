@@ -69,7 +69,7 @@ impl Root for Global {
         Ok(value)
     }
 }
-copy_schema!(Hero,game::PublicHeroView,0x1104,{
+copy_schema!(Hero,game::PublicHeroView,0x1104,2,{
     1=>id:u64=1=>p(Units::Unitless,U64),
     2=>position:[f32;2]=[0.0;2]=>linear(Units::Metres,F),
     3=>elevation:f32=0.0=>p(Units::Metres,F),
@@ -85,6 +85,7 @@ copy_schema!(Hero,game::PublicHeroView,0x1104,{
     13=>combo:u32=0=>p(Units::Unitless,U32),
     14=>hit_flash:f32=0.0=>p(Units::Seconds,F),
     15=>attack_flash:f32=0.0=>p(Units::Seconds,F),
+    16=>color:[u8;3]=crate::player_color_for_slot(0)=>p(Units::Unitless,U8),
 });
 impl Root for Hero {
     type Model = game::PublicHeroView;

@@ -1,7 +1,7 @@
 //! The isolated simulation world shared by server authority and client replay.
 use crate::*;
 use bevy::ecs::query::QueryState;
-use std::sync::Mutex;
+use std::{collections::BTreeSet, sync::Mutex};
 
 type SnapshotData = (
     Option<&'static Hero>,
@@ -363,7 +363,7 @@ impl DreamSimulation {
         }
     }
     pub fn add_player(&mut self, id: u64) -> bool {
-        self.add_player_with_activity(id, true)
+        self.add_player_with_activity(id, true, None)
     }
     /// Pausable gameplay time, distinct from the server driver's committed tick.
     pub fn gameplay_tick(&self) -> u32 {
@@ -372,7 +372,7 @@ impl DreamSimulation {
     /// Reserve checkpointable state without granting gameplay participation.
     /// The server activates only after content and initial scope proofs succeed.
     pub fn add_pending_player(&mut self, id: u64) -> bool {
-        self.add_player_with_activity(id, false)
+        self.add_player_with_activity(id, false, None)
     }
     pub fn player_is_active(&mut self, id: u64) -> bool {
         self.world
@@ -431,7 +431,12 @@ impl DreamSimulation {
         encounters::reconcile_ready(&mut self.world);
         true
     }
-    fn add_player_with_activity(&mut self, id: u64, active: bool) -> bool {
+    fn add_player_with_activity(
+        &mut self,
+        id: u64,
+        active: bool,
+        preserved_color: Option<[u8; 3]>,
+    ) -> bool {
         if id == 0 || id >= 1 << 63 {
             return false;
         }
@@ -442,6 +447,20 @@ impl DreamSimulation {
         if query.iter(&self.world).count() >= MAX_HEROES {
             return false;
         }
+        let used_colors = query
+            .iter(&self.world)
+            .map(|hero| hero.view.color)
+            .collect::<BTreeSet<_>>();
+        let color = preserved_color
+            .filter(|color| valid_player_color(*color) && !used_colors.contains(color))
+            .or_else(|| {
+                (0..MAX_HEROES)
+                    .map(player_color_for_slot)
+                    .find(|color| !used_colors.contains(color))
+            });
+        let Some(color) = color else {
+            return false;
+        };
         let count = query.iter(&self.world).filter(|h| h.active).count();
         let mut hero = SavedHero::new(id, self.world.resource::<Run>().seed);
         hero.actor.active = active;
@@ -464,6 +483,7 @@ impl DreamSimulation {
                 memory.refresh();
             }
         }
+        hero.view.color = color;
         let run = self.world.resource::<Run>();
         if matches!(run.phase, RunPhase::Reward | RunPhase::Rest) {
             hero.rewards = run.rewards.clone();
@@ -538,12 +558,12 @@ impl DreamSimulation {
             .world
             .query::<HeroActorReadOnly>()
             .iter(&self.world)
-            .map(|h| (h.view.id, h.active))
+            .map(|h| (h.view.id, h.active, h.view.color))
             .collect();
         *self = Self::new(seed, lucid);
         self.remove_player(1);
-        for (id, active) in ids {
-            self.add_player_with_activity(id, active);
+        for (id, active, color) in ids {
+            self.add_player_with_activity(id, active, Some(color));
         }
     }
     pub fn set_paused(&mut self, paused: bool) {

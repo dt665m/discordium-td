@@ -138,6 +138,10 @@ views do not disclose stamina or cooldown.
 Any connected Traveler can select **Enter the Dream** or **Lucid Dream** to begin.
 There is no party leader or initial readiness vote. Friends can join an ongoing run.
 
+The server assigns each connected Traveler a unique color within the game. Every
+client displays that same color, including the Traveler's own client. Players
+keep their colors as others join or leave and when the party starts another run.
+
 Each player chooses their own rewards and Memory target slots. Once everyone has
 finished, each player selects **Ready to Cross** for the next room. In a sanctuary,
 **Continue** skips your remaining blessing choice. Disconnected players do not

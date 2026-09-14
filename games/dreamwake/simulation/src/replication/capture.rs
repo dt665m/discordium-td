@@ -540,6 +540,7 @@ impl CommittedReplication {
 pub(super) fn public_hero(hero: &SavedHero) -> PublicHeroView {
     PublicHeroView {
         id: hero.view.id,
+        color: hero.view.color,
         position: crate::collision::planar_position(&hero.motion),
         elevation: hero.motion.position[1],
         crouched: hero.motion.stance == engine_core::Stance::Crouched,

@@ -6,7 +6,7 @@ use serde_json::Value;
 use std::{collections::BTreeSet, sync::OnceLock};
 pub(crate) mod bounded_json;
 
-pub const CHECKPOINT_SCHEMA: u32 = 11;
+pub const CHECKPOINT_SCHEMA: u32 = 12;
 // Full-authority/offline envelope budget; this is NOT the planned 16 KiB
 // per-owner scoped checkpoint transport budget.
 const MAX_BYTES: usize = 8 * 1024 * 1024;
@@ -410,11 +410,22 @@ fn validate_current(s: crate::snapshot_capture::StateView<'_>) -> Result<(), Che
     }) {
         return Err(fault("invalid saved ability state"));
     }
-    if s.heroes
+    if s.heroes.iter().any(|v| {
+        v.view.id >= 1 << 63
+            || !valid_player_color(v.view.color)
+            || v.loadout.0.len() != 4
+            || v.health.max_hp <= 0.0
+    }) || s
+        .heroes
         .iter()
-        .any(|v| v.view.id >= 1 << 63 || v.loadout.0.len() != 4 || v.health.max_hp <= 0.0)
+        .map(|hero| hero.view.color)
+        .collect::<BTreeSet<_>>()
+        .len()
+        != s.heroes.len()
     {
-        return Err(fault("invalid hero identity, loadout or health capacity"));
+        return Err(fault(
+            "invalid hero identity, color, loadout or health capacity",
+        ));
     }
     if s.heroes.iter().any(|hero| {
         !hero.critical_rng.belongs_to(

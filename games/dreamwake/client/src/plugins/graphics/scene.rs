@@ -2,7 +2,7 @@
 mod collision;
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     f32::consts::{FRAC_PI_2, PI, TAU},
     time::Duration,
 };
@@ -77,7 +77,6 @@ struct SceneArt {
     tile: Handle<StandardMaterial>,
     gold: Handle<StandardMaterial>,
     ivory: Handle<StandardMaterial>,
-    teal: Handle<StandardMaterial>,
     dark: Handle<StandardMaterial>,
     red: Handle<StandardMaterial>,
     violet: Handle<StandardMaterial>,
@@ -93,6 +92,7 @@ struct SceneArt {
     warning_fill: Handle<StandardMaterial>,
     friendly_fill: Handle<StandardMaterial>,
     anonymous_fill: Handle<StandardMaterial>,
+    player_materials: HashMap<[u8; 3], (Handle<StandardMaterial>, Handle<StandardMaterial>)>,
     realm: usize,
 }
 
@@ -247,7 +247,6 @@ fn setup_scene(
         tile: material(&mut materials, [0.105, 0.23, 0.24], 0.18),
         gold: material(&mut materials, [0.62, 0.46, 0.23], 0.7),
         ivory: material(&mut materials, [0.96, 0.89, 0.73], 0.2),
-        teal: material(&mut materials, [0.035, 0.50, 0.47], 0.2),
         dark: material(&mut materials, [0.018, 0.025, 0.048], 0.15),
         red: material(&mut materials, [0.54, 0.13, 0.18], 0.22),
         violet: material(&mut materials, [0.28, 0.12, 0.41], 0.3),
@@ -263,6 +262,7 @@ fn setup_scene(
         warning_fill: transparent(&mut materials, [0.95, 0.07, 0.12, 0.18]),
         friendly_fill: transparent(&mut materials, [0.15, 0.95, 0.72, 0.12]),
         anonymous_fill: transparent(&mut materials, [0.65, 0.72, 0.76, 0.22]),
+        player_materials: HashMap::new(),
         realm: usize::MAX,
     };
     commands.insert_resource(ClearColor(Color::srgb(0.016, 0.025, 0.055)));
@@ -692,6 +692,7 @@ const ACTOR_SAMPLE_GRACE_SECS: f32 = 0.15;
 struct ActorVisual {
     id: u64,
     kind: Option<EnemyKind>,
+    color: Option<[u8; 3]>,
     local: bool,
     motion: f32,
     gait_phase: f32,
@@ -855,9 +856,11 @@ fn fixed_part(
 
 fn spawn_actor(
     commands: &mut Commands,
-    art: &SceneArt,
+    art: &mut SceneArt,
+    materials: &mut Assets<StandardMaterial>,
     id: u64,
     kind: Option<EnemyKind>,
+    hero_color: Option<[u8; 3]>,
     position: Vec3,
     local: bool,
     snapshot: &DreamPresentation,
@@ -871,6 +874,7 @@ fn spawn_actor(
             ActorVisual {
                 id,
                 kind,
+                color: hero_color,
                 local,
                 motion: 0.0,
                 gait_phase: 0.0,
@@ -907,28 +911,19 @@ fn spawn_actor(
     );
     match kind {
         None => {
-            // Local teal and stable ally accents distinguish the shared Traveler silhouette.
-            let accent = if local {
-                &art.glow
-            } else {
-                match id % 4 {
-                    0 => &art.gold_glow,
-                    1 => &art.purple_glow,
-                    2 => &art.ice_glow,
-                    _ => &art.healing_glow,
-                }
-            };
-            let cloth = if local {
-                &art.teal
-            } else {
-                match id % 4 {
-                    0 => &art.gold,
-                    1 => &art.violet,
-                    2 => &art.stone,
-                    _ => &art.teal,
-                }
-            };
-            ground_child_ring(commands, parent, art, accent, 0.71, 0.045);
+            let color = hero_color.expect("hero actors have an authoritative color");
+            let (cloth, accent) = art
+                .player_materials
+                .entry(color)
+                .or_insert_with(|| {
+                    let rgb = color.map(|channel| f32::from(channel) / 255.0);
+                    (
+                        material(materials, rgb, 0.2),
+                        glow_material(materials, rgb, 1.7),
+                    )
+                })
+                .clone();
+            ground_child_ring(commands, parent, art, &accent, 0.71, 0.045);
             if local {
                 ground_child_ring(commands, parent, art, &art.ivory, 0.82, 0.05);
             }
@@ -938,7 +933,7 @@ fn spawn_actor(
                 art,
                 PartKind::Body,
                 &art.cone,
-                cloth,
+                &cloth,
                 Vec3::Y * 0.91,
                 Vec3::new(0.42, 0.91, 0.34),
                 Quat::IDENTITY,
@@ -971,7 +966,7 @@ fn spawn_actor(
                 art,
                 PartKind::Body,
                 &art.sphere,
-                cloth,
+                &cloth,
                 Vec3::new(0.0, 1.57, 0.01),
                 Vec3::new(0.36, 0.40, 0.32),
                 Quat::IDENTITY,
@@ -1009,7 +1004,7 @@ fn spawn_actor(
                         PartKind::RightArm
                     },
                     &art.cube,
-                    cloth,
+                    &cloth,
                     Vec3::new(side * 0.40, 1.03, -0.05),
                     Vec3::new(0.19, 0.62, 0.20),
                     Quat::from_rotation_z(side * 0.14),
@@ -1058,7 +1053,7 @@ fn spawn_actor(
                 art,
                 PartKind::Shield,
                 &art.ring,
-                accent,
+                &accent,
                 Vec3::Y * 1.0,
                 Vec3::splat(0.99),
                 Quat::from_rotation_x(-0.4),
@@ -1069,7 +1064,7 @@ fn spawn_actor(
                 art,
                 PartKind::Shield,
                 &art.ring,
-                accent,
+                &accent,
                 Vec3::Y * 0.7,
                 Vec3::splat(1.0),
                 Quat::from_rotation_x(-FRAC_PI_2),
@@ -1672,6 +1667,16 @@ fn sync_scene(
     let mut existing = HashSet::new();
     let dt = time.delta_secs().min(0.1);
     for (entity, mut actor, mut transform) in &mut actors {
+        if actor.kind.is_none()
+            && snapshot
+                .heroes
+                .iter()
+                .find(|hero| hero.id == actor.id)
+                .is_some_and(|hero| actor.color != Some(hero.color))
+        {
+            commands.entity(entity).despawn();
+            continue;
+        }
         existing.insert(actor.id);
         let (position, elevation, crouched, direction, speed, attack, windup, hit, dash) =
             if actor.kind.is_none() {
@@ -1762,9 +1767,11 @@ fn sync_scene(
         if !existing.contains(&hero.id) {
             spawn_actor(
                 &mut commands,
-                &art,
+                &mut art,
+                &mut materials,
                 hero.id,
                 None,
+                Some(hero.color),
                 world(hero.position, hero.elevation),
                 hero.id == snapshot.hero.id,
                 snapshot,
@@ -1775,9 +1782,11 @@ fn sync_scene(
         if !existing.contains(&e.id) {
             spawn_actor(
                 &mut commands,
-                &art,
+                &mut art,
+                &mut materials,
                 e.id,
                 Some(e.kind),
+                None,
                 world(e.position, 0.0),
                 false,
                 snapshot,
@@ -1801,7 +1810,7 @@ fn sync_scene(
                     font_size: FontSize::Px(11.0),
                     ..default()
                 },
-                TextColor(companion_color(hero.id)),
+                TextColor(player_color(hero.color)),
                 Node {
                     position_type: PositionType::Absolute,
                     ..default()
@@ -2068,13 +2077,12 @@ fn place_damage_numbers(
 #[derive(Component)]
 struct TravelerLabel(u64);
 
-pub(crate) fn companion_color(id: u64) -> Color {
-    match id % 4 {
-        0 => Color::srgb(0.95, 0.77, 0.43),
-        1 => Color::srgb(0.83, 0.59, 1.0),
-        2 => Color::srgb(0.48, 0.78, 1.0),
-        _ => Color::srgb(0.65, 0.96, 0.48),
-    }
+pub(crate) fn player_color(rgb: [u8; 3]) -> Color {
+    Color::srgb(
+        f32::from(rgb[0]) / 255.0,
+        f32::from(rgb[1]) / 255.0,
+        f32::from(rgb[2]) / 255.0,
+    )
 }
 
 fn place_traveler_labels(
@@ -2114,10 +2122,8 @@ fn place_traveler_labels(
         }
         color.0 = if hero.hp <= 0.0 {
             Color::srgb(0.80, 0.59, 0.60)
-        } else if local {
-            Color::srgb(0.40, 0.94, 0.85)
         } else {
-            companion_color(hero.id)
+            player_color(hero.color)
         };
         let origin = actors
             .iter()
@@ -2156,6 +2162,7 @@ mod tests {
         ActorVisual {
             id: 1,
             kind: Some(EnemyKind::Ranged),
+            color: None,
             local: false,
             motion: 0.0,
             gait_phase: 0.0,
@@ -2660,5 +2667,56 @@ mod tests {
         assert_eq!(actors[0].0.id, local_id);
         assert_eq!(actors[0].1.scale, Vec3::new(0.90, 0.27, 0.90));
         assert_eq!(world.query::<&TravelerLabel>().iter(world).count(), 1);
+    }
+
+    #[test]
+    fn scene_rebuilds_same_id_actor_when_authority_corrects_its_color() {
+        let mut sim = DreamSimulation::new(7, false);
+        assert!(sim.add_player(5));
+        let corrected_color = sim.snapshot_for(5).hero.color;
+        let snapshot = crate::offline_presentation(sim.snapshot_for(1));
+        let hero_id = snapshot.hero.id;
+        let initial_color = snapshot.hero.color;
+        assert_ne!(corrected_color, initial_color);
+        let mut app = App::new();
+        app.add_plugins((
+            MinimalPlugins,
+            bevy::asset::AssetPlugin::default(),
+            bevy::scene::ScenePlugin,
+        ))
+        .init_resource::<Assets<Mesh>>()
+        .init_resource::<Assets<StandardMaterial>>()
+        .insert_resource(UiScale(1.0))
+        .insert_resource(DreamView(snapshot))
+        .add_plugins(DreamScenePlugin);
+        app.update();
+
+        {
+            let mut view = app.world_mut().resource_mut::<DreamView>();
+            view.0.hero.color = corrected_color;
+            view.0.heroes[0].color = corrected_color;
+        }
+        app.update();
+
+        let world = app.world_mut();
+        let mut actors = world.query::<(Entity, &ActorVisual)>();
+        let (actor_entity, actor) = actors
+            .iter(world)
+            .find(|(_, actor)| actor.id == hero_id)
+            .unwrap();
+        assert_eq!(actor.color, Some(corrected_color));
+        let cloth = world
+            .resource::<SceneArt>()
+            .player_materials
+            .get(&corrected_color)
+            .unwrap()
+            .0
+            .clone();
+        assert!(
+            world
+                .query::<(&ArtPart, &MeshMaterial3d<StandardMaterial>)>()
+                .iter(world)
+                .any(|(part, material)| part.actor == actor_entity && material.0 == cloth)
+        );
     }
 }

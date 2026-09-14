@@ -613,6 +613,7 @@ mod tests {
                 ServerTick(40),
                 &PublicReplica::Hero(dreamwake_sim::replication::PublicHeroView {
                     id: 3,
+                    color: [82, 242, 242],
                     position: [0.0, 0.0],
                     elevation: 0.0,
                     crouched: false,

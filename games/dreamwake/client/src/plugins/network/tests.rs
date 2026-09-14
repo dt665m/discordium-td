@@ -32,6 +32,7 @@ pub(super) fn public_full_state(
                 id: index,
                 position: [0.0, 0.0],
                 facing: [0.0, -1.0],
+                velocity: [0.0, 0.0],
                 hp: 10.0,
                 max_hp: 10.0,
                 kind: dreamwake_sim::EnemyKind::Melee,

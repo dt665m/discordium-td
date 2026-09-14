@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 /// Live bolts plus reserved Echo bolts share one hard per-owner allowance.
 pub const STARFALL_CAPACITY: usize = 8;
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SpawnKey {
     pub action: RayActionKey,

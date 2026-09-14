@@ -127,7 +127,8 @@ impl PredictedEvents {
                     kind: PROJECTILE,
                     spawn_ordinal: u32::from(key.ordinal),
                 }));
-                for &key in state.0.starfall_cues() {
+                for &action in state.0.cast_cues() {
+                    let key = SpawnKey { action, ordinal: 0 };
                     for (kind, payload) in [
                         (CAST_SOUND, PresentationEvent::CastSound),
                         (CAST_CAMERA, PresentationEvent::CastCamera),

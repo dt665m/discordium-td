@@ -15,6 +15,9 @@ mod collision_tests;
 #[cfg(test)]
 mod crowding_tests;
 mod owner;
+pub(crate) use owner::{MAX_OWNER_DELAYED, MAX_OWNER_PROJECTILES, MAX_OWNER_WISPS};
+#[cfg(test)]
+use owner::{OwnerTransients, decode_owner_transients, encode_owner_transients};
 #[cfg(test)]
 mod platform_tests;
 mod presentation;
@@ -25,7 +28,7 @@ mod wire;
 pub use capture::{ApprovedSources, CommittedReplication, ReplicationKey};
 pub use owner::{
     OWNER_CHECKPOINT_SCHEMA, OwnerCheckpoint, OwnerCombatAction, OwnerExpectation,
-    OwnerPredictionState,
+    OwnerPredictionRunner, OwnerPredictionState,
 };
 pub use presentation::DreamPresentation;
 pub use public::*;

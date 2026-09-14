@@ -43,6 +43,24 @@ pub struct ProjectileState {
     pub pending_impacts: Vec<ProjectileImpact>,
 }
 
+/// Advance the deterministic, publicly projectable part of a projectile.
+/// Collision contacts and source-presence policy remain authority concerns.
+pub fn advance_projectile_motion(
+    position: &mut [f32; 2],
+    direction: [f32; 2],
+    speed: f32,
+    remaining: &mut f32,
+    max_distance: Option<f32>,
+    dt: f32,
+) -> bool {
+    if !dt.is_finite() || dt < 0.0 {
+        return false;
+    }
+    *position = integrate(*position, scale(direction, speed), dt);
+    *remaining -= dt;
+    *remaining > 0.0 && max_distance.is_none_or(|limit| length(*position) <= limit)
+}
+
 impl ProjectileState {
     pub fn record_hit(&mut self, target_id: u64) -> bool {
         if self.expired || self.hits_remaining == 0 || self.hit_ids.contains(&target_id) {
@@ -69,8 +87,14 @@ impl ProjectileState {
             return;
         }
         self.previous_position = self.position;
-        self.position = integrate(self.position, scale(self.direction, self.speed), dt);
-        self.remaining -= dt;
+        let motion_active = advance_projectile_motion(
+            &mut self.position,
+            self.direction,
+            self.speed,
+            &mut self.remaining,
+            self.max_distance,
+            dt,
+        );
         let source_available = match self.source_policy {
             ProjectileSourcePolicy::Independent => true,
             ProjectileSourcePolicy::RequirePresent => targets.iter().any(|t| t.id == self.owner),
@@ -78,12 +102,7 @@ impl ProjectileState {
                 targets.iter().any(|t| t.id == self.owner && t.active)
             }
         };
-        if self.remaining <= 0.0
-            || self
-                .max_distance
-                .is_some_and(|limit| length(self.position) > limit)
-            || !source_available
-        {
+        if !motion_active || !source_available {
             self.expired = true;
             return;
         }

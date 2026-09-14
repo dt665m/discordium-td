@@ -276,9 +276,11 @@ fn missing_or_conflicting_retirement_scope_never_hides_behind_an_old_group() {
                 match case {
                     "missing fence" => {
                         let session = fixture.runtime.prediction.as_mut().unwrap();
-                        let mut scopes =
-                            ClientScopes::new(session.scopes.connection(), ScopeLimits::default())
-                                .unwrap();
+                        let mut scopes = ClientScopes::new(
+                            session.scopes.connection(),
+                            dreamwake_protocol::live::baselines::scope_limits(),
+                        )
+                        .unwrap();
                         for fence in &fixture.current {
                             let state = session
                                 .scopes

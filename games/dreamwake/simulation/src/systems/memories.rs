@@ -48,6 +48,7 @@ pub(crate) fn execute_memory(
                     essence,
                     23.0,
                     0.34 * vast,
+                    None,
                 );
             }
         }
@@ -66,6 +67,7 @@ pub(crate) fn execute_memory(
                     essence,
                     15.0 * power,
                     i,
+                    source,
                 );
             }
             action_effect(commands, run, hero.view.id, source, origin, 1.8, 28);
@@ -192,6 +194,10 @@ pub(crate) fn execute_memory(
                             power: power * 0.60,
                             origin: center,
                             direction,
+                            graphics: source
+                                .repeat()
+                                .id((run.seed ^ (run.seed >> 32)) as u32, hero.view.id),
+                            authority_id: None,
                         },
                     ),
                 ));
@@ -229,16 +235,13 @@ pub(crate) fn delayed_casts(
                         cast.direction,
                         None,
                     );
-                    flight.authority_id = Some(cast.id);
+                    flight.authority_id = Some(cast.authority_id.unwrap_or(cast.id));
                     spawn_starfall(&mut commands, &mut run, flight, 38.0 * cast.power);
                     action_effect(
                         &mut commands,
                         &run,
                         cast.owner,
-                        ActionEffect {
-                            sequence: cast.action_sequence,
-                            slot: cast.presentation_slot,
-                        },
+                        ActionEffect::from_id(cast.graphics),
                         add(cast.origin, scale(cast.direction, 0.9)),
                         0.8,
                         12,
@@ -256,10 +259,7 @@ pub(crate) fn delayed_casts(
                         cast.power,
                         cast.origin,
                         cast.direction,
-                        ActionEffect {
-                            sequence: cast.action_sequence,
-                            slot: cast.presentation_slot,
-                        },
+                        ActionEffect::from_id(cast.graphics),
                     );
                 }
             }

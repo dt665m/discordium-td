@@ -279,49 +279,38 @@ impl CommittedReplication {
             self.state.collision.identity(),
         )?;
         checkpoint.required_bases = self.required_bases(owner);
-        checkpoint.starfall.flights = self
+        checkpoint.transients.projectiles = self
             .state
             .projectiles
             .iter()
-            .filter_map(|p| {
-                let (key, origin_tick) = p.payload.spawn?;
-                (p.state.owner == owner
-                    && key.action.actor_generation == hero.combat_identity.generation
-                    && (key.action.connection_epoch == 0
-                        || key.action.ownership_epoch == ownership_revision)
-                    && !p.state.finished())
-                .then_some(crate::starfall::StarfallFlight {
-                    key,
-                    origin_tick,
-                    position: p.state.position,
-                    direction: p.state.direction,
-                    radius: p.state.radius,
-                    remaining: p.state.remaining,
-                    essence: p.payload.essence,
-                    authority_id: Some(p.state.id),
-                })
-            })
+            .filter(|p| p.state.owner == owner && !p.state.finished())
+            .cloned()
             .collect();
-        checkpoint.starfall.repeats = self
+        checkpoint.transients.wisps = self
+            .state
+            .wisps
+            .iter()
+            .filter(|w| w.state.owner == owner && !w.state.expired)
+            .cloned()
+            .collect();
+        checkpoint.transients.effects = self
+            .state
+            .effects
+            .iter()
+            .filter(|effect| effect.id.owner == owner && effect.age_ticks < effect.duration_ticks)
+            .copied()
+            .collect();
+        checkpoint.transients.delayed = self
             .state
             .delayed
             .iter()
-            .filter_map(|d| {
-                let (key, origin_tick) = d.payload.spawn?;
-                (d.payload.owner == owner
-                    && key.action.actor_generation == hero.combat_identity.generation
-                    && (key.action.connection_epoch == 0
-                        || key.action.ownership_epoch == ownership_revision))
-                    .then_some(crate::starfall::StarfallRepeat {
-                        authority_id: Some(d.payload.id),
-                        key,
-                        origin_tick,
-                        remaining: d.remaining,
-                        origin: d.payload.origin,
-                        direction: d.payload.direction,
-                    })
-            })
+            .filter(|d| d.payload.owner == owner)
+            .cloned()
             .collect();
+        checkpoint
+            .transients
+            .bind_match_epoch(self.global.stamp.match_epoch);
+        checkpoint.transients.canonicalize(true);
         checkpoint.validate_for(checkpoint.expectation())?;
         Ok(checkpoint)
     }
@@ -342,6 +331,11 @@ impl CommittedReplication {
             &hero.motion,
             hero.view.movement_speed,
             &self.state.collision.config(),
+            hero.loadout
+                .0
+                .iter()
+                .map(|slot| slot.kind.displacement(slot.modifier))
+                .fold(0.0, f32::max),
             hero.active && self.global.phase == RunPhase::Combat,
             self.state
                 .platforms
@@ -397,6 +391,7 @@ impl CommittedReplication {
             id: view.id,
             position: view.position,
             facing: view.facing,
+            velocity: enemy.motor.velocity,
             hp: view.hp,
             max_hp: view.max_hp,
             kind: view.kind,
@@ -430,6 +425,9 @@ impl CommittedReplication {
                 .then_some(projectile.state.owner),
             position: projectile.state.position,
             direction: projectile.state.direction,
+            speed: projectile.state.speed,
+            remaining: projectile.state.remaining,
+            max_distance: projectile.state.max_distance,
             radius: projectile.state.radius,
             friendly: projectile.state.faction == 1,
             essence: projectile.payload.essence,
@@ -437,10 +435,24 @@ impl CommittedReplication {
     }
     pub fn project_wisp(&self, id: u64, sources: &ApprovedSources) -> Option<PublicWispView> {
         let wisp = &self.state.wisps[*self.index.get(&ReplicationKey::Wisp(id))?];
+        let owner_velocity = self
+            .state
+            .heroes
+            .iter()
+            .find(|hero| hero.view.id == wisp.state.owner && hero.active)
+            .map_or([0.0; 2], |hero| {
+                crate::collision::planar_velocity(&hero.motion)
+            });
+        let tangent_speed = wisp.state.orbit_radius * wisp.state.orbit_speed;
+        let velocity = [
+            owner_velocity[0] - wisp.state.orbit_angle.sin() * tangent_speed,
+            owner_velocity[1] + wisp.state.orbit_angle.cos() * tangent_speed,
+        ];
         Some(PublicWispView {
             id,
             owner: sources.allows(wisp.state.owner).then_some(wisp.state.owner),
             position: wisp.state.position,
+            velocity,
             remaining: wisp.state.remaining,
             essence: wisp.payload.essence,
         })

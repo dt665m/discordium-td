@@ -392,6 +392,54 @@ fn compact_zero_width_children_preserve_counts_options_and_following_fields() {
     );
 }
 
+crate::schema! { struct Binary(SchemaId(107),1,Representation::PublicPresentation) {
+    1 => bytes: BoundedBytes<8> = BoundedBytes::default() => PLAIN,
+}}
+
+#[test]
+fn compact_bounded_bytes_are_contiguous_and_round_trip_empty_and_maximum_values() {
+    let registered = registered::<Binary>();
+    let empty = registered
+        .codec()
+        .encode_compact(&Binary::defaults())
+        .unwrap();
+    assert_eq!(empty, 0u32.to_le_bytes());
+    assert_eq!(
+        registered.codec().decode_compact(&empty).unwrap(),
+        Binary::defaults()
+    );
+
+    let value = Binary {
+        bytes: BoundedBytes::new(vec![0, 1, 2, 3, 252, 253, 254, 255]).unwrap(),
+    };
+    let encoded = registered.codec().encode_compact(&value).unwrap();
+    assert_eq!(encoded, [8, 0, 0, 0, 0, 1, 2, 3, 252, 253, 254, 255]);
+    assert_eq!(registered.codec().decode_compact(&encoded).unwrap(), value);
+}
+
+#[test]
+fn compact_bounded_bytes_reject_hostile_counts_truncation_and_trailing_data() {
+    let registered = registered::<Binary>();
+    for count in [9, u32::MAX] {
+        assert_eq!(
+            registered.codec().decode_compact(&count.to_le_bytes()),
+            Err(SchemaError::CountBudget)
+        );
+    }
+    assert_eq!(
+        registered.codec().decode_compact(&[8, 0, 0, 0, 1, 2, 3]),
+        Err(SchemaError::Truncated)
+    );
+    assert_eq!(
+        registered.codec().decode_compact(&[0, 0, 0, 0, 1]),
+        Err(SchemaError::TrailingBytes)
+    );
+    assert_eq!(
+        BoundedBytes::<8>::new(vec![0; 9]),
+        Err(SchemaError::CountBudget)
+    );
+}
+
 fn read_compact<T: CompactValue>(bytes: &[u8], limits: SchemaLimits) -> Result<T, SchemaError> {
     let mut reader = Reader::new(bytes);
     let value = T::read_compact(&mut reader, &mut Work::new(limits), 0)?;
@@ -474,6 +522,16 @@ fn compact_runtime_work_accounts_for_nested_collections_text_nodes_and_depth() {
     assert_eq!(
         read_compact::<BoundedString<8>>(
             &[8, 0, 0, 0, 97, 98, 99, 100, 101, 102, 103, 104],
+            SchemaLimits {
+                allocation_bytes: 7,
+                ..SchemaLimits::default()
+            }
+        ),
+        Err(SchemaError::AllocationBudget)
+    );
+    assert_eq!(
+        read_compact::<BoundedBytes<8>>(
+            &[8, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7],
             SchemaLimits {
                 allocation_bytes: 7,
                 ..SchemaLimits::default()

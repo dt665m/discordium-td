@@ -97,18 +97,33 @@ build using that server's endpoint.
 
 ## Stage and promote the server
 
-On Oracle, stage the tested source at
-`/home/ubuntu/projects/deployments/$RELEASE_ID/discordium-td`. Build on the server
-or a compatible Linux target; a macOS release binary cannot run on Oracle.
+Build the server locally for Oracle's ARM64 Linux target, then copy the release
+binary. The server runs Ubuntu 24.04 with glibc 2.39. A normal macOS release binary
+cannot run there; [cargo-zigbuild](https://github.com/rust-cross/cargo-zigbuild)
+uses Zig to cross-compile and target that glibc version.
+
+Install Zig, `cargo-zigbuild`, and the `aarch64-unknown-linux-gnu` Rust target on
+the build host once. Keep the local `target/` directory between releases so Cargo
+can reuse compiled dependencies. The first cross-build needs its own dependency
+cache even if the native macOS build is already cached.
+
+```sh
+just oracle-build
+RELEASE_ID=YOUR_RELEASE_ID
+ssh oracle-free 'mkdir -p /home/ubuntu/projects/discordium-td/target/releases'
+scp target/aarch64-unknown-linux-gnu/release/game_server \
+  "oracle-free:/home/ubuntu/projects/discordium-td/target/releases/game_server-$RELEASE_ID"
+```
+
+Copying the binary only stages it. Promote it with the matching browser release
+when the protocol changes. Keep the exact source revision and binary checksum
+with the release artifacts.
 
 ```sh
 ssh oracle-free
 RELEASE_ID=YOUR_RELEASE_ID
-. "$HOME/.cargo/env"
-cd "/home/ubuntu/projects/deployments/$RELEASE_ID/discordium-td"
-cargo build --release --locked -p dreamwake_server -j 2
-install -m 755 target/release/game_server \
-  "/home/ubuntu/projects/discordium-td/target/releases/game_server-$RELEASE_ID"
+mkdir -p "/home/ubuntu/projects/deployments/$RELEASE_ID"
+chmod 755 "/home/ubuntu/projects/discordium-td/target/releases/game_server-$RELEASE_ID"
 sudo systemctl cat discordium-td
 sudo cp /etc/systemd/system/discordium-td.service.d/90-dreamwake.conf \
   "/home/ubuntu/projects/deployments/$RELEASE_ID/previous-service.conf"

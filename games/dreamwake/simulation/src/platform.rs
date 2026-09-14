@@ -206,6 +206,7 @@ pub fn dependency_radius(
     motion: &engine_core::KinematicState,
     speed: f32,
     config: &engine_core::KinematicConfig,
+    authored_displacement: f32,
 ) -> f32 {
     let ordinary = horizontal_speed(motion, speed);
     let ticks = DEPENDENCY_LOOKAHEAD_TICKS;
@@ -219,7 +220,8 @@ pub fn dependency_radius(
     BASE_DEPENDENCY_RADIUS.max(
         support_radius(config)
             + reach
-            + crate::CHARGE_MAX_DISTANCE * (1 + ticks / u32::from(crate::CHARGE_COOLDOWN)) as f32,
+            + crate::CHARGE_MAX_DISTANCE * (1 + ticks / u32::from(crate::CHARGE_COOLDOWN)) as f32
+            + authored_displacement,
     )
 }
 /// The platform's bounded region is game content, so no unreceived pose is read.
@@ -247,10 +249,11 @@ pub(crate) fn required(
     motion: &engine_core::KinematicState,
     speed: f32,
     config: &engine_core::KinematicConfig,
+    authored_displacement: f32,
     active: bool,
     views: impl IntoIterator<Item = PublicPlatformView>,
 ) -> Vec<ColliderKey> {
-    let radius = dependency_radius(motion, speed, config);
+    let radius = dependency_radius(motion, speed, config, authored_displacement);
     views
         .into_iter()
         .filter(|view| {

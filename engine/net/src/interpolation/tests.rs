@@ -33,6 +33,26 @@ impl PosePolicy<Pose> for Linear {
         })
     }
 }
+
+struct SelfDescribing;
+impl PosePolicy<Pose> for SelfDescribing {
+    fn valid(&self, p: &Pose) -> bool {
+        p.x.is_finite() && p.yaw.is_finite()
+    }
+    fn interpolate(&self, a: &Pose, b: &Pose, alpha: f32) -> Option<Pose> {
+        Linear.interpolate(a, b, alpha)
+    }
+    fn project_latest(&self, latest: &Pose, ahead: Duration) -> Option<Pose> {
+        Some(Pose {
+            x: latest.x + ahead.as_secs_f32() * 10.0,
+            yaw: latest.yaw,
+            heap: vec![],
+        })
+    }
+    fn extrapolate(&self, a: &Pose, b: &Pose, interval: Duration, ahead: Duration) -> Option<Pose> {
+        Linear.extrapolate(a, b, interval, ahead)
+    }
+}
 fn config() -> Config {
     Config {
         rate: TickRate::new(60).unwrap(),
@@ -100,6 +120,30 @@ fn reordering_brackets_by_tick_and_cursor_never_reverses_when_delay_changes() {
     assert_eq!(
         buffer.receive(sample(66, 100.0), &Linear),
         Err(Error::Conflict)
+    );
+}
+
+#[test]
+fn one_self_describing_sample_projects_to_the_bounded_cursor() {
+    let mut buffer = buffer();
+    buffer.receive(sample(60, 1.0), &SelfDescribing).unwrap();
+    buffer.advance(Duration::from_millis(1150));
+    let shown = buffer
+        .sample(identity(7).scope, &SelfDescribing)
+        .unwrap()
+        .unwrap();
+    assert!((shown.value.x - 1.5).abs() < 0.001);
+    assert_eq!(shown.status, Status::Extrapolated);
+
+    buffer.advance(Duration::from_millis(1400));
+    let frozen = buffer
+        .sample(identity(7).scope, &SelfDescribing)
+        .unwrap()
+        .unwrap();
+    assert!((frozen.value.x - 2.0).abs() < 0.001);
+    assert_eq!(
+        frozen.status,
+        Status::Frozen(FreezeReason::ExtrapolationLimit)
     );
 }
 

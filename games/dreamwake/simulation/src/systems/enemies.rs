@@ -122,6 +122,8 @@ pub(crate) fn enemy_actions(
                     ActionEffect {
                         sequence: phase as u32,
                         slot: 0xc300,
+                        scope: None,
+                        match_epoch: None,
                     },
                     enemy.motor.position,
                     6.0,
@@ -159,6 +161,7 @@ pub(crate) fn enemy_actions(
                             None,
                             9.5,
                             0.35,
+                            None,
                         );
                     }
                     EnemyKind::Support => {
@@ -185,6 +188,8 @@ pub(crate) fn enemy_actions(
                             ActionEffect {
                                 sequence: enemy.attack_index,
                                 slot: 0xc200,
+                                scope: None,
+                                match_epoch: None,
                             },
                             target,
                             enemy.view.warn_radius,
@@ -214,6 +219,8 @@ pub(crate) fn enemy_actions(
                             ActionEffect {
                                 sequence: enemy.attack_index,
                                 slot: 0xc200,
+                                scope: None,
+                                match_epoch: None,
                             },
                             target,
                             enemy.view.warn_radius,
@@ -234,6 +241,7 @@ pub(crate) fn enemy_actions(
                                 None,
                                 7.0 + enemy.view.phase as f32 * 0.7,
                                 0.32,
+                                None,
                             );
                         }
                         if enemy.view.phase == 3
@@ -283,6 +291,8 @@ pub(crate) fn enemy_actions(
                             ActionEffect {
                                 sequence: enemy.attack_index,
                                 slot: 0xc200,
+                                scope: None,
+                                match_epoch: None,
                             },
                             target,
                             enemy.view.warn_radius,
@@ -302,6 +312,7 @@ pub(crate) fn enemy_actions(
                                     None,
                                     7.0,
                                     0.30,
+                                    None,
                                 );
                             }
                         }

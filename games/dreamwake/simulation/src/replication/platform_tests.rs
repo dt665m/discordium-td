@@ -233,7 +233,8 @@ fn upgraded_speed_admits_reachable_platform_and_missing_history_stops_before_con
     // longer than one replay burst, but it cannot silently reach a missing base.
     let speed = 15.0;
     let motion = engine_core::KinematicState::new([0.0; 3], 1);
-    let radius = crate::platform::dependency_radius(&motion, speed, &collision.manifest().config());
+    let radius =
+        crate::platform::dependency_radius(&motion, speed, &collision.manifest().config(), 0.0);
     for mut hero in sim.world.query::<HeroActor>().iter_mut(&mut sim.world) {
         *hero.motion = engine_core::KinematicState::new([0.0, 0.0, -10.0 + radius + 0.1], 1);
         hero.view.movement_speed = speed;

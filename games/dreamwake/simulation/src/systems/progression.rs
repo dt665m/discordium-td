@@ -38,6 +38,8 @@ pub(crate) fn resolve_deaths(
             ActionEffect {
                 sequence: 0,
                 slot: 0xc100,
+                scope: None,
+                match_epoch: None,
             },
             position,
             if kind == EnemyKind::Boss { 9.0 } else { 1.6 },
@@ -67,6 +69,8 @@ pub(crate) fn resolve_deaths(
                     ActionEffect {
                         sequence: previous_level + offset,
                         slot: 0xc400,
+                        scope: None,
+                        match_epoch: None,
                     },
                     planar_position(&hero.motion),
                     3.5,
@@ -123,6 +127,8 @@ pub(crate) fn finish_encounter(
                 ActionEffect {
                     sequence: run.room as u32,
                     slot: 0xc500 + (run.reinforcements * 16 + i) as u16,
+                    scope: None,
+                    match_epoch: None,
                 },
                 position,
                 1.6,

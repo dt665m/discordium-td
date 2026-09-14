@@ -57,6 +57,21 @@ impl MemoryKind {
             Self::Wisp => 10.0,
         }
     }
+    /// Maximum authored displacement caused immediately by one accepted cast.
+    /// Prediction dependency admission consumes this game-supplied value without
+    /// knowing individual ability implementations.
+    pub(crate) fn displacement(self, essence: Option<EssenceKind>) -> f32 {
+        match self {
+            Self::Blink => {
+                6.0 * if essence == Some(EssenceKind::Vast) {
+                    1.55
+                } else {
+                    1.0
+                }
+            }
+            _ => 0.0,
+        }
+    }
     pub fn icon(self) -> &'static str {
         match self {
             Self::Crescent => "C",

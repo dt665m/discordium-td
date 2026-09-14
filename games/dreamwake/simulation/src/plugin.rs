@@ -8,6 +8,16 @@ pub struct DreamInputs(pub Vec<(u64, DreamInput)>);
 #[derive(ScheduleLabel, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct DreamStep;
 
+/// Distinguishes the complete authority world from an owner-scoped replay world.
+/// Owner replay still runs the normal gameplay schedule, but terminal encounter
+/// decisions stay with the server because their required population is private.
+#[derive(Resource, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum SimulationScope {
+    #[default]
+    Authority,
+    OwnerPrediction,
+}
+
 /// Public integration points in one deterministic, explicitly stepped schedule.
 /// `Active` and `Combat` are conditional parents, not sequential stages.
 #[derive(SystemSet, Clone, Debug, PartialEq, Eq, Hash)]
@@ -121,6 +131,8 @@ impl Plugin for DreamwakePlugin {
                     D::Combat.in_set(D::Active).run_if(is_combat),
                     D::Graphics.in_set(D::Active),
                     D::Ambient.in_set(D::Active),
+                    D::Deaths.run_if(authority_world),
+                    D::Finish.run_if(authority_world),
                 ),
             )
             .configure_sets(
@@ -240,6 +252,9 @@ fn is_active(run: Res<Run>) -> bool {
 }
 fn is_combat(run: Res<Run>) -> bool {
     run.phase == RunPhase::Combat
+}
+fn authority_world(scope: Option<Res<SimulationScope>>) -> bool {
+    scope.is_none_or(|scope| *scope == SimulationScope::Authority)
 }
 fn canonicalize_inputs(mut inputs: ResMut<DreamInputs>) {
     inputs.0.sort_by_key(|(id, _)| *id);

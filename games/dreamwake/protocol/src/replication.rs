@@ -5,7 +5,7 @@ use dreamwake_sim::replication::{
 };
 use engine_net::codec::BoundedVec;
 
-const MAX_REPLICA_BYTES: usize = 16_384;
+const MAX_REPLICA_BYTES: usize = crate::live::baselines::PAYLOAD_BYTES;
 // Outer type byte + raw/compressed marker + fixed bincode collection length.
 const MAX_DTO_BYTES: usize = MAX_REPLICA_BYTES - 10;
 type DtoBytes = BoundedVec<u8, MAX_DTO_BYTES>;

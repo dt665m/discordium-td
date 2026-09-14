@@ -99,7 +99,7 @@ impl Root for Hero {
         Ok(v)
     }
 }
-engine_net::schema! {pub(super) struct Enemy(SchemaId(0x1105),1,Representation::PublicPresentation) {
+engine_net::schema! {pub(super) struct Enemy(SchemaId(0x1105),2,Representation::PublicPresentation) {
     1=>id:u64=1=>p(Units::Unitless,U64),
     2=>position:[f32;2]=[0.0;2]=>linear(Units::Metres,F),
     3=>facing:[f32;2]=[0.0,-1.0]=>p(Units::Unitless,F),
@@ -112,6 +112,7 @@ engine_net::schema! {pub(super) struct Enemy(SchemaId(0x1105),1,Representation::
     10=>phase:u8=0=>p(Units::Unitless,U8),
     11=>slowed:bool=false=>p(Units::Unitless,Range::None),
     12=>hit_flash:f32=0.0=>p(Units::Seconds,F),
+    13=>velocity:[f32;2]=[0.0;2]=>p(Units::Custom("metres/second"),F),
 }}
 impl Root for Enemy {
     type Model = game::PublicEnemyView;
@@ -121,6 +122,7 @@ impl Root for Enemy {
             id: v.id,
             position: v.position,
             facing: v.facing,
+            velocity: v.velocity,
             hp: v.hp,
             max_hp: v.max_hp,
             kind: v.kind.into(),
@@ -137,6 +139,7 @@ impl Root for Enemy {
             id: self.id,
             position: self.position,
             facing: self.facing,
+            velocity: self.velocity,
             hp: self.hp,
             max_hp: self.max_hp,
             kind: self.kind.clone().into(),
@@ -151,7 +154,7 @@ impl Root for Enemy {
         Ok(v)
     }
 }
-engine_net::schema! {pub(super) struct Projectile(SchemaId(0x1106),1,Representation::PublicPresentation) {
+engine_net::schema! {pub(super) struct Projectile(SchemaId(0x1106),2,Representation::PublicPresentation) {
     1=>id:u64=1=>p(Units::Unitless,U64),
     2=>owner:Option<u64>=None=>p(Units::Unitless,U64),
     3=>position:[f32;2]=[0.0;2]=>linear(Units::Metres,F),
@@ -159,6 +162,9 @@ engine_net::schema! {pub(super) struct Projectile(SchemaId(0x1106),1,Representat
     5=>radius:f32=0.1=>p(Units::Metres,NONNEG),
     6=>friendly:bool=true=>p(Units::Unitless,Range::None),
     7=>essence:Option<Essence>=None=>p(Units::Unitless,Range::None),
+    8=>speed:f32=0.0=>p(Units::Custom("metres/second"),NONNEG),
+    9=>remaining:f32=0.0=>p(Units::Seconds,NONNEG),
+    10=>max_distance:Option<f32>=None=>p(Units::Metres,NONNEG),
 }}
 impl Root for Projectile {
     type Model = game::PublicProjectileView;
@@ -171,6 +177,9 @@ impl Root for Projectile {
             owner: v.owner,
             position: v.position,
             direction: v.direction,
+            speed: v.speed,
+            remaining: v.remaining,
+            max_distance: v.max_distance,
             radius: v.radius,
             friendly: v.friendly,
             essence: v.essence.map(Into::into),
@@ -182,6 +191,9 @@ impl Root for Projectile {
             owner: self.owner,
             position: self.position,
             direction: self.direction,
+            speed: self.speed,
+            remaining: self.remaining,
+            max_distance: self.max_distance,
             radius: self.radius,
             friendly: self.friendly,
             essence: self.essence.map(Into::into),
@@ -192,12 +204,13 @@ impl Root for Projectile {
         Ok(v)
     }
 }
-engine_net::schema! {pub(super) struct Wisp(SchemaId(0x1107),1,Representation::PublicPresentation) {
+engine_net::schema! {pub(super) struct Wisp(SchemaId(0x1107),2,Representation::PublicPresentation) {
     1=>id:u64=1=>p(Units::Unitless,U64),
     2=>owner:Option<u64>=None=>p(Units::Unitless,U64),
     3=>position:[f32;2]=[0.0;2]=>linear(Units::Metres,F),
     4=>remaining:f32=0.0=>p(Units::Seconds,NONNEG),
     5=>essence:Option<Essence>=None=>p(Units::Unitless,Range::None),
+    6=>velocity:[f32;2]=[0.0;2]=>p(Units::Custom("metres/second"),F),
 }}
 impl Root for Wisp {
     type Model = game::PublicWispView;
@@ -207,6 +220,7 @@ impl Root for Wisp {
             id: v.id,
             owner: v.owner,
             position: v.position,
+            velocity: v.velocity,
             remaining: v.remaining,
             essence: v.essence.map(Into::into),
         })
@@ -216,6 +230,7 @@ impl Root for Wisp {
             id: self.id,
             owner: self.owner,
             position: self.position,
+            velocity: self.velocity,
             remaining: self.remaining,
             essence: self.essence.map(Into::into),
         };

@@ -114,7 +114,7 @@ queued for the next tick, so a legal burst of decode receipts cannot disconnect
 the peer.
 
 Whole owner messages are admitted only when the graph scheduler and Renet's
-32 KiB sender queue have capacity. Unpublished state coalesces to the latest
+64 KiB sender queue have capacity. Unpublished state coalesces to the latest
 committed capture. Each accepted identity is enqueued once; stock Renet owns all
 slicing, packet acknowledgements and retransmission. Packetization allows 7,000
 payload bytes per flush, accommodating the 20 Hz remote publication burst.
@@ -122,7 +122,7 @@ Final egress independently charges every encrypted send, including retries and
 ACKs, under the transport pacer. No application fragment prefix or retransmission
 preflight remains.
 
-Owner receive memory is 128 KiB, separately sized from the sender's 32 KiB because
+Owner receive memory is 128 KiB, separately sized from the sender's 64 KiB because
 Renet rounds incomplete slices up to its 1,200-byte stride. Reliable controls use
 128 KiB per direction. Bootstrap/reset retains only exact expected receipts,
 referenced bases and a two-second deadline; ordinary owner messages need no
@@ -320,7 +320,7 @@ Public actor views contain approved presentation data. Private loadouts,
 progression and latent owner state appear only in that owner's checkpoint.
 World RNG, allocation state, future encounters and complete server state are
 absent from live public/global payloads. The owner, global summary, collision
-scene and any required rotating base form one bounded message of at most 32 KiB
+scene and any required rotating base form one bounded message of at most 64 KiB
 on a dedicated reliable-unordered channel, published atomically. Each member
 uses a bounded full or delta encoding against an exact
 retained decode receipt in the same scope and baseline generation. All
@@ -374,9 +374,12 @@ A complete validated owner group for exactly the next baseline generation may
 wait for its reliable reset under the same context. Waiting grants no retention
 proof and does not refresh connection freshness.
 
-Client prediction runs a restricted owner model using the same movement and
-attack-acceptance functions as authority. It does not simulate remote AI or
-restore the complete world. Complete group identities authorize bootstrap;
+Client prediction restores the admitted owner and its transient components into
+a reusable `DreamSimulation` runner. The same `DreamwakePlugin` systems execute
+movement, skills, delayed actions, companions, projectiles and graphics on the
+server and during owner replay. Authority-only systems retain ownership of enemy
+decisions, contacts, damage resolution and encounter progression. Complete group
+identities authorize bootstrap;
 correction restores tick K and replays K+1 onward under aggregate memory and
 work limits. Missing history, revoked dependencies and excess work request
 bounded recovery. Before the first authored command, with no retained command or
@@ -405,12 +408,20 @@ the same simulation clock, including fractional tick phase. Newly assigned
 commands use dependencies from the latest admitted checkpoint; already recorded
 commands retain their original dependency
 frames for replay. This refreshes bounded platform samples without rewriting
-historical reads. Starfall flight and reversible graphics use the admitted owner
-state; remote damage and hit resolution remain authoritative. The
+historical reads. Skills and reversible graphics use the admitted owner state;
+remote damage and hit resolution remain authoritative. The
 [moving-base contract](moving-bases.md) describes platform dependency and rider
 display time. Presentation consumes `DreamPresentation`, while offline replay
 uses the complete `DreamCheckpoint` codec. See
 [predicted graphics](predicted-graphics.md) for simulation-owned effect identity.
+
+Each newly authored or forecast frame also retains up to 64 nearest independently
+disclosed enemy poses as optional companion targeting inputs. Samples newer than
+the frame are excluded. Replay uses those recorded values rather than live
+replicas; a scope exit removes the target from subsequent frames. They supply
+neither an authoritative damage decision nor enemy AI. Owner state charges a
+64 KiB decoded allocation envelope, with an 80 KiB per-checkpoint limit including
+inline state and metadata, under the existing aggregate history budget.
 
 The current protocol identity is defined in the [game protocol crate](../games/dreamwake/protocol/src/lib.rs).
 Bump it when serialized authoritative layout changes, and rebuild clients and

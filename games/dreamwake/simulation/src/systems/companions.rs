@@ -9,10 +9,19 @@ pub(crate) fn spawn_wisp(
     essence: Option<EssenceKind>,
     damage: f32,
     index: u32,
+    source: ActionEffect,
 ) {
+    let match_epoch = (run.seed ^ (run.seed >> 32)) as u32;
     commands.spawn((
         DreamOwned,
-        Wisp { damage, essence },
+        Wisp {
+            damage,
+            essence,
+            // Reserve 64 stable child slots for each wisp so simultaneous
+            // companions cannot alias one another's projectile identities.
+            graphics: source.offset((index as u16) * 64).id(match_epoch, owner),
+            shots: 0,
+        },
         CompanionState {
             id: run.id(),
             owner,
@@ -42,12 +51,19 @@ pub(crate) fn spawn_wisp(
 pub(crate) fn wisp_actions(
     mut commands: Commands,
     mut run: ResMut<Run>,
-    mut wisps: Query<(Entity, &Wisp, &mut CompanionState)>,
+    mut wisps: Query<(Entity, &mut Wisp, &mut CompanionState)>,
+    projectiles: Query<&engine_core::ProjectileState>,
 ) {
+    let mut projectile_counts = std::collections::HashMap::<u64, usize>::new();
+    for projectile in &projectiles {
+        if !projectile.finished() {
+            *projectile_counts.entry(projectile.owner).or_default() += 1;
+        }
+    }
     let mut ordered: Vec<_> = wisps.iter().map(|(e, _, state)| (state.id, e)).collect();
     ordered.sort_unstable();
     for (_, entity) in ordered {
-        let Ok((_, payload, mut state)) = wisps.get_mut(entity) else {
+        let Ok((_, mut payload, mut state)) = wisps.get_mut(entity) else {
             continue;
         };
         if state.expired {
@@ -55,6 +71,20 @@ pub(crate) fn wisp_actions(
             continue;
         }
         if let Some(direction) = state.pending_shot.take() {
+            let count = projectile_counts.entry(state.owner).or_default();
+            if *count >= crate::replication::MAX_OWNER_PROJECTILES {
+                continue;
+            }
+            let graphics = engine_core::GraphicsId {
+                slot: payload
+                    .graphics
+                    .slot
+                    .wrapping_add(0x0400)
+                    .wrapping_add(payload.shots),
+                ..payload.graphics
+            };
+            payload.shots = payload.shots.wrapping_add(1);
+            *count += 1;
             projectile(
                 &mut commands,
                 &mut run,
@@ -66,6 +96,7 @@ pub(crate) fn wisp_actions(
                 payload.essence,
                 20.0,
                 0.24,
+                Some(graphics),
             );
         }
     }

@@ -8,7 +8,7 @@ where
         .restore()
         .unwrap_or_else(|e| panic!("{}: {e:?}", std::any::type_name::<S>()));
     let encoded = encode(r, &model).unwrap();
-    assert!(encoded.len() <= 16_374);
+    assert!(encoded.len() <= 32 * 1024);
     assert_eq!(decode(r, &encoded).unwrap(), model);
     assert_eq!(
         r.codec().encode(&r.capture(&model).unwrap()).unwrap(),
@@ -114,38 +114,13 @@ fn owner_maximum_collections_and_text_fit_the_wire_budget() {
     owner.hero.defense_episodes.granted =
         engine_net::codec::BoundedVec::new(vec![1.0; 64]).unwrap();
     owner.hero.defense_episodes.spent = engine_net::codec::BoundedVec::new(vec![0.0; 64]).unwrap();
-    let mut domain = crate::starfall::StarfallDomain::default();
-    for sequence in 1..=8 {
-        let mut flight = crate::starfall::flight(
-            crate::starfall::SpawnKey {
-                action: crate::combat::RayActionKey {
-                    match_epoch: 1,
-                    connection_epoch: 0,
-                    command_stream: 0,
-                    ownership_epoch: 0,
-                    actor: 1,
-                    actor_generation: 1,
-                    command_sequence: sequence,
-                    action_slot: 0,
-                },
-                ordinal: 0,
-            },
-            0,
-            [0.0; 2],
-            [1.0, 0.0],
-            Some(crate::EssenceKind::Vast),
-        );
-        flight.authority_id = Some((1u64 << 63) + sequence);
-        domain.flights.push(flight);
-    }
-    owner.starfall = (&domain).try_into().unwrap();
     let model = owner.restore().unwrap();
     let bytes = encode_owner(&model).unwrap();
     eprintln!(
         "Maximum populated owner collections plus8flights: {} bytes",
         bytes.len()
     );
-    assert!(bytes.len() <= 16_374);
+    assert!(bytes.len() <= 32 * 1024);
     assert_eq!(decode_owner(&bytes).unwrap(), model);
 }
 #[test]
@@ -305,23 +280,19 @@ fn cover_content_and_moving_pose_are_validated_after_staged_decode() {
     }
 }
 #[test]
-fn starfall_maximum_schema_budget() {
+fn complete_owner_transient_schema_budget() {
     let mut limits = SchemaLimits::default();
     limits.wire_bytes = 1024 * 1024;
     let bytes = record_maximum::<Owner>(&mut Work::new(limits), 0).unwrap() + 36;
-    let entry = <starfall::Entry as FieldValue>::maximum_size(&mut Work::new(limits), 0).unwrap();
-    eprintln!(
-        "Owner schema maximum bytes including Starfall: {bytes}, each entry {entry}, empty domain {}",
-        bytes - 8 * (entry + 4)
-    );
-    assert!(bytes <= 16_374, "owner maximum {bytes}");
+    eprintln!("Owner schema maximum bytes including generic transients: {bytes}");
+    assert!(bytes <= u16::MAX as usize, "owner maximum {bytes}");
 }
 
 #[test]
 fn owner_group_maxima_are_explicit() {
     let maxima = owner_group_schema_maxima().unwrap();
     eprintln!("Owner-group schema maxima [global,owner,collision,platform]: {maxima:?}");
-    assert!(maxima.iter().all(|n| *n <= 16_374));
+    assert!(maxima.iter().all(|n| *n <= u16::MAX as usize));
 }
 #[test]
 fn shield_columns_reject_mismatched_lengths_and_invalid_intervals() {

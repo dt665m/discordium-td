@@ -25,6 +25,10 @@ dreamwake-server max_clients="8":
 dreamwake-build:
     cargo build --release -p dreamwake_client
 
+# Cross-compile on the local build host for Oracle's ARM64 Ubuntu 24.04 server.
+oracle-build:
+    cargo zigbuild --release --locked -p dreamwake_server --bin game_server --target aarch64-unknown-linux-gnu.2.39
+
 wasm-target:
     rustup target add wasm32-unknown-unknown
 

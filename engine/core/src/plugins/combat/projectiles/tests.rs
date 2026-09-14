@@ -83,6 +83,33 @@ fn expiration_precedes_collision_and_present_dead_owner_is_allowed() {
 }
 
 #[test]
+fn public_motion_capability_applies_lifetime_and_world_distance() {
+    let mut position = [4.5, 0.0];
+    let mut remaining = 2.0;
+    assert!(!advance_projectile_motion(
+        &mut position,
+        [1.0, 0.0],
+        10.0,
+        &mut remaining,
+        Some(5.0),
+        0.1,
+    ));
+    assert_eq!(position, [5.5, 0.0]);
+    assert!((remaining - 1.9).abs() < 0.0001);
+
+    position = [0.0, 0.0];
+    remaining = 0.1;
+    assert!(!advance_projectile_motion(
+        &mut position,
+        [1.0, 0.0],
+        10.0,
+        &mut remaining,
+        None,
+        0.1,
+    ));
+}
+
+#[test]
 fn plugin_ticks_serializable_state_without_despawning_payload() {
     let mut app = App::new();
     app.insert_resource(SimulationStep(1.0));

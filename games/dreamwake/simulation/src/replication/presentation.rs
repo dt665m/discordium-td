@@ -121,6 +121,15 @@ impl DreamPresentation {
         let mut effect_ids = BTreeSet::new();
         for replica in replicas {
             validate_replica(replica)?;
+            // The complete owner checkpoint is the sole source for its
+            // transients. Public scopes may arrive on another delivery lane;
+            // they must not duplicate or rewind locally replayed entities.
+            if matches!(replica, PublicReplica::Projectile(v) if v.owner == Some(owner.owner()))
+                || matches!(replica, PublicReplica::Wisp(v) if v.owner == Some(owner.owner()))
+                || matches!(replica, PublicReplica::Effect(v) if v.id.owner == owner.owner())
+            {
+                continue;
+            }
             let id = match replica {
                 PublicReplica::Hero(v) => {
                     if v.id != owner.owner() {
@@ -184,11 +193,6 @@ impl DreamPresentation {
                     if v.id.owner != 0 && !sources.contains(&v.id.owner) {
                         continue;
                     }
-                    if v.id.owner == owner.owner()
-                        && matches!(v.kind, engine_core::GraphicsKind::Beam { .. })
-                    {
-                        continue;
-                    }
                     result.presentations.push(engine_core::GraphicsInstance {
                         id: v.id,
                         kind: v.kind,
@@ -230,8 +234,15 @@ impl DreamPresentation {
                 return Err(ReplicationError::DuplicateReplica);
             }
         }
+        result.projectiles.extend(owner.projectile_views());
+        result.wisps.extend(owner.wisp_views());
+        result.presentations.extend_from_slice(owner.graphics());
         if let Some(beam) = owner.beam_graphics() {
-            result.presentations.push(beam);
+            if let Some(existing) = result.presentations.iter_mut().find(|v| v.id == beam.id) {
+                *existing = beam;
+            } else {
+                result.presentations.push(beam);
+            }
         }
         result.heroes.push(hero);
         result.heroes.sort_by_key(|v| v.id);
@@ -341,7 +352,14 @@ pub(super) fn validate_replica(replica: &PublicReplica) -> Result<(), Replicatio
         PublicReplica::Cover(v) => !v.valid(),
         PublicReplica::CoverMarker(v) => !v.valid(),
         PublicReplica::Platform(v) => !v.valid(),
-        PublicReplica::Projectile(v) => v.id == 0 || v.owner == Some(0) || v.radius < 0.0,
+        PublicReplica::Projectile(v) => {
+            v.id == 0
+                || v.owner == Some(0)
+                || v.radius < 0.0
+                || v.speed < 0.0
+                || v.remaining < 0.0
+                || v.max_distance.is_some_and(|distance| distance < 0.0)
+        }
         PublicReplica::Wisp(v) => v.id == 0 || v.owner == Some(0) || v.remaining < 0.0,
         PublicReplica::Effect(v) => {
             !crate::state::valid_graphics_kind(v.kind)

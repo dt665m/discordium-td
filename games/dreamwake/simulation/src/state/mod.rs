@@ -322,6 +322,8 @@ pub(super) struct CastPayload {
     pub power: f32,
     pub origin: [f32; 2],
     pub direction: [f32; 2],
+    pub graphics: engine_core::GraphicsId,
+    pub authority_id: Option<u64>,
 }
 #[derive(Resource, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(super) struct Run {

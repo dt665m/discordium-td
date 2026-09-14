@@ -6,7 +6,7 @@ use serde_json::Value;
 use std::{collections::BTreeSet, sync::OnceLock};
 pub(crate) mod bounded_json;
 
-pub const CHECKPOINT_SCHEMA: u32 = 12;
+pub const CHECKPOINT_SCHEMA: u32 = 13;
 // Full-authority/offline envelope budget; this is NOT the planned 16 KiB
 // per-owner scoped checkpoint transport budget.
 const MAX_BYTES: usize = 8 * 1024 * 1024;

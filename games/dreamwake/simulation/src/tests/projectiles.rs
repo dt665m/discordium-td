@@ -23,6 +23,7 @@ fn bolt(sim: &mut DreamSimulation, friendly: bool, piercing: bool) {
             piercing.then_some(EssenceKind::Vast),
             600.0,
             0.1,
+            None,
         );
         queue.apply(world);
     });

@@ -366,6 +366,56 @@ fn explicit_enum_tags_options_and_utf8_are_canonical_and_bounded() {
 crate::schema! { struct TextCollection(SchemaId(19),1,Representation::PublicPresentation) {
     1 => values: BoundedVec<BoundedString<8>,4> = BoundedVec::default() => FieldSpec::exact(Units::Unitless,Range::None,Visibility::Public,Prediction::None),
 }}
+
+crate::schema! { struct BinaryOnly(SchemaId(20),1,Representation::OwnerCheckpoint) {
+    1 => bytes: BoundedBytes<8> = BoundedBytes::default() => FieldSpec::exact(Units::Unitless,Range::None,Visibility::Owner,Prediction::None),
+}}
+
+#[test]
+fn canonical_bounded_bytes_round_trip_without_per_byte_field_framing() {
+    let registered = registered::<BinaryOnly>();
+    for bytes in [Vec::new(), vec![0, 1, 2, 3, 252, 253, 254, 255]] {
+        let state = BinaryOnly {
+            bytes: BoundedBytes::new(bytes.clone()).unwrap(),
+        };
+        let encoded = registered.codec().encode(&state).unwrap();
+        assert_eq!(registered.codec().decode(&encoded).unwrap(), state);
+        assert_eq!(&encoded[encoded.len() - bytes.len()..], bytes.as_slice());
+        // A single inner byte count is the only payload overhead inside the field.
+        let count_offset = encoded.len() - bytes.len() - 4;
+        assert_eq!(
+            &encoded[count_offset..count_offset + 4],
+            &(bytes.len() as u32).to_le_bytes()
+        );
+    }
+}
+
+#[test]
+fn canonical_bounded_bytes_reject_oversized_and_malformed_bodies() {
+    assert_eq!(
+        BoundedBytes::<8>::new(vec![0; 9]),
+        Err(SchemaError::CountBudget)
+    );
+    let registered = registered::<BinaryOnly>();
+    let value = BinaryOnly {
+        bytes: BoundedBytes::new(vec![1, 2, 3]).unwrap(),
+    };
+    let mut hostile_count = registered.codec().encode(&value).unwrap();
+    let count_offset = hostile_count.len() - value.bytes.len() - 4;
+    hostile_count[count_offset..count_offset + 4].copy_from_slice(&9u32.to_le_bytes());
+    assert_eq!(
+        registered.codec().decode(&hostile_count),
+        Err(SchemaError::CountBudget)
+    );
+
+    let mut truncated = registered.codec().encode(&value).unwrap();
+    truncated.pop();
+    assert_eq!(
+        registered.codec().decode(&truncated),
+        Err(SchemaError::Truncated)
+    );
+}
+
 #[test]
 fn aggregate_text_and_collection_work_survive_nested_maximum_analysis() {
     let text = SchemaLimits {

@@ -10,6 +10,7 @@ pub(crate) fn player_actions(
     mut heroes: Query<HeroActor, Without<Enemy>>,
     mut enemies: Query<(Entity, EnemyActor), Without<Hero>>,
     projectiles: Query<(&Projectile, &engine_core::ProjectileState)>,
+    wisps: Query<&engine_core::CompanionState>,
     delayed: Query<&DelayedCast>,
 ) {
     let mut party: Vec<_> = heroes.iter_mut().collect();
@@ -98,11 +99,21 @@ pub(crate) fn player_actions(
             );
         }
         if motion.dash_started {
+            let source = transactions
+                .requests
+                .iter()
+                .find_map(|request| match request {
+                    crate::combat::CombatAction::Dash { key, .. } if key.actor == hero.view.id => {
+                        Some(ActionEffect::network(*key, 0))
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| ActionEffect::input(input.action_sequences[0], run.tick, 0));
             action_effect(
                 &mut commands,
                 &run,
                 hero.view.id,
-                ActionEffect::input(input.action_sequences[0], run.tick, 0),
+                source,
                 dash_origin,
                 1.5,
                 18,
@@ -173,6 +184,8 @@ pub(crate) fn player_actions(
                 ActionEffect {
                     sequence: hero.action.sequence,
                     slot: 0x8000,
+                    scope: None,
+                    match_epoch: None,
                 },
                 add(origin, scale(direction, 1.2)),
                 reach * 0.55,
@@ -187,34 +200,95 @@ pub(crate) fn player_actions(
                 .iter()
                 .filter(|d| d.payload.spawn.is_some() && d.payload.owner == hero.view.id)
                 .count();
+        let mut owner_projectiles = projectiles
+            .iter()
+            .filter(|(_, state)| state.owner == hero.view.id && !state.finished())
+            .count();
+        let mut owner_wisps = wisps
+            .iter()
+            .filter(|state| state.owner == hero.view.id && !state.expired)
+            .count()
+            + delayed
+                .iter()
+                .filter(|cast| {
+                    cast.payload.owner == hero.view.id && cast.payload.kind == MemoryKind::Wisp
+                })
+                .count();
+        let mut owner_delayed = delayed
+            .iter()
+            .filter(|cast| cast.payload.owner == hero.view.id)
+            .count();
         for (index, pressed) in input.casts.into_iter().enumerate() {
             if !pressed {
                 continue;
             }
+            let key = transactions
+                .requests
+                .iter()
+                .find_map(|request| match request {
+                    crate::combat::CombatAction::Cast { key, slot, .. }
+                        if key.actor == hero.view.id && usize::from(*slot) == index =>
+                    {
+                        Some(*key)
+                    }
+                    _ => None,
+                })
+                .unwrap_or(crate::combat::RayActionKey {
+                    match_epoch: ((run.seed ^ (run.seed >> 32)) as u32).max(1),
+                    connection_epoch: 0,
+                    command_stream: 0,
+                    ownership_epoch: 0,
+                    actor: hero.view.id,
+                    actor_generation: hero.combat_identity.generation,
+                    command_sequence: u64::from(input.action_sequences[index + 1].max(run.tick)),
+                    action_slot: index as u8,
+                });
+            let source = if key.connection_epoch == 0 {
+                ActionEffect::input(
+                    input.action_sequences[index + 1],
+                    run.tick,
+                    ((index + 1) as u16) << 12,
+                )
+            } else {
+                ActionEffect::network(key, ((index + 1) as u16) << 12)
+            };
+            let memory = hero.loadout.0[index];
+            let projectile_reservation = if memory.kind == MemoryKind::Starfall {
+                crate::starfall::spawn_count(memory.modifier)
+            } else {
+                0
+            };
+            let wisp_reservation = if memory.kind == MemoryKind::Wisp {
+                if matches!(memory.modifier, Some(EssenceKind::Twin | EssenceKind::Echo)) {
+                    2
+                } else {
+                    1
+                }
+            } else {
+                0
+            };
+            let delayed_reservation = usize::from(
+                memory.modifier == Some(EssenceKind::Echo)
+                    || (memory.modifier == Some(EssenceKind::Twin)
+                        && matches!(
+                            memory.kind,
+                            MemoryKind::Crescent | MemoryKind::Nova | MemoryKind::Blink
+                        )),
+            );
+            if owner_projectiles + projectile_reservation
+                > crate::replication::MAX_OWNER_PROJECTILES
+                || owner_wisps + wisp_reservation > crate::replication::MAX_OWNER_WISPS
+                || owner_delayed + delayed_reservation > crate::replication::MAX_OWNER_DELAYED
+            {
+                transactions.simple(
+                    hero.view.id,
+                    Some(index as u8),
+                    run.tick,
+                    crate::combat::ActionReason::Budget,
+                );
+                continue;
+            }
             if hero.loadout.0[index].kind == MemoryKind::Starfall {
-                let key = transactions
-                    .requests
-                    .iter()
-                    .find_map(|request| match request {
-                        crate::combat::CombatAction::Cast { key, slot, .. }
-                            if key.actor == hero.view.id && usize::from(*slot) == index =>
-                        {
-                            Some(*key)
-                        }
-                        _ => None,
-                    })
-                    .unwrap_or(crate::combat::RayActionKey {
-                        match_epoch: ((run.seed ^ (run.seed >> 32)) as u32).max(1),
-                        connection_epoch: 0,
-                        command_stream: 0,
-                        ownership_epoch: 0,
-                        actor: hero.view.id,
-                        actor_generation: hero.combat_identity.generation,
-                        command_sequence: u64::from(
-                            input.action_sequences[index + 1].max(run.tick),
-                        ),
-                        action_slot: index as u8,
-                    });
                 let result = if key.valid() && u32::try_from(key.command_sequence).is_ok() {
                     crate::starfall::accept(&mut hero.loadout.0[index], occupied)
                 } else {
@@ -231,8 +305,9 @@ pub(crate) fn player_actions(
                 if result.is_err() {
                     continue;
                 }
-                let memory = hero.loadout.0[index];
                 occupied += crate::starfall::spawn_count(memory.modifier);
+                owner_projectiles += projectile_reservation;
+                owner_delayed += delayed_reservation;
                 let power = hero.view.ability_power * (1.0 + (memory.level - 1) as f32 * 0.25);
                 let origin = planar_position(&hero.motion);
                 let direction = hero.motion.facing;
@@ -265,6 +340,8 @@ pub(crate) fn player_actions(
                                 power: power * 0.65,
                                 origin,
                                 direction,
+                                graphics: source.repeat().id(key.match_epoch, hero.view.id),
+                                authority_id: repeat.authority_id,
                             },
                         ),
                     ));
@@ -274,11 +351,7 @@ pub(crate) fn player_actions(
                     &mut commands,
                     &run,
                     hero.view.id,
-                    ActionEffect::input(
-                        input.action_sequences[index + 1],
-                        run.tick,
-                        ((index + 1) as u16) << 12,
-                    ),
+                    source,
                     add(origin, scale(direction, 0.9)),
                     0.8,
                     12,
@@ -300,15 +373,11 @@ pub(crate) fn player_actions(
                 run.tick,
                 crate::combat::ActionReason::Accepted,
             );
-            let memory = hero.loadout.0[index];
+            owner_wisps += wisp_reservation;
+            owner_delayed += delayed_reservation;
             let power = hero.view.ability_power * (1.0 + (memory.level - 1) as f32 * 0.25);
             let origin = planar_position(&hero.motion);
             let direction = hero.motion.facing;
-            let source = ActionEffect::input(
-                input.action_sequences[index + 1],
-                run.tick,
-                ((index + 1) as u16) << 12,
-            );
             execute_memory(
                 &mut commands,
                 &mut run,
@@ -340,6 +409,8 @@ pub(crate) fn player_actions(
                             power: power * 0.65,
                             origin,
                             direction,
+                            graphics: source.repeat().id(key.match_epoch, hero.view.id),
+                            authority_id: None,
                         },
                     ),
                 ));

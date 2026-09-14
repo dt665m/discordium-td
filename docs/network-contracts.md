@@ -73,7 +73,7 @@ must preserve current caches and pending retirements atomically.
 Owner publications use one bounded reliable-unordered message; stock Renet owns
 its slices and retries. Game decode receipts remain separate from transport ACKs.
 A complete, validated future baseline generation can wait for its control-lane
-reset in one 32 KiB slot, with the original two-second deadline. Applying the
+reset in one 64 KiB slot, with the original two-second deadline. Applying the
 reset retries local publication without requiring another message from the server.
 A validated older owner-group context is obsolete after a newer topology reset
 or publication. Its delayed deltas cannot replace the current baseline cache or
@@ -128,9 +128,10 @@ resulting state for authoritative restore and owner replay.
 
 Select the existing headless Bevy simulation path. `DreamwakePlugin` composes
 engine capabilities in `DreamStep`; `DreamSimulation` supplies the stepped
-authoritative world and offline replay. The restricted live owner predictor
-shares the authority's owner intent and component transition functions, using
-only its approved checkpoint. Portable networking algorithms may have no
+authoritative world, offline replay and scoped owner replay. Live prediction
+restores approved owner components and dependencies into a reusable runner,
+then executes the shared schedule with authority-only responsibilities disabled.
+Portable networking algorithms may have no
 Bevy dependency, but this integration does not replace Bevy scheduling, entity
 relationships, transforms or change detection with parallel implementations.
 
@@ -140,7 +141,7 @@ Authenticated transport -> bounded command inbox -> Dreamwake admission
     -> shared graph prepare -> per-connection gather/policy/dependencies
     -> scoped lifecycle -> budget/encode -> transport
 
-Decoded owner group -> transactional restore -> bounded restricted owner replay
+Decoded owner group -> transactional restore -> bounded shared owner replay
     -> read-only presentation extraction -> renderer correction offset
 ```
 
@@ -183,7 +184,7 @@ describes Character Movement (CMC) as established in shipped projects and Mover
 as experimental. CMC processes client-authored moves when their RPCs arrive.
 The shared-timeline Network Prediction model buffers inputs for their intended
 simulation frame and predicts ahead locally. Dreamwake uses the latter timing
-shape, with its own restricted owner simulation. This resemblance is not evidence
+shape, with its own scoped owner simulation. This resemblance is not evidence
 that our implementation or limits are used by Fortnite.
 
 The following references are Epic's UE 5.8 documentation. API descriptions expose
@@ -191,8 +192,9 @@ specific contracts; they do not establish undocumented control algorithms.
 
 | Concern | Epic reference and mechanism | Local application and difference |
 |---|---|---|
+| Shared capability prediction | [CMC/Mover comparison](https://dev.epicgames.com/documentation/en-us/unreal-engine/comparing-mover-and-character-movement-component-in-unreal-engine) describes Mover/Network Prediction's shared simulation timeline, client prediction and rollback; [Network Prediction model services](https://dev.epicgames.com/documentation/en-us/unreal-engine/API/Plugins/NetworkPrediction) separate model ticking, rollback, cues and smoothing. The reviewed documentation is UE 5.8 and still describes Mover as experimental. | Owner replay runs the shared Bevy gameplay schedule over the admitted owner checkpoint and owned transient components. Optional disclosed target proxies are retained with each prediction frame and can guide companion presentation; they cannot resolve damage or run undisclosed AI. Remote presentation advances replicated motion and lifetime capabilities independently of packet arrivals. Checkpoint bounds, public proxy policy and prediction horizons are Dreamwake choices, not claimed Epic algorithms or Fortnite settings. |
 | Player color identity | [Networking overview](https://dev.epicgames.com/documentation/en-us/unreal-engine/networking-overview-for-unreal-engine) describes replicated properties flowing from authoritative actors to their remote proxies. This is the established server-authoritative replication model. | Assign each concurrent hero a unique color identity in the authoritative simulation and carry it through complete snapshots, owner checkpoints and public hero replicas. Restore/replay preserves the assignment; clients render the same identity for local and remote heroes. Color allocation and palette are Dreamwake policy, not an Epic algorithm. Existing scoped state delivery and ACK rules apply; color needs no separate event or delivery lane. |
-| Whole group delivery and cross-channel dependencies | [Reliable RPCs](https://dev.epicgames.com/documentation/en-us/unreal-engine/remote-procedure-calls-in-unreal-engine#reliability) separate reliable retransmission from application execution; [replicated object execution order](https://dev.epicgames.com/documentation/en-us/unreal-engine/replicated-object-execution-order-in-unreal-engine) recommends retaining dependent values until usable and limits ordering guarantees to specific scopes. | Enqueue each owner publication once on stock Renet reliable-unordered transport. Validate the complete group and retain exact decoded receipts independently of packet ACKs. Stage one complete message if its baseline reset has not arrived; reject valid older topology contexts without replacing current caches when the newer reset or publication arrives first. The generic synthetic harness counts validated superseded standalone states and groups without acknowledging or republishing them; malformed states and conflicting watermarks remain failures. Its whole-message workload does not require partial-group delivery. Channel selection, 32/128 KiB memory budgets, the two-second deadline and atomic owner-group protocol are local decisions, not Epic wire behavior or tuning. |
+| Whole group delivery and cross-channel dependencies | [Reliable RPCs](https://dev.epicgames.com/documentation/en-us/unreal-engine/remote-procedure-calls-in-unreal-engine#reliability) separate reliable retransmission from application execution; [replicated object execution order](https://dev.epicgames.com/documentation/en-us/unreal-engine/replicated-object-execution-order-in-unreal-engine) recommends retaining dependent values until usable and limits ordering guarantees to specific scopes. | Enqueue each owner publication once on stock Renet reliable-unordered transport. Validate the complete group and retain exact decoded receipts independently of packet ACKs. Stage one complete message if its baseline reset has not arrived; reject valid older topology contexts without replacing current caches when the newer reset or publication arrives first. The generic synthetic harness counts validated superseded standalone states and groups without acknowledging or republishing them; malformed states and conflicting watermarks remain failures. Its whole-message workload does not require partial-group delivery. Channel selection, 64/128 KiB memory budgets, the two-second deadline and atomic owner-group protocol are local decisions, not Epic wire behavior or tuning. |
 | Handshake confirmation retries | [StatelessConnectHandlerComponent](https://dev.epicgames.com/documentation/unreal-engine/API/Runtime/Engine/StatelessConnectHandlerComponent?lang=en-US) exposes handshake-specific send timestamps and explicit challenge completion. | Keep handshake retry timing in renetcode: before authenticated client confirmation, outgoing application payloads cannot reset the KeepAlive retry timestamp. Both UDP and WebRTC exercise loss of the initial KeepAlive under continuous payload sends. This is a correction to renetcode's existing protocol, not an Unreal handshake algorithm or retry setting; no transport pacing workaround or Renet packet configuration extension is required. |
 | Client identity replacement | [Actor relevancy](https://dev.epicgames.com/documentation/en-us/unreal-engine/actor-relevancy-in-unreal-engine) ties client actor lifetimes to the connection's current relevant set; [replicated object execution order](https://dev.epicgames.com/documentation/en-us/unreal-engine/replicated-object-execution-order-in-unreal-engine) does not guarantee relative reliable/unreliable order. | After a standalone state or complete atomic group publishes a newer entity generation, retire older generations at that index from client membership and combat-pose bookkeeping. Delayed old Exit/Destroy controls retain the replacement. Rejected or incomplete publications cannot retire it. The numeric generation fence and combat cohort are local contracts, not Epic identity or wire formats. |
 | Recovery request ownership | [Reliable RPCs](https://dev.epicgames.com/documentation/en-us/unreal-engine/remote-procedure-calls-in-unreal-engine#reliability) retransmit until acknowledged, and their send policy separates enqueue from network dispatch. [Networked character movement](https://dev.epicgames.com/documentation/unreal-engine/understanding-networked-movement-in-the-character-movement-component-for-unreal-engine) distinguishes server acknowledgements/corrections from saved client moves and warns about reliable buffer overflow. | Recovery retains one pending resync request until control encoding and reliable enqueue succeed. Poll services it while prediction is stopped; an enqueued request waits for replacement Welcome while Renet owns retransmission. The server may also retire an expired active baseline-reset stream through the same capped resynchronization path, preserving authoritative participation and requiring fresh proofs. Old queued controls/state remain transport-owned and are fenced by epoch. Finalization-audit expiry remains strict. The one-second request throttle, two-second checkpoint deadline, three-per-thirty-second cap and Welcome handshake are local mechanisms, not an Epic recovery algorithm or tuning. |

@@ -84,6 +84,8 @@ pub struct PublicEnemyView {
     pub id: u64,
     pub position: [f32; 2],
     pub facing: [f32; 2],
+    /// Current authoritative planar velocity for bounded presentation prediction.
+    pub velocity: [f32; 2],
     pub hp: f32,
     pub max_hp: f32,
     pub kind: EnemyKind,
@@ -102,6 +104,10 @@ pub struct PublicProjectileView {
     pub owner: Option<u64>,
     pub position: [f32; 2],
     pub direction: [f32; 2],
+    /// Authoritative engine motion, sufficient to integrate this generic projectile.
+    pub speed: f32,
+    pub remaining: f32,
+    pub max_distance: Option<f32>,
     pub radius: f32,
     pub friendly: bool,
     pub essence: Option<EssenceKind>,
@@ -112,6 +118,8 @@ pub struct PublicWispView {
     pub id: u64,
     pub owner: Option<u64>,
     pub position: [f32; 2],
+    /// Current authoritative tangent velocity for bounded presentation prediction.
+    pub velocity: [f32; 2],
     pub remaining: f32,
     pub essence: Option<EssenceKind>,
 }

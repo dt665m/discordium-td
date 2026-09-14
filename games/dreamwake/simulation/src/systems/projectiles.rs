@@ -4,6 +4,12 @@ use engine_core::{
     SceneQueryBudget, StaticCollider, TargetIndex,
 };
 
+/// Public, rollback-pinned target pose used only by companion target selection.
+/// It deliberately lacks Enemy/Health/Combat components, so it cannot receive
+/// predicted damage or run private AI.
+#[derive(Component, Clone, Copy)]
+pub(crate) struct PredictionTarget(pub CollisionTarget);
+
 pub(crate) fn projectile(
     commands: &mut Commands,
     run: &mut Run,
@@ -15,6 +21,7 @@ pub(crate) fn projectile(
     essence: Option<EssenceKind>,
     speed: f32,
     radius: f32,
+    graphics: Option<engine_core::GraphicsId>,
 ) {
     commands.spawn((
         DreamOwned,
@@ -22,6 +29,8 @@ pub(crate) fn projectile(
             damage,
             essence,
             spawn: None,
+            graphics,
+            authority_id: None,
         },
         ProjectileState {
             id: run.id(),
@@ -51,7 +60,7 @@ pub(crate) fn projectile(
     ));
 }
 
-pub(super) fn enemy_radius(kind: EnemyKind) -> f32 {
+pub(crate) fn enemy_radius(kind: EnemyKind) -> f32 {
     match kind {
         EnemyKind::Boss => 1.5,
         EnemyKind::Elite => 0.9,
@@ -63,6 +72,7 @@ pub(super) fn enemy_radius(kind: EnemyKind) -> f32 {
 pub(crate) fn refresh_target_index(
     heroes: Query<HeroActorReadOnly, Without<Enemy>>,
     enemies: Query<EnemyActorReadOnly, Without<Hero>>,
+    predicted: Query<&PredictionTarget>,
     mut index: ResMut<TargetIndex>,
 ) {
     index.0.clear();
@@ -80,6 +90,7 @@ pub(crate) fn refresh_target_index(
         radius: enemy_radius(e.view.kind),
         active: e.health.hp > 0.0,
     }));
+    index.0.extend(predicted.iter().map(|target| target.0));
 }
 
 pub(crate) fn projectile_actions(
@@ -247,6 +258,8 @@ pub(crate) fn spawn_starfall(
             damage,
             essence: flight.essence,
             spawn: Some((flight.key, flight.origin_tick)),
+            graphics: flight.graphics_instance().map(|graphic| graphic.id),
+            authority_id: flight.authority_id,
         },
         flight.engine_state(),
     ));

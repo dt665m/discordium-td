@@ -215,6 +215,7 @@ fn dynamic_cover_uses_current_swept_geometry_for_projectiles() {
                 None,
                 600.0,
                 0.1,
+                None,
             );
             queue.apply(world);
         });

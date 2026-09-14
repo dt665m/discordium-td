@@ -10,7 +10,6 @@ mod motion;
 mod owner;
 mod platform;
 mod public;
-mod starfall;
 use collision::Collision;
 use components::*;
 use enums::*;
@@ -99,7 +98,7 @@ fn registry() -> &'static Registry {
 impl Registry {
     fn new() -> Result<Self, SchemaError> {
         let mut schemas = SchemaRegistry::new(SchemaLimits {
-            wire_bytes: 16_374,
+            wire_bytes: u16::MAX as usize,
             nesting: 16,
             ..SchemaLimits::default()
         })?;

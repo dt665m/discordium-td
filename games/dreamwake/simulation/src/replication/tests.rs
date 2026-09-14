@@ -145,12 +145,16 @@ fn owner_checkpoint_restores_exact_selected_latent_state_and_rng() {
             "next_id",
             "heroes",
             "enemies",
-            "projectiles",
-            "wisps",
-            "delayed",
             "reinforcements",
             "attack_index",
         ],
+    );
+    assert!(
+        checkpoint
+            .transients
+            .projectiles
+            .iter()
+            .all(|projectile| projectile.state.hit_ids.is_empty())
     );
     let decoded = OwnerCheckpoint::decode(&bytes, checkpoint.expectation()).unwrap();
     assert_eq!(decoded, checkpoint);
@@ -349,11 +353,14 @@ fn hidden_sources_omit_effect_identity_and_strip_projectile_owner() {
         .collect();
     assert!(!projectiles.is_empty());
     for id in projectiles {
-        assert_eq!(capture.project_projectile(id, &hidden).unwrap().owner, None);
-        assert_eq!(
-            capture.project_projectile(id, &disclosed).unwrap().owner,
-            Some(2)
-        );
+        let hidden_projectile = capture.project_projectile(id, &hidden).unwrap();
+        assert_eq!(hidden_projectile.owner, None);
+        assert!(hidden_projectile.speed > 0.0);
+        assert!(hidden_projectile.remaining > 0.0);
+        let disclosed_projectile = capture.project_projectile(id, &disclosed).unwrap();
+        assert_eq!(disclosed_projectile.owner, Some(2));
+        assert_eq!(disclosed_projectile.speed, hidden_projectile.speed);
+        assert_eq!(disclosed_projectile.remaining, hidden_projectile.remaining);
     }
     let proxy = CoarseEffectProxy {
         proxy_id: 8,
@@ -492,6 +499,9 @@ fn presentation_stages_unresolved_sources_without_bypassing_replica_validation()
                 owner: Some(source_id),
                 position: [1.0, 2.0],
                 direction: [1.0, 0.0],
+                speed: 17.0,
+                remaining: 1.5,
+                max_distance: Some(64.0),
                 radius: 0.3,
                 friendly: false,
                 essence: None,
@@ -500,6 +510,7 @@ fn presentation_stages_unresolved_sources_without_bypassing_replica_validation()
                 id: 900_002,
                 owner: Some(source_id),
                 position: [3.0, 4.0],
+                velocity: [-0.5, 0.75],
                 remaining: 1.0,
                 essence: None,
             }),
@@ -774,4 +785,218 @@ fn required_platforms(
         .into_iter()
         .filter(|p| owner.required_bases().contains(&p.collider))
         .collect()
+}
+
+fn owner_cast_key(sequence: u64) -> crate::combat::RayActionKey {
+    crate::combat::RayActionKey {
+        match_epoch: 7,
+        connection_epoch: 3,
+        command_stream: 2,
+        ownership_epoch: 1,
+        actor: 1,
+        actor_generation: 1,
+        command_sequence: sequence,
+        action_slot: 0,
+    }
+}
+
+fn comparable_transients(mut value: OwnerTransients) -> OwnerTransients {
+    for projectile in &mut value.projectiles {
+        projectile.payload.authority_id = None;
+    }
+    for delayed in &mut value.delayed {
+        delayed.payload.authority_id = None;
+    }
+    value
+}
+
+#[test]
+fn owner_transient_binary_codec_rejects_collection_count_before_allocation() {
+    let empty = OwnerTransients::default();
+    let encoded = encode_owner_transients(&empty).unwrap();
+    assert_eq!(decode_owner_transients(&encoded).unwrap(), empty);
+
+    // The first fixed-width field is the projectile collection count. A forged
+    // count is rejected by BoundedVec before reserving or decoding elements.
+    let mut hostile = encoded;
+    hostile[..8].copy_from_slice(&(MAX_OWNER_PROJECTILES as u64 + 1).to_le_bytes());
+    assert!(decode_owner_transients(&hostile).is_err());
+}
+
+#[test]
+fn shared_owner_prediction_covers_every_memory_and_essence_lifecycle() {
+    for (case, (kind, essence)) in MemoryKind::ALL
+        .into_iter()
+        .flat_map(|kind| {
+            std::iter::once(None)
+                .chain(EssenceKind::ALL.into_iter().map(Some))
+                .map(move |essence| (kind, essence))
+        })
+        .enumerate()
+    {
+        let mut authority = party();
+        for mut hero in authority
+            .world
+            .query::<HeroActor>()
+            .iter_mut(&mut authority.world)
+        {
+            if hero.view.id == 1 {
+                hero.loadout.0[0] = crate::state::memory_slot(kind);
+                hero.loadout.0[0].modifier = essence;
+            }
+        }
+        // Keep the authoritative encounter alive without introducing contacts,
+        // damage, or private target state into the owner-only comparison.
+        for mut enemy in authority
+            .world
+            .query::<EnemyActor>()
+            .iter_mut(&mut authority.world)
+        {
+            enemy.motor.position = [50.0, 50.0];
+            enemy.motor.movement_lock = 1000.0;
+            enemy.action.recovery = 1000.0;
+        }
+        let initial = authority
+            .capture_replication(stamp(&authority))
+            .unwrap()
+            .owner_checkpoint(1, 1)
+            .unwrap();
+        let encoded = initial.encode().unwrap();
+        let decoded = OwnerCheckpoint::decode(&encoded, initial.expectation()).unwrap();
+        let mut predicted =
+            OwnerPredictionState::from_checkpoint(&decoded, decoded.expectation()).unwrap();
+        let mut replay =
+            OwnerPredictionState::from_checkpoint(&decoded, decoded.expectation()).unwrap();
+        let collision = collision();
+        let bases = required_platforms(&authority, &predicted);
+        let sequence = 10_000 + case as u64;
+        let key = owner_cast_key(sequence);
+        let input = DreamInput {
+            aim: [1.0, 0.0],
+            casts: [true, false, false, false],
+            ..Default::default()
+        };
+        let action = OwnerCombatAction::Cast {
+            key,
+            slot: 0,
+            aim: input.aim,
+        };
+        let mut runner = OwnerPredictionRunner::new();
+        runner
+            .step(
+                &mut predicted,
+                input,
+                &collision,
+                &bases,
+                Some(action),
+                None,
+            )
+            .unwrap();
+        let mut replay_runner = OwnerPredictionRunner::new();
+        replay_runner
+            .step(&mut replay, input, &collision, &bases, Some(action), None)
+            .unwrap();
+        assert_eq!(replay, predicted, "{kind:?}/{essence:?} restore/replay");
+        assert_eq!(predicted.cast_cues(), &[key]);
+
+        authority
+            .step_multiplayer_with_actions(
+                &[(1, input)],
+                &[crate::combat::CombatAction::Cast {
+                    key,
+                    execution_server_tick: 1001,
+                    slot: 0,
+                    aim: input.aim,
+                }],
+            )
+            .unwrap();
+        let captured = authority.capture_replication(stamp(&authority)).unwrap();
+        let authoritative = captured.owner_checkpoint(1, 1).unwrap();
+        assert_eq!(
+            predicted.checkpoint.hero, authoritative.hero,
+            "{kind:?}/{essence:?} hero"
+        );
+        assert_eq!(
+            comparable_transients(predicted.checkpoint.transients.clone()),
+            comparable_transients(authoritative.transients.clone()),
+            "{kind:?}/{essence:?} transients"
+        );
+
+        let shown = DreamPresentation::from_replicas(captured.global(), &predicted, &[]).unwrap();
+        assert_eq!(shown.projectiles, predicted.projectile_views());
+        assert_eq!(shown.wisps, predicted.wisp_views());
+        for effect in predicted.graphics() {
+            assert!(shown.presentations.contains(effect));
+        }
+        if let Some(effect) = predicted.graphics().first().copied() {
+            let public = PublicReplica::Effect(PublicEffectView {
+                id: effect.id,
+                kind: effect.kind,
+                position: effect.pos,
+                radius: effect.radius,
+                age_ticks: effect.age_ticks,
+                duration_ticks: effect.duration_ticks,
+            });
+            let with_duplicate =
+                DreamPresentation::from_replicas(captured.global(), &predicted, &[public]).unwrap();
+            assert_eq!(with_duplicate.presentations, shown.presentations);
+        }
+
+        // A second action while the memory is cooling down is rejected by the
+        // same shared acceptance system and cannot allocate another transient.
+        let ids_before = predicted
+            .projectile_views()
+            .into_iter()
+            .map(|value| value.id)
+            .chain(predicted.wisp_views().into_iter().map(|value| value.id))
+            .collect::<std::collections::BTreeSet<_>>();
+        let rejected = OwnerCombatAction::Cast {
+            key: owner_cast_key(sequence + 1),
+            slot: 0,
+            aim: input.aim,
+        };
+        runner
+            .step(
+                &mut predicted,
+                input,
+                &collision,
+                &bases,
+                Some(rejected),
+                None,
+            )
+            .unwrap();
+        assert!(predicted.cast_cues().is_empty());
+        let ids_after = predicted
+            .projectile_views()
+            .into_iter()
+            .map(|value| value.id)
+            .chain(predicted.wisp_views().into_iter().map(|value| value.id))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(ids_after, ids_before, "{kind:?}/{essence:?} rejection");
+
+        // Haste Aegis is the longest owner-created lifetime (10 seconds).
+        // Running slightly past it proves effects, repeats, missiles, wisps,
+        // shield and invulnerability all retire through shared systems.
+        for _ in 0..620 {
+            runner
+                .step(
+                    &mut predicted,
+                    DreamInput::default(),
+                    &collision,
+                    &bases,
+                    None,
+                    None,
+                )
+                .unwrap();
+        }
+        assert!(
+            predicted.checkpoint.transients == OwnerTransients::default(),
+            "{kind:?}/{essence:?} transient expiry"
+        );
+        assert_eq!(predicted.checkpoint.hero.combat.shield_remaining, 0.0);
+        assert_eq!(
+            predicted.checkpoint.hero.combat.invulnerability_remaining,
+            0.0
+        );
+    }
 }

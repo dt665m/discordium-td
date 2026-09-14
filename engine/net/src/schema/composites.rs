@@ -1,5 +1,89 @@
 use super::*;
 
+/// An owned byte string whose maximum wire and allocation cost is part of its
+/// type. Bytes are encoded contiguously rather than as individually framed
+/// collection elements.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BoundedBytes<const N: usize>(Vec<u8>);
+impl<const N: usize> BoundedBytes<N> {
+    pub fn new(value: impl Into<Vec<u8>>) -> Result<Self, SchemaError> {
+        let value = value.into();
+        if value.len() > N {
+            return Err(SchemaError::CountBudget);
+        }
+        Ok(Self(value))
+    }
+    pub fn as_slice(&self) -> &[u8] {
+        &self.0
+    }
+    pub fn into_vec(self) -> Vec<u8> {
+        self.0
+    }
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+impl<const N: usize> Default for BoundedBytes<N> {
+    fn default() -> Self {
+        Self(Vec::new())
+    }
+}
+impl<const N: usize> FieldValue for BoundedBytes<N> {
+    fn inspect(spec: &FieldSpec, inspection: &mut Inspection, _: usize) -> Result<(), SchemaError> {
+        if spec.range != Range::None {
+            return Err(SchemaError::InvalidRange);
+        }
+        if !matches!(
+            spec.interpolation,
+            Interpolation::None | Interpolation::Step
+        ) {
+            return Err(SchemaError::InvalidInterpolation);
+        }
+        u32::try_from(N).map_err(|_| SchemaError::CountBudget)?;
+        inspection.tag(19);
+        inspection.number(N as u64);
+        Ok(())
+    }
+    fn maximum_size(work: &mut Work, depth: usize) -> Result<usize, SchemaError> {
+        work.node(depth)?;
+        work.allocate(N)?;
+        work.size(N.checked_add(4).ok_or(SchemaError::WireBudget)?)
+    }
+    fn value_size(
+        &self,
+        spec: &FieldSpec,
+        work: &mut Work,
+        depth: usize,
+    ) -> Result<usize, SchemaError> {
+        if spec.range != Range::None {
+            return Err(SchemaError::InvalidRange);
+        }
+        work.node(depth)?;
+        work.size(self.0.len().checked_add(4).ok_or(SchemaError::WireBudget)?)
+    }
+    fn write(&self, out: &mut Vec<u8>, work: &mut Work, depth: usize) -> Result<(), SchemaError> {
+        work.node(depth)?;
+        let count = u32::try_from(self.0.len()).map_err(|_| SchemaError::CountBudget)?;
+        work.append(out, &count.to_le_bytes())?;
+        work.append(out, &self.0)
+    }
+    fn read(bytes: &[u8], work: &mut Work, depth: usize) -> Result<Self, SchemaError> {
+        work.node(depth)?;
+        let mut reader = Reader::new(bytes);
+        let count = reader.u32()? as usize;
+        if count > N {
+            return Err(SchemaError::CountBudget);
+        }
+        let value = reader.take(count)?;
+        reader.finish()?;
+        work.allocate(count)?;
+        Ok(Self(value.to_vec()))
+    }
+}
+
 /// UTF-8 with a byte bound in its type. No unbounded `String` gains FieldValue.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BoundedString<const N: usize>(String);

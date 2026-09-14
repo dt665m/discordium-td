@@ -14,7 +14,7 @@ pub use combat::history::{
 };
 pub use combat::projectiles::{
     ProjectileImpact, ProjectilePlugin, ProjectileSourcePolicy, ProjectileState, ProjectileStep,
-    advance_projectiles, tick_projectiles,
+    advance_projectile_motion, advance_projectiles, tick_projectiles,
 };
 pub use combat::targeting::*;
 pub use combat::{

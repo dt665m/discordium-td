@@ -5,7 +5,7 @@ use dreamwake_protocol::replication::{
 use dreamwake_sim::replication::{
     ApprovedSources, CommittedReplication, PublicReplica, ReplicationKey,
 };
-use engine_net::{interest::*, replication::ScopeLimits, replication::ServerScopes, types::*};
+use engine_net::{interest::*, replication::ServerScopes, types::*};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 #[derive(Debug)]
@@ -245,7 +245,7 @@ impl DreamReplication {
                     epoch,
                     self.graph.accounting().world_revision,
                     POLICY,
-                    ScopeLimits::default(),
+                    dreamwake_protocol::live::baselines::scope_limits(),
                 )
                 .map_err(error)?,
             },
@@ -943,7 +943,11 @@ mod tests {
             panic!("marker root")
         };
         assert_eq!(marker_view.parent, cover.scope);
-        let mut client = ClientScopes::new(ConnectionEpoch(1), ScopeLimits::default()).unwrap();
+        let mut client = ClientScopes::new(
+            ConnectionEpoch(1),
+            dreamwake_protocol::live::baselines::scope_limits(),
+        )
+        .unwrap();
         client
             .apply_full(marker.clone(), |bytes| decode_replica(bytes, None).is_ok())
             .unwrap();
@@ -1097,7 +1101,11 @@ mod tests {
             rep.actor_content[&ReplicationKey::Effect(pulse.id)].value,
             PublicReplica::Effect(effect)
         );
-        let mut client = ClientScopes::new(ConnectionEpoch(1), ScopeLimits::default()).unwrap();
+        let mut client = ClientScopes::new(
+            ConnectionEpoch(1),
+            dreamwake_protocol::live::baselines::scope_limits(),
+        )
+        .unwrap();
         client.apply_full(visible.clone(), |_| true).unwrap();
         let mut previous_state = visible;
 

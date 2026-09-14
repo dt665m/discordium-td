@@ -250,7 +250,7 @@ impl Session {
             baselines: Default::default(),
             baseline_repairs: 0,
             delivery: DeliveryMetrics::default(),
-            scopes: ClientScopes::new(epoch, ScopeLimits::default()).map_err(err)?,
+            scopes: ClientScopes::new(epoch, baseline_wire::scope_limits()).map_err(err)?,
             groups: GroupAssembler::new(epoch, group_limits()).map_err(err)?,
             pending_reset_group: None,
             predictor: new_predictor(epoch)?,
@@ -303,7 +303,7 @@ impl Session {
             resync_request: ResyncRequest::Idle,
             poses: super::presentation::RemotePoses::new(epoch, welcome.content.scene_revision)
                 .map_err(|e| format!("remote presentation: {e:?}"))?,
-            model: OwnerModel { welcome },
+            model: OwnerModel::new(welcome),
         })
     }
     pub(super) fn observe_clock(&mut self, exchange: TimeExchange) -> Result<(), SyncError> {
@@ -496,6 +496,12 @@ impl Session {
         })
     }
     pub(super) fn advance_presentation_clock(&mut self, at: Duration) {
+        if let Some(state) = self.scopes.state(self.model.welcome.global_entity)
+            && let Ok(ReplicaPayload::Global(global)) = decode_replica(&state.payload, None)
+        {
+            self.poses
+                .set_paused(global.paused, ServerTick(global.stamp.server_tick));
+        }
         if let Ok(elapsed) = self.clock.estimate_server_elapsed(at) {
             self.estimated_server_tick =
                 TickRate::new(dreamwake_sim::TICK_HZ).and_then(|rate| rate.elapsed_ticks(elapsed));
@@ -509,6 +515,57 @@ impl Session {
                 TickRate::new(dreamwake_sim::TICK_HZ).and_then(|rate| rate.elapsed_ticks(elapsed));
             self.poses.advance_time(elapsed);
         }
+    }
+    /// Capture optional public targeting inputs once. Replay reads the retained
+    /// dependency frame, never a newer or retired presentation replica.
+    pub(super) fn prediction_dependencies(
+        &self,
+        at: ServerTick,
+    ) -> Result<DependencyFrame<CollisionDependency>, String> {
+        let mut dependencies = self
+            .predictor
+            .checkpoint_dependencies(OWNER_GROUP)
+            .cloned()
+            .ok_or("missing admitted checkpoint dependencies")?;
+        let owner = self
+            .predictor
+            .state(OWNER_GROUP)
+            .ok_or("missing owner prediction")?
+            .0
+            .hero_view()
+            .position;
+        let mut targets = Vec::new();
+        for entity in &self.entities {
+            let Some(state) = self.scopes.state(*entity) else {
+                continue;
+            };
+            if state.end_tick > at {
+                continue;
+            }
+            let ReplicaPayload::Actor(dreamwake_sim::replication::PublicReplica::Enemy(target)) =
+                decode_replica(&state.payload, Some(self.model.expectation())).map_err(err)?
+            else {
+                continue;
+            };
+            if target.hp <= 0.0 {
+                continue;
+            }
+            let distance = (target.position[0] - owner[0]).hypot(target.position[1] - owner[1]);
+            targets.push((distance, state.scope, state.version, target));
+        }
+        targets.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.entity.cmp(&b.1.entity)));
+        for (_, scope, version, target) in targets.into_iter().take(MAX_PRESENTATION_TARGETS) {
+            dependencies.records.insert(
+                scope.entity,
+                DependencyRecord {
+                    scope,
+                    version,
+                    scene_revision: self.model.welcome.content.scene_revision,
+                    value: DependencyValue::Known(CollisionDependency::PresentationTarget(target)),
+                },
+            );
+        }
+        Ok(dependencies)
     }
     pub(super) fn next_action(
         &mut self,
@@ -1186,8 +1243,8 @@ impl Session {
                 {
                     continue;
                 }
-                if predicted {
-                    self.poses.apply(state.scope, &mut actor);
+                if predicted && !self.poses.apply(state.scope, &mut actor) {
+                    continue;
                 }
                 actors.push(actor);
             }
@@ -1246,13 +1303,19 @@ impl Session {
             DreamPresentation::from_replicas(&global, &owner, &actors).map_err(err)?;
         presentation.cover_markers = cover_markers;
         if predicted {
-            for flight in owner.starfall_flights() {
-                if self.events.represented(flight.key)
-                    && let Some(graphic) = flight.graphics_instance()
-                {
-                    presentation.presentations.push(graphic);
-                }
-            }
+            presentation.elapsed = self.poses.presentation_elapsed(&global);
+            // Retain already-proven retirement fences from the existing action
+            // binding lane while an older owner checkpoint is still in flight.
+            // Entity creation and advancement come only from shared simulation.
+            let retired = owner
+                .starfall_flights()
+                .iter()
+                .filter(|flight| !self.events.represented(flight.key))
+                .filter_map(|flight| owner.projectile_visual_id(flight.key))
+                .collect::<BTreeSet<_>>();
+            presentation
+                .projectiles
+                .retain(|shot| !retired.contains(&shot.id));
             if let Some(base) = owner.base_attachment() {
                 for platform in &mut presentation.platforms {
                     if platform.collider == base.collider
@@ -1332,7 +1395,7 @@ fn replace_topology(
     }
     // Retain both managers until commit, including worst-case checkpoint,
     // dependency and command storage plus map/event bookkeeping for each frame.
-    let staging = (replay as usize + 1) * (64 * 1024 + COLLISION_HISTORY_BYTES + 8192);
+    let staging = (replay as usize + 1) * (80 * 1024 + COLLISION_HISTORY_BYTES + 8192);
     if old.retained_bytes().saturating_add(staging) > 64 * 1024 * 1024 {
         return Err("topology replay exceeds aggregate history bytes".into());
     }
@@ -1376,7 +1439,9 @@ fn new_predictor(epoch: ConnectionEpoch) -> Result<PredictionManager<OwnerModel>
     PredictionManager::new(
         epoch,
         PredictionLimits {
-            checkpoint_bytes: 64 * 1024,
+            // Includes the inline state and map metadata in addition to the
+            // owner's bounded 64 KiB decoded allocation envelope.
+            checkpoint_bytes: 80 * 1024,
             dependency_bytes: COLLISION_HISTORY_BYTES,
             ..Default::default()
         },

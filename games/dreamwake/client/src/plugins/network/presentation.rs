@@ -1,13 +1,30 @@
 //! Game pose policy over bounded engine renderer-only history. Never simulation input.
 use dreamwake_sim::replication::PublicReplica;
 use engine_net::{interpolation::*, replication::Payload, types::*};
-use std::time::Duration;
+use std::{collections::VecDeque, time::Duration};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Pose {
     position: [f32; 2],
+    velocity: [f32; 2],
+    deterministic_motion: bool,
+    motion_active: bool,
+    projectile_direction: [f32; 2],
+    projectile_speed: f32,
+    projectile_max_distance: Option<f32>,
+    paused_elapsed: f32,
+    projected_seconds: f32,
     elevation: f32,
     facing: Option<[f32; 2]>,
+    remaining: Option<f32>,
+    effect_age: Option<f32>,
+    damage_age: Option<f32>,
+    hit_flash: Option<f32>,
+    attack_flash: Option<f32>,
+    windup: Option<f32>,
+    beam_direction: Option<[f32; 3]>,
+    beam_elevation: Option<f32>,
+    beam_length: Option<f32>,
     cover_open: Option<bool>,
     platform_tick: Option<u32>,
     platform_motion: Option<u32>,
@@ -17,18 +34,152 @@ impl Payload for Pose {
         0
     }
 }
-struct DreamPosePolicy;
+struct DreamPosePolicy {
+    paused_elapsed: f32,
+}
+
+fn interpolate_optional(a: Option<f32>, b: Option<f32>, alpha: f32) -> Option<f32> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a + (b - a) * alpha),
+        (a, b) => {
+            if alpha < 1.0 {
+                a
+            } else {
+                b
+            }
+        }
+    }
+}
+
+fn interpolate_direction(a: [f32; 3], b: [f32; 3], alpha: f32) -> [f32; 3] {
+    let blended = std::array::from_fn(|axis| a[axis] + (b[axis] - a[axis]) * alpha);
+    let length = blended.into_iter().map(|v| v * v).sum::<f32>().sqrt();
+    if length > 0.000_001 {
+        blended.map(|v| v / length)
+    } else {
+        b
+    }
+}
+
+fn advance_clocks(pose: &mut Pose, seconds: f32) {
+    for countdown in [
+        &mut pose.hit_flash,
+        &mut pose.attack_flash,
+        &mut pose.windup,
+    ] {
+        if let Some(value) = countdown {
+            *value = (*value - seconds).max(0.0);
+        }
+    }
+    if !pose.deterministic_motion
+        && let Some(remaining) = &mut pose.remaining
+    {
+        *remaining = (*remaining - seconds).max(0.0);
+    }
+    for age in [&mut pose.effect_age, &mut pose.damage_age] {
+        if let Some(value) = age {
+            *value += seconds;
+        }
+    }
+}
+
+fn project_pose(mut pose: Pose, ahead: Duration, paused_elapsed: f32) -> Pose {
+    let seconds = (ahead.as_secs_f32() - (paused_elapsed - pose.paused_elapsed).max(0.0)).max(0.0);
+    if seconds > 0.0 {
+        if pose.deterministic_motion {
+            if let Some(remaining) = &mut pose.remaining {
+                pose.motion_active = engine_core::advance_projectile_motion(
+                    &mut pose.position,
+                    pose.projectile_direction,
+                    pose.projectile_speed,
+                    remaining,
+                    pose.projectile_max_distance,
+                    seconds,
+                );
+                *remaining = (*remaining).max(0.0);
+            }
+        } else {
+            pose.position = engine_core::spatial::integrate(pose.position, pose.velocity, seconds);
+        }
+        if let Some(tick) = pose.platform_tick {
+            pose.platform_tick =
+                Some(tick.saturating_add((seconds * dreamwake_sim::TICK_HZ as f32).floor() as u32));
+        }
+        advance_clocks(&mut pose, seconds);
+        pose.projected_seconds += seconds;
+    }
+    pose
+}
+
 impl PosePolicy<Pose> for DreamPosePolicy {
     fn valid(&self, pose: &Pose) -> bool {
         pose.position
             .into_iter()
             .chain([pose.elevation])
+            .chain(pose.velocity)
+            .chain(pose.projectile_direction)
+            .chain([pose.projectile_speed])
+            .chain(pose.projectile_max_distance)
+            .chain([pose.paused_elapsed, pose.projected_seconds])
             .chain(pose.facing.into_iter().flatten())
+            .chain(
+                [
+                    pose.remaining,
+                    pose.effect_age,
+                    pose.damage_age,
+                    pose.hit_flash,
+                    pose.attack_flash,
+                    pose.windup,
+                    pose.beam_elevation,
+                    pose.beam_length,
+                ]
+                .into_iter()
+                .flatten(),
+            )
+            .chain(pose.beam_direction.into_iter().flatten())
             .all(f32::is_finite)
     }
     fn interpolate(&self, a: &Pose, b: &Pose, alpha: f32) -> Option<Pose> {
         Some(Pose {
             elevation: a.elevation + (b.elevation - a.elevation) * alpha,
+            velocity: std::array::from_fn(|i| {
+                a.velocity[i] + (b.velocity[i] - a.velocity[i]) * alpha
+            }),
+            deterministic_motion: if alpha < 1.0 {
+                a.deterministic_motion
+            } else {
+                b.deterministic_motion
+            },
+            motion_active: if alpha < 1.0 {
+                a.motion_active
+            } else {
+                b.motion_active
+            },
+            projectile_direction: std::array::from_fn(|axis| {
+                a.projectile_direction[axis]
+                    + (b.projectile_direction[axis] - a.projectile_direction[axis]) * alpha
+            }),
+            projectile_speed: a.projectile_speed
+                + (b.projectile_speed - a.projectile_speed) * alpha,
+            projectile_max_distance: if alpha < 1.0 {
+                a.projectile_max_distance
+            } else {
+                b.projectile_max_distance
+            },
+            paused_elapsed: a.paused_elapsed + (b.paused_elapsed - a.paused_elapsed) * alpha,
+            projected_seconds: 0.0,
+            remaining: interpolate_optional(a.remaining, b.remaining, alpha),
+            effect_age: interpolate_optional(a.effect_age, b.effect_age, alpha),
+            damage_age: interpolate_optional(a.damage_age, b.damage_age, alpha),
+            hit_flash: interpolate_optional(a.hit_flash, b.hit_flash, alpha),
+            attack_flash: interpolate_optional(a.attack_flash, b.attack_flash, alpha),
+            windup: interpolate_optional(a.windup, b.windup, alpha),
+            beam_direction: a
+                .beam_direction
+                .zip(b.beam_direction)
+                .map(|(a, b)| interpolate_direction(a, b, alpha)),
+            beam_elevation: interpolate_optional(a.beam_elevation, b.beam_elevation, alpha),
+            beam_length: interpolate_optional(a.beam_length, b.beam_length, alpha),
             platform_tick: a.platform_tick.zip(b.platform_tick).and_then(|(a, b)| {
                 b.checked_sub(a)
                     .map(|span| (f64::from(a) + f64::from(span) * f64::from(alpha)).floor() as u32)
@@ -53,8 +204,11 @@ impl PosePolicy<Pose> for DreamPosePolicy {
             }),
         })
     }
-    fn extrapolate(&self, _: &Pose, _: &Pose, _: Duration, _: Duration) -> Option<Pose> {
-        None
+    fn project_latest(&self, latest: &Pose, ahead: Duration) -> Option<Pose> {
+        Some(project_pose(latest.clone(), ahead, self.paused_elapsed))
+    }
+    fn extrapolate(&self, _: &Pose, latest: &Pose, _: Duration, ahead: Duration) -> Option<Pose> {
+        Some(project_pose(latest.clone(), ahead, self.paused_elapsed))
     }
 }
 #[derive(Debug, Clone, Copy, Default)]
@@ -74,6 +228,10 @@ pub(super) struct RemotePoses {
     buffer: RemoteBuffer<Pose>,
     scene: SceneRevision,
     combat_entities: std::collections::BTreeSet<EntityId>,
+    paused: bool,
+    pause_started_at: Option<Duration>,
+    pause_history: VecDeque<(Duration, Duration)>,
+    retired_paused: Duration,
 }
 impl RemotePoses {
     pub fn metrics(&self) -> RemotePoseMetrics {
@@ -87,7 +245,12 @@ impl RemotePoses {
             ..Default::default()
         };
         for identity in self.buffer.identities() {
-            if let Ok(Some(pose)) = self.buffer.sample(identity.scope, &DreamPosePolicy) {
+            if let Ok(Some(pose)) = self.buffer.sample(
+                identity.scope,
+                &DreamPosePolicy {
+                    paused_elapsed: self.paused_elapsed_at(self.buffer.cursor()).as_secs_f32(),
+                },
+            ) {
                 metrics.maximum_pose_age = metrics.maximum_pose_age.max(pose.total_age);
                 match pose.status {
                     Status::Buffering => metrics.buffering += 1,
@@ -108,15 +271,69 @@ impl RemotePoses {
                 Config {
                     rate: TickRate::new(dreamwake_sim::TICK_HZ).unwrap(),
                     delay: Duration::from_millis(100),
-                    // No trustworthy remote velocity is currently projected by Dreamwake.
-                    // Starvation explicitly freezes rather than extrapolating guessed motion.
-                    extrapolation_cap: Duration::ZERO,
+                    // Public replicas carry authoritative capability motion. Its
+                    // positional projection remains bounded during starvation.
+                    extrapolation_cap: Duration::from_millis(100),
                     limits: Limits::default(),
                 },
             )?,
             scene,
             combat_entities: Default::default(),
+            paused: false,
+            pause_started_at: None,
+            pause_history: VecDeque::new(),
+            retired_paused: Duration::ZERO,
         })
+    }
+    pub fn set_paused(&mut self, paused: bool, authority_tick: ServerTick) {
+        let Some(at) =
+            TickRate::new(dreamwake_sim::TICK_HZ).and_then(|rate| rate.deadline(authority_tick))
+        else {
+            return;
+        };
+        if paused && !self.paused {
+            self.pause_started_at = Some(at);
+        } else if !paused
+            && self.paused
+            && let Some(started) = self.pause_started_at.take()
+        {
+            self.pause_history.push_back((started, at.max(started)));
+            if self.pause_history.len() > 64
+                && let Some((start, end)) = self.pause_history.pop_front()
+            {
+                self.retired_paused += end.saturating_sub(start);
+            }
+        }
+        self.paused = paused;
+    }
+
+    fn paused_elapsed_at(&self, at: Duration) -> Duration {
+        let completed = self
+            .pause_history
+            .iter()
+            .fold(self.retired_paused, |total, &(started, ended)| {
+                total + at.min(ended).saturating_sub(started)
+            });
+        completed
+            + self
+                .pause_started_at
+                .map_or(Duration::ZERO, |started| at.saturating_sub(started))
+    }
+
+    pub fn presentation_elapsed(
+        &self,
+        global: &dreamwake_sim::replication::DreamGlobalView,
+    ) -> f32 {
+        if global.paused {
+            return global.elapsed;
+        }
+        let Some(authority_time) = TickRate::new(dreamwake_sim::TICK_HZ)
+            .and_then(|rate| rate.deadline(ServerTick(global.stamp.server_tick)))
+        else {
+            return global.elapsed;
+        };
+        let offset = self.buffer.cursor().as_secs_f64() - authority_time.as_secs_f64();
+        (f64::from(global.elapsed) + offset).max(0.0) as f32
     }
     pub fn receive(
         &mut self,
@@ -127,15 +344,21 @@ impl RemotePoses {
         if matches!(actor, PublicReplica::CoverMarker(_)) {
             return Ok(());
         }
-        let (position, facing) = match actor {
-            PublicReplica::Hero(v) => (v.position, Some(v.facing)),
-            PublicReplica::Enemy(v) => (v.position, Some(v.facing)),
-            PublicReplica::Projectile(v) => (v.position, Some(v.direction)),
-            PublicReplica::Wisp(v) => (v.position, None),
-            PublicReplica::Effect(v) => (v.position, None),
-            PublicReplica::Damage(v) => (v.position, None),
-            PublicReplica::Cover(v) => ([v.position[0], v.position[2]], None),
-            PublicReplica::Platform(v) => ([v.pose.position[0], v.pose.position[2]], None),
+        let (position, velocity, facing) = match actor {
+            PublicReplica::Hero(v) => (v.position, v.velocity, Some(v.facing)),
+            PublicReplica::Enemy(v) => (v.position, v.velocity, Some(v.facing)),
+            PublicReplica::Projectile(v) => (
+                v.position,
+                v.direction.map(|component| component * v.speed),
+                Some(v.direction),
+            ),
+            PublicReplica::Wisp(v) => (v.position, v.velocity, None),
+            PublicReplica::Effect(v) => (v.position, [0.0; 2], None),
+            PublicReplica::Damage(v) => (v.position, [0.0; 2], None),
+            PublicReplica::Cover(v) => ([v.position[0], v.position[2]], [0.0; 2], None),
+            PublicReplica::Platform(v) => {
+                ([v.pose.position[0], v.pose.position[2]], [0.0; 2], None)
+            }
             PublicReplica::CoverMarker(_) => unreachable!("attachments use their parent pose"),
         };
         let platform_motion = match actor {
@@ -168,6 +391,26 @@ impl RemotePoses {
                 tick,
                 value: Pose {
                     position,
+                    velocity,
+                    deterministic_motion: matches!(actor, PublicReplica::Projectile(_)),
+                    motion_active: true,
+                    projectile_direction: match actor {
+                        PublicReplica::Projectile(v) => v.direction,
+                        _ => [0.0; 2],
+                    },
+                    projectile_speed: match actor {
+                        PublicReplica::Projectile(v) => v.speed,
+                        _ => 0.0,
+                    },
+                    projectile_max_distance: match actor {
+                        PublicReplica::Projectile(v) => v.max_distance,
+                        _ => None,
+                    },
+                    paused_elapsed: TickRate::new(dreamwake_sim::TICK_HZ)
+                        .and_then(|rate| rate.deadline(tick))
+                        .map_or(Duration::ZERO, |at| self.paused_elapsed_at(at))
+                        .as_secs_f32(),
+                    projected_seconds: 0.0,
                     elevation: match actor {
                         PublicReplica::Hero(v) => v.elevation,
                         PublicReplica::Cover(v) => v.position[1],
@@ -175,6 +418,55 @@ impl RemotePoses {
                         _ => 0.0,
                     },
                     facing,
+                    remaining: match actor {
+                        PublicReplica::Projectile(v) => Some(v.remaining),
+                        PublicReplica::Wisp(v) => Some(v.remaining),
+                        _ => None,
+                    },
+                    effect_age: match actor {
+                        PublicReplica::Effect(v) => {
+                            Some(v.age_ticks as f32 / dreamwake_sim::TICK_HZ as f32)
+                        }
+                        _ => None,
+                    },
+                    damage_age: match actor {
+                        PublicReplica::Damage(v) => Some(v.age),
+                        _ => None,
+                    },
+                    hit_flash: match actor {
+                        PublicReplica::Hero(v) => Some(v.hit_flash),
+                        PublicReplica::Enemy(v) => Some(v.hit_flash),
+                        _ => None,
+                    },
+                    attack_flash: match actor {
+                        PublicReplica::Hero(v) => Some(v.attack_flash),
+                        _ => None,
+                    },
+                    windup: match actor {
+                        PublicReplica::Enemy(v) => Some(v.windup),
+                        _ => None,
+                    },
+                    beam_direction: match actor {
+                        PublicReplica::Effect(v) => match v.kind {
+                            engine_core::GraphicsKind::Beam { direction, .. } => Some(direction),
+                            _ => None,
+                        },
+                        _ => None,
+                    },
+                    beam_elevation: match actor {
+                        PublicReplica::Effect(v) => match v.kind {
+                            engine_core::GraphicsKind::Beam { elevation, .. } => Some(elevation),
+                            _ => None,
+                        },
+                        _ => None,
+                    },
+                    beam_length: match actor {
+                        PublicReplica::Effect(v) => match v.kind {
+                            engine_core::GraphicsKind::Beam { length, .. } => Some(length),
+                            _ => None,
+                        },
+                        _ => None,
+                    },
                     platform_tick: match actor {
                         PublicReplica::Platform(v) => Some(v.gameplay_tick),
                         _ => None,
@@ -186,7 +478,9 @@ impl RemotePoses {
                     },
                 },
             },
-            &DreamPosePolicy,
+            &DreamPosePolicy {
+                paused_elapsed: self.paused_elapsed_at(self.buffer.cursor()).as_secs_f32(),
+            },
         )?;
         if self
             .buffer
@@ -235,7 +529,12 @@ impl RemotePoses {
             let identity = self.buffer.identity(*entity)?;
             let shown = self
                 .buffer
-                .sample(identity.scope, &DreamPosePolicy)
+                .sample(
+                    identity.scope,
+                    &DreamPosePolicy {
+                        paused_elapsed: self.paused_elapsed_at(self.buffer.cursor()).as_secs_f32(),
+                    },
+                )
                 .ok()??;
             if common.is_some_and(|previous| previous != shown.pose_time) {
                 return None;
@@ -259,11 +558,44 @@ impl RemotePoses {
             self.advance_time(now);
         }
     }
-    pub fn apply(&self, scope: ScopeIdentity, actor: &mut PublicReplica) {
-        let Ok(Some(shown)) = self.buffer.sample(scope, &DreamPosePolicy) else {
-            return;
+    pub fn apply(&self, scope: ScopeIdentity, actor: &mut PublicReplica) -> bool {
+        let Ok(Some(shown)) = self.buffer.sample(
+            scope,
+            &DreamPosePolicy {
+                paused_elapsed: self.paused_elapsed_at(self.buffer.cursor()).as_secs_f32(),
+            },
+        ) else {
+            return true;
         };
-        let pose = shown.value;
+        let mut pose = shown.value;
+        if let Some(latest) = self.buffer.latest(scope)
+            && let Some(latest_time) =
+                TickRate::new(dreamwake_sim::TICK_HZ).and_then(|rate| rate.deadline(latest.tick))
+        {
+            let active_ahead = (shown.cursor.saturating_sub(latest_time).as_secs_f32()
+                - (self.paused_elapsed_at(shown.cursor).as_secs_f32()
+                    - latest.value.paused_elapsed)
+                    .max(0.0))
+            .max(0.0);
+            let additional = (active_ahead - pose.projected_seconds).max(0.0);
+            if pose.deterministic_motion {
+                if let Some(remaining) = &mut pose.remaining {
+                    pose.motion_active = engine_core::advance_projectile_motion(
+                        &mut pose.position,
+                        pose.projectile_direction,
+                        pose.projectile_speed,
+                        remaining,
+                        pose.projectile_max_distance,
+                        additional,
+                    );
+                    *remaining = (*remaining).max(0.0);
+                }
+            }
+            // Visual clocks and declared ballistic motion are deterministic and
+            // can finish from one accepted sample. Actor tangent drift remains
+            // at the engine's starvation cap.
+            advance_clocks(&mut pose, additional);
+        }
         match actor {
             PublicReplica::Hero(v) => {
                 v.position = pose.position;
@@ -271,11 +603,23 @@ impl RemotePoses {
                 if let Some(facing) = pose.facing {
                     v.facing = facing;
                 }
+                if let Some(hit_flash) = pose.hit_flash {
+                    v.hit_flash = hit_flash;
+                }
+                if let Some(attack_flash) = pose.attack_flash {
+                    v.attack_flash = attack_flash;
+                }
             }
             PublicReplica::Enemy(v) => {
                 v.position = pose.position;
                 if let Some(facing) = pose.facing {
                     v.facing = facing;
+                }
+                if let Some(windup) = pose.windup {
+                    v.windup = windup;
+                }
+                if let Some(hit_flash) = pose.hit_flash {
+                    v.hit_flash = hit_flash;
                 }
             }
             PublicReplica::Projectile(v) => {
@@ -283,10 +627,46 @@ impl RemotePoses {
                 if let Some(facing) = pose.facing {
                     v.direction = facing;
                 }
+                if let Some(remaining) = pose.remaining {
+                    v.remaining = remaining;
+                }
             }
-            PublicReplica::Wisp(v) => v.position = pose.position,
-            PublicReplica::Effect(v) => v.position = pose.position,
-            PublicReplica::Damage(v) => v.position = pose.position,
+            PublicReplica::Wisp(v) => {
+                v.position = pose.position;
+                if let Some(remaining) = pose.remaining {
+                    v.remaining = remaining;
+                }
+            }
+            PublicReplica::Effect(v) => {
+                v.position = pose.position;
+                if let Some(age) = pose.effect_age {
+                    v.age_ticks = (age * dreamwake_sim::TICK_HZ as f32)
+                        .floor()
+                        .min(v.duration_ticks as f32) as u32;
+                }
+                if let engine_core::GraphicsKind::Beam {
+                    direction,
+                    elevation,
+                    length,
+                } = &mut v.kind
+                {
+                    if let Some(value) = pose.beam_direction {
+                        *direction = value;
+                    }
+                    if let Some(value) = pose.beam_elevation {
+                        *elevation = value;
+                    }
+                    if let Some(value) = pose.beam_length {
+                        *length = value;
+                    }
+                }
+            }
+            PublicReplica::Damage(v) => {
+                v.position = pose.position;
+                if let Some(age) = pose.damage_age {
+                    v.age = age;
+                }
+            }
             PublicReplica::Platform(v) => {
                 if pose.platform_motion == Some(v.motion_revision)
                     && let Some(tick) = pose.platform_tick
@@ -308,6 +688,13 @@ impl RemotePoses {
                 }
             }
             PublicReplica::CoverMarker(_) => {}
+        }
+        match actor {
+            PublicReplica::Projectile(v) => pose.motion_active && v.remaining > 0.0,
+            PublicReplica::Wisp(v) => v.remaining > 0.0,
+            PublicReplica::Effect(v) => v.age_ticks < v.duration_ticks,
+            PublicReplica::Damage(v) => v.age <= 0.85,
+            _ => true,
         }
     }
 }
@@ -334,6 +721,7 @@ mod tests {
                         id: 7,
                         position: [0.0; 2],
                         facing: [1.0, 0.0],
+                        velocity: [0.0, 0.0],
                         hp: 10.0,
                         max_hp: 10.0,
                         kind: dreamwake_sim::EnemyKind::Melee,
@@ -490,11 +878,22 @@ mod tests {
         assert_eq!(shown, actor(3.0));
         poses.advance(ServerTick(100));
         poses.apply(scope, &mut shown);
-        assert_eq!(shown, actor(6.0));
+        let PublicReplica::Damage(shown_damage) = shown else {
+            unreachable!()
+        };
+        assert_eq!(shown_damage.position, [6.0, 0.0]);
+        assert!((shown_damage.age - 28.0 / 60.0).abs() < 0.001);
         assert_eq!(
             poses
                 .buffer
-                .sample(scope, &DreamPosePolicy)
+                .sample(
+                    scope,
+                    &DreamPosePolicy {
+                        paused_elapsed: poses
+                            .paused_elapsed_at(poses.buffer.cursor())
+                            .as_secs_f32(),
+                    },
+                )
                 .unwrap()
                 .unwrap()
                 .status,
@@ -512,12 +911,13 @@ mod tests {
         assert_eq!(poses.buffer.accounting().known_entities, 1);
     }
     #[test]
-    fn delayed_enemy_samples_preserve_interpolation_without_extrapolating() {
+    fn delayed_enemy_samples_interpolate_then_use_authoritative_velocity_with_a_bound() {
         let enemy = |x| {
             PublicReplica::Enemy(dreamwake_sim::replication::PublicEnemyView {
                 id: 7,
                 position: [x, 0.0],
                 facing: [1.0, 0.0],
+                velocity: [10.0, 0.0],
                 hp: 100.0,
                 max_hp: 100.0,
                 kind: dreamwake_sim::EnemyKind::Melee,
@@ -559,9 +959,192 @@ mod tests {
 
         poses.advance(ServerTick(90));
         poses.apply(scope, &mut shown);
-        assert_eq!(shown, enemy(3.0));
+        assert_eq!(shown, enemy(4.0));
+        assert_eq!(poses.metrics().extrapolated, 1);
+        assert_eq!(poses.combat_view_tick(), Some(ServerTick(84)));
+
+        poses.advance(ServerTick(100));
+        poses.apply(scope, &mut shown);
+        assert_eq!(shown, enemy(4.0));
         assert_eq!(poses.metrics().frozen, 1);
-        assert_eq!(poses.combat_view_tick(), Some(ServerTick(78)));
+        assert_eq!(poses.combat_view_tick(), Some(ServerTick(84)));
+    }
+
+    fn projectile(position: [f32; 2], remaining: f32) -> PublicReplica {
+        PublicReplica::Projectile(dreamwake_sim::replication::PublicProjectileView {
+            id: 71,
+            owner: Some(1),
+            position,
+            direction: [1.0, 0.0],
+            speed: 10.0,
+            remaining,
+            max_distance: Some(64.0),
+            radius: 0.3,
+            friendly: false,
+            essence: None,
+        })
+    }
+
+    #[test]
+    fn one_projectile_sample_drives_bounded_motion_and_full_deterministic_lifetime() {
+        let scope = ScopeIdentity {
+            connection: ConnectionEpoch(1),
+            entity: EntityId {
+                index: 71,
+                generation: 1,
+            },
+            scope: ScopeEpoch(1),
+            representation: RepresentationRevision(1),
+        };
+        let mut poses = RemotePoses::new(ConnectionEpoch(1), SceneRevision(1)).unwrap();
+        poses
+            .receive(scope, ServerTick(60), &projectile([0.0, 0.0], 1.0))
+            .unwrap();
+
+        poses.advance(ServerTick(69));
+        let mut shown = projectile([0.0, 0.0], 1.0);
+        assert!(poses.apply(scope, &mut shown));
+        let PublicReplica::Projectile(shown) = shown else {
+            unreachable!()
+        };
+        assert!((shown.position[0] - 0.5).abs() < 0.001);
+        assert!((shown.remaining - 0.95).abs() < 0.001);
+
+        poses.advance(ServerTick(120));
+        let mut shown = projectile([0.0, 0.0], 1.0);
+        assert!(poses.apply(scope, &mut shown));
+        let PublicReplica::Projectile(shown) = shown else {
+            unreachable!()
+        };
+        assert!((shown.position[0] - 9.0).abs() < 0.001);
+        assert!((shown.remaining - 0.1).abs() < 0.001);
+
+        poses.advance(ServerTick(126));
+        let mut expired = projectile([0.0, 0.0], 1.0);
+        assert!(!poses.apply(scope, &mut expired));
+    }
+
+    #[test]
+    fn projected_projectile_respects_authoritative_world_distance() {
+        let scope = ScopeIdentity {
+            connection: ConnectionEpoch(1),
+            entity: EntityId {
+                index: 75,
+                generation: 1,
+            },
+            scope: ScopeEpoch(1),
+            representation: RepresentationRevision(1),
+        };
+        let mut authority = projectile([0.7, 0.0], 2.0);
+        let PublicReplica::Projectile(projectile) = &mut authority else {
+            unreachable!()
+        };
+        projectile.max_distance = Some(0.75);
+        let mut poses = RemotePoses::new(ConnectionEpoch(1), SceneRevision(1)).unwrap();
+        poses.receive(scope, ServerTick(60), &authority).unwrap();
+        poses.advance(ServerTick(69));
+        assert!(!poses.apply(scope, &mut authority));
+    }
+
+    #[test]
+    fn pause_freezes_capability_motion_and_clocks() {
+        let scope = ScopeIdentity {
+            connection: ConnectionEpoch(1),
+            entity: EntityId {
+                index: 72,
+                generation: 1,
+            },
+            scope: ScopeEpoch(1),
+            representation: RepresentationRevision(1),
+        };
+        let authority = projectile([2.0, 3.0], 1.0);
+        let mut poses = RemotePoses::new(ConnectionEpoch(1), SceneRevision(1)).unwrap();
+        poses.receive(scope, ServerTick(60), &authority).unwrap();
+        poses.advance(ServerTick(66));
+        poses.set_paused(true, ServerTick(66));
+        poses.advance(ServerTick(126));
+        let mut shown = authority.clone();
+        assert!(poses.apply(scope, &mut shown));
+        let PublicReplica::Projectile(shown) = shown else {
+            unreachable!()
+        };
+        assert!((shown.position[0] - 3.0).abs() < 0.001);
+        assert!((shown.remaining - 0.9).abs() < 0.001);
+
+        poses.set_paused(false, ServerTick(126));
+        poses.advance(ServerTick(138));
+        let mut resumed = authority.clone();
+        assert!(poses.apply(scope, &mut resumed));
+        let PublicReplica::Projectile(resumed) = resumed else {
+            unreachable!()
+        };
+        assert!((resumed.position[0] - 4.0).abs() < 0.001);
+        assert!((resumed.remaining - 0.8).abs() < 0.001);
+    }
+
+    #[test]
+    fn authoritative_projectile_correction_replaces_the_projected_path() {
+        let scope = ScopeIdentity {
+            connection: ConnectionEpoch(1),
+            entity: EntityId {
+                index: 73,
+                generation: 1,
+            },
+            scope: ScopeEpoch(1),
+            representation: RepresentationRevision(1),
+        };
+        let mut poses = RemotePoses::new(ConnectionEpoch(1), SceneRevision(1)).unwrap();
+        poses
+            .receive(scope, ServerTick(60), &projectile([0.0, 0.0], 2.0))
+            .unwrap();
+        poses
+            .receive(scope, ServerTick(66), &projectile([2.0, 0.0], 1.9))
+            .unwrap();
+        poses.advance(ServerTick(69));
+        let mut shown = projectile([2.0, 0.0], 1.9);
+        assert!(poses.apply(scope, &mut shown));
+        let PublicReplica::Projectile(shown) = shown else {
+            unreachable!()
+        };
+        assert!((shown.position[0] - 1.0).abs() < 0.001);
+        assert!((shown.remaining - 1.95).abs() < 0.001);
+    }
+
+    #[test]
+    fn one_effect_sample_ages_and_expires_without_another_packet() {
+        let scope = ScopeIdentity {
+            connection: ConnectionEpoch(1),
+            entity: EntityId {
+                index: 74,
+                generation: 1,
+            },
+            scope: ScopeEpoch(1),
+            representation: RepresentationRevision(1),
+        };
+        let effect = PublicReplica::Effect(dreamwake_sim::replication::PublicEffectView {
+            id: engine_core::GraphicsId {
+                scope: None,
+                match_epoch: 1,
+                owner: 1,
+                action_seq: 1,
+                slot: 1,
+            },
+            kind: engine_core::GraphicsKind::RadialPulse,
+            position: [0.0, 0.0],
+            radius: 2.0,
+            age_ticks: 0,
+            duration_ticks: 30,
+        });
+        let mut poses = RemotePoses::new(ConnectionEpoch(1), SceneRevision(1)).unwrap();
+        poses.receive(scope, ServerTick(60), &effect).unwrap();
+        poses.advance(ServerTick(69));
+        let mut shown = effect.clone();
+        assert!(poses.apply(scope, &mut shown));
+        assert!(matches!(shown, PublicReplica::Effect(v) if v.age_ticks == 3));
+
+        poses.advance(ServerTick(96));
+        let mut expired = effect;
+        assert!(!poses.apply(scope, &mut expired));
     }
     #[test]
     fn teleport_resets_engine_segment_instead_of_blending_journey() {

@@ -505,6 +505,7 @@ fn saved_sample(sample: ValidatedRay, tick: u32) -> BeamSample {
 
 pub(crate) fn beam_graphics(
     mut commands: Commands,
+    run: Res<Run>,
     heroes: Query<HeroActorReadOnly>,
     mut graphics: Query<(Entity, &mut engine_core::GraphicsInstance)>,
 ) {
@@ -516,11 +517,11 @@ pub(crate) fn beam_graphics(
         if !hero.active || hero.health.hp <= 0.0 {
             continue;
         }
-        let Some(next) = hero.ray.graphics(&hero.motion) else {
+        let Some(next) = hero.ray.graphics(&hero.motion, run.tick) else {
             continue;
         };
         let id = next.id;
-        active.insert((id.match_epoch, id.owner, id.action_seq, id.slot));
+        active.insert(id);
         if let Some((_, mut current)) = graphics.iter_mut().find(|(_, current)| current.id == id) {
             if *current != next {
                 *current = next;
@@ -531,12 +532,7 @@ pub(crate) fn beam_graphics(
     }
     for (entity, current) in &graphics {
         if matches!(current.kind, engine_core::GraphicsKind::Beam { .. })
-            && !active.contains(&(
-                current.id.match_epoch,
-                current.id.owner,
-                current.id.action_seq,
-                current.id.slot,
-            ))
+            && !active.contains(&current.id)
         {
             commands.entity(entity).despawn();
         }

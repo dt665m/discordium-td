@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 
 pub const OWNER_GROUP: GroupId = GroupId(1);
 /// Whole-message allowance on the reliable-unordered owner channel.
-pub const OWNER_GROUP_MESSAGE_BYTES: usize = 32 * 1024;
+pub const OWNER_GROUP_MESSAGE_BYTES: usize = 64 * 1024;
 /// Public actors and controls remain small messages under stock Renet's slice size.
 pub const APPLICATION_FRAME_BYTES: usize = 1100;
 const WELCOME_MAGIC: &[u8; 4] = b"DW16";

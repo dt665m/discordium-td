@@ -6,6 +6,9 @@ pub(crate) struct Projectile {
     pub damage: f32,
     pub spawn: Option<(crate::starfall::SpawnKey, u32)>,
     pub essence: Option<EssenceKind>,
+    pub graphics: Option<engine_core::GraphicsId>,
+    /// Opaque authority allocation retained only for accepted-spawn retirement binding.
+    pub authority_id: Option<u64>,
 }
 impl Projectile {
     pub fn snapshot(&self, state: &ProjectileState) -> ProjectileView {
@@ -25,6 +28,8 @@ impl Projectile {
 pub(crate) struct Wisp {
     pub damage: f32,
     pub essence: Option<EssenceKind>,
+    pub graphics: engine_core::GraphicsId,
+    pub shots: u16,
 }
 impl Wisp {
     pub fn snapshot(&self, state: &CompanionState) -> WispView {

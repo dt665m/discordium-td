@@ -86,7 +86,12 @@ fn starfall_owner_and_authority_share_acceptance_flight_and_echo_restore() {
                 authoritative.hero_view().memories[1].cooldown
             );
             let mut predicted = owner.starfall_flights().to_vec();
-            let mut actual = authoritative.starfall.flights.clone();
+            let authoritative_state = replication::OwnerPredictionState::from_checkpoint(
+                &authoritative,
+                authoritative.expectation(),
+            )
+            .unwrap();
+            let mut actual = authoritative_state.starfall_flights().to_vec();
             for flight in &mut predicted {
                 flight.authority_id = None;
             }
@@ -123,22 +128,18 @@ fn starfall_capacity_reserves_echo_and_rejects_whole_twin_before_cooldown() {
 }
 #[test]
 fn starfall_owner_schema_is_bounded_and_excludes_target_hit_history() {
-    let sim = arena(None);
+    let mut sim = arena(Some(EssenceKind::Twin));
+    sim.step_multiplayer_with_actions(
+        &[],
+        &[combat::CombatAction::Cast {
+            key: key(1),
+            execution_server_tick: 1,
+            slot: 1,
+            aim: [1.0, 0.0],
+        }],
+    )
+    .unwrap();
     let mut owner = checkpoint(&sim);
-    for n in 1..=8 {
-        let mut flight = starfall::flight(
-            starfall::SpawnKey {
-                action: key(n),
-                ordinal: 0,
-            },
-            0,
-            [0.0, 0.0],
-            [1.0, 0.0],
-            Some(EssenceKind::Vast),
-        );
-        flight.authority_id = Some(u64::MAX - n);
-        owner.starfall.flights.push(flight);
-    }
     let encoded = owner.encode().unwrap();
     assert!(
         encoded.len() < 12 * 1024,
@@ -148,13 +149,17 @@ fn starfall_owner_schema_is_bounded_and_excludes_target_hit_history() {
     eprintln!("Starfall cap8 populated owner bytes: {}", encoded.len());
     let restored = replication::OwnerCheckpoint::decode(&encoded, owner.expectation()).unwrap();
     assert_eq!(restored, owner);
-    let json = serde_json::to_string(&owner).unwrap();
-    assert!(!json.contains("hit_ids"));
-    assert!(!json.contains("damage"));
+    assert!(
+        owner
+            .transients
+            .projectiles
+            .iter()
+            .all(|projectile| projectile.state.hit_ids.is_empty())
+    );
     owner
-        .starfall
-        .flights
-        .push(owner.starfall.flights[0].clone());
+        .transients
+        .projectiles
+        .push(owner.transients.projectiles[0].clone());
     assert!(owner.encode().is_err());
 }
 #[test]
@@ -234,7 +239,8 @@ fn echo_reserves_identity_before_spawn_and_cancels_on_departure() {
         .unwrap()
         .1;
     let cp = checkpoint(&sim);
-    assert_eq!(cp.starfall.repeats[0].authority_id, Some(future));
+    let owner = replication::OwnerPredictionState::from_checkpoint(&cp, cp.expectation()).unwrap();
+    assert_eq!(owner.starfall_repeats()[0].authority_id, Some(future));
     let mut resumed = DreamSimulation::from_snapshot(&sim.snapshot());
     sim.set_player_active(1, false);
     assert!(sim.starfall_bindings(key(1)).is_empty());

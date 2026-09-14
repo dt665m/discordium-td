@@ -20,9 +20,9 @@ mod value;
 mod wire;
 use crate::types::SchemaId;
 pub use compact::CompactValue;
-pub use composites::BoundedString;
 #[doc(hidden)]
 pub use composites::enum_ids;
+pub use composites::{BoundedBytes, BoundedString};
 #[doc(hidden)]
 pub use inspection::Inspection;
 pub use model::*;

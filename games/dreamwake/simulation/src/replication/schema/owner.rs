@@ -1,7 +1,16 @@
 //! Complete owner projection; all latent fields have explicit stable IDs.
 use super::*;
 use crate::state;
-use engine_net::codec::BoundedVec;
+use engine_net::{codec::BoundedVec, schema::BoundedBytes};
+fn transient_defaults() -> BoundedBytes<{ crate::replication::owner::OWNER_TRANSIENT_BYTES }> {
+    BoundedBytes::new(
+        crate::replication::owner::encode_owner_transients(
+            &crate::replication::owner::OwnerTransients::default(),
+        )
+        .unwrap(),
+    )
+    .unwrap()
+}
 engine_net::schema! {pub(super) struct Body(SchemaId(0x120b),2,Representation::OwnerCheckpoint) {
 1=>id:u64=1=>o(Units::Unitless,U64),
 2=>shards:u32=0=>o(Units::Unitless,U32),
@@ -532,7 +541,7 @@ impl From<InputContinuity> for engine_net::commands::InputContinuity<crate::Drea
         }
     }
 }
-engine_net::schema! {pub(super) struct Owner(SchemaId(0x1102),5,Representation::OwnerCheckpoint) {
+engine_net::schema! {pub(super) struct Owner(SchemaId(0x1102),6,Representation::OwnerCheckpoint) {
 1=>schema_version:u32=crate::replication::OWNER_CHECKPOINT_SCHEMA=>o(Units::Unitless,U32),
 2=>ruleset:BoundedString<64>=BoundedString::new(crate::CheckpointIdentity::current(1).ruleset).unwrap()=>o(Units::Unitless,Range::None),
 3=>owner:u64=1=>o(Units::Unitless,U64),
@@ -541,9 +550,9 @@ engine_net::schema! {pub(super) struct Owner(SchemaId(0x1102),5,Representation::
 6=>collision_identity:[u8;32]=crate::collision::CollisionManifest::current(1).identity()=>o(Units::Unitless,U8),
 7=>context:Global=Global::defaults()=>o(Units::Unitless,Range::None),
 8=>hero:SavedHero=SavedHero::defaults()=>o(Units::Unitless,Range::None),
-10=>starfall:super::starfall::Domain=super::starfall::Domain::defaults()=>o(Units::Unitless,Range::None),
 11=>required_bases:BoundedVec<ColliderKey,1>=BoundedVec::default()=>o(Units::Unitless,Range::None),
 12=>input_continuity:InputContinuity=InputContinuity::defaults()=>o(Units::Unitless,Range::None),
+13=>transients:BoundedBytes<{crate::replication::owner::OWNER_TRANSIENT_BYTES}>=transient_defaults()=>o(Units::Unitless,Range::None),
 }}
 impl Root for Owner {
     type Model = crate::replication::OwnerCheckpoint;
@@ -558,12 +567,15 @@ impl Root for Owner {
             collision_identity: v.collision_identity,
             context: Global::capture(&v.context)?,
             hero: (&v.hero).try_into()?,
-            starfall: (&v.starfall).try_into()?,
             required_bases: BoundedVec::new(
                 v.required_bases.iter().copied().map(Into::into).collect(),
             )
             .map_err(invalid)?,
             input_continuity: (&v.input_continuity).into(),
+            transients: BoundedBytes::new(
+                crate::replication::owner::encode_owner_transients(&v.transients)
+                    .map_err(invalid)?,
+            )?,
         })
     }
     fn restore(&self) -> Result<Self::Model, SchemaError> {
@@ -576,7 +588,6 @@ impl Root for Owner {
             collision_identity: self.collision_identity,
             context: self.context.restore()?,
             hero: self.hero.clone().try_into()?,
-            starfall: self.starfall.clone().into(),
             required_bases: self
                 .required_bases
                 .clone()
@@ -585,6 +596,10 @@ impl Root for Owner {
                 .map(Into::into)
                 .collect(),
             input_continuity: self.input_continuity.clone().into(),
+            transients: crate::replication::owner::decode_owner_transients(
+                self.transients.as_slice(),
+            )
+            .map_err(invalid)?,
         };
         value.validate_for(value.expectation()).map_err(invalid)?;
         Ok(value)

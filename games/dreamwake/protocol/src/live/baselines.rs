@@ -8,16 +8,30 @@ pub const MEMBERS: usize = 4;
 pub fn valid_member_count(count: usize) -> bool {
     (MIN_MEMBERS..=MEMBERS).contains(&count)
 }
-pub const PAYLOAD_BYTES: usize = 16_384;
+pub const PAYLOAD_BYTES: usize = 48 * 1024;
 pub const MEMBER_BYTES: usize = PAYLOAD_BYTES + 256;
+const _: () = assert!(MEMBER_BYTES <= u16::MAX as usize);
 pub const GROUP_BYTES: usize = OWNER_GROUP_MESSAGE_BYTES - codec::HEADER_BYTES - 1;
 pub const GROUP_INCOMPLETE: usize = 8;
 pub const GROUP_STAGING_BYTES: usize = GROUP_BYTES * GROUP_INCOMPLETE;
-pub const GROUP_RESIDENT_BYTES: usize = MEMBERS * 160 * 1024;
+pub const GROUP_RESIDENT_BYTES: usize = MEMBERS * 512 * 1024;
 pub const GROUP_PEAK_BYTES: usize = GROUP_RESIDENT_BYTES * 2 + GROUP_STAGING_BYTES;
 
 pub fn limits() -> BaselineLimits {
-    BaselineLimits::default()
+    BaselineLimits {
+        payload_bytes: PAYLOAD_BYTES,
+        packet_bytes: PAYLOAD_BYTES + 12,
+        resident_bytes: 512 * 1024,
+        peak_bytes: 640 * 1024,
+        ..BaselineLimits::default()
+    }
+}
+
+pub fn scope_limits() -> ScopeLimits {
+    ScopeLimits {
+        payload_bytes: PAYLOAD_BYTES,
+        ..ScopeLimits::default()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

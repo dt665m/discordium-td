@@ -789,7 +789,7 @@ mod tests {
     }
     #[test]
     fn optional_member_reset_preseed_and_retained_scope_proof_are_bounded() {
-        use engine_net::replication::{ClientScopes, ObsoleteReason, ScopeExit, ScopeLimits};
+        use engine_net::replication::{ClientScopes, ObsoleteReason, ScopeExit};
         let (mut client, context, _) = control_fixture();
         let mut new_context = context;
         new_context.group = Some((dreamwake_protocol::live::OWNER_GROUP, GroupRevision(7)));
@@ -812,7 +812,11 @@ mod tests {
             client.identity(optional.scope.entity),
             Some((optional, BaselineGeneration(1)))
         );
-        let mut scopes = ClientScopes::new(ConnectionEpoch(1), ScopeLimits::default()).unwrap();
+        let mut scopes = ClientScopes::new(
+            ConnectionEpoch(1),
+            dreamwake_protocol::live::baselines::scope_limits(),
+        )
+        .unwrap();
         let mut public = state(2);
         public.scope = optional.scope;
         scopes.apply_full(public, |_| true).unwrap();
@@ -851,7 +855,11 @@ mod tests {
             Some((newest, BaselineGeneration(1)))
         );
         assert!(client.identity(optional.scope.entity).is_none());
-        let absent = ClientScopes::new(ConnectionEpoch(1), ScopeLimits::default()).unwrap();
+        let absent = ClientScopes::new(
+            ConnectionEpoch(1),
+            dreamwake_protocol::live::baselines::scope_limits(),
+        )
+        .unwrap();
         assert_eq!(
             client.apply_resets_with_scopes(&late, &absent),
             Err(ReplicationError::Conflict)

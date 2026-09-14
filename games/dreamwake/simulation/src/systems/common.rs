@@ -22,12 +22,37 @@ pub(crate) fn decrement(timer: &mut f32) {
 pub(crate) struct ActionEffect {
     pub(crate) sequence: u32,
     pub(crate) slot: u16,
+    pub(crate) scope: Option<engine_core::GraphicsScope>,
+    pub(crate) match_epoch: Option<u32>,
 }
 impl ActionEffect {
     pub(crate) fn input(sequence: u32, tick: u32, slot: u16) -> Self {
         Self {
             sequence: if sequence == 0 { tick } else { sequence },
             slot,
+            scope: None,
+            match_epoch: None,
+        }
+    }
+    pub(crate) fn network(key: crate::combat::RayActionKey, slot: u16) -> Self {
+        Self {
+            sequence: u32::try_from(key.command_sequence).unwrap_or(u32::MAX),
+            slot,
+            scope: Some(engine_core::GraphicsScope {
+                source_epoch: key.connection_epoch,
+                stream: key.command_stream,
+                control_epoch: key.ownership_epoch,
+                generation: key.actor_generation,
+            }),
+            match_epoch: Some(key.match_epoch),
+        }
+    }
+    pub(crate) fn from_id(id: engine_core::GraphicsId) -> Self {
+        Self {
+            sequence: id.action_seq,
+            slot: id.slot,
+            scope: id.scope,
+            match_epoch: Some(id.match_epoch),
         }
     }
     pub(crate) fn repeat(self) -> Self {
@@ -40,6 +65,15 @@ impl ActionEffect {
         Self {
             slot: self.slot + offset,
             ..self
+        }
+    }
+    pub(crate) fn id(self, fallback_match_epoch: u32, owner: u64) -> engine_core::GraphicsId {
+        engine_core::GraphicsId {
+            scope: self.scope,
+            match_epoch: self.match_epoch.unwrap_or(fallback_match_epoch),
+            owner,
+            action_seq: self.sequence,
+            slot: self.slot,
         }
     }
 }
@@ -56,13 +90,7 @@ pub(crate) fn action_effect(
     commands.spawn((
         DreamOwned,
         engine_core::GraphicsInstance {
-            id: engine_core::GraphicsId {
-                scope: None,
-                match_epoch: (run.seed ^ (run.seed >> 32)) as u32,
-                owner,
-                action_seq: source.sequence,
-                slot: source.slot,
-            },
+            id: source.id((run.seed ^ (run.seed >> 32)) as u32, owner),
             kind: engine_core::GraphicsKind::RadialPulse,
             pos: position,
             radius,

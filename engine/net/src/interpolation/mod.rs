@@ -102,6 +102,12 @@ pub struct Presented<P> {
 pub trait PosePolicy<P> {
     fn valid(&self, value: &P) -> bool;
     fn interpolate(&self, earlier: &P, later: &P, alpha: f32) -> Option<P>;
+    /// Project a self-describing sample without estimating motion from history.
+    /// Policies should implement this only when the payload carries an admitted
+    /// velocity or other deterministic presentation capability.
+    fn project_latest(&self, _: &P, _: Duration) -> Option<P> {
+        None
+    }
     fn extrapolate(
         &self,
         earlier: &P,
@@ -397,11 +403,24 @@ impl<P: Payload> RemoteBuffer<P> {
                 if ahead.is_zero() {
                     (latest.value.clone(), Status::Sampled)
                 } else if samples.len() < 2 {
-                    pose_time = latest_time;
-                    (
-                        latest.value.clone(),
-                        Status::Frozen(FreezeReason::InsufficientHistory),
-                    )
+                    let projected = ahead.min(self.config.extrapolation_cap);
+                    if let Some(value) = policy.project_latest(&latest.value, projected) {
+                        pose_time = latest_time.checked_add(projected).ok_or(Error::TimeRange)?;
+                        (
+                            value,
+                            if ahead > self.config.extrapolation_cap {
+                                Status::Frozen(FreezeReason::ExtrapolationLimit)
+                            } else {
+                                Status::Extrapolated
+                            },
+                        )
+                    } else {
+                        pose_time = latest_time;
+                        (
+                            latest.value.clone(),
+                            Status::Frozen(FreezeReason::InsufficientHistory),
+                        )
+                    }
                 } else if self.config.extrapolation_cap.is_zero() {
                     pose_time = latest_time;
                     (

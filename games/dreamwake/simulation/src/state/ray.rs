@@ -134,8 +134,13 @@ impl RayState {
     pub fn graphics(
         &self,
         motion: &engine_core::KinematicState,
+        tick: u32,
     ) -> Option<engine_core::GraphicsInstance> {
         let beam = self.beam.as_ref()?;
+        let age_ticks = tick.checked_sub(beam.started_tick)?;
+        if age_ticks >= BEAM_DURATION_TICKS {
+            return None;
+        }
         let aim = engine_core::spatial::normalize(beam.sample.aim);
         Some(engine_core::GraphicsInstance {
             id: engine_core::GraphicsId {
@@ -162,8 +167,8 @@ impl RayState {
             },
             pos: [motion.position[0], motion.position[2]],
             radius: 0.06,
-            age_ticks: 0,
-            duration_ticks: 2,
+            age_ticks,
+            duration_ticks: BEAM_DURATION_TICKS,
         })
     }
     pub fn valid_at(&self, actor: u64, generation: u32, tick: u32) -> bool {

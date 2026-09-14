@@ -155,6 +155,31 @@ impl<const N: usize> CompactValue for BoundedString<N> {
     }
 }
 
+impl<const N: usize> CompactValue for BoundedBytes<N> {
+    fn write_compact(
+        &self,
+        out: &mut Vec<u8>,
+        work: &mut Work,
+        depth: usize,
+    ) -> Result<(), SchemaError> {
+        self.write(out, work, depth)
+    }
+    fn read_compact(
+        reader: &mut Reader<'_>,
+        work: &mut Work,
+        depth: usize,
+    ) -> Result<Self, SchemaError> {
+        work.node(depth)?;
+        let count = reader.u32()? as usize;
+        if count > N {
+            return Err(SchemaError::CountBudget);
+        }
+        let value = reader.take(count)?;
+        work.allocate(count)?;
+        Self::new(value.to_vec())
+    }
+}
+
 impl<T: CompactValue> CompactValue for Option<T> {
     fn write_compact(
         &self,

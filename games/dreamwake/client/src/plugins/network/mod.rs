@@ -1273,11 +1273,7 @@ fn generate_commands(runtime: &mut Runtime, now: Duration) -> Result<(), String>
     let mut covered = Vec::new();
     for tick in current.0 + 1..=target.0 {
         if forecast_gap && tick < target.0 {
-            let dependencies = session
-                .predictor
-                .checkpoint_dependencies(OWNER_GROUP)
-                .cloned()
-                .ok_or("missing admitted checkpoint dependencies")?;
+            let dependencies = session.prediction_dependencies(ServerTick(tick))?;
             session
                 .predictor
                 .predict_substitute(OWNER_GROUP, ServerTick(tick), dependencies, &session.model)
@@ -1310,11 +1306,7 @@ fn generate_commands(runtime: &mut Runtime, now: Duration) -> Result<(), String>
         // New commands use the latest admitted atomic checkpoint. Reusing the
         // speculative frontier would keep its original moving-base sample alive
         // indefinitely; replay still retains each existing frame's dependencies.
-        let dependencies = session
-            .predictor
-            .checkpoint_dependencies(OWNER_GROUP)
-            .cloned()
-            .ok_or("missing admitted checkpoint dependencies")?;
+        let dependencies = session.prediction_dependencies(ServerTick(tick))?;
         session
             .predictor
             .predict(
@@ -1613,6 +1605,8 @@ mod generation_tests;
 mod obsolete_tests;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod pending_retry_tests;
+#[cfg(test)]
+mod prediction_target_tests;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod recovery_tests;
 #[cfg(all(test, not(target_arch = "wasm32")))]

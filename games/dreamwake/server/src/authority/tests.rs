@@ -224,8 +224,13 @@ impl TestClient {
                 self.pending_reset_group = None;
                 self.groups =
                     Some(GroupAssembler::new(welcome.stream.epoch, live::group_limits()).unwrap());
-                self.scopes =
-                    Some(ClientScopes::new(welcome.stream.epoch, ScopeLimits::default()).unwrap());
+                self.scopes = Some(
+                    ClientScopes::new(
+                        welcome.stream.epoch,
+                        dreamwake_protocol::live::baselines::scope_limits(),
+                    )
+                    .unwrap(),
+                );
                 let content = welcome.content;
                 self.welcome = Some(welcome);
                 self.active = false;

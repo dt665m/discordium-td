@@ -1,4 +1,4 @@
-//! Pure restricted-owner adapter. Replica bytes never become a full simulation.
+//! Scoped owner replay through the shared gameplay simulation.
 use dreamwake_protocol::{
     DreamAction,
     live::{TickInput, Welcome},
@@ -22,7 +22,7 @@ impl Payload for OwnerState {
     fn retained_bytes(&self) -> usize {
         // Owner schema bounds all owned vectors/strings. Charge its entire allowed
         // decoded allocation envelope rather than only the current JSON length.
-        48 * 1024
+        64 * 1024
     }
 }
 #[derive(Clone, PartialEq)]
@@ -36,18 +36,24 @@ impl Payload for InputCommand {
 pub(super) enum CollisionDependency {
     StaticCollision(dreamwake_sim::collision::CollisionWorld),
     Platform(dreamwake_sim::replication::PublicPlatformView),
+    /// An independently disclosed pose may guide reversible companion targeting.
+    /// It cannot supply an authoritative contact, damage result or enemy AI.
+    PresentationTarget(dreamwake_sim::replication::PublicEnemyView),
 }
 impl Payload for CollisionDependency {
     fn retained_bytes(&self) -> usize {
         match self {
             Self::StaticCollision(world) => world.retained_bytes(),
             Self::Platform(_) => 1024,
+            Self::PresentationTarget(_) => 0,
         }
     }
 }
 // 64 permitted colliders, conservative prepared geometry envelope plus the
 // dependency record/map overhead. This is independent of wire group size.
-pub(super) const COLLISION_HISTORY_BYTES: usize = 4096 + 64 * 1024 + 2048;
+pub(super) const MAX_PRESENTATION_TARGETS: usize = 64;
+pub(super) const COLLISION_HISTORY_BYTES: usize =
+    4096 + 64 * 1024 + 2048 + MAX_PRESENTATION_TARGETS * 512;
 
 /// Validate every reconstructible member even when another member's old delta
 /// base has retired. Complete publications additionally require group validation.
@@ -205,8 +211,15 @@ pub(super) fn validate_owner_group<'a>(
 }
 pub(super) struct OwnerModel {
     pub welcome: Welcome,
+    runner: std::sync::Mutex<dreamwake_sim::replication::OwnerPredictionRunner>,
 }
 impl OwnerModel {
+    pub fn new(welcome: Welcome) -> Self {
+        Self {
+            welcome,
+            runner: std::sync::Mutex::new(dreamwake_sim::replication::OwnerPredictionRunner::new()),
+        }
+    }
     pub fn expectation(&self) -> OwnerExpectation {
         OwnerExpectation {
             owner: self.welcome.player.get(),
@@ -374,6 +387,10 @@ impl OwnerModel {
                     DreamAction::Dash { direction } => {
                         input.dash = true;
                         input.movement = direction;
+                        action = Some(OwnerCombatAction::Dash {
+                            key: key(edge.slot),
+                            direction,
+                        });
                     }
                     DreamAction::Dreamlance { aim, .. } => {
                         action = Some(OwnerCombatAction::Ray {
@@ -418,19 +435,41 @@ impl OwnerModel {
             beam = command.0.input.beam.map(|sample| (key(0), sample.aim));
             state.0.record_predicted_input(command.0.input.held);
         }
-        state
-            .0
-            .step_restricted_combat_with_bases(input, collision, &bases, action, beam)
+        let targets = dependencies
+            .records
+            .values()
+            .filter_map(|record| match &record.value {
+                DependencyValue::Known(CollisionDependency::PresentationTarget(target)) => {
+                    Some(*target)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if targets.len() > MAX_PRESENTATION_TARGETS {
+            return Err(PredictionError::InvalidDependency);
+        }
+        self.runner
+            .lock()
+            .map_err(|_| PredictionError::InvalidState)?
+            .step_with_targets(
+                &mut state.0,
+                input,
+                collision,
+                &bases,
+                action,
+                beam,
+                &targets,
+            )
             .map_err(|_| PredictionError::InvalidState)?;
         Ok(state
             .0
-            .starfall_cues()
+            .cast_cues()
             .iter()
             .map(|cue| ActionKey {
-                connection: ConnectionEpoch(cue.action.connection_epoch),
-                stream: CommandStream(cue.action.command_stream),
-                command: CommandSeq(cue.action.command_sequence),
-                slot: cue.action.action_slot,
+                connection: ConnectionEpoch(cue.connection_epoch),
+                stream: CommandStream(cue.command_stream),
+                command: CommandSeq(cue.command_sequence),
+                slot: cue.action_slot,
             })
             .collect())
     }

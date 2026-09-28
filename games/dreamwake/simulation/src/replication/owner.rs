@@ -12,6 +12,10 @@ pub(crate) const MAX_OWNER_PROJECTILES: usize = 64;
 pub(crate) const MAX_OWNER_WISPS: usize = 16;
 pub(crate) const MAX_OWNER_EFFECTS: usize = 32;
 pub(crate) const MAX_OWNER_DELAYED: usize = 8;
+/// Public enemy replicas a client may hand to prediction as a retained
+/// dependency frame. The simulation owns the bound because it is what sizes
+/// the replayed `PredictionTarget` set.
+pub const MAX_PREDICTION_TARGETS: usize = 64;
 
 /// Complete owner-created latent state. These are ordinary shared-simulation
 /// entities, captured generically so adding an ability does not require another
@@ -966,7 +970,7 @@ impl OwnerPredictionRunner {
         beam_aim: Option<(crate::combat::RayActionKey, [f32; 2])>,
         targets: &[PublicEnemyView],
     ) -> Result<(), ReplicationError> {
-        if targets.len() > 64
+        if targets.len() > MAX_PREDICTION_TARGETS
             || targets.iter().any(|target| {
                 target.id == 0
                     || target.hp < 0.0

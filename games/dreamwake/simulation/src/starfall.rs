@@ -1,8 +1,6 @@
 //! Owner-safe Starfall flight. Damage and target contact remain authoritative.
 use crate::{EssenceKind, combat::RayActionKey};
-use engine_core::{
-    CollisionScene, CollisionTarget, ProjectileSourcePolicy, ProjectileState, SceneQueryBudget,
-};
+use engine_core::{ProjectileSourcePolicy, ProjectileState};
 use serde::{Deserialize, Serialize};
 
 /// Live bolts plus reserved Echo bolts share one hard per-owner allowance.
@@ -41,100 +39,6 @@ pub struct StarfallRepeat {
 pub struct StarfallDomain {
     pub flights: Vec<StarfallFlight>,
     pub repeats: Vec<StarfallRepeat>,
-}
-impl StarfallDomain {
-    pub fn valid(&self, owner: u64, generation: u32) -> bool {
-        let keys = self
-            .flights
-            .iter()
-            .map(|f| f.key)
-            .chain(self.repeats.iter().map(|r| r.key))
-            .collect::<Vec<_>>();
-        keys.len() <= STARFALL_CAPACITY
-            && keys.iter().enumerate().all(|(i, k)| {
-                k.action.valid()
-                    && k.action.actor == owner
-                    && k.action.actor_generation == generation
-                    && k.ordinal <= 3
-                    && !keys[..i].contains(k)
-            })
-            && self.flights.iter().all(|f| {
-                f.position
-                    .into_iter()
-                    .chain(f.direction)
-                    .all(f32::is_finite)
-                    && f.radius > 0.0
-                    && f.radius <= 0.527
-                    && f.remaining > 0.0
-                    && f.remaining <= 2.0
-                    && f.authority_id != Some(0)
-            })
-            && self.repeats.iter().all(|r| {
-                r.key.ordinal == 3
-                    && r.authority_id != Some(0)
-                    && r.remaining >= 0.0
-                    && r.remaining <= 0.55
-                    && r.origin.into_iter().chain(r.direction).all(f32::is_finite)
-            })
-    }
-    pub(crate) fn advance(
-        &mut self,
-        scene: &CollisionScene,
-    ) -> Result<Vec<SpawnKey>, engine_core::KinematicError> {
-        // Echo follows the same delayed-action phase as authority: before flight.
-        for repeat in &mut self.repeats {
-            repeat.remaining = (repeat.remaining - crate::DT).max(0.0);
-        }
-        for repeat in self.repeats.iter().filter(|r| r.remaining == 0.0) {
-            let mut spawned = flight(
-                repeat.key,
-                repeat.origin_tick,
-                repeat.origin,
-                repeat.direction,
-                None,
-            );
-            spawned.authority_id = repeat.authority_id;
-            self.flights.push(spawned);
-        }
-        self.repeats.retain(|r| r.remaining > 0.0);
-        let mut budget = SceneQueryBudget::new(1_048_576, 65_536).expect("fixed flight budget");
-        for f in &mut self.flights {
-            let mut state = f.engine_state();
-            state.advance(
-                crate::DT,
-                &[CollisionTarget {
-                    id: f.key.action.actor,
-                    faction: 1,
-                    position: [0.0; 2],
-                    radius: 0.48,
-                    active: true,
-                }],
-            );
-            f.position = state.position;
-            f.remaining = state.remaining;
-            let start = bevy::prelude::Vec3::new(
-                state.previous_position[0],
-                0.9,
-                state.previous_position[1],
-            );
-            let end = bevy::prelude::Vec3::new(f.position[0], 0.9, f.position[1]);
-            if state.finished()
-                || scene
-                    .sphere_cast(start, end - start, f.radius, &mut budget)?
-                    .is_some()
-            {
-                f.remaining = 0.0;
-            }
-        }
-        let retired = self
-            .flights
-            .iter()
-            .filter(|f| f.remaining <= 0.0)
-            .map(|f| f.key)
-            .collect();
-        self.flights.retain(|f| f.remaining > 0.0);
-        Ok(retired)
-    }
 }
 impl StarfallFlight {
     pub(crate) fn engine_state(&self) -> ProjectileState {
@@ -278,12 +182,7 @@ impl StarfallFlight {
                 owner: action.actor,
                 action_seq: u32::try_from(action.command_sequence).ok()?,
                 slot: 61_000 + u16::from(action.action_slot) * 4 + u16::from(self.key.ordinal),
-                scope: Some(engine_core::GraphicsScope {
-                    source_epoch: action.connection_epoch,
-                    stream: action.command_stream,
-                    control_epoch: action.ownership_epoch,
-                    generation: action.actor_generation,
-                }),
+                scope: Some(action.graphics_scope()),
             },
             kind: engine_core::GraphicsKind::Orb { elevation: 0.9 },
             pos: self.position,

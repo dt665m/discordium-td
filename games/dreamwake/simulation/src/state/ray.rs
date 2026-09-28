@@ -144,12 +144,7 @@ impl RayState {
         let aim = engine_core::spatial::normalize(beam.sample.aim);
         Some(engine_core::GraphicsInstance {
             id: engine_core::GraphicsId {
-                scope: Some(engine_core::GraphicsScope {
-                    source_epoch: beam.key.connection_epoch,
-                    stream: beam.key.command_stream,
-                    control_epoch: beam.key.ownership_epoch,
-                    generation: beam.key.actor_generation,
-                }),
+                scope: Some(beam.key.graphics_scope()),
                 match_epoch: beam.key.match_epoch,
                 owner: beam.key.actor,
                 action_seq: u32::try_from(beam.key.command_sequence).ok()?,

@@ -51,7 +51,8 @@ impl Payload for CollisionDependency {
 }
 // 64 permitted colliders, conservative prepared geometry envelope plus the
 // dependency record/map overhead. This is independent of wire group size.
-pub(super) const MAX_PRESENTATION_TARGETS: usize = 64;
+// The simulation enforces the same bound in `step_with_targets`.
+pub(super) use dreamwake_sim::replication::MAX_PREDICTION_TARGETS as MAX_PRESENTATION_TARGETS;
 pub(super) const COLLISION_HISTORY_BYTES: usize =
     4096 + 64 * 1024 + 2048 + MAX_PRESENTATION_TARGETS * 512;
 

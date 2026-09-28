@@ -94,6 +94,16 @@ pub struct ActionVerdict {
 }
 
 impl RayActionKey {
+    /// The identity every graphics instance spawned by this action shares, so
+    /// authority and prediction derive the same ids from one place.
+    pub(crate) fn graphics_scope(self) -> engine_core::GraphicsScope {
+        engine_core::GraphicsScope {
+            source_epoch: self.connection_epoch,
+            stream: self.command_stream,
+            control_epoch: self.ownership_epoch,
+            generation: self.actor_generation,
+        }
+    }
     pub(crate) fn valid(self) -> bool {
         self.match_epoch > 0
             && self.actor > 0

@@ -323,21 +323,15 @@ fn allows_twelve_tick_advance(input: StoredInput) {
 }
 
 #[test]
-fn authored_history_rejects_topology_more_than_twelve_ticks_ahead() {
-    rejects_thirteen_tick_advance(StoredInput::Command);
+fn history_rejects_topology_more_than_twelve_ticks_ahead() {
+    for input in [StoredInput::Command, StoredInput::Substitute] {
+        rejects_thirteen_tick_advance(input);
+    }
 }
 
 #[test]
-fn substitute_history_with_zero_sequence_rejects_topology_more_than_twelve_ticks_ahead() {
-    rejects_thirteen_tick_advance(StoredInput::Substitute);
-}
-
-#[test]
-fn authored_history_allows_topology_exactly_twelve_ticks_ahead() {
-    allows_twelve_tick_advance(StoredInput::Command);
-}
-
-#[test]
-fn substitute_history_allows_topology_exactly_twelve_ticks_ahead() {
-    allows_twelve_tick_advance(StoredInput::Substitute);
+fn history_allows_topology_exactly_twelve_ticks_ahead() {
+    for input in [StoredInput::Command, StoredInput::Substitute] {
+        allows_twelve_tick_advance(input);
+    }
 }

@@ -504,18 +504,10 @@ fn assert_generation_causality(frame_millis: u64) {
 }
 
 #[test]
-fn delayed_owner_with_33_ms_frames_never_authors_committed_input() {
-    assert_generation_causality(33);
-}
-
-#[test]
-fn delayed_owner_with_50_ms_frames_never_authors_committed_input() {
-    assert_generation_causality(50);
-}
-
-#[test]
-fn delayed_owner_with_63_ms_frames_never_authors_committed_input() {
-    assert_generation_causality(63);
+fn delayed_owner_frames_never_author_committed_input() {
+    for frame_millis in [33, 50, 63] {
+        assert_generation_causality(frame_millis);
+    }
 }
 
 fn receive_server_batch(

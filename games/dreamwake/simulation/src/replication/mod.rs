@@ -27,8 +27,8 @@ mod tests;
 mod wire;
 pub use capture::{ApprovedSources, CommittedReplication, ReplicationKey};
 pub use owner::{
-    OWNER_CHECKPOINT_SCHEMA, OwnerCheckpoint, OwnerCombatAction, OwnerExpectation,
-    OwnerPredictionRunner, OwnerPredictionState,
+    MAX_PREDICTION_TARGETS, OWNER_CHECKPOINT_SCHEMA, OwnerCheckpoint, OwnerCombatAction,
+    OwnerExpectation, OwnerPredictionRunner, OwnerPredictionState,
 };
 pub use presentation::DreamPresentation;
 pub use public::*;

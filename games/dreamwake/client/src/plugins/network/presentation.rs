@@ -83,29 +83,36 @@ fn advance_clocks(pose: &mut Pose, seconds: f32) {
     }
 }
 
+/// Declared ballistic travel plus the visual clocks. Shared by the sampled
+/// projection and `apply`'s top-up so the two never disagree on how a
+/// projectile advances.
+fn advance_motion(pose: &mut Pose, seconds: f32) {
+    if pose.deterministic_motion
+        && let Some(remaining) = &mut pose.remaining
+    {
+        pose.motion_active = engine_core::advance_projectile_motion(
+            &mut pose.position,
+            pose.projectile_direction,
+            pose.projectile_speed,
+            remaining,
+            pose.projectile_max_distance,
+            seconds,
+        );
+    }
+    advance_clocks(pose, seconds);
+}
+
 fn project_pose(mut pose: Pose, ahead: Duration, paused_elapsed: f32) -> Pose {
     let seconds = (ahead.as_secs_f32() - (paused_elapsed - pose.paused_elapsed).max(0.0)).max(0.0);
     if seconds > 0.0 {
-        if pose.deterministic_motion {
-            if let Some(remaining) = &mut pose.remaining {
-                pose.motion_active = engine_core::advance_projectile_motion(
-                    &mut pose.position,
-                    pose.projectile_direction,
-                    pose.projectile_speed,
-                    remaining,
-                    pose.projectile_max_distance,
-                    seconds,
-                );
-                *remaining = (*remaining).max(0.0);
-            }
-        } else {
+        if !pose.deterministic_motion {
             pose.position = engine_core::spatial::integrate(pose.position, pose.velocity, seconds);
         }
         if let Some(tick) = pose.platform_tick {
             pose.platform_tick =
                 Some(tick.saturating_add((seconds * dreamwake_sim::TICK_HZ as f32).floor() as u32));
         }
-        advance_clocks(&mut pose, seconds);
+        advance_motion(&mut pose, seconds);
         pose.projected_seconds += seconds;
     }
     pose
@@ -234,6 +241,13 @@ pub(super) struct RemotePoses {
     retired_paused: Duration,
 }
 impl RemotePoses {
+    /// Pause accounting decides whether a pose advances, so every sample site
+    /// reads it from here rather than re-spelling the cursor lookup.
+    fn policy(&self) -> DreamPosePolicy {
+        DreamPosePolicy {
+            paused_elapsed: self.paused_elapsed_at(self.buffer.cursor()).as_secs_f32(),
+        }
+    }
     pub fn metrics(&self) -> RemotePoseMetrics {
         let accounting = self.buffer.accounting();
         let mut metrics = RemotePoseMetrics {
@@ -244,13 +258,9 @@ impl RemotePoses {
             cursor: self.buffer.cursor(),
             ..Default::default()
         };
+        let policy = self.policy();
         for identity in self.buffer.identities() {
-            if let Ok(Some(pose)) = self.buffer.sample(
-                identity.scope,
-                &DreamPosePolicy {
-                    paused_elapsed: self.paused_elapsed_at(self.buffer.cursor()).as_secs_f32(),
-                },
-            ) {
+            if let Ok(Some(pose)) = self.buffer.sample(identity.scope, &policy) {
                 metrics.maximum_pose_age = metrics.maximum_pose_age.max(pose.total_age);
                 match pose.status {
                     Status::Buffering => metrics.buffering += 1,
@@ -344,26 +354,27 @@ impl RemotePoses {
         if matches!(actor, PublicReplica::CoverMarker(_)) {
             return Ok(());
         }
-        let (position, velocity, facing) = match actor {
-            PublicReplica::Hero(v) => (v.position, v.velocity, Some(v.facing)),
-            PublicReplica::Enemy(v) => (v.position, v.velocity, Some(v.facing)),
+        // Everything the segment check below needs, before the pose itself.
+        let (position, velocity, facing, platform_motion) = match actor {
+            PublicReplica::Hero(v) => (v.position, v.velocity, Some(v.facing), None),
+            PublicReplica::Enemy(v) => (v.position, v.velocity, Some(v.facing), None),
             PublicReplica::Projectile(v) => (
                 v.position,
                 v.direction.map(|component| component * v.speed),
                 Some(v.direction),
+                None,
             ),
-            PublicReplica::Wisp(v) => (v.position, v.velocity, None),
-            PublicReplica::Effect(v) => (v.position, [0.0; 2], None),
-            PublicReplica::Damage(v) => (v.position, [0.0; 2], None),
-            PublicReplica::Cover(v) => ([v.position[0], v.position[2]], [0.0; 2], None),
-            PublicReplica::Platform(v) => {
-                ([v.pose.position[0], v.pose.position[2]], [0.0; 2], None)
-            }
+            PublicReplica::Wisp(v) => (v.position, v.velocity, None, None),
+            PublicReplica::Effect(v) => (v.position, [0.0; 2], None, None),
+            PublicReplica::Damage(v) => (v.position, [0.0; 2], None, None),
+            PublicReplica::Cover(v) => ([v.position[0], v.position[2]], [0.0; 2], None, None),
+            PublicReplica::Platform(v) => (
+                [v.pose.position[0], v.pose.position[2]],
+                [0.0; 2],
+                None,
+                Some(v.motion_revision),
+            ),
             PublicReplica::CoverMarker(_) => unreachable!("attachments use their parent pose"),
-        };
-        let platform_motion = match actor {
-            PublicReplica::Platform(v) => Some(v.motion_revision),
-            _ => None,
         };
         let mut segment = self
             .buffer
@@ -371,8 +382,7 @@ impl RemotePoses {
             .filter(|v| v.scope == scope)
             .map_or(1, |v| v.segment);
         if let Some(previous) = self.buffer.latest(scope) {
-            let distance = (position[0] - previous.value.position[0])
-                .hypot(position[1] - previous.value.position[1]);
+            let distance = engine_core::spatial::distance(position, previous.value.position);
             // Delivery gaps do not prove a movement discontinuity. Preserve the
             // bounded history so late samples can still bracket the render time.
             if tick > previous.tick
@@ -381,6 +391,80 @@ impl RemotePoses {
                 segment = segment.checked_add(1).ok_or(Error::Capacity)?;
             }
         }
+        let mut pose = Pose {
+            position,
+            velocity,
+            facing,
+            platform_motion,
+            deterministic_motion: false,
+            motion_active: true,
+            projectile_direction: [0.0; 2],
+            projectile_speed: 0.0,
+            projectile_max_distance: None,
+            paused_elapsed: TickRate::new(dreamwake_sim::TICK_HZ)
+                .and_then(|rate| rate.deadline(tick))
+                .map_or(Duration::ZERO, |at| self.paused_elapsed_at(at))
+                .as_secs_f32(),
+            projected_seconds: 0.0,
+            elevation: 0.0,
+            remaining: None,
+            effect_age: None,
+            damage_age: None,
+            hit_flash: None,
+            attack_flash: None,
+            windup: None,
+            beam_direction: None,
+            beam_elevation: None,
+            beam_length: None,
+            platform_tick: None,
+            cover_open: None,
+        };
+        // One arm per replica, so adding a variant or a field cannot leave a
+        // silent default behind in an arm nobody thought to update.
+        match actor {
+            PublicReplica::Hero(v) => {
+                pose.elevation = v.elevation;
+                pose.hit_flash = Some(v.hit_flash);
+                pose.attack_flash = Some(v.attack_flash);
+            }
+            PublicReplica::Enemy(v) => {
+                pose.hit_flash = Some(v.hit_flash);
+                pose.windup = Some(v.windup);
+            }
+            PublicReplica::Projectile(v) => {
+                pose.deterministic_motion = true;
+                pose.projectile_direction = v.direction;
+                pose.projectile_speed = v.speed;
+                pose.projectile_max_distance = v.max_distance;
+                pose.remaining = Some(v.remaining);
+            }
+            PublicReplica::Wisp(v) => pose.remaining = Some(v.remaining),
+            PublicReplica::Effect(v) => {
+                pose.effect_age = Some(v.age_ticks as f32 / dreamwake_sim::TICK_HZ as f32);
+                if let engine_core::GraphicsKind::Beam {
+                    direction,
+                    elevation,
+                    length,
+                    ..
+                } = v.kind
+                {
+                    pose.beam_direction = Some(direction);
+                    pose.beam_elevation = Some(elevation);
+                    pose.beam_length = Some(length);
+                }
+            }
+            PublicReplica::Damage(v) => pose.damage_age = Some(v.age),
+            PublicReplica::Cover(v) => {
+                pose.elevation = v.position[1];
+                pose.cover_open = Some(v.open);
+            }
+            PublicReplica::Platform(v) => {
+                pose.elevation = v.pose.position[1];
+                pose.platform_tick = Some(v.gameplay_tick);
+            }
+            PublicReplica::CoverMarker(_) => unreachable!("attachments use their parent pose"),
+        }
+        let policy = self.policy();
         self.buffer.receive(
             RemoteSample {
                 identity: RemoteIdentity {
@@ -389,98 +473,9 @@ impl RemotePoses {
                     segment,
                 },
                 tick,
-                value: Pose {
-                    position,
-                    velocity,
-                    deterministic_motion: matches!(actor, PublicReplica::Projectile(_)),
-                    motion_active: true,
-                    projectile_direction: match actor {
-                        PublicReplica::Projectile(v) => v.direction,
-                        _ => [0.0; 2],
-                    },
-                    projectile_speed: match actor {
-                        PublicReplica::Projectile(v) => v.speed,
-                        _ => 0.0,
-                    },
-                    projectile_max_distance: match actor {
-                        PublicReplica::Projectile(v) => v.max_distance,
-                        _ => None,
-                    },
-                    paused_elapsed: TickRate::new(dreamwake_sim::TICK_HZ)
-                        .and_then(|rate| rate.deadline(tick))
-                        .map_or(Duration::ZERO, |at| self.paused_elapsed_at(at))
-                        .as_secs_f32(),
-                    projected_seconds: 0.0,
-                    elevation: match actor {
-                        PublicReplica::Hero(v) => v.elevation,
-                        PublicReplica::Cover(v) => v.position[1],
-                        PublicReplica::Platform(v) => v.pose.position[1],
-                        _ => 0.0,
-                    },
-                    facing,
-                    remaining: match actor {
-                        PublicReplica::Projectile(v) => Some(v.remaining),
-                        PublicReplica::Wisp(v) => Some(v.remaining),
-                        _ => None,
-                    },
-                    effect_age: match actor {
-                        PublicReplica::Effect(v) => {
-                            Some(v.age_ticks as f32 / dreamwake_sim::TICK_HZ as f32)
-                        }
-                        _ => None,
-                    },
-                    damage_age: match actor {
-                        PublicReplica::Damage(v) => Some(v.age),
-                        _ => None,
-                    },
-                    hit_flash: match actor {
-                        PublicReplica::Hero(v) => Some(v.hit_flash),
-                        PublicReplica::Enemy(v) => Some(v.hit_flash),
-                        _ => None,
-                    },
-                    attack_flash: match actor {
-                        PublicReplica::Hero(v) => Some(v.attack_flash),
-                        _ => None,
-                    },
-                    windup: match actor {
-                        PublicReplica::Enemy(v) => Some(v.windup),
-                        _ => None,
-                    },
-                    beam_direction: match actor {
-                        PublicReplica::Effect(v) => match v.kind {
-                            engine_core::GraphicsKind::Beam { direction, .. } => Some(direction),
-                            _ => None,
-                        },
-                        _ => None,
-                    },
-                    beam_elevation: match actor {
-                        PublicReplica::Effect(v) => match v.kind {
-                            engine_core::GraphicsKind::Beam { elevation, .. } => Some(elevation),
-                            _ => None,
-                        },
-                        _ => None,
-                    },
-                    beam_length: match actor {
-                        PublicReplica::Effect(v) => match v.kind {
-                            engine_core::GraphicsKind::Beam { length, .. } => Some(length),
-                            _ => None,
-                        },
-                        _ => None,
-                    },
-                    platform_tick: match actor {
-                        PublicReplica::Platform(v) => Some(v.gameplay_tick),
-                        _ => None,
-                    },
-                    platform_motion,
-                    cover_open: match actor {
-                        PublicReplica::Cover(v) => Some(v.open),
-                        _ => None,
-                    },
-                },
+                value: pose,
             },
-            &DreamPosePolicy {
-                paused_elapsed: self.paused_elapsed_at(self.buffer.cursor()).as_secs_f32(),
-            },
+            &policy,
         )?;
         if self
             .buffer
@@ -525,17 +520,10 @@ impl RemotePoses {
     /// The playback cursor alone is insufficient when a target or cover has frozen.
     pub fn combat_view_time(&self) -> Option<Duration> {
         let mut common = None;
+        let policy = self.policy();
         for entity in &self.combat_entities {
             let identity = self.buffer.identity(*entity)?;
-            let shown = self
-                .buffer
-                .sample(
-                    identity.scope,
-                    &DreamPosePolicy {
-                        paused_elapsed: self.paused_elapsed_at(self.buffer.cursor()).as_secs_f32(),
-                    },
-                )
-                .ok()??;
+            let shown = self.buffer.sample(identity.scope, &policy).ok()??;
             if common.is_some_and(|previous| previous != shown.pose_time) {
                 return None;
             }
@@ -559,12 +547,7 @@ impl RemotePoses {
         }
     }
     pub fn apply(&self, scope: ScopeIdentity, actor: &mut PublicReplica) -> bool {
-        let Ok(Some(shown)) = self.buffer.sample(
-            scope,
-            &DreamPosePolicy {
-                paused_elapsed: self.paused_elapsed_at(self.buffer.cursor()).as_secs_f32(),
-            },
-        ) else {
+        let Ok(Some(shown)) = self.buffer.sample(scope, &self.policy()) else {
             return true;
         };
         let mut pose = shown.value;
@@ -578,23 +561,10 @@ impl RemotePoses {
                     .max(0.0))
             .max(0.0);
             let additional = (active_ahead - pose.projected_seconds).max(0.0);
-            if pose.deterministic_motion {
-                if let Some(remaining) = &mut pose.remaining {
-                    pose.motion_active = engine_core::advance_projectile_motion(
-                        &mut pose.position,
-                        pose.projectile_direction,
-                        pose.projectile_speed,
-                        remaining,
-                        pose.projectile_max_distance,
-                        additional,
-                    );
-                    *remaining = (*remaining).max(0.0);
-                }
-            }
             // Visual clocks and declared ballistic motion are deterministic and
             // can finish from one accepted sample. Actor tangent drift remains
             // at the engine's starvation cap.
-            advance_clocks(&mut pose, additional);
+            advance_motion(&mut pose, additional);
         }
         match actor {
             PublicReplica::Hero(v) => {
@@ -886,14 +856,7 @@ mod tests {
         assert_eq!(
             poses
                 .buffer
-                .sample(
-                    scope,
-                    &DreamPosePolicy {
-                        paused_elapsed: poses
-                            .paused_elapsed_at(poses.buffer.cursor())
-                            .as_secs_f32(),
-                    },
-                )
+                .sample(scope, &poses.policy())
                 .unwrap()
                 .unwrap()
                 .status,

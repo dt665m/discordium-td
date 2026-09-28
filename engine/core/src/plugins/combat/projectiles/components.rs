@@ -57,7 +57,8 @@ pub fn advance_projectile_motion(
         return false;
     }
     *position = integrate(*position, scale(direction, speed), dt);
-    *remaining -= dt;
+    // Clamp here so no caller can observe (or replicate) a negative lifetime.
+    *remaining = (*remaining - dt).max(0.0);
     *remaining > 0.0 && max_distance.is_none_or(|limit| length(*position) <= limit)
 }
 

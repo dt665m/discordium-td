@@ -193,6 +193,21 @@ fn starfall_from_outside_base_closure_clears_every_rotating_support_pose() {
             0.9 - domain.flights[0].radius > top,
             "larger/lower Starfall requires platform prediction dependency"
         );
+        // The whole lifetime as one swept segment: the flight is deterministic
+        // and straight, so clearing the support here clears it every tick.
+        let flight = &domain.flights[0];
+        let start = bevy::prelude::Vec3::new(flight.position[0], 0.9, flight.position[1]);
+        let travel = bevy::prelude::Vec3::new(
+            flight.direction[0] * 23.0 * flight.remaining,
+            0.0,
+            flight.direction[1] * 23.0 * flight.remaining,
+        );
+        assert!(
+            (start.x..=start.x + travel.x).contains(&platform::PLATFORM_POSITION[0])
+                && (start.z - platform::PLATFORM_POSITION[2]).abs()
+                    < platform::PLATFORM_HALF_EXTENTS[2],
+            "the swept path must cross the support for this to prove anything"
+        );
         for phase in [0, 128, 511, 1023] {
             let pose = platform::pose(phase);
             let mut collider = engine_core::StaticCollider::cuboid(
@@ -205,16 +220,14 @@ fn starfall_from_outside_base_closure_clears_every_rotating_support_pose() {
             );
             collider.rotation = pose.rotation;
             let scene = engine_core::CollisionScene::new(1, vec![collider]).unwrap();
-            let empty = engine_core::CollisionScene::new(1, vec![]).unwrap();
-            let mut without = domain.clone();
-            let mut with = domain.clone();
-            for _ in 0..130 {
-                assert_eq!(
-                    without.advance(&empty).unwrap(),
-                    with.advance(&scene).unwrap()
-                );
-                assert_eq!(without, with);
-            }
+            let mut budget = engine_core::SceneQueryBudget::new(1_048_576, 65_536).unwrap();
+            assert_eq!(
+                scene
+                    .sphere_cast(start, travel, flight.radius, &mut budget)
+                    .unwrap(),
+                None,
+                "Starfall must not contact the support at rotation phase {phase}"
+            );
         }
     }
 }

@@ -400,20 +400,20 @@ impl<P: Payload> RemoteBuffer<P> {
                     .deadline(latest.tick)
                     .ok_or(Error::TimeRange)?;
                 let ahead = at.saturating_sub(latest_time);
+                // One clamp and one starvation verdict, so both projection
+                // paths report the same status for the same starvation.
+                let projected = ahead.min(self.config.extrapolation_cap);
+                let projected_status = if ahead > self.config.extrapolation_cap {
+                    Status::Frozen(FreezeReason::ExtrapolationLimit)
+                } else {
+                    Status::Extrapolated
+                };
                 if ahead.is_zero() {
                     (latest.value.clone(), Status::Sampled)
                 } else if samples.len() < 2 {
-                    let projected = ahead.min(self.config.extrapolation_cap);
                     if let Some(value) = policy.project_latest(&latest.value, projected) {
                         pose_time = latest_time.checked_add(projected).ok_or(Error::TimeRange)?;
-                        (
-                            value,
-                            if ahead > self.config.extrapolation_cap {
-                                Status::Frozen(FreezeReason::ExtrapolationLimit)
-                            } else {
-                                Status::Extrapolated
-                            },
-                        )
+                        (value, projected_status)
                     } else {
                         pose_time = latest_time;
                         (
@@ -435,23 +435,9 @@ impl<P: Payload> RemoteBuffer<P> {
                             .rate
                             .deadline(previous.tick)
                             .ok_or(Error::TimeRange)?;
-                    pose_time = latest_time
-                        .checked_add(ahead.min(self.config.extrapolation_cap))
-                        .ok_or(Error::TimeRange)?;
-                    match policy.extrapolate(
-                        &previous.value,
-                        &latest.value,
-                        interval,
-                        ahead.min(self.config.extrapolation_cap),
-                    ) {
-                        Some(value) => (
-                            value,
-                            if ahead > self.config.extrapolation_cap {
-                                Status::Frozen(FreezeReason::ExtrapolationLimit)
-                            } else {
-                                Status::Extrapolated
-                            },
-                        ),
+                    pose_time = latest_time.checked_add(projected).ok_or(Error::TimeRange)?;
+                    match policy.extrapolate(&previous.value, &latest.value, interval, projected) {
+                        Some(value) => (value, projected_status),
                         None => {
                             pose_time = latest_time;
                             (latest.value.clone(), Status::Frozen(FreezeReason::Policy))

@@ -38,12 +38,7 @@ impl ActionEffect {
         Self {
             sequence: u32::try_from(key.command_sequence).unwrap_or(u32::MAX),
             slot,
-            scope: Some(engine_core::GraphicsScope {
-                source_epoch: key.connection_epoch,
-                stream: key.command_stream,
-                control_epoch: key.ownership_epoch,
-                generation: key.actor_generation,
-            }),
+            scope: Some(key.graphics_scope()),
             match_epoch: Some(key.match_epoch),
         }
     }

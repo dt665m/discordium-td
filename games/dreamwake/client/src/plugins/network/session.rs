@@ -550,7 +550,7 @@ impl Session {
             if target.hp <= 0.0 {
                 continue;
             }
-            let distance = (target.position[0] - owner[0]).hypot(target.position[1] - owner[1]);
+            let distance = engine_core::spatial::distance(target.position, owner);
             targets.push((distance, state.scope, state.version, target));
         }
         targets.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.entity.cmp(&b.1.entity)));

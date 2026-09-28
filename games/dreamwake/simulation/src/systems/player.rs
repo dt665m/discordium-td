@@ -13,6 +13,34 @@ pub(crate) fn player_actions(
     wisps: Query<&engine_core::CompanionState>,
     delayed: Query<&DelayedCast>,
 ) {
+    // One pass per query rather than one per hero: these bounds are the owner
+    // checkpoint's, so every hero reads the same tallies.
+    type OwnerCounts = std::collections::HashMap<u64, usize>;
+    let (mut occupied_counts, mut live_projectiles) = (OwnerCounts::new(), OwnerCounts::new());
+    for (payload, state) in &projectiles {
+        if payload.spawn.is_some() {
+            *occupied_counts.entry(state.owner).or_default() += 1;
+        }
+        if !state.finished() {
+            *live_projectiles.entry(state.owner).or_default() += 1;
+        }
+    }
+    let mut live_wisps = OwnerCounts::new();
+    for state in &wisps {
+        if !state.expired {
+            *live_wisps.entry(state.owner).or_default() += 1;
+        }
+    }
+    let mut delayed_counts = OwnerCounts::new();
+    for cast in &delayed {
+        *delayed_counts.entry(cast.payload.owner).or_default() += 1;
+        if cast.payload.spawn.is_some() {
+            *occupied_counts.entry(cast.payload.owner).or_default() += 1;
+        }
+        if cast.payload.kind == MemoryKind::Wisp {
+            *live_wisps.entry(cast.payload.owner).or_default() += 1;
+        }
+    }
     let mut party: Vec<_> = heroes.iter_mut().collect();
     party.sort_by_key(|h| h.view.id);
     for mut hero in party {
@@ -192,32 +220,11 @@ pub(crate) fn player_actions(
                 13,
             );
         }
-        let mut occupied = projectiles
-            .iter()
-            .filter(|(p, s)| p.spawn.is_some() && s.owner == hero.view.id)
-            .count()
-            + delayed
-                .iter()
-                .filter(|d| d.payload.spawn.is_some() && d.payload.owner == hero.view.id)
-                .count();
-        let mut owner_projectiles = projectiles
-            .iter()
-            .filter(|(_, state)| state.owner == hero.view.id && !state.finished())
-            .count();
-        let mut owner_wisps = wisps
-            .iter()
-            .filter(|state| state.owner == hero.view.id && !state.expired)
-            .count()
-            + delayed
-                .iter()
-                .filter(|cast| {
-                    cast.payload.owner == hero.view.id && cast.payload.kind == MemoryKind::Wisp
-                })
-                .count();
-        let mut owner_delayed = delayed
-            .iter()
-            .filter(|cast| cast.payload.owner == hero.view.id)
-            .count();
+        let count = |counts: &OwnerCounts| counts.get(&hero.view.id).copied().unwrap_or_default();
+        let mut occupied = count(&occupied_counts);
+        let mut owner_projectiles = count(&live_projectiles);
+        let mut owner_wisps = count(&live_wisps);
+        let mut owner_delayed = count(&delayed_counts);
         for (index, pressed) in input.casts.into_iter().enumerate() {
             if !pressed {
                 continue;

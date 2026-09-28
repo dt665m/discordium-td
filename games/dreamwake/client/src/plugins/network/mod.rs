@@ -237,6 +237,12 @@ pub fn connect(world: &mut World, attempts: u32) {
                         conditioner: Some(conditioner),
                     },
                     connection_config: connection_config(),
+                    // Headroom for the burst of channel callbacks that lands
+                    // when a blocked main thread resumes, which arrives before
+                    // the next frame can drain the inbox. Overflow retains the
+                    // freshest packets, so this only widens the window; it is
+                    // not a substitute for the transport keeping its own queue.
+                    max_inbox_packets: 1024,
                     ..Default::default()
                 },
             )

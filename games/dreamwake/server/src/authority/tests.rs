@@ -1879,6 +1879,35 @@ fn authenticated_udp_rejoin_preserves_player_and_rejects_a_second_controller() {
 }
 
 #[test]
+fn stalled_bootstrap_peer_is_displaced_by_a_fresh_stream_for_the_same_player() {
+    let mut h = Harness::new();
+    let stalled = h.join_player(700);
+    // Withholding the owner group proof reproduces a client whose bootstrap
+    // never completes, so it holds no participation, health or readiness.
+    h.clients[stalled].send_proofs = false;
+    h.pump(30);
+    let first = h.clients[stalled].welcome.clone().unwrap();
+    let first_connection = first.client.0;
+    assert!(!h.clients[stalled].active);
+    assert!(!h.driver.authority.peers[&first_connection].active);
+    assert!(!h.driver.authority.peers[&first_connection].activation_committed);
+
+    // The replacement is admitted instead of refused, so a stalled bootstrap
+    // cannot strand its own profile or spend its three resynchronizations.
+    let fresh = h.join_player(700);
+    h.pump(45);
+    assert!(
+        !h.driver.authority.peers.contains_key(&first_connection),
+        "the never-activated peer is displaced"
+    );
+    assert!(h.clients[fresh].active, "the fresh stream activates");
+    let welcome = h.clients[fresh].welcome.as_ref().unwrap();
+    assert_eq!(welcome.player, first.player);
+    assert!(welcome.stream.epoch > first.stream.epoch);
+    assert!(welcome.stream.ownership > first.stream.ownership);
+}
+
+#[test]
 fn retained_participant_capacity_is_separate_from_live_capacity_and_resets_with_run() {
     let mut authority = DreamAuthority::new(3, false, 1);
     for player in 1..=dreamwake_sim::MAX_HEROES as u64 {

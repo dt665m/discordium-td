@@ -1122,6 +1122,35 @@ impl engine_server::Authority for DreamAuthority {
             .values()
             .any(|peer| peer.welcome.player == player && peer.welcome.client.0 != id)
         {
+            // A peer that never committed activation holds no participation,
+            // health, progression or readiness by contract, so preserving it
+            // protects nothing. Refusing the newcomer instead strands the
+            // profile until the stalled bootstrap expires, and every retry
+            // spends one of its three resynchronizations. Displace the pending
+            // peer so a fresh stream can bootstrap immediately.
+            let stalled: Vec<u64> = self
+                .peers
+                .values()
+                .filter(|peer| {
+                    peer.welcome.player == player
+                        && peer.welcome.client.0 != id
+                        && !peer.active
+                        && !peer.activation_committed
+                })
+                .map(|peer| peer.welcome.client.0)
+                .collect();
+            if !stalled.is_empty() {
+                for previous in stalled {
+                    log::warn!(
+                        "Dreamwake admission: displacing never-activated peer {previous} for player {}",
+                        player.get()
+                    );
+                    server.disconnect(previous);
+                    DreamAuthority::disconnect(self, previous);
+                }
+                return self.admit_player(id, player)
+                    && publish::welcome(server, id, self.peers.get_mut(&id).unwrap()).is_ok();
+            }
             let Some(grant) = grant else {
                 return false;
             };

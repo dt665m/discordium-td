@@ -138,8 +138,11 @@ The server's once-per-second `Dreamwake egress` log reports cumulative applicati
 bytes/messages for control and state, finalization batches/receipts/deferred
 publications, Renet retained payload bytes per channel, and the
 transport's independent native UDP/IP or WebRTC logical-byte counters. Healthy
-samples use info level; new pacing drops or a full finalization control window
-use warn level. Queued bytes come from Renet's public available-memory API and
+samples use info level; new pacing drops, new transport backend drops or a full
+finalization control window use warn level. A backend drop is a send the
+transport refused outright, which a full WebRTC data channel does after Renet
+has already accounted the packet as sent; it never appears as a pacing or
+capacity drop, and sustained backend loss stalls reliable bootstrap. Queued bytes come from Renet's public available-memory API and
 include sent reliable messages awaiting transport ACKs. They are not decode proofs.
 
 ## Input and acknowledgement invariants
@@ -239,6 +242,10 @@ before Ready. A joining hero remains inactive until the required initial owner
 group has exact decode receipts. Activation commits on a simulation tick, then
 the client receives and proves the active checkpoint before enabling commands.
 Pending players cannot move, receive rewards, take damage or block party readiness.
+They also receive no remote public actors until activation commits, so the owner
+group keeps the connection to itself while it bootstraps. A fresh authenticated
+stream displaces a peer that never committed activation for the same profile,
+rather than being refused until that stalled bootstrap expires.
 The advertised owner identity survives ticks between Welcome and Ready while
 its connection grant remains absent. Initial synchronization has a ten-second
 absolute deadline. If an immutable initial owner group expires after two seconds

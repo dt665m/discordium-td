@@ -305,7 +305,15 @@ fn peer_state(
     };
     // Keep remote cadence independent of owner queue backpressure.
     let mut requests = Vec::new();
-    for entry in eligible.entries() {
+    // A pending owner cannot display remote actors before it proves its own
+    // checkpoint, and activation depends only on the owner group's decode
+    // receipts. Publishing the public stream first competes with that group for
+    // a transport whose real ceiling is lower than this scheduler's budget: a
+    // browser data channel refuses writes once its buffer fills, and Renet has
+    // already accounted those packets as sent. Withhold remote state until the
+    // owner activates so bootstrap keeps the pipe to itself.
+    let remotes_eligible = peer.active;
+    for entry in eligible.entries().filter(|_| remotes_eligible) {
         let entity = entry.entity();
         if peer.owner_group_entities().contains(&entity) {
             continue;
@@ -670,6 +678,11 @@ fn report_egress(
     let web = stats.and_then(|stats| stats.webrtc_logical);
     let pacing_drops =
         native.map_or(0, |stats| stats.pacing_drops) + web.map_or(0, |stats| stats.pacing_drops);
+    // A refused data channel write is discarded after Renet has accounted the
+    // packet as sent, so it never appears as a pacing or capacity drop. Report
+    // it at warn level: sustained backend loss stalls reliable bootstrap.
+    let backend_drops =
+        native.map_or(0, |stats| stats.backend_drops) + web.map_or(0, |stats| stats.backend_drops);
     let line = format!(
         "Dreamwake egress peer={id} at_ms={} finalized_through={} control_messages_total={} control_bytes_total={} finalized_messages_total={} finalized_bytes_total={} finalized_receipts_total={} finalized_deferred_total={} state_messages_total={} state_bytes_total={} control_queue_payload_bytes={} state_queue_payload_bytes={} group_queue_payload_bytes={} native_udp_ip={native:?} webrtc_logical={web:?}",
         now.as_millis(),
@@ -693,10 +706,14 @@ fn report_egress(
         peer.egress.group_age_ticks,
         peer.egress.maximum_group_age_ticks,
     );
-    if pacing_drops > peer.last_pacing_drops || control_bytes >= wire::CONTROL_MEMORY_BYTES / 2 {
+    if pacing_drops > peer.last_pacing_drops
+        || backend_drops > peer.last_backend_drops
+        || control_bytes >= wire::CONTROL_MEMORY_BYTES / 2
+    {
         log::warn!("{line}");
     } else {
         log::info!("{line}");
     }
     peer.last_pacing_drops = pacing_drops;
+    peer.last_backend_drops = backend_drops;
 }

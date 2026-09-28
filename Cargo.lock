@@ -5796,9 +5796,7 @@ dependencies = [
 
 [[package]]
 name = "renet-cross"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e1e28640498f0f09060e8fcb966405755822e35a5e93f7497f92ee44e4f138e6"
+version = "0.8.0"
 dependencies = [
  "axum",
  "base64",

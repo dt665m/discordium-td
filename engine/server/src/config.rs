@@ -269,6 +269,7 @@ fn start_configured<P: SessionAuthPolicy + Send + Sync + 'static>(
     let mut transport = MixedTransportBuilder::new(protocol_id)
         .transport_config(renet_cross::ServerTransportConfig {
             conditioner: Some(conditioner.clone()),
+            ..Default::default()
         })
         .udp_bind(udp_bind)
         .webrtc_bind(webrtc_bind)

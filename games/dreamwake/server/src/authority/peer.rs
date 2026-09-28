@@ -81,6 +81,10 @@ pub(super) struct Peer {
     pub egress: EgressCounters,
     pub next_egress_report: Duration,
     pub last_pacing_drops: u64,
+    /// Transport-refused sends. A full WebRTC data channel discards the packet
+    /// after Renet has already accounted it as sent, so this loss is invisible
+    /// to the reliable channel and must be reported on its own.
+    pub last_backend_drops: u64,
     pub menu_received: CommandSeq,
     pub menu_applied: Option<CommandSeq>,
     pub menus: VecDeque<(CommandSeq, DreamAction)>,
@@ -141,6 +145,7 @@ impl Peer {
             egress: EgressCounters::default(),
             next_egress_report: now + Duration::from_secs(1),
             last_pacing_drops: 0,
+            last_backend_drops: 0,
             menu_received: CommandSeq(0),
             menu_applied: None,
             menus: VecDeque::new(),

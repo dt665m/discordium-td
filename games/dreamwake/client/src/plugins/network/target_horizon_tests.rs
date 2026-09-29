@@ -1,9 +1,9 @@
 //! Delayed delivery preserves adaptive lead; stalled authority bounds speculation.
 use super::*;
 use engine_net::{
-    commands::{CommandLimits, FinalizedReceipt, FinalizedStatus},
+    commands::{FinalizedReceipt, FinalizedStatus},
     prediction::PredictionLimits,
-    synchronization::{LeadController, ResyncReason},
+    synchronization::LeadController,
 };
 
 fn active_runtime() -> Runtime {
@@ -228,31 +228,31 @@ fn stalled_authority_horizon_preserves_input_and_sequence_then_resumes() {
 fn committed_clock_does_not_weaken_lead_or_discontinuity_recovery() {
     let mut runtime = active_runtime();
     let session = runtime.prediction.as_mut().unwrap();
+    // A round trip past what lead can cover saturates. The player keeps
+    // playing with late commands; it never disables target assignment, because
+    // recovery cannot shorten the path it is complaining about.
+    let maximum = engine_net::types::MAX_COMMAND_LEAD_TICKS;
     for slack in [0, -1] {
-        session.lead = LeadController::new(CommandLimits::default().future_ticks).unwrap();
-        assert!(matches!(
-            session.lead.observe_arrival_slack(slack),
-            Err(SyncError::ResyncRequired(ResyncReason::LeadExceeded))
-        ));
-        assert!(
-            session
-                .assign_command_target(ServerTick(1000))
-                .unwrap_err()
-                .contains("LeadExceeded")
-        );
+        session.lead = LeadController::new(maximum).unwrap();
+        assert_eq!(session.lead.observe_arrival_slack(slack), Ok(maximum));
+        assert_eq!(session.lead.needs_resynchronization(), None);
+        assert!(session.assign_command_target(ServerTick(1000)).is_ok());
     }
     let sequence = session.sequence;
     assert!(sequence.0 > 0);
-    assert_eq!(session.journal.pending_samples(), 0);
 
     session.lead = LeadController::new(3).unwrap();
     assert_eq!(
         session.assign_command_target(ServerTick(20)).unwrap(),
         Some(TargetTick(23))
     );
+    // Only a jump past the whole horizon is a discontinuity; a lead change
+    // legitimately moves the target by up to that much.
     assert!(
         session
-            .assign_command_target(ServerTick(33))
+            .assign_command_target(ServerTick(
+                20 + u64::from(engine_net::types::MAX_COMMAND_LEAD_TICKS) + 2
+            ))
             .unwrap_err()
             .contains("TargetDiscontinuity")
     );
@@ -279,7 +279,13 @@ fn timestamped_progress_preserves_adaptive_lead_with_delayed_finalization() {
             session.estimated_simulation_tick.unwrap().0 + u64::from(lead),
             expected
         );
-        assert!(expected > session.finalized.0 + u64::from(CommandLimits::default().future_ticks));
+        // Speculation continues past delayed finalization and stays inside
+        // the replay budget. It is not pinned to the admission window.
+        assert!(expected > session.finalized.0);
+        assert!(
+            expected
+                <= session.finalized.0 + PredictionLimits::default().replay_ticks_per_frame as u64
+        );
         assert_eq!(session.lead.needs_resynchronization(), None);
         assert!(session.active && !session.recovering);
     }
@@ -288,7 +294,8 @@ fn timestamped_progress_preserves_adaptive_lead_with_delayed_finalization() {
 #[test]
 fn duplicate_and_older_finalized_feedback_cannot_exhaust_lead() {
     let (mut session, _) = tests::fixture();
-    session.lead = LeadController::new(11).unwrap();
+    let maximum = engine_net::types::MAX_COMMAND_LEAD_TICKS;
+    session.lead = LeadController::new(maximum - 1).unwrap();
     session.sequence = CommandSeq(1);
     session.record_command_issuance(session.sequence, TargetTick(11), TargetTick(11));
     let fresh = finalized_bytes(&session, 11, 11, Some(0));
@@ -304,7 +311,7 @@ fn duplicate_and_older_finalized_feedback_cannot_exhaust_lead() {
         &mut world,
     )
     .unwrap();
-    assert_eq!(runtime.prediction.as_ref().unwrap().lead.lead(), 12);
+    assert_eq!(runtime.prediction.as_ref().unwrap().lead.lead(), maximum);
     for (index, bytes) in [&fresh, &older, &fresh, &older].into_iter().enumerate() {
         receive_message(
             &mut runtime,
@@ -315,7 +322,7 @@ fn duplicate_and_older_finalized_feedback_cannot_exhaust_lead() {
         )
         .unwrap();
         let session = runtime.prediction.as_ref().unwrap();
-        assert_eq!(session.lead.lead(), 12);
+        assert_eq!(session.lead.lead(), maximum);
         assert_eq!(session.lead.needs_resynchronization(), None);
         assert_eq!(session.finalized, ServerTick(11));
         assert_eq!(session.simulation_clock.committed(), ServerTick(11));
@@ -328,25 +335,22 @@ fn duplicate_and_older_finalized_feedback_cannot_exhaust_lead() {
     session.sequence = CommandSeq(2);
     session.record_command_issuance(session.sequence, TargetTick(12), TargetTick(12));
     let current_policy_late = finalized_bytes(session, 12, 12, Some(0));
-    let error = receive_message(
+    receive_message(
         &mut runtime,
         CONTROL_CHANNEL,
         &current_policy_late,
         Duration::from_millis(10),
         &mut world,
     )
-    .unwrap_err();
-    assert!(matches!(
-        error,
-        ReceiveRejection::Clock(SyncError::ResyncRequired(ResyncReason::LeadExceeded))
-    ));
+    .unwrap();
+    // The missed deadline is still counted; it simply cannot push lead past
+    // the maximum, and saturating there is not a reason to end the session.
     let session = runtime.prediction.as_ref().unwrap();
     assert_eq!(session.metrics().arrival_feedback.late_commands, 2);
     assert_eq!(session.metrics().arrival_feedback_applied, 2);
-    assert_eq!(
-        session.lead.needs_resynchronization(),
-        Some(ResyncReason::LeadExceeded)
-    );
+    assert_eq!(session.lead.lead(), maximum);
+    assert_eq!(session.lead.needs_resynchronization(), None);
+    assert!(!session.recovering);
 }
 
 #[test]

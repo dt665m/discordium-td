@@ -272,7 +272,13 @@ fn owner_stream() -> OwnerStream {
 fn stalled_speculation_can_be_future_until_the_same_command_becomes_admissible() {
     let rate = TickRate::new(60).unwrap();
     let owner = owner_stream();
-    let limits = CommandLimits::default();
+    // The production window now reaches the speculation bound, so a
+    // well-behaved client cannot outrun it. Pin a narrower one to exercise the
+    // retention and immutability of a command that is admitted later.
+    let limits = CommandLimits {
+        future_ticks: 12,
+        ..Default::default()
+    };
     let mut inbox = CommandInbox::new(owner, ServerTick(100), limits).unwrap();
     let mut clock = CommittedClock::new(rate, ServerTick(100), ms(1000), replay_budget()).unwrap();
     let mut lead = LeadController::new(4).unwrap();
@@ -298,7 +304,7 @@ fn stalled_speculation_can_be_future_until_the_same_command_becomes_admissible()
                 Admission::Accepted { arrival_slack } => {
                     accepted += 1;
                     assert!(arrival_slack <= u64::from(limits.future_ticks));
-                    assert!(target.0 <= 112);
+                    assert!(target.0 <= 100 + u64::from(limits.future_ticks));
                 }
                 Admission::Future => retry = Some(command),
                 other => panic!("stalled command admission: {other:?}"),
@@ -327,12 +333,19 @@ fn stalled_speculation_can_be_future_until_the_same_command_becomes_admissible()
         let receipt = inbox.commit(prepared.tick()).unwrap();
         clock.commit(receipt.tick);
     }
-    assert_eq!(clock.committed(), ServerTick(120));
+    // Committed reaches exactly the point where the retained target re-enters
+    // the admission window, so the slack it reports is that whole window.
+    assert_eq!(
+        clock.committed(),
+        ServerTick(command.target.0 - u64::from(limits.future_ticks))
+    );
     // The exact retained command is retried: its original sequence, target,
     // input, and actions remain immutable even while admission was Future.
     assert_eq!(
         inbox.admit(owner.connection, command.clone(), &Rules),
-        Ok(Admission::Accepted { arrival_slack: 12 })
+        Ok(Admission::Accepted {
+            arrival_slack: u64::from(limits.future_ticks)
+        })
     );
     assert_eq!(
         inbox.admit(owner.connection, command, &Rules),

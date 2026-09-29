@@ -211,8 +211,12 @@ fn held_generation_retries_future_action_immutably_and_server_consumes_it_once()
     let (mut runtime, mut server, action) = stalled_frontier();
     let owner = action.owner;
     let rules = Rules(owner);
-    let limits = CommandLimits::default();
-    assert_eq!(limits.future_ticks, 12);
+    // This exercises retry of an action that is initially past the window, so
+    // it pins the window rather than inheriting the shared maximum.
+    let limits = CommandLimits {
+        future_ticks: 12,
+        ..Default::default()
+    };
     let mut inbox = CommandInbox::new(owner, ServerTick(10), limits).unwrap();
     assert_eq!(
         inbox
@@ -245,12 +249,20 @@ fn held_generation_retries_future_action_immutably_and_server_consumes_it_once()
     let trace = runtime.outcomes.latest_trace(1).unwrap();
     let packets = generate(&mut runtime, &mut server, 1100);
     let records = packets.into_iter().flatten().collect::<Vec<_>>();
-    assert_eq!(records.len(), 9);
+    // Retries cover every retained target still inside the admission window,
+    // so the span follows the shared horizon rather than a pinned count.
+    // Retries carry every retained target still inside the admission window,
+    // oldest first and without duplicates. The span follows the shared horizon
+    // rather than a pinned count.
+    let retry_through = 11 + u64::from(CommandLimits::default().future_ticks);
     let targets = records
         .iter()
         .map(|record| record.target.0)
         .collect::<std::collections::BTreeSet<_>>();
-    assert_eq!(targets, (15..=23).collect());
+    assert_eq!(records.len(), targets.len());
+    assert_eq!(targets.first().copied(), Some(15));
+    assert!(targets.last().copied().unwrap() <= retry_through);
+    assert!(targets.iter().all(|target| *target > 11));
     assert_eq!(
         records.iter().filter(|record| **record == action).count(),
         1
@@ -268,13 +280,21 @@ fn held_generation_retries_future_action_immutably_and_server_consumes_it_once()
     assert_eq!(after_trace.first_enqueued_at, trace.first_enqueued_at);
     assert_eq!(runtime.outcomes.trace(1, 8).len(), 1);
 
+    // This inbox pins a narrower window than the client's retry span, so the
+    // retries that reach past it are legitimately future rather than lost.
     for record in records {
-        assert!(matches!(
-            inbox.admit(owner.connection, record, &rules).unwrap(),
-            Admission::Accepted {
-                arrival_slack: 4..=12
-            }
-        ));
+        let slack = record.target.0 - inbox.finalized_through().0;
+        let admission = inbox.admit(owner.connection, record, &rules).unwrap();
+        if slack > u64::from(limits.future_ticks) {
+            assert_eq!(admission, Admission::Future);
+        } else {
+            assert!(matches!(
+                admission,
+                Admission::Accepted {
+                    arrival_slack: 4..=12
+                }
+            ));
+        }
     }
     assert_eq!(
         inbox

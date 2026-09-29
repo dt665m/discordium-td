@@ -189,7 +189,14 @@ fn future_action_retry_waits_for_admission_without_reserving_an_outcome() {
     let connection = authority.peers[&41].welcome.stream.epoch;
     authority.sim.set_player_active(owner, true);
     authority.begin_run();
-    let edge = command(&authority, 1, authority.tick.0 + 13);
+    // One tick past the admission window, wherever that window sits.
+    let edge = command(
+        &authority,
+        1,
+        authority.tick.0
+            + u64::from(engine_net::commands::CommandLimits::default().future_ticks)
+            + 1,
+    );
     let key = edge.action_key(0);
     authority.now = Duration::from_secs(2);
     for _ in 0..3 {
@@ -219,7 +226,7 @@ fn future_action_retry_waits_for_admission_without_reserving_an_outcome() {
             None
         );
     }
-    // Only committed progress makes the unchanged target eligible at +12.
+    // Only committed progress makes the unchanged target eligible again.
     authority.step(Duration::from_secs(2));
     submit(&mut authority, edge.clone());
     assert!(authority.outcomes.lookup(owner, key).is_none());

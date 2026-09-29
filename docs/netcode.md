@@ -404,9 +404,18 @@ time, ordinary contiguous batches retain their historical hardware deadlines.
 Timestamped clock replies anchor a separate estimate of the
 server's committed simulation tick; delayed checkpoints and finalization receipts
 advance its proven lower bound without pretending they describe receipt time.
-Adaptive command lead remains limited to 12 ticks, and the server independently
-enforces its 12-tick admission window. The client bounds speculation to the
-existing 32-tick replay budget beyond the latest proven committed tick. Replies
+Adaptive command lead saturates at `MAX_COMMAND_LEAD_TICKS`, and the server
+independently enforces the wider `MAX_COMMAND_HORIZON_TICKS` admission window.
+Both live in `engine_net::types` so the two sides cannot drift. Targets are
+chosen against the client's estimated tick while the window is measured from the
+server's finalized tick, so the window sits above the lead cap and an ordinary
+finalization lag does not push a legitimately led command outside it. Latency is
+a quality axis, never an admission criterion: a round trip past what lead can
+cover makes commands arrive late, which the player sees and can play through. It
+never fails the clock, ends the session, or spends a recovery attempt, because
+recovery cannot shorten the path it would be complaining about. The client
+bounds speculation to the 32-tick replay budget beyond the latest proven
+committed tick. Replies
 that repeat a stalled tick cannot refill that budget. Once exhausted, assignment
 waits without consuming input edges or command sequences; the wall-clock estimate
 and server debt remain visible. Repeated finalization controls do not apply

@@ -577,7 +577,13 @@ impl DreamAuthority {
                 Some(Admission::Accepted { .. } | Admission::Late)
             ) {
                 let slack = match admission {
-                    Admission::Accepted { arrival_slack } => Some(arrival_slack.min(12) as u8),
+                    // Report the slack the window can actually express. Pinning
+                    // a narrower number would hide how much headroom a distant
+                    // player really has from its own lead controller.
+                    Admission::Accepted { arrival_slack } => Some(
+                        arrival_slack.min(u64::from(engine_net::types::MAX_COMMAND_LEAD_TICKS))
+                            as u8,
+                    ),
                     Admission::Late => Some(0),
                     _ => None,
                 };

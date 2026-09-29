@@ -70,7 +70,7 @@ pub struct CommandLimits {
 impl Default for CommandLimits {
     fn default() -> Self {
         Self {
-            future_ticks: 12,
+            future_ticks: crate::types::MAX_COMMAND_HORIZON_TICKS,
             held_grace_ticks: 3,
             audit_records: 256,
             sequence_ahead: 256,
@@ -187,7 +187,7 @@ impl<I: Clone + Serialize, A: Clone + Serialize> CommandInbox<I, A> {
         limits: CommandLimits,
     ) -> Result<Self, CommandError> {
         if limits.future_ticks == 0
-            || limits.future_ticks > 12
+            || limits.future_ticks > crate::types::MAX_COMMAND_HORIZON_TICKS
             || limits.held_grace_ticks > 3
             || limits.audit_records < usize::from(limits.future_ticks)
             || limits.sequence_ahead < u64::from(limits.future_ticks)
@@ -740,8 +740,11 @@ mod tests {
     #[test]
     fn future_and_sequence_windows_never_retarget_or_fast_forward() {
         let mut inbox = inbox();
+        // One tick past the admission window, wherever that window sits.
+        let window = u64::from(CommandLimits::default().future_ticks);
+        let beyond = window + 1;
         assert_eq!(
-            inbox.admit(ConnectionId(7), command(1, 13), &Rules),
+            inbox.admit(ConnectionId(7), command(1, beyond), &Rules),
             Ok(Admission::Future)
         );
         assert_eq!(inbox.pending_len(), 0);
@@ -749,18 +752,20 @@ mod tests {
             inbox.admit(ConnectionId(7), command(257, 1), &Rules),
             Err(CommandError::SequenceWindow)
         );
-        let mut changed = command(1, 13);
-        changed.target = TargetTick(12);
+        let mut changed = command(1, beyond);
+        changed.target = TargetTick(window);
         assert_eq!(
             inbox.admit(ConnectionId(7), changed, &Rules),
             Err(CommandError::Equivocation)
         );
         advance(&mut inbox);
         assert_eq!(
-            inbox.admit(ConnectionId(7), command(1, 13), &Rules),
-            Ok(Admission::Accepted { arrival_slack: 12 })
+            inbox.admit(ConnectionId(7), command(1, beyond), &Rules),
+            Ok(Admission::Accepted {
+                arrival_slack: window
+            })
         );
-        for tick in 2..13 {
+        for tick in 2..beyond {
             assert!(advance(&mut inbox).is_substitute());
             assert_eq!(inbox.finalized_through(), ServerTick(tick));
         }
@@ -771,8 +776,11 @@ mod tests {
         let mut inbox = CommandInbox::new(
             owner(),
             ServerTick(0),
+            // A deliberately small audit; the lead horizon is not what this
+            // exercises, so pin it rather than inherit the shared maximum.
             CommandLimits {
                 audit_records: 12,
+                future_ticks: 12,
                 ..Default::default()
             },
         )

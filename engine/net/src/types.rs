@@ -5,6 +5,30 @@
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
+/// Largest command lead, in ticks, a client may run ahead of committed
+/// simulation and the server will admit. One value so the two sides cannot
+/// drift: a client that leads further has its commands rejected as future, and
+/// a server that admits less rejects a lead the client legitimately chose.
+///
+/// This is a quality bound, not a reachability bound. It caps how far
+/// prediction may speculate, so it stays well under
+/// `PredictionLimits::replay_ticks_per_frame` and one correction cannot consume
+/// a whole frame's replay budget. At 60 Hz it covers 400 ms of one-way
+/// headroom, so an ordinary intercontinental round trip needs no special
+/// handling.
+pub const MAX_COMMAND_LEAD_TICKS: u8 = 24;
+
+/// Furthest ahead of committed simulation the server will admit a command.
+///
+/// Targets are chosen against the client's *estimated* tick while this window
+/// is measured from the server's *finalized* tick, and those differ by the
+/// finalization lag. The window therefore sits above
+/// [`MAX_COMMAND_LEAD_TICKS`] rather than equal to it, so an ordinary lag does
+/// not push a legitimately led command outside it and force a retry. It is
+/// still bounded by the client's speculation budget, because a command beyond
+/// that could never have been predicted locally.
+pub const MAX_COMMAND_HORIZON_TICKS: u8 = 32;
+
 macro_rules! identity {
     ($($name:ident($repr:ty);)+) => {$ (
         #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

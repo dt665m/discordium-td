@@ -449,10 +449,10 @@ fn eight_maximum_width_decoded_receipts_fit_smallest_admitted_frame() {
 fn finalized_arrival_feedback_preserves_typed_clock_recovery() {
     use engine_net::{
         commands::{FinalizedReceipt, FinalizedStatus},
-        synchronization::{LeadController, ResyncReason},
+        synchronization::LeadController,
     };
     let (mut session, _) = fixture();
-    session.lead = LeadController::new(12).unwrap();
+    session.lead = LeadController::new(engine_net::types::MAX_COMMAND_LEAD_TICKS).unwrap();
     let through = session.finalized.checked_next().unwrap();
     session.sequence = CommandSeq(1);
     session.record_command_issuance(
@@ -513,25 +513,24 @@ fn finalized_arrival_feedback_preserves_typed_clock_recovery() {
         outcomes: Default::default(),
     };
     let mut world = World::new();
-    assert!(matches!(
-        receive_message(
-            &mut runtime,
-            CONTROL_CHANNEL,
-            &bytes,
-            Duration::ZERO,
-            &mut world
-        ),
-        Err(ReceiveRejection::Clock(SyncError::ResyncRequired(
-            ResyncReason::LeadExceeded
-        )))
-    ));
+    // Feedback that would push lead past the maximum saturates and is still
+    // applied: a slow link keeps its session, and the clock error channel stays
+    // reserved for faults recovery can actually repair.
+    receive_message(
+        &mut runtime,
+        CONTROL_CHANNEL,
+        &bytes,
+        Duration::ZERO,
+        &mut world,
+    )
+    .unwrap();
     let session = runtime.prediction.as_ref().unwrap();
     assert_eq!(session.finalized, through);
-    assert_eq!(session.finalized_ack_pending, None);
     assert_eq!(
-        session.lead.needs_resynchronization(),
-        Some(ResyncReason::LeadExceeded)
+        session.lead.lead(),
+        engine_net::types::MAX_COMMAND_LEAD_TICKS
     );
+    assert_eq!(session.lead.needs_resynchronization(), None);
     assert!(matches!(
         receive_message(
             &mut runtime,
@@ -688,7 +687,7 @@ fn slow_first_clock_reply_does_not_partially_initialize_prediction() {
         client_send: Duration::from_secs(1),
         server_receive: Duration::from_millis(2020),
         server_send: Duration::from_millis(2020),
-        client_receive: Duration::from_millis(1700),
+        client_receive: Duration::from_millis(1900),
     };
     // The delay happened locally after the server replied, so this round trip
     // measures a renderer or asset stall rather than the network. Discard the
@@ -1294,13 +1293,15 @@ fn small_finalized_checkpoint_ahead_is_adopted_without_resync_or_input_loss() {
         session.predictor.predicted_tick(OWNER_GROUP),
         Some(ServerTick(12))
     );
-    let (_, frames) = fixture_publication(30, 3, 1);
+    // Past the horizon the client can absorb, adoption is refused.
+    let ahead = 12 + u64::from(engine_net::types::MAX_COMMAND_LEAD_TICKS) + 4;
+    let (_, frames) = fixture_publication(ahead, 3, 1);
     for frame in frames {
         session
             .receive_state(&frame, Duration::from_millis(30))
             .unwrap();
     }
-    session.finalized = ServerTick(30);
+    session.finalized = ServerTick(ahead);
     assert!(session.reconcile().unwrap_err().contains("CheckpointAhead"));
 }
 

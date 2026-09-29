@@ -4,7 +4,7 @@
 //! path symmetry; arrival-slack feedback corrects useful command lead without
 //! claiming an exact uplink measurement. These clocks schedule fixed simulation
 //! steps; they never alter simulation dt or rewrite an already assigned target.
-use crate::types::{ServerTick, TargetTick, TickRate};
+use crate::types::{MAX_COMMAND_LEAD_TICKS, ServerTick, TargetTick, TickRate};
 use std::{cmp::Reverse, collections::VecDeque, time::Duration};
 
 mod committed;
@@ -250,7 +250,7 @@ pub struct LeadController {
 }
 impl LeadController {
     pub fn new(lead: u8) -> Result<Self, SyncError> {
-        if !(1..=12).contains(&lead) {
+        if !(1..=MAX_COMMAND_LEAD_TICKS).contains(&lead) {
             return Err(SyncError::InvalidConfiguration);
         }
         Ok(Self {
@@ -273,7 +273,11 @@ impl LeadController {
         let ticks = (estimate.as_nanos() * u128::from(rate.hz()))
             .div_ceil(1_000_000_000)
             .max(1);
-        if ticks > 12 {
+        // Beyond the horizon this controller can cover. Report it so the
+        // caller can prefer a cleaner probe: the first sample is timestamped
+        // when the client processes the reply, so a local stall reads as an
+        // enormous round trip that no lead would actually fix.
+        if ticks > u128::from(MAX_COMMAND_LEAD_TICKS) {
             return Err(SyncError::ResyncRequired(ResyncReason::LeadExceeded));
         }
         Self::new(ticks as u8)
@@ -290,16 +294,21 @@ impl LeadController {
         if let Some(reason) = self.resync {
             return Err(SyncError::ResyncRequired(reason));
         }
-        if !(-12..=12).contains(&slack) {
+        let bound = i32::from(MAX_COMMAND_LEAD_TICKS);
+        if !(-bound..=bound).contains(&slack) {
             return Err(SyncError::InvalidSample);
         }
         if slack <= 0 {
-            if self.lead == 12 {
-                self.resync = Some(ResyncReason::LeadExceeded);
-                return Err(SyncError::ResyncRequired(ResyncReason::LeadExceeded));
+            // Saturate rather than fail. A round trip this controller cannot
+            // cover makes commands arrive late, which is a quality outcome the
+            // player can see and play through. Ending the session instead
+            // fixes nothing: recovery cannot shorten the path, and each attempt
+            // spends one of the three the sliding window allows, so a slow link
+            // would be disconnected for being slow.
+            if self.lead < MAX_COMMAND_LEAD_TICKS {
+                self.lead += 1;
+                self.samples.clear();
             }
-            self.lead += 1;
-            self.samples.clear();
         } else {
             if self.samples.len() == 32 {
                 self.samples.pop_front();
@@ -335,7 +344,9 @@ impl LeadController {
             if target <= previous {
                 return Ok(None);
             }
-            if target.0 - previous.0 > 12 {
+            // A lead change legitimately moves the target by up to the whole
+            // horizon, so only a jump past that is a real discontinuity.
+            if target.0 - previous.0 > u64::from(MAX_COMMAND_LEAD_TICKS) {
                 self.resync = Some(ResyncReason::TargetDiscontinuity);
                 return Err(SyncError::ResyncRequired(ResyncReason::TargetDiscontinuity));
             }
@@ -503,15 +514,26 @@ mod tests {
     }
     #[test]
     fn lead_capacity_and_presentation_monotonicity_are_explicit() {
+        let rate = TickRate::new(60).unwrap();
+        // An ordinary intercontinental round trip is covered, not refused.
+        assert_eq!(
+            LeadController::bootstrap(rate, ms(600), ms(20))
+                .unwrap()
+                .lead(),
+            20
+        );
+        // Past the horizon the controller can cover, it reports rather than
+        // guesses, so the caller can prefer a cleaner probe.
         assert!(matches!(
-            LeadController::bootstrap(TickRate::new(60).unwrap(), ms(600), ms(0)),
+            LeadController::bootstrap(rate, ms(1200), ms(0)),
             Err(SyncError::ResyncRequired(ResyncReason::LeadExceeded))
         ));
-        let mut lead = LeadController::new(12).unwrap();
-        assert_eq!(
-            lead.observe_arrival_slack(-1),
-            Err(SyncError::ResyncRequired(ResyncReason::LeadExceeded))
-        );
+        // Saturating lead is a quality outcome, never a failed session: a slow
+        // link keeps playing with late commands instead of being disconnected.
+        let mut lead = LeadController::new(MAX_COMMAND_LEAD_TICKS).unwrap();
+        assert_eq!(lead.observe_arrival_slack(-1), Ok(MAX_COMMAND_LEAD_TICKS));
+        assert_eq!(lead.observe_arrival_slack(-1), Ok(MAX_COMMAND_LEAD_TICKS));
+        assert_eq!(lead.needs_resynchronization(), None);
         let mut cursor = PresentationCursor::default();
         assert_eq!(cursor.advance(ms(1000), ms(100)), ms(900));
         assert_eq!(cursor.advance(ms(1010), ms(200)), ms(900));

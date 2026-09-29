@@ -1098,7 +1098,9 @@ impl Session {
                         )
                     })?;
             } else if proof.end_tick() > predicted
-                && (proof.end_tick().0 - predicted.0 <= 12 || self.unstarted_prediction())
+                && (proof.end_tick().0 - predicted.0
+                    <= u64::from(engine_net::types::MAX_COMMAND_LEAD_TICKS)
+                    || self.unstarted_prediction())
                 && same_identity
             {
                 // Receive precedes command generation. A small authoritative

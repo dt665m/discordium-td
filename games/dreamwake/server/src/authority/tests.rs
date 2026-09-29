@@ -1767,8 +1767,12 @@ fn arrival_feedback_counts_first_effective_observations_without_duplicate_inflat
     );
 
     // Future is not effective feedback. Retrying identical input contributes
-    // exactly once when committed progress opens the unchanged twelve-tick window.
-    receive(&mut authority, vec![command(305, 314)]);
+    // exactly once when committed progress opens the unchanged window.
+    let window = engine_net::commands::CommandLimits::default().future_ticks;
+    let future_target = 302 + u64::from(window);
+    // Reported slack is capped at what a lead can actually use.
+    let reported = engine_net::types::MAX_COMMAND_LEAD_TICKS.min(window);
+    receive(&mut authority, vec![command(305, future_target)]);
     assert_eq!(
         authority.peers[&41].arrival,
         live::ArrivalFeedback {
@@ -1781,17 +1785,17 @@ fn arrival_feedback_counts_first_effective_observations_without_duplicate_inflat
     let prepared = peer.inbox.prepare_next(&rules).unwrap();
     peer.inbox.commit(prepared.tick()).unwrap();
     authority.tick = ServerTick(302);
-    receive(&mut authority, vec![command(305, 314)]);
+    receive(&mut authority, vec![command(305, future_target)]);
     assert_eq!(
         authority.peers[&41].arrival,
         live::ArrivalFeedback {
-            sample: Some(sample(305, 314, 302, 12)),
+            sample: Some(sample(305, future_target, 302, reported)),
             observed_commands: 307,
             late_commands: 302,
         }
     );
     authority.peers.get_mut(&41).unwrap().arrival.sample = None;
-    receive(&mut authority, vec![command(305, 314)]);
+    receive(&mut authority, vec![command(305, future_target)]);
     assert_eq!(
         authority.peers[&41].arrival,
         live::ArrivalFeedback {

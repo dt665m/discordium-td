@@ -1279,6 +1279,11 @@ mod tests {
             Some((ServerTick(64), 32768))
         );
         poses.advance_time(Duration::from_millis(1300));
-        assert_eq!(poses.combat_view_time(), Some(Duration::from_millis(1100)));
+        // Both members are now carried the same bounded distance past their
+        // last sample, so the cohort stays coherent and keeps one displayed
+        // time. Remote poses used to freeze here instead, because the policy
+        // refused to extrapolate at all; they now project under the cap, and
+        // the server still rejects any view its own history cannot bracket.
+        assert_eq!(poses.combat_view_time(), Some(Duration::from_millis(1200)));
     }
 }

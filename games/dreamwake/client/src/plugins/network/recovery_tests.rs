@@ -47,6 +47,7 @@ fn recovery_at_250ms_enqueues_its_first_request_immediately() {
         &mut runtime,
         Duration::from_millis(250),
         "invalid checkpoint",
+        ResyncReason::InvalidCheckpoint,
     );
     assert!(runtime.prediction.as_ref().unwrap().recovering);
     assert!(matches!(
@@ -157,6 +158,7 @@ fn throttled_recovery_is_serviced_by_poll_despite_continued_valid_snapshots() {
         &mut runtime,
         Duration::from_millis(250),
         "recovery inside throttle",
+        ResyncReason::InvalidCheckpoint,
     );
     assert_eq!(
         runtime.prediction.as_ref().unwrap().resync_request,
@@ -205,6 +207,7 @@ fn failed_encoding_keeps_recovery_pending_without_advancing_the_throttle() {
         &mut runtime,
         Duration::from_millis(250),
         "cannot encode control",
+        ResyncReason::InvalidCheckpoint,
     );
     let session = runtime.prediction.as_mut().unwrap();
     assert_eq!(session.last_resync, None);
@@ -248,6 +251,7 @@ fn full_control_queue_retains_resync_until_poll_can_enqueue_it() {
         &mut runtime,
         Duration::from_millis(250),
         "control backpressure",
+        ResyncReason::InvalidCheckpoint,
     );
     assert!(!runtime.renet.is_disconnected());
     assert_eq!(runtime.prediction.as_ref().unwrap().last_resync, None);
@@ -289,6 +293,7 @@ fn queued_resync_uses_reliable_retransmission_then_new_welcome_resumes_predictio
         &mut runtime,
         Duration::from_millis(250),
         "recover",
+        ResyncReason::InvalidCheckpoint,
     );
     let sequence = runtime.prediction.as_ref().unwrap().control_sequence;
     assert!(!runtime.renet.get_packets_to_send().is_empty()); // drop the first transmission
@@ -298,6 +303,7 @@ fn queued_resync_uses_reliable_retransmission_then_new_welcome_resumes_predictio
         &mut runtime,
         Duration::from_secs(2),
         "another fault while awaiting Welcome",
+        ResyncReason::InvalidCheckpoint,
     );
     assert_eq!(
         runtime.prediction.as_ref().unwrap().control_sequence,

@@ -406,12 +406,19 @@ fn flush_decoded_receipts(runtime: &mut Runtime) -> Result<(), String> {
     }
     Ok(())
 }
-fn request_resync(world: &mut World, runtime: &mut Runtime, now: Duration, reason: &str) {
+fn request_resync(
+    world: &mut World,
+    runtime: &mut Runtime,
+    now: Duration,
+    reason: &str,
+    kind: ResyncReason,
+) {
     world
         .resource_mut::<diagnostics::Telemetry>()
         .record_issue(diagnostics::IssueKind::Recovery, reason);
     log::warn!("Scoped session requires resynchronization: {reason}");
     if let Some(session) = &mut runtime.prediction {
+        session.resync_reason = kind;
         session.recover();
     }
     service_pending_resync(runtime, now);
@@ -430,7 +437,7 @@ fn service_pending_resync(runtime: &mut Runtime, now: Duration) {
     }
     // Encoding/backpressure failure retains PendingEnqueue and its deadline.
     let Ok(bytes) = session.control(&ClientControl::Resync {
-        reason: ResyncReason::InvalidCheckpoint,
+        reason: session.resync_reason,
     }) else {
         return;
     };
@@ -598,7 +605,13 @@ fn poll_network(world: &mut World) {
             }
             world.resource_mut::<DreamView>().0 = displayed;
         }
-        Err(error) => request_resync(world, &mut runtime, now, &error),
+        Err(error) => request_resync(
+            world,
+            &mut runtime,
+            now,
+            &error,
+            ResyncReason::InvalidCheckpoint,
+        ),
         _ => {}
     }
     let mut probe = false;
@@ -609,7 +622,13 @@ fn poll_network(world: &mut World) {
         }
         let expired = session.expire_groups(now).unwrap_or(1);
         if expired > 0 {
-            request_resync(world, &mut runtime, now, "group assembly expired");
+            request_resync(
+                world,
+                &mut runtime,
+                now,
+                "group assembly expired",
+                ResyncReason::ExpiredGroup,
+            );
         }
     }
     if probe {
@@ -1133,7 +1152,13 @@ fn journal_hardware(world: &mut World) {
         .and_then(|beam| beam.0);
     if let Some(mut runtime) = world.remove_non_send::<Runtime>() {
         if edge_overflow {
-            request_resync(world, &mut runtime, now, "Hardware action edge capacity");
+            request_resync(
+                world,
+                &mut runtime,
+                now,
+                "Hardware action edge capacity",
+                ResyncReason::ReplayBudget,
+            );
             world.insert_non_send(runtime);
             return;
         }
@@ -1145,7 +1170,13 @@ fn journal_hardware(world: &mut World) {
                     edges,
                     mouse_delta: [0.0; 2],
                 }) {
-                    request_resync(world, &mut runtime, now, &error.to_string());
+                    request_resync(
+                        world,
+                        &mut runtime,
+                        now,
+                        &error.to_string(),
+                        ResyncReason::ReplayBudget,
+                    );
                 }
             }
         }
@@ -1163,7 +1194,13 @@ fn predict_and_send(world: &mut World) {
     let now = world.resource::<Time<Real>>().elapsed();
     let result = generate_commands(&mut runtime, now);
     if let Err(error) = result {
-        request_resync(world, &mut runtime, now, &error);
+        request_resync(
+            world,
+            &mut runtime,
+            now,
+            &error,
+            ResyncReason::MissingHistory,
+        );
     }
     if now.as_secs_f64() - runtime.last_received <= PREDICTION_MAX_SNAPSHOT_AGE {
         if let Some(displayed) = runtime

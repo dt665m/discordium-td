@@ -149,6 +149,10 @@ pub(crate) struct Session {
     pub(super) last_probe: Duration,
     pub(super) last_resync: Option<Duration>,
     pub(super) resync_request: ResyncRequest,
+    /// Why recovery was requested. The protocol carries a typed reason and it
+    /// is the only attribution the server ever sees, so it must describe the
+    /// fault that actually happened rather than a fixed placeholder.
+    pub(super) resync_reason: dreamwake_protocol::live::ResyncReason,
 }
 impl Session {
     #[cfg(not(target_arch = "wasm32"))]
@@ -301,6 +305,7 @@ impl Session {
             last_probe: Duration::ZERO,
             last_resync: None,
             resync_request: ResyncRequest::Idle,
+            resync_reason: dreamwake_protocol::live::ResyncReason::InvalidCheckpoint,
             poses: super::presentation::RemotePoses::new(epoch, welcome.content.scene_revision)
                 .map_err(|e| format!("remote presentation: {e:?}"))?,
             model: OwnerModel::new(welcome),

@@ -359,9 +359,11 @@ fn rejected_clock_reply_does_not_partially_commit_simulation_anchor() {
         server_send: Duration::from_millis(400),
         client_receive: Duration::from_millis(800),
     };
+    // The stalled reply is discarded rather than escalated, and coupled
+    // initialization still leaves the anchor untouched.
     assert_eq!(
         session.observe_clock_reply(exchange, ServerTick(24)),
-        Err(SyncError::ResyncRequired(ResyncReason::LeadExceeded))
+        Ok(())
     );
     assert_eq!(session.simulation_clock.anchor(), anchor);
     assert_eq!(session.simulation_clock.committed(), ServerTick(10));

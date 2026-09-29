@@ -14,8 +14,8 @@ use engine_net::{
     prediction::*,
     replication::*,
     synchronization::{
-        ClockConfig, ClockEstimator, ClockSample, CommittedClock, LeadController, SyncError,
-        TimeExchange,
+        ClockConfig, ClockEstimator, ClockSample, CommittedClock, LeadController, ResyncReason,
+        SyncError, TimeExchange,
     },
     types::*,
 };
@@ -306,17 +306,34 @@ impl Session {
             model: OwnerModel::new(welcome),
         })
     }
-    pub(super) fn observe_clock(&mut self, exchange: TimeExchange) -> Result<(), SyncError> {
+    /// Returns whether this probe initialized or advanced the clock. A probe
+    /// that was discarded commits nothing, so callers must not commit coupled
+    /// state for it either.
+    pub(super) fn observe_clock(&mut self, exchange: TimeExchange) -> Result<bool, SyncError> {
         // Initial renderer/asset stalls can delay the first reply far beyond the
         // command horizon. Validate the coupled lead before committing an offset;
         // the next usable probe must still initialize both pieces together.
         let initial_lead = if self.clock.sample_count() == 0 {
             let sample = ClockSample::from_exchange(exchange)?;
-            Some(LeadController::bootstrap(
+            match LeadController::bootstrap(
                 TickRate::new(dreamwake_sim::TICK_HZ).unwrap(),
                 sample.network_round_trip,
                 Duration::from_millis(20),
-            )?)
+            ) {
+                Ok(lead) => Some(lead),
+                // A local renderer or asset stall delays this reply after the
+                // server sent it, so the round trip it reports is the stall,
+                // not the network. Discard the probe and wait for the next
+                // one, exactly as the coupled-initialization rule above
+                // requires. Escalating instead would reject the reply, leave
+                // the clock uninitialized, and spend a recovery attempt that
+                // cannot make a stalled frame arrive sooner; three of those
+                // inside the sliding window end the connection. A round trip
+                // that is genuinely past the horizon still stops the join at
+                // the bootstrap deadline.
+                Err(SyncError::ResyncRequired(ResyncReason::LeadExceeded)) => return Ok(false),
+                Err(error) => return Err(error),
+            }
         } else {
             None
         };
@@ -324,7 +341,7 @@ impl Session {
         if let Some(lead) = initial_lead {
             self.lead = lead;
         }
-        Ok(())
+        Ok(true)
     }
     pub(super) fn observe_clock_reply(
         &mut self,
@@ -333,7 +350,10 @@ impl Session {
     ) -> Result<(), SyncError> {
         let mut simulation_clock = self.simulation_clock;
         simulation_clock.observe(tick, exchange.server_send)?;
-        self.observe_clock(exchange)?;
+        // Coupled initialization: a discarded probe advances neither piece.
+        if !self.observe_clock(exchange)? {
+            return Ok(());
+        }
         self.simulation_clock = simulation_clock;
         Ok(())
     }

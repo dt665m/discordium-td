@@ -690,13 +690,14 @@ fn slow_first_clock_reply_does_not_partially_initialize_prediction() {
         server_send: Duration::from_millis(2020),
         client_receive: Duration::from_millis(1700),
     };
-    assert_eq!(
-        session.observe_clock(delayed),
-        Err(engine_net::synchronization::SyncError::ResyncRequired(
-            engine_net::synchronization::ResyncReason::LeadExceeded
-        ))
-    );
+    // The delay happened locally after the server replied, so this round trip
+    // measures a renderer or asset stall rather than the network. Discard the
+    // probe and keep waiting: escalating would reject the reply, leave the
+    // clock uninitialized anyway, and spend one of the three recovery attempts
+    // the sliding window allows before the connection ends.
+    assert_eq!(session.observe_clock(delayed), Ok(false));
     assert_eq!(session.clock.sample_count(), 0);
+    assert_eq!(session.lead.needs_resynchronization(), None);
     assert_eq!(session.clock.target_offset_nanos(), None);
     assert_eq!(session.lead.lead(), 3);
     assert_eq!(

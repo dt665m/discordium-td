@@ -524,12 +524,24 @@ impl RemotePoses {
         for entity in &self.combat_entities {
             let identity = self.buffer.identity(*entity)?;
             let shown = self.buffer.sample(identity.scope, &policy).ok()??;
-            if common.is_some_and(|previous| previous != shown.pose_time) {
+            if matches!(shown.status, Status::Buffering) {
                 return None;
             }
-            common = Some(shown.pose_time);
+            // Agreement covers how the time was reached, not just its value. A
+            // member carried past its last sample reports the same stamp as one
+            // an observation actually brackets, so comparing stamps alone lets
+            // a starved target resolve combat against a pose the server never
+            // published. A cohort starved together still shares one displayed
+            // time and stays usable.
+            let observed = matches!(shown.status, Status::Sampled | Status::Interpolated);
+            if common.is_some_and(|previous| previous != (shown.pose_time, observed)) {
+                return None;
+            }
+            common = Some((shown.pose_time, observed));
         }
-        common.or_else(|| Some(self.buffer.cursor()))
+        common
+            .map(|(time, _)| time)
+            .or_else(|| Some(self.buffer.cursor()))
     }
     pub fn combat_view_tick(&self) -> Option<ServerTick> {
         TickRate::new(dreamwake_sim::TICK_HZ)?.elapsed_ticks(self.combat_view_time()?)

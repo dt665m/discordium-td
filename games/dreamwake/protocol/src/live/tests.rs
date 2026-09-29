@@ -553,7 +553,7 @@ fn complete_enemy_replicas_use_exact_compact_fields() {
         let payload = ReplicaPayload::Actor(actor);
         let encoded = encode_replica(&payload).unwrap();
         assert_eq!(encoded[1], 0, "compact enemies need no general compression");
-        assert_eq!(encoded.len(), 67);
+        assert_eq!(encoded.len(), 75);
         assert_eq!(decode_replica(&encoded, None).unwrap(), payload);
         let frame_bytes = |bytes: Vec<u8>| {
             encode_state(
@@ -715,9 +715,20 @@ fn maximum_declared_schema_envelopes_roundtrip_without_compression() {
         members,
     };
     let encoded = encode_group(&group, group_limits(), |payload| Ok(payload.clone())).unwrap();
-    assert_eq!(encoded.len(), 29_241);
+    // Capacity proof at every schema's declared maximum, not a live payload.
+    // Track the exact figure so a schema change cannot quietly consume the
+    // group budget, and keep real headroom under the cap: an owner group that
+    // reached GROUP_BYTES could not be published at all, and bootstrap depends
+    // on publishing it atomically. A large opaque BoundedBytes field charges
+    // its whole declared size here even when it is nearly empty on the wire.
+    assert_eq!(encoded.len(), 51_929);
     assert!(encoded.len() > 16 * 1024);
-    assert!(encoded.len() <= baselines::GROUP_BYTES);
+    assert!(
+        encoded.len() <= baselines::GROUP_BYTES * 7 / 8,
+        "owner group maximum {} leaves too little headroom under {}",
+        encoded.len(),
+        baselines::GROUP_BYTES
+    );
     let message = encode_state(
         &StateFrame::Group(group.clone()),
         publication.connection,

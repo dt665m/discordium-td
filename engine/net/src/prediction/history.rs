@@ -11,6 +11,17 @@ pub enum DependencyValue<D> {
     ExplicitlyAbsent,
     Unavailable,
 }
+impl<D: crate::replication::Payload> DependencyValue<D> {
+    /// Whether losing this record only degrades presentation. A frame that
+    /// recorded an absent or unavailable dependency read no value from it, so
+    /// revoking that scope cannot change what the frame reproduces.
+    pub fn optional(&self) -> bool {
+        match self {
+            Self::Known(value) => value.optional(),
+            Self::ExplicitlyAbsent | Self::Unavailable => true,
+        }
+    }
+}
 #[derive(Debug, Clone, PartialEq)]
 pub struct DependencyRecord<D> {
     pub scope: ScopeIdentity,

@@ -96,6 +96,10 @@ impl Payload for Dependency {
     fn retained_bytes(&self) -> usize {
         0
     }
+    /// Negative values stand for presentation-only dependencies.
+    fn optional(&self) -> bool {
+        self.0 < 0
+    }
 }
 #[derive(Debug, Clone, PartialEq)]
 struct Wire {
@@ -749,6 +753,38 @@ fn historical_dependency_samples_outlive_visible_scope_exit_but_revocation_block
         manager
             .dependency_history(GroupId(1), ServerTick(1))
             .is_some()
+    );
+}
+
+#[test]
+fn revoking_a_presentation_only_disclosure_prunes_it_without_stopping_prediction() {
+    // An observer moving through the world sees scopes leave range constantly.
+    // When the frames that read them only used the value for presentation,
+    // that is ordinary movement and prediction has to survive it; recovering
+    // instead would spend the session's capped recoveries on routine events.
+    // Published without this scope in the group manifest: a presentation
+    // target is an independently disclosed actor, not a group member.
+    let (mut manager, _replicas, model) = initialized(
+        PredictionLimits::default(),
+        State::default(),
+        DependencyFrame::default(),
+    );
+    let deps = dependency(1, DependencyValue::Known(Dependency(-1)));
+    predict(&mut manager, 2, &deps, &model);
+    manager.revoke_scope(scope(99));
+    assert_eq!(manager.recovery(GroupId(1)), None);
+    // The entitlement is still withdrawn: nothing keeps predicting from it.
+    assert_eq!(
+        manager
+            .dependency_history(GroupId(1), ServerTick(1))
+            .unwrap()
+            .value(entity(99)),
+        None
+    );
+    assert!(
+        manager
+            .predict(GroupId(1), input(1, 3), deps, &model)
+            .is_ok()
     );
 }
 

@@ -1041,15 +1041,23 @@ impl<M: PredictionModel> PredictionManager<M> {
     /// explicit resynchronization lifecycle replaces/removes this group.
     pub fn revoke_scope(&mut self, scope: ScopeIdentity) {
         for history in self.groups.values_mut() {
-            if history.identity.scopes.contains(&scope)
-                || history.frames.values().any(|frame| {
-                    frame
-                        .dependencies
-                        .records
-                        .values()
-                        .any(|record| record.scope == scope)
-                })
-            {
+            // Drop the entitlement everywhere it is retained, so nothing keeps
+            // predicting from a disclosure that was withdrawn.
+            let mut required = history.identity.scopes.contains(&scope);
+            for frame in history.frames.values_mut() {
+                frame.dependencies.records.retain(|_, record| {
+                    if record.scope != scope {
+                        return true;
+                    }
+                    // Only a value the simulation had to read makes this frame
+                    // unreplayable. A presentation-only value is dropped and
+                    // the frame stands, because a scope leaving range is
+                    // ordinary movement, not a fault worth recovering from.
+                    required |= !record.value.optional();
+                    false
+                });
+            }
+            if required {
                 history.recovery = Some(RecoveryReason::DisclosureRevoked);
             }
         }

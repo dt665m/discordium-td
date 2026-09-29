@@ -48,6 +48,17 @@ impl Payload for CollisionDependency {
             Self::PresentationTarget(_) => 0,
         }
     }
+    fn optional(&self) -> bool {
+        match self {
+            // Replay must read these back to reproduce collision and platform
+            // motion, so losing either really does make a frame unreplayable.
+            Self::StaticCollision(_) | Self::Platform(_) => false,
+            // Reversible companion targeting only. An enemy leaving range is
+            // ordinary movement, and replay already drops targets per frame,
+            // so a revoked pose must not invalidate frames that saw it.
+            Self::PresentationTarget(_) => true,
+        }
+    }
 }
 // 64 permitted colliders, conservative prepared geometry envelope plus the
 // dependency record/map overhead. This is independent of wire group size.

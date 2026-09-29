@@ -25,6 +25,19 @@ pub use server::*;
 /// bound decoding allocations before constructing this value.
 pub trait Payload: Clone + PartialEq {
     fn retained_bytes(&self) -> usize;
+
+    /// Whether losing this value only degrades presentation.
+    ///
+    /// A dependency the simulation must read to reproduce a frame is required:
+    /// if its disclosure is revoked, the frame can no longer be replayed and
+    /// prediction has to recover. A value that merely guides reversible
+    /// presentation is not, and revoking it must not invalidate frames that
+    /// already read it, because a scope leaving an observer's range is ordinary
+    /// and frequent rather than a fault. Default to required, so a new
+    /// dependency is only exempt when its author says so.
+    fn optional(&self) -> bool {
+        false
+    }
 }
 impl Payload for Vec<u8> {
     fn retained_bytes(&self) -> usize {

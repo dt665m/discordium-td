@@ -1,6 +1,29 @@
 use super::*;
 use crate::*;
 
+/// Replay rebuilds a one-shot edge from the admitted action, exactly as the
+/// client does, so a dash must be supplied here and not only as an input bit.
+fn dash_key(sequence: u64) -> crate::combat::RayActionKey {
+    crate::combat::RayActionKey {
+        // Must match this fixture's stamp: a transient keyed to another match
+        // epoch fails owner validation.
+        match_epoch: 1,
+        connection_epoch: 3,
+        command_stream: 2,
+        ownership_epoch: 1,
+        actor: 1,
+        actor_generation: 1,
+        command_sequence: sequence,
+        action_slot: 0,
+    }
+}
+fn dash_action(tick: u64, input: &DreamInput) -> Option<OwnerCombatAction> {
+    input.dash.then(|| OwnerCombatAction::Dash {
+        key: dash_key(tick + 1),
+        direction: input.movement,
+    })
+}
+
 fn arena(players: u64) -> DreamSimulation {
     let mut sim = DreamSimulation::new(19, false);
     for owner in 2..=players {
@@ -72,7 +95,9 @@ fn eight_overlapping_and_crossing_players_do_not_change_owner_collision_or_repla
             .collect();
         crowded.step_multiplayer(&party);
         alone.step(input);
-        predicted.step_restricted(input, &collision).unwrap();
+        predicted
+            .step_restricted_combat(input, &collision, dash_action(tick as u64, &input), None)
+            .unwrap();
         let authoritative = checkpoint(&crowded, tick as u64 + 1);
         assert_eq!(
             authoritative.hero.motion,
@@ -97,8 +122,15 @@ fn eight_overlapping_and_crossing_players_do_not_change_owner_collision_or_repla
     // be arbitrarily far behind. The replay API has no rendered actor input.
     for boundary in [0, 17, 60, 125, 170] {
         let mut replay = history[boundary].clone();
-        for input in &inputs[boundary..] {
-            replay.step_restricted(*input, &collision).unwrap();
+        for (offset, input) in inputs[boundary..].iter().enumerate() {
+            replay
+                .step_restricted_combat(
+                    *input,
+                    &collision,
+                    dash_action((boundary + offset) as u64, input),
+                    None,
+                )
+                .unwrap();
         }
         assert_eq!(
             replay.checkpoint.hero.motion,

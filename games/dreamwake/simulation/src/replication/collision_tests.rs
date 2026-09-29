@@ -2,6 +2,29 @@ use super::*;
 use crate::{collision::*, *};
 use engine_core::{ColliderKey, KinematicState, Stance};
 
+/// Replay rebuilds a one-shot edge from the admitted action, exactly as the
+/// client does, so a dash must be supplied here and not only as an input bit.
+fn dash_key(sequence: u64) -> crate::combat::RayActionKey {
+    crate::combat::RayActionKey {
+        // Must match this fixture's stamp: a transient keyed to another match
+        // epoch fails owner validation.
+        match_epoch: 1,
+        connection_epoch: 3,
+        command_stream: 2,
+        ownership_epoch: 1,
+        actor: 1,
+        actor_generation: 1,
+        command_sequence: sequence,
+        action_slot: 0,
+    }
+}
+fn dash_action(tick: u64, input: &DreamInput) -> Option<OwnerCombatAction> {
+    input.dash.then(|| OwnerCombatAction::Dash {
+        key: dash_key(tick + 1),
+        direction: input.movement,
+    })
+}
+
 fn stamp(sim: &DreamSimulation, tick: u64) -> ReplicationStamp {
     ReplicationStamp {
         match_epoch: 1,
@@ -68,7 +91,7 @@ fn shared_capsule_sweeps_dash_at_perimeter_and_restores_replay_exactly() {
                 input,
                 &collision,
                 &required_platforms(&sim, &predicted),
-                None,
+                dash_action(tick as u64, &input),
                 None,
             )
             .unwrap();

@@ -636,12 +636,18 @@ fn restricted_owner_replays_shared_motion_dash_attack_without_world_state() {
             attack: true,
             ..Default::default()
         };
+        // Replay rebuilds a one-shot edge from the admitted action, exactly as
+        // the client does, so the dash must be supplied here as well.
+        let action = input.dash.then(|| OwnerCombatAction::Dash {
+            key: owner_cast_key(tick as u64 + 1),
+            direction: input.movement,
+        });
         predicted
             .step_restricted_combat_with_bases(
                 input,
                 &collision(),
                 &required_platforms(&sim, &predicted),
-                None,
+                action,
                 None,
             )
             .unwrap();
@@ -978,6 +984,13 @@ fn shared_owner_prediction_covers_every_memory_and_essence_lifecycle() {
         // Running slightly past it proves effects, repeats, missiles, wisps,
         // shield and invulnerability all retire through shared systems.
         for _ in 0..620 {
+            // A base sample further than MAX_SAMPLE_DISTANCE from the predicted
+            // tick is deliberately refused, so the authority has to keep moving
+            // and republishing platform state the way a live server does.
+            // Holding one snapshot across this whole run would stop being a
+            // declared trajectory and start being a stale one.
+            authority.step(DreamInput::default());
+            let bases = required_platforms(&authority, &predicted);
             runner
                 .step(
                     &mut predicted,

@@ -35,7 +35,9 @@ pub struct ArrivalSample {
     pub sequence: CommandSeq,
     pub target: TargetTick,
     pub arrival_tick: ServerTick,
-    /// Zero means a missed deadline; accepted commands have 1..=12 ticks left.
+    /// Zero means a missed deadline; accepted commands have 1 to
+    /// `MAX_COMMAND_LEAD_TICKS` ticks left. More headroom than the lead
+    /// controller can use is reported at that cap.
     pub slack: u8,
 }
 
@@ -54,9 +56,13 @@ impl ArrivalFeedback {
                 self.observed_commands != 0
                     && sample.sequence.0 != 0
                     && sample.target.0 != 0
-                    && sample.slack <= 12
-                    && sample.target.0.saturating_sub(sample.arrival_tick.0)
-                        == u64::from(sample.slack)
+                    && sample.slack <= engine_net::types::MAX_COMMAND_LEAD_TICKS
+                    && {
+                        let headroom = sample.target.0.saturating_sub(sample.arrival_tick.0);
+                        headroom == u64::from(sample.slack)
+                            || (sample.slack == engine_net::types::MAX_COMMAND_LEAD_TICKS
+                                && headroom > u64::from(sample.slack))
+                    }
                     && if sample.slack == 0 {
                         self.late_commands != 0
                     } else {

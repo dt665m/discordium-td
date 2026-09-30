@@ -40,6 +40,15 @@ fn arrival_feedback_roundtrips_identity_counters_and_separate_finalization() {
             arrival_tick: ServerTick(10),
             slack: 12,
         }),
+        // More headroom than lead can use is reported at the lead cap. The
+        // server produces this whenever a command arrives that early; refusing
+        // it once ended the session from the server's own encoder.
+        Some(ArrivalSample {
+            sequence: CommandSeq(7),
+            target: TargetTick(50),
+            arrival_tick: ServerTick(10),
+            slack: engine_net::types::MAX_COMMAND_LEAD_TICKS,
+        }),
         Some(ArrivalSample {
             sequence: CommandSeq(3),
             target: TargetTick(9),
@@ -104,8 +113,9 @@ fn arrival_feedback_rejects_impossible_samples_on_encoding_and_decoding() {
             2 => bad.sample.as_mut().unwrap().sequence = CommandSeq(0),
             3 => bad.sample.as_mut().unwrap().target = TargetTick(0),
             4 => {
-                bad.sample.as_mut().unwrap().target = TargetTick(23);
-                bad.sample.as_mut().unwrap().slack = 13;
+                let beyond = engine_net::types::MAX_COMMAND_LEAD_TICKS + 1;
+                bad.sample.as_mut().unwrap().target = TargetTick(10 + u64::from(beyond));
+                bad.sample.as_mut().unwrap().slack = beyond;
             }
             5 => bad.sample.as_mut().unwrap().slack = 7,
             6 => bad.sample.as_mut().unwrap().slack = 0,

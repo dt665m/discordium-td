@@ -534,7 +534,6 @@ fn finalized_arrival_feedback_preserves_typed_clock_recovery() {
         session.lead.lead(),
         engine_net::types::MAX_COMMAND_LEAD_TICKS
     );
-    assert_eq!(session.lead.needs_resynchronization(), None);
     assert!(matches!(
         receive_message(
             &mut runtime,
@@ -700,7 +699,6 @@ fn slow_first_clock_reply_does_not_partially_initialize_prediction() {
     // the sliding window allows before the connection ends.
     assert_eq!(session.observe_clock(delayed), Ok(false));
     assert_eq!(session.clock.sample_count(), 0);
-    assert_eq!(session.lead.needs_resynchronization(), None);
     assert_eq!(session.clock.target_offset_nanos(), None);
     assert_eq!(session.lead.lead(), 3);
     assert_eq!(
@@ -729,12 +727,11 @@ fn slow_first_clock_reply_does_not_partially_initialize_prediction() {
             .unwrap(),
         ServerTick(182)
     );
-    let suspended = engine_net::synchronization::SyncError::ResyncRequired(
-        engine_net::synchronization::ResyncReason::Suspension,
-    );
+    // Four seconds without a frame (a background tab) is time that passed,
+    // not a fault: the estimate lands where the server now is.
     assert_eq!(
         session.clock.estimate_server_tick(Duration::from_secs(6)),
-        Err(suspended)
+        Ok(ServerTick(420))
     );
     assert_eq!(
         session.observe_clock(TimeExchange {
@@ -743,9 +740,9 @@ fn slow_first_clock_reply_does_not_partially_initialize_prediction() {
             server_send: Duration::from_millis(7020),
             client_receive: Duration::from_millis(6040),
         }),
-        Err(suspended)
+        Ok(true)
     );
-    assert_eq!(session.clock.sample_count(), 1);
+    assert_eq!(session.clock.sample_count(), 2);
 }
 
 pub(super) fn fixture_publication(
@@ -1297,7 +1294,8 @@ fn small_finalized_checkpoint_ahead_is_adopted_without_resync_or_input_loss() {
         session.predictor.predicted_tick(OWNER_GROUP),
         Some(ServerTick(12))
     );
-    // Past the horizon the client can absorb, adoption is refused.
+    // However far the finalized checkpoint is ahead (a hitch, a background
+    // tab), every discarded target is already finalized, so it is adopted.
     let ahead = 12 + u64::from(engine_net::types::MAX_COMMAND_LEAD_TICKS) + 4;
     let (_, frames) = fixture_publication(ahead, 3, 1);
     for frame in frames {
@@ -1306,7 +1304,12 @@ fn small_finalized_checkpoint_ahead_is_adopted_without_resync_or_input_loss() {
             .unwrap();
     }
     session.finalized = ServerTick(ahead);
-    assert!(session.reconcile().unwrap_err().contains("CheckpointAhead"));
+    session.reconcile().unwrap();
+    assert_eq!(
+        session.predictor.predicted_tick(OWNER_GROUP),
+        Some(ServerTick(ahead))
+    );
+    assert!(!session.recovering);
 }
 
 #[test]
@@ -1906,17 +1909,23 @@ fn moderate_join_gap_uses_budget_and_preserves_sample_deadlines() {
             mouse_delta: [0.0; 2],
         })
         .unwrap();
-    assert!(preflight_prediction_commands(&session, 0, ServerTick(411), TargetTick(444)).is_err());
-    assert!(
-        preflight_prediction_commands(&session, 242, ServerTick(411), TargetTick(426)).is_err()
+    // Owner history bounds the frame budget, so a moderate join gap is
+    // covered at once; only unacknowledged capacity can refuse it.
+    assert_eq!(
+        prediction_ticks_this_frame(&session, 0, ServerTick(411), TargetTick(444)),
+        Ok(33)
     );
+    assert!(prediction_ticks_this_frame(&session, 242, ServerTick(411), TargetTick(426)).is_err());
     assert_eq!(session.journal.pending_samples(), 1);
     assert_eq!(session.sequence, CommandSeq(0));
     assert_eq!(
         session.predictor.predicted_tick(OWNER_GROUP),
         Some(ServerTick(411))
     );
-    preflight_prediction_commands(&session, 0, ServerTick(411), TargetTick(426)).unwrap();
+    assert_eq!(
+        prediction_ticks_this_frame(&session, 0, ServerTick(411), TargetTick(426)),
+        Ok(15)
+    );
     for tick in 412..=426 {
         let sample = session
             .command_sample(TargetTick(tick), TargetTick(426), now)
@@ -2452,7 +2461,7 @@ fn new_prediction_frames_refresh_platform_samples_across_long_running_checkpoint
 }
 
 #[test]
-fn stale_bootstrap_waits_for_fresh_checkpoint_without_assigning_or_replaying_commands() {
+fn stale_bootstrap_forecasts_from_its_checkpoint_and_adopts_newer_ones() {
     let (mut session, frames) = fixture_publication(10, 1, 1);
     session.begin_frame().unwrap();
     for frame in frames {
@@ -2478,22 +2487,21 @@ fn stale_bootstrap_waits_for_fresh_checkpoint_without_assigning_or_replaying_com
             mouse_delta: [0.0; 2],
         })
         .unwrap();
+    // A stale bootstrap checkpoint is a starting point, not a fault. The
+    // target is assigned and generation forecasts server-style substitutes
+    // forward from the checkpoint; no command identity is spent meanwhile.
     assert_eq!(
         session.assign_command_target(ServerTick(100)).unwrap(),
-        None
-    );
-    assert_eq!(
-        session.assign_command_target(ServerTick(120)).unwrap(),
-        None
+        Some(TargetTick(103))
     );
     assert_eq!(session.sequence, CommandSeq(0));
     assert_eq!(session.journal.pending_samples(), 1);
     assert_eq!(
-        session.predictor.predicted_tick(OWNER_GROUP),
-        Some(ServerTick(10))
+        prediction_ticks_this_frame(&session, 0, ServerTick(10), TargetTick(103)),
+        Ok(93)
     );
 
-    // A large authoritative advance is safe only because nothing was predicted.
+    // A newer finalized checkpoint is adopted before anything was predicted.
     let (_, frames) = fixture_publication(105, 2, 1);
     session.begin_frame().unwrap();
     session.finalized = ServerTick(105);
@@ -2509,14 +2517,6 @@ fn stale_bootstrap_waits_for_fresh_checkpoint_without_assigning_or_replaying_com
     );
     assert_eq!(session.predictor.work().replay_ticks, 0);
     assert_eq!(session.predictor.work().predicted_ticks, 0);
-    assert_eq!(
-        session.assign_command_target(ServerTick(120)).unwrap(),
-        Some(TargetTick(123))
-    );
-    assert_eq!(session.sequence, CommandSeq(0));
-    assert_eq!(session.journal.pending_samples(), 1);
-    preflight_prediction_commands(&session, 0, ServerTick(105), TargetTick(123)).unwrap();
-    assert!(preflight_prediction_commands(&session, 0, ServerTick(105), TargetTick(138)).is_err());
 
     let command = InputCommand(Command {
         owner: session.model.welcome.stream,
@@ -2535,7 +2535,8 @@ fn stale_bootstrap_waits_for_fresh_checkpoint_without_assigning_or_replaying_com
         .predict(OWNER_GROUP, command, dependencies, &session.model)
         .unwrap();
     session.sequence = CommandSeq(1);
-    // The bootstrap exception cannot discard an established speculative history.
+    // An established history is rebased too once the checkpoint finalizes
+    // every command in it; the command sequence continues.
     let (_, frames) = fixture_publication(150, 3, 1);
     session.begin_frame().unwrap();
     session.finalized = ServerTick(150);
@@ -2544,5 +2545,10 @@ fn stale_bootstrap_waits_for_fresh_checkpoint_without_assigning_or_replaying_com
             .receive_state(&frame, Duration::from_secs(3))
             .unwrap();
     }
-    assert!(session.reconcile().is_err());
+    session.reconcile().unwrap();
+    assert_eq!(
+        session.predictor.predicted_tick(OWNER_GROUP),
+        Some(ServerTick(150))
+    );
+    assert_eq!(session.sequence, CommandSeq(1));
 }

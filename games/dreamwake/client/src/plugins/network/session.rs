@@ -371,28 +371,14 @@ impl Session {
     /// authored ticks consume hardware samples at their own capture deadlines.
     /// Lead changes may pause the input deadline but cannot drain it backward.
     /// This never edits an already assigned command or its target.
+    /// Choose the fresh command head. Forecast ticks before that head use
+    /// checkpointed missing-input state; authored ticks consume hardware
+    /// samples at their own capture deadlines. This never edits an already
+    /// assigned command or its target.
     pub(super) fn assign_command_target(
         &mut self,
         estimated: ServerTick,
     ) -> Result<Option<TargetTick>, String> {
-        if self.unstarted_prediction() {
-            let current = self.predictor.predicted_tick(OWNER_GROUP).unwrap();
-            let target = estimated
-                .0
-                .checked_add(u64::from(self.lead.lead()))
-                .ok_or("clock range")?;
-            let remaining = self
-                .predictor
-                .remaining_prediction_ticks(OWNER_GROUP)
-                .ok_or("missing owner prediction")?;
-            // Admission can finish while its initial checkpoint is still old.
-            // Wait for a current complete checkpoint before assigning any intent;
-            // otherwise assigning a target here poisons the lead controller even
-            // though no command could fit the unchanged frame work budget.
-            if target.saturating_sub(current.0) > remaining as u64 {
-                return Ok(None);
-            }
-        }
         self.lead.assign_target(estimated).map_err(err)
     }
     pub(super) fn forecast_gap(&self, estimated: ServerTick) -> bool {
@@ -483,21 +469,6 @@ impl Session {
             self.lead_policy_head = None;
         }
         Ok(())
-    }
-    fn unstarted_prediction(&self) -> bool {
-        self.sequence == CommandSeq(0)
-            && self
-                .predictor
-                .predicted_tick(OWNER_GROUP)
-                .is_some_and(|tick| {
-                    self.predictor
-                        .replay_input_history(OWNER_GROUP, tick)
-                        .is_none()
-                        && self
-                            .predictor
-                            .state(OWNER_GROUP)
-                            .is_some_and(|state| state.0.stamp().server_tick == tick.0)
-                })
     }
     pub(super) fn capture_combat_view(&mut self, at: Duration) -> Option<CombatViewStamp> {
         if !self.active || self.recovering {
@@ -1097,28 +1068,22 @@ impl Session {
                 // An intermediate closure may be lost on the state lane. A
                 // later revision can therefore contain the same scopes again;
                 // it still requires an atomic replacement and bounded replay.
-                let unstarted = self.unstarted_prediction();
-                self.predictor =
-                    replace_topology(&self.predictor, &self.model, &proof, self.frame, unstarted)
-                        .map_err(|error| {
+                self.predictor = replace_topology(&self.predictor, &self.model, &proof, self.frame)
+                    .map_err(|error| {
                         format!(
                             "{error}; active={} sequence={}",
                             self.active, self.sequence.0
                         )
                     })?;
-            } else if proof.end_tick() > predicted
-                && (proof.end_tick().0 - predicted.0
-                    <= u64::from(engine_net::types::MAX_COMMAND_LEAD_TICKS)
-                    || self.unstarted_prediction())
-                && same_identity
-            {
-                // Receive precedes command generation. A small authoritative
-                // advance can therefore outrun the last rendered prediction.
-                // Before the first command, any newer complete checkpoint needs
-                // no replay; no speculative history or assigned intent exists.
-                // Every discarded target is already finalized; adopt a fully
-                // decoded replacement atomically, without inventing inputs or
-                // discarding the hardware journal/future command sequence.
+            } else if proof.end_tick() > predicted && same_identity {
+                // The server has simulated past everything this client has
+                // predicted: receive precedes command generation, and after a
+                // hitch or a background tab the gap is as long as the pause.
+                // Every discarded target is already finalized (checked above),
+                // so nothing local remains to replay. Rebase on the complete
+                // checkpoint atomically, without inventing inputs or discarding
+                // the hardware journal/future command sequence; command
+                // generation forecasts forward from here.
                 let mut replacement = new_predictor(self.model.welcome.stream.epoch)?;
                 replacement
                     .begin_frame(ReplicationFrame(self.frame))
@@ -1400,30 +1365,13 @@ fn replace_topology(
     model: &OwnerModel,
     proof: &PublishedGroup<'_, Vec<u8>>,
     frame: u64,
-    unstarted: bool,
 ) -> Result<PredictionManager<OwnerModel>, String> {
     let predicted = old
         .predicted_tick(OWNER_GROUP)
         .ok_or("missing topology history")?;
+    // Replay is bounded by retained history. A checkpoint ahead of the
+    // prediction (after a hitch) has nothing to replay and becomes the base.
     let replay = predicted.0.saturating_sub(proof.end_tick().0);
-    let work = old.work();
-    if replay > 32
-        || work.replay_ticks != 0
-        || work.predicted_ticks != 0
-        // A pure authoritative checkpoint has no input to replay. A newer
-        // complete closure can replace it when no replayable transition remains.
-        || (!unstarted && proof.end_tick().0 > predicted.0.saturating_add(12))
-    {
-        return Err(format!(
-            "topology replay exceeds frame work budget: predicted={} incoming={} revision={} replay={} work_replay={} work_predicted={} unstarted={unstarted}",
-            predicted.0,
-            proof.end_tick().0,
-            proof.publication().revision.0,
-            replay,
-            work.replay_ticks,
-            work.predicted_ticks,
-        ));
-    }
     // Retain both managers until commit, including worst-case checkpoint,
     // dependency and command storage plus map/event bookkeeping for each frame.
     let staging = (replay as usize + 1) * (80 * 1024 + COLLISION_HISTORY_BYTES + 8192);
@@ -1467,6 +1415,12 @@ fn replace_topology(
 }
 
 fn new_predictor(epoch: ConnectionEpoch) -> Result<PredictionManager<OwnerModel>, String> {
+    let defaults = PredictionLimits::default();
+    // One small owner group: retained history is the real bound on replay and
+    // forecast work. A tighter per-frame budget would turn round trip plus
+    // lead, or a hitch, into a fault instead of a slightly longer frame.
+    let ticks = defaults.history_ticks;
+    let steps = ticks * defaults.entities_per_group;
     PredictionManager::new(
         epoch,
         PredictionLimits {
@@ -1474,7 +1428,11 @@ fn new_predictor(epoch: ConnectionEpoch) -> Result<PredictionManager<OwnerModel>
             // owner's bounded 64 KiB decoded allocation envelope.
             checkpoint_bytes: 80 * 1024,
             dependency_bytes: COLLISION_HISTORY_BYTES,
-            ..Default::default()
+            replay_ticks_per_frame: ticks,
+            replay_entity_steps_per_frame: steps,
+            prediction_ticks_per_frame: ticks,
+            prediction_entity_steps_per_frame: steps,
+            ..defaults
         },
     )
     .map_err(err)

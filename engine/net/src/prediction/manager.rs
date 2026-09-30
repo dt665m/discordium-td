@@ -901,18 +901,26 @@ impl<M: PredictionModel> PredictionManager<M> {
             let steps = replay_ticks
                 .checked_mul(history.identity.scopes.len())
                 .ok_or(PredictionError::Capacity)?;
-            if manager
-                .work
-                .replay_ticks
-                .checked_add(replay_ticks)
-                .is_none_or(|n| n > manager.limits.replay_ticks_per_frame)
-                || manager
+            // The budget spreads replay across frames; it never stops
+            // reconciliation. Replay length is already bounded by retained
+            // history, and it grows with round trip plus lead, so refusing a
+            // single long replay would end sessions on slow links. The first
+            // replay of a frame therefore always runs; a later one in the same
+            // frame waits, leaving this checkpoint for the next frame.
+            let already_replayed = manager.work.replay_ticks > 0;
+            if already_replayed
+                && (manager
                     .work
-                    .replay_entity_steps
-                    .checked_add(steps)
-                    .is_none_or(|n| n > manager.limits.replay_entity_steps_per_frame)
+                    .replay_ticks
+                    .checked_add(replay_ticks)
+                    .is_none_or(|n| n > manager.limits.replay_ticks_per_frame)
+                    || manager
+                        .work
+                        .replay_entity_steps
+                        .checked_add(steps)
+                        .is_none_or(|n| n > manager.limits.replay_entity_steps_per_frame))
             {
-                return recover(history, RecoveryReason::ReplayBudget);
+                return Ok(Correction::Deferred);
             }
             let per_frame = manager
                 .limits

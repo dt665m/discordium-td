@@ -1346,22 +1346,26 @@ fn predict_and_send(world: &mut World) {
     }
     world.insert_non_send(runtime);
 }
-fn preflight_prediction_commands(
+/// How many ticks toward `target` fit this frame's prediction budget. A gap
+/// longer than the budget (the client stopped running for a while) is covered
+/// over several frames rather than treated as a fault.
+fn prediction_ticks_this_frame(
     session: &Session,
     pending: usize,
     current: ServerTick,
     target: TargetTick,
-) -> Result<(), String> {
-    let gap = usize::try_from(target.0.saturating_sub(current.0))
-        .map_err(|_| "prediction history discontinuity")?;
+) -> Result<u64, String> {
     let remaining = session
         .predictor
         .remaining_prediction_ticks(OWNER_GROUP)
         .ok_or("missing owner prediction")?;
-    if gap > remaining || pending.checked_add(gap).is_none_or(|count| count > 256) {
-        return Err("prediction history discontinuity".into());
+    let reachable = target.0.saturating_sub(current.0).min(remaining as u64);
+    // Unacknowledged commands are bounded by what the server can still admit;
+    // reaching that means acknowledgements stopped, which no pause explains.
+    if pending.saturating_add(reachable as usize) > 256 {
+        return Err("unacknowledged command capacity".into());
     }
-    Ok(())
+    Ok(reachable)
 }
 fn generate_commands(runtime: &mut Runtime, now: Duration) -> Result<(), String> {
     let Some(session) = &mut runtime.prediction else {
@@ -1399,13 +1403,25 @@ fn generate_commands(runtime: &mut Runtime, now: Duration) -> Result<(), String>
     if target.0 <= current.0 {
         return retry_pending_commands(runtime, &[]);
     }
-    preflight_prediction_commands(session, runtime.pending.len(), current, target)?;
+    let reachable = prediction_ticks_this_frame(session, runtime.pending.len(), current, target)?;
     // Bootstrap or a frontier behind estimated simulation time is a forecast
     // gap. Replay server-style substitutes through the fresh head's predecessor;
     // only that head authors intent. An already-ahead frontier keeps every normal
     // contiguous hardware sample. Forecast never drains an edge or allocates a
     // command/action identity, and consumes the ordinary prediction work budget.
     let forecast_gap = session.forecast_gap(estimated);
+    if reachable < target.0 - current.0 {
+        // Catch up by forecasting only; the head is authored once in reach.
+        for tick in current.0 + 1..=current.0 + reachable {
+            let dependencies = session.prediction_dependencies(ServerTick(tick))?;
+            session
+                .predictor
+                .predict_substitute(OWNER_GROUP, ServerTick(tick), dependencies, &session.model)
+                .map_err(|e| e.to_string())?;
+            session.events.publish(&session.predictor)?;
+        }
+        return retry_pending_commands(runtime, &[]);
+    }
     let mut covered = Vec::new();
     for tick in current.0 + 1..=target.0 {
         if forecast_gap && tick < target.0 {

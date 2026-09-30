@@ -351,7 +351,7 @@ mod trace_tests {
         telemetry.record_decode_rejection("InvalidState");
         telemetry.record_decode_rejection("WrongEpoch");
         telemetry.record_clock_rejection(engine_net::synchronization::SyncError::ResyncRequired(
-            engine_net::synchronization::ResyncReason::Suspension,
+            engine_net::synchronization::ResyncReason::LeadExceeded,
         ));
         telemetry
             .record_obsolete_rejection(engine_net::replication::ObsoleteReason::Scope, "snapshot");

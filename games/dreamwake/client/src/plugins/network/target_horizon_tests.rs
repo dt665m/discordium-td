@@ -225,7 +225,7 @@ fn stalled_authority_horizon_preserves_input_and_sequence_then_resumes() {
 }
 
 #[test]
-fn committed_clock_does_not_weaken_lead_or_discontinuity_recovery() {
+fn saturated_lead_and_forward_jumps_keep_assigning_targets() {
     let mut runtime = active_runtime();
     let session = runtime.prediction.as_mut().unwrap();
     // A round trip past what lead can cover saturates. The player keeps
@@ -235,7 +235,6 @@ fn committed_clock_does_not_weaken_lead_or_discontinuity_recovery() {
     for slack in [0, -1] {
         session.lead = LeadController::new(maximum).unwrap();
         assert_eq!(session.lead.observe_arrival_slack(slack), Ok(maximum));
-        assert_eq!(session.lead.needs_resynchronization(), None);
         assert!(session.assign_command_target(ServerTick(1000)).is_ok());
     }
     let sequence = session.sequence;
@@ -246,15 +245,12 @@ fn committed_clock_does_not_weaken_lead_or_discontinuity_recovery() {
         session.assign_command_target(ServerTick(20)).unwrap(),
         Some(TargetTick(23))
     );
-    // Only a jump past the whole horizon is a discontinuity; a lead change
-    // legitimately moves the target by up to that much.
-    assert!(
-        session
-            .assign_command_target(ServerTick(
-                20 + u64::from(engine_net::types::MAX_COMMAND_LEAD_TICKS) + 2
-            ))
-            .unwrap_err()
-            .contains("TargetDiscontinuity")
+    // A jump past the whole horizon (the client stopped running) moves the
+    // head forward instead of stopping command assignment.
+    let resumed = 20 + u64::from(engine_net::types::MAX_COMMAND_LEAD_TICKS) + 2;
+    assert_eq!(
+        session.assign_command_target(ServerTick(resumed)).unwrap(),
+        Some(TargetTick(resumed + 3))
     );
     assert_eq!(session.sequence, sequence);
 }
@@ -286,7 +282,6 @@ fn timestamped_progress_preserves_adaptive_lead_with_delayed_finalization() {
             expected
                 <= session.finalized.0 + PredictionLimits::default().replay_ticks_per_frame as u64
         );
-        assert_eq!(session.lead.needs_resynchronization(), None);
         assert!(session.active && !session.recovering);
     }
 }
@@ -323,7 +318,6 @@ fn duplicate_and_older_finalized_feedback_cannot_exhaust_lead() {
         .unwrap();
         let session = runtime.prediction.as_ref().unwrap();
         assert_eq!(session.lead.lead(), maximum);
-        assert_eq!(session.lead.needs_resynchronization(), None);
         assert_eq!(session.finalized, ServerTick(11));
         assert_eq!(session.simulation_clock.committed(), ServerTick(11));
         assert_eq!(session.finalized_ack_pending, Some(ServerTick(11)));
@@ -349,7 +343,6 @@ fn duplicate_and_older_finalized_feedback_cannot_exhaust_lead() {
     assert_eq!(session.metrics().arrival_feedback.late_commands, 2);
     assert_eq!(session.metrics().arrival_feedback_applied, 2);
     assert_eq!(session.lead.lead(), maximum);
-    assert_eq!(session.lead.needs_resynchronization(), None);
     assert!(!session.recovering);
 }
 

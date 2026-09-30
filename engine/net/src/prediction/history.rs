@@ -224,6 +224,9 @@ pub struct AuthoritativeRebase {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Correction {
     Stale,
+    /// This frame's replay budget is spent; the checkpoint was not applied and
+    /// history is unchanged. Offer the same or a newer checkpoint next frame.
+    Deferred,
     Equal,
     Replaced,
     Replayed {

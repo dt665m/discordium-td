@@ -276,38 +276,12 @@ fn assert_stored_input(session: &Session, input: StoredInput) {
     }
 }
 
-fn rejects_thirteen_tick_advance(input: StoredInput) {
-    let (mut sim, mut session) = started_prediction(input);
-    let identity = session.predictor.identity(OWNER_GROUP).unwrap().clone();
-    let state = session.predictor.state(OWNER_GROUP).unwrap().clone();
-    let bytes = session.predictor.retained_bytes();
-    move_authority(&mut sim, [1.0, 0.25, -10.0]);
-    receive_topology(&sim, &mut session, 455);
-    assert_eq!(
-        session.reconcile().unwrap_err(),
-        format!(
-            "topology replay exceeds frame work budget: predicted=442 incoming=455 revision=2 replay=0 work_replay=0 work_predicted=0 unstarted=false; active=true sequence={}",
-            session.sequence.0,
-        )
-    );
-    assert_eq!(session.predictor.identity(OWNER_GROUP), Some(&identity));
-    assert_eq!(session.predictor.state(OWNER_GROUP), Some(&state));
-    assert_eq!(session.predictor.retained_bytes(), bytes);
-    assert_eq!(
-        session.predictor.predicted_tick(OWNER_GROUP),
-        Some(ServerTick(442))
-    );
-    assert_eq!(session.predictor.work().predicted_ticks, 0);
-    assert_eq!(session.predictor.work().replay_ticks, 0);
-    assert_stored_input(&session, input);
-}
-
-fn allows_twelve_tick_advance(input: StoredInput) {
+fn adopts_topology_ahead(input: StoredInput, tick: u64) {
     let (mut sim, mut session) = started_prediction(input);
     let binding = session.model.binding();
     let sequence = session.sequence;
     move_authority(&mut sim, [1.0, 0.25, -10.0]);
-    receive_topology(&sim, &mut session, 454);
+    receive_topology(&sim, &mut session, tick);
     session.reconcile().unwrap();
     let identity = session.predictor.identity(OWNER_GROUP).unwrap();
     assert_eq!(identity.binding, binding);
@@ -315,7 +289,7 @@ fn allows_twelve_tick_advance(input: StoredInput) {
     assert_eq!(identity.scopes.len(), 4);
     assert_eq!(
         session.predictor.predicted_tick(OWNER_GROUP),
-        Some(ServerTick(454))
+        Some(ServerTick(tick))
     );
     assert_eq!(session.sequence, sequence);
     assert_eq!(session.predictor.work().predicted_ticks, 0);
@@ -323,15 +297,12 @@ fn allows_twelve_tick_advance(input: StoredInput) {
 }
 
 #[test]
-fn history_rejects_topology_more_than_twelve_ticks_ahead() {
+fn history_adopts_topology_however_far_ahead() {
+    // A checkpoint past the prediction (after a hitch) has nothing to replay
+    // and becomes the base, whatever the distance.
     for input in [StoredInput::Command, StoredInput::Substitute] {
-        rejects_thirteen_tick_advance(input);
-    }
-}
-
-#[test]
-fn history_allows_topology_exactly_twelve_ticks_ahead() {
-    for input in [StoredInput::Command, StoredInput::Substitute] {
-        allows_twelve_tick_advance(input);
+        for tick in [454, 455, 442 + 120] {
+            adopts_topology_ahead(input, tick);
+        }
     }
 }

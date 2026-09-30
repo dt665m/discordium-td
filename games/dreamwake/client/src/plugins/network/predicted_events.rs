@@ -22,6 +22,7 @@ impl Payload for PresentationEvent {
     }
 }
 pub(crate) struct PredictedEvents {
+    scope: JournalScope,
     journal: EventJournal<PresentationEvent>,
     pub(crate) sounds: u16,
     pub(crate) camera_cues: u16,
@@ -62,6 +63,7 @@ fn event(
 impl PredictedEvents {
     pub(crate) fn new(scope: JournalScope) -> Result<Self, String> {
         Ok(Self {
+            scope,
             journal: EventJournal::new(scope, Limits::default()).map_err(err)?,
             sounds: 0,
             camera_cues: 0,
@@ -88,10 +90,27 @@ impl PredictedEvents {
         Ok(())
     }
     /// Called only after the predictor published its entire successful update.
+    ///
+    /// These events only drive presentation (cast sounds, camera cues and
+    /// projectile visuals), so they never end a session. When the journal
+    /// cannot follow the prediction, for example after a rebase that moved
+    /// the predicted tick or retired its commands, it restarts for the same
+    /// scope from the current prediction. At worst a cue repeats or is missed.
     pub(super) fn publish(
         &mut self,
         predictor: &PredictionManager<OwnerModel>,
     ) -> Result<(), String> {
+        let Err(error) = self.follow(predictor) else {
+            return Ok(());
+        };
+        log::warn!("Predicted presentation events restarted: {error}");
+        self.journal = EventJournal::new(self.scope, Limits::default()).map_err(err)?;
+        if let Err(error) = self.follow(predictor) {
+            log::warn!("Predicted presentation events skipped this frame: {error}");
+        }
+        Ok(())
+    }
+    fn follow(&mut self, predictor: &PredictionManager<OwnerModel>) -> Result<(), String> {
         let Some(now) = predictor.predicted_tick(OWNER_GROUP) else {
             return Ok(());
         };

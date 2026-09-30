@@ -300,7 +300,7 @@ fn substitute_replay_uses_pinned_dependency_updates_and_rejects_missing_closure(
 }
 
 #[test]
-fn substitutes_obey_prediction_and_replay_budgets_without_partial_commit() {
+fn substitutes_obey_prediction_budget_and_replay_always_progresses() {
     let limits = PredictionLimits {
         prediction_ticks_per_frame: 2,
         ..Default::default()
@@ -343,14 +343,14 @@ fn substitutes_obey_prediction_and_replay_budgets_without_partial_commit() {
         DependencyFrame::default(),
     );
     manager.begin_frame(ReplicationFrame(2)).unwrap();
-    assert_eq!(
+    // A single replay longer than the budget still runs: the budget spreads
+    // work across frames, it never refuses reconciliation outright.
+    assert!(matches!(
         manager.reconcile(&replicas.proof(1), binding(1), ServerTick(0), &model),
-        Err(PredictionError::ResyncRequired(
-            RecoveryReason::ReplayBudget
-        ))
-    );
-    assert_eq!(manager.state(GroupId(1)), Some(&before));
-    assert_eq!(manager.work().replay_ticks, 0);
+        Ok(Correction::Replayed { .. })
+    ));
+    assert_ne!(manager.state(GroupId(1)), Some(&before));
+    assert_eq!(manager.work().replay_ticks, 2);
 }
 
 #[test]

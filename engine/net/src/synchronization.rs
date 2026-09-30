@@ -52,12 +52,12 @@ impl ClockSample {
         })
     }
 }
+/// Only bootstrap can refuse: a first sample past the lead horizon is reported so
+/// the caller can wait for a cleaner probe. Once running, every clock
+/// discontinuity re-anchors in place; none of them ends the session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResyncReason {
-    Suspension,
-    OffsetJump,
     LeadExceeded,
-    TargetDiscontinuity,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncError {
@@ -102,7 +102,6 @@ pub struct ClockEstimator {
     samples: VecDeque<ClockSample>,
     offset: Option<i128>,
     last_estimate: Option<(Duration, Duration)>,
-    resync: Option<ResyncReason>,
 }
 impl ClockEstimator {
     pub fn new(
@@ -126,7 +125,6 @@ impl ClockEstimator {
             samples: VecDeque::new(),
             offset: None,
             last_estimate: None,
-            resync: None,
         })
     }
     pub fn sample_count(&self) -> usize {
@@ -144,15 +142,7 @@ impl ClockEstimator {
                 - self.best_network_round_trip()?,
         )
     }
-    pub fn needs_resynchronization(&self) -> Option<ResyncReason> {
-        self.resync
-    }
-    fn active(&self) -> Result<(), SyncError> {
-        self.resync
-            .map_or(Ok(()), |reason| Err(SyncError::ResyncRequired(reason)))
-    }
     pub fn observe(&mut self, exchange: TimeExchange) -> Result<ClockSample, SyncError> {
-        self.active()?;
         let sample = ClockSample::from_exchange(exchange)?;
         if sample.network_round_trip > self.config.maximum_round_trip {
             return Err(SyncError::InvalidSample);
@@ -172,41 +162,49 @@ impl ClockEstimator {
             .chain(std::iter::once(&sample))
             .min_by_key(|s| (s.network_round_trip, Reverse(s.client_receive)))
             .expect("new sample exists");
+        let best_offset = best.offset_nanos;
         if self
             .offset
-            .is_some_and(|old| (best.offset_nanos - old).abs() > nanos(self.config.offset_jump))
+            .is_some_and(|old| (best_offset - old).abs() > nanos(self.config.offset_jump))
         {
-            self.resync = Some(ResyncReason::OffsetJump);
-            return Err(SyncError::ResyncRequired(ResyncReason::OffsetJump));
+            // A step this large is a host clock change or a new path, not drift,
+            // and slewing at 2% would take many seconds to close it. Re-anchor
+            // on the new sample: the older window describes a clock that no
+            // longer exists.
+            self.samples.clear();
+            self.last_estimate = None;
         }
-        self.offset = Some(best.offset_nanos);
+        self.offset = Some(best_offset);
         if self.samples.len() == self.config.sample_window {
             self.samples.pop_front();
         }
         self.samples.push_back(sample);
         Ok(sample)
     }
-    /// Local monotonic time only. A discontinuity latches resync and stops new
-    /// estimates until the owner installs a fresh checkpoint/command incarnation.
+    /// Local monotonic time only. After a suspension (a background tab, a
+    /// debugger, a long hitch) the estimate jumps to the target instead of
+    /// slewing, so the caller sees the time that actually passed.
     pub fn estimate_server_time(&mut self, local_now: Duration) -> Result<Duration, SyncError> {
-        self.active()?;
         let offset = self.offset.ok_or(SyncError::NotSynchronized)?;
         let target = nanos(local_now) + offset;
-        let estimate = if let Some((last_local, last_server)) = self.last_estimate {
-            let elapsed = local_now
-                .checked_sub(last_local)
-                .ok_or(SyncError::NonMonotonicTime)?;
-            if elapsed > self.config.suspension {
-                self.resync = Some(ResyncReason::Suspension);
-                return Err(SyncError::ResyncRequired(ResyncReason::Suspension));
+        let continuing = match self.last_estimate {
+            Some((last_local, _)) => {
+                let elapsed = local_now
+                    .checked_sub(last_local)
+                    .ok_or(SyncError::NonMonotonicTime)?;
+                (elapsed <= self.config.suspension).then_some(elapsed)
             }
-            let free_running = nanos(last_server) + nanos(elapsed);
-            let max_adjustment =
-                nanos(elapsed) * i128::from(self.config.slew_parts_per_million) / 1_000_000;
-            free_running + (target - free_running).clamp(-max_adjustment, max_adjustment)
-        } else {
-            target
+            None => None,
         };
+        let estimate =
+            if let (Some(elapsed), Some((_, last_server))) = (continuing, self.last_estimate) {
+                let free_running = nanos(last_server) + nanos(elapsed);
+                let max_adjustment =
+                    nanos(elapsed) * i128::from(self.config.slew_parts_per_million) / 1_000_000;
+                free_running + (target - free_running).clamp(-max_adjustment, max_adjustment)
+            } else {
+                target
+            };
         let estimate = duration(estimate)?;
         self.last_estimate = Some((local_now, estimate));
         Ok(estimate)
@@ -221,14 +219,13 @@ impl ClockEstimator {
         let elapsed = self.estimate_server_elapsed(local_now)?;
         self.rate.elapsed_ticks(elapsed).ok_or(SyncError::TimeRange)
     }
-    /// This does not resolve old action outcomes or authorize starting input. The
-    /// application must complete its explicit resynchronization lifecycle first.
+    /// Start over for a new match epoch. This does not resolve old action
+    /// outcomes; the caller's session lifecycle owns those.
     pub fn reset(&mut self, server_epoch: Duration) {
         self.server_epoch = server_epoch;
         self.samples.clear();
         self.offset = None;
         self.last_estimate = None;
-        self.resync = None;
     }
 }
 fn nanos(duration: Duration) -> i128 {
@@ -246,7 +243,6 @@ pub struct LeadController {
     lead: u8,
     samples: VecDeque<i32>,
     last_target: Option<TargetTick>,
-    resync: Option<ResyncReason>,
 }
 impl LeadController {
     pub fn new(lead: u8) -> Result<Self, SyncError> {
@@ -257,7 +253,6 @@ impl LeadController {
             lead,
             samples: VecDeque::new(),
             last_target: None,
-            resync: None,
         })
     }
     /// Half RTT is only a bootstrap estimate. Processing time must already be
@@ -285,15 +280,9 @@ impl LeadController {
     pub fn lead(&self) -> u8 {
         self.lead
     }
-    pub fn needs_resynchronization(&self) -> Option<ResyncReason> {
-        self.resync
-    }
     /// Slack is target_tick - authoritative_tick_at_arrival. Increase promptly on
     /// missed deadlines; decrease only after eight consistently overbuffered samples.
     pub fn observe_arrival_slack(&mut self, slack: i32) -> Result<u8, SyncError> {
-        if let Some(reason) = self.resync {
-            return Err(SyncError::ResyncRequired(reason));
-        }
         let bound = i32::from(MAX_COMMAND_LEAD_TICKS);
         if !(-bound..=bound).contains(&slack) {
             return Err(SyncError::InvalidSample);
@@ -327,29 +316,21 @@ impl LeadController {
     }
     /// A lead reduction waits for the server clock to catch up. It never reassigns
     /// a previously issued tick, and repeated polling cannot create a command burst.
+    /// A forward jump (the client stopped running for a while) simply moves the
+    /// head: the skipped ticks had no player input, and the server fills them
+    /// with the same substitutes the client forecasts.
     pub fn assign_target(
         &mut self,
         estimated_server_tick: ServerTick,
     ) -> Result<Option<TargetTick>, SyncError> {
-        if let Some(reason) = self.resync {
-            return Err(SyncError::ResyncRequired(reason));
-        }
         let target = TargetTick(
             estimated_server_tick
                 .0
                 .checked_add(u64::from(self.lead))
                 .ok_or(SyncError::TimeRange)?,
         );
-        if let Some(previous) = self.last_target {
-            if target <= previous {
-                return Ok(None);
-            }
-            // A lead change legitimately moves the target by up to the whole
-            // horizon, so only a jump past that is a real discontinuity.
-            if target.0 - previous.0 > u64::from(MAX_COMMAND_LEAD_TICKS) {
-                self.resync = Some(ResyncReason::TargetDiscontinuity);
-                return Err(SyncError::ResyncRequired(ResyncReason::TargetDiscontinuity));
-            }
+        if self.last_target.is_some_and(|previous| target <= previous) {
+            return Ok(None);
         }
         self.last_target = Some(target);
         Ok(Some(target))
@@ -465,7 +446,7 @@ mod tests {
         assert!(clock.estimate_server_tick(ms(2440)).unwrap().0 >= 177);
     }
     #[test]
-    fn suspension_and_offset_discontinuity_require_explicit_resync() {
+    fn suspension_and_offset_steps_re_anchor_instead_of_stopping() {
         let mut clock = ClockEstimator::new(
             TickRate::new(60).unwrap(),
             Duration::ZERO,
@@ -474,17 +455,16 @@ mod tests {
         .unwrap();
         clock.observe(exchange(1000, 500, 20, 0)).unwrap();
         clock.estimate_server_time(ms(1040)).unwrap();
-        assert_eq!(
-            clock.estimate_server_time(ms(10000)),
-            Err(SyncError::ResyncRequired(ResyncReason::Suspension))
-        );
-        assert!(clock.observe(exchange(11000, 500, 20, 0)).is_err());
-        clock.reset(Duration::ZERO);
+        // Ten seconds suspended: the estimate reports the time that passed
+        // rather than slewing toward it at 2%.
+        assert_eq!(clock.estimate_server_time(ms(10000)).unwrap(), ms(10500));
         clock.observe(exchange(11000, 500, 20, 0)).unwrap();
-        assert_eq!(
-            clock.observe(exchange(12000, 1500, 10, 0)),
-            Err(SyncError::ResyncRequired(ResyncReason::OffsetJump))
-        );
+        // A one-second clock step replaces the window instead of ending the
+        // session, and the next estimate follows the new offset at once.
+        clock.observe(exchange(12000, 1500, 10, 0)).unwrap();
+        assert_eq!(clock.sample_count(), 1);
+        assert_eq!(clock.target_offset_nanos(), Some(1_500_000_000));
+        assert_eq!(clock.estimate_server_time(ms(12100)).unwrap(), ms(13600));
     }
     #[test]
     fn uplink_slack_tunes_lead_and_decrease_never_rewrites_sent_targets() {
@@ -507,9 +487,10 @@ mod tests {
             Some(TargetTick(14))
         );
         assert_eq!(lead.assign_target(ServerTick(12)).unwrap(), None);
+        // After the client stops running for a while, the head moves forward.
         assert_eq!(
-            lead.assign_target(ServerTick(1000)),
-            Err(SyncError::ResyncRequired(ResyncReason::TargetDiscontinuity))
+            lead.assign_target(ServerTick(1000)).unwrap(),
+            Some(TargetTick(1002))
         );
     }
     #[test]
@@ -533,7 +514,6 @@ mod tests {
         let mut lead = LeadController::new(MAX_COMMAND_LEAD_TICKS).unwrap();
         assert_eq!(lead.observe_arrival_slack(-1), Ok(MAX_COMMAND_LEAD_TICKS));
         assert_eq!(lead.observe_arrival_slack(-1), Ok(MAX_COMMAND_LEAD_TICKS));
-        assert_eq!(lead.needs_resynchronization(), None);
         let mut cursor = PresentationCursor::default();
         assert_eq!(cursor.advance(ms(1000), ms(100)), ms(900));
         assert_eq!(cursor.advance(ms(1010), ms(200)), ms(900));

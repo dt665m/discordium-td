@@ -891,15 +891,13 @@ fn aggregate_frame_replay_budget_cannot_be_reset_per_group() {
         if owner == 1 {
             assert!(result.is_ok());
         } else {
-            assert_eq!(
-                result,
-                Err(PredictionError::ResyncRequired(
-                    RecoveryReason::ReplayBudget
-                ))
-            );
+            // The shared budget is spent: the second group waits a frame
+            // instead of stopping, and nothing of it changes meanwhile.
+            assert_eq!(result, Ok(Correction::Deferred));
         }
     }
     assert_eq!(manager.state(GroupId(2)), Some(&second));
+    assert_eq!(manager.recovery(GroupId(2)), None);
     assert_eq!(manager.work().replay_ticks, 2);
     assert_eq!(
         manager.begin_frame(ReplicationFrame(1)),

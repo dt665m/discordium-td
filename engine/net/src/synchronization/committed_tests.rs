@@ -221,7 +221,6 @@ fn fresh_same_tick_replies_do_not_refill_a_stalled_authoritys_budget() {
         }
         assert_eq!(clock.committed(), ServerTick(100));
     }
-    assert_eq!(lead.needs_resynchronization(), None);
 
     // Only actual progress grants another slot, even without a new clock reply.
     clock.commit(ServerTick(101));
@@ -351,7 +350,6 @@ fn stalled_speculation_can_be_future_until_the_same_command_becomes_admissible()
         inbox.admit(owner.connection, command, &Rules),
         Ok(Admission::Duplicate)
     );
-    assert_eq!(lead.needs_resynchronization(), None);
 }
 
 /// Each complete block of 100 packets loses three, with independent bounded
@@ -655,8 +653,6 @@ fn delayed_owner_and_finalized_feedback_keeps_lead_stable_at_one_hundred_ms_rtt(
             steady_min = steady_min.min(lead.lead());
             steady_max = steady_max.max(lead.lead());
         }
-        assert_eq!(wall.needs_resynchronization(), None);
-        assert_eq!(lead.needs_resynchronization(), None);
     }
 
     eprintln!(

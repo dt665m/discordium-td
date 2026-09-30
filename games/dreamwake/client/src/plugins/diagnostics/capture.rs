@@ -481,13 +481,8 @@ mod tests {
     fn typed_clock_resync_is_separate_from_malformed_errors_and_survives_reset() {
         use engine_net::synchronization::{ResyncReason, SyncError};
         let mut telemetry = Telemetry::default();
-        for reason in [
-            ResyncReason::LeadExceeded,
-            ResyncReason::Suspension,
-            ResyncReason::OffsetJump,
-            ResyncReason::TargetDiscontinuity,
-        ] {
-            telemetry.record_clock_rejection(SyncError::ResyncRequired(reason));
+        for _ in 0..4 {
+            telemetry.record_clock_rejection(SyncError::ResyncRequired(ResyncReason::LeadExceeded));
         }
         assert_eq!(telemetry.clock_resync_rejections, 4);
         assert_eq!(telemetry.decode_failures, 0);
@@ -495,7 +490,7 @@ mod tests {
         assert_eq!(telemetry.clock_resync_rejections, 4);
         assert_eq!(
             telemetry.decode_issue.as_deref(),
-            Some("clock synchronization: ResyncRequired(TargetDiscontinuity)")
+            Some("clock synchronization: ResyncRequired(LeadExceeded)")
         );
         for error in [
             SyncError::InvalidSample,
@@ -578,7 +573,7 @@ mod tests {
             decode_failures: u64::MAX - 1,
             ..Default::default()
         };
-        telemetry.record_clock_rejection(SyncError::ResyncRequired(ResyncReason::Suspension));
+        telemetry.record_clock_rejection(SyncError::ResyncRequired(ResyncReason::LeadExceeded));
         telemetry.record_decode_rejection("WrongEpoch");
         telemetry.record_obsolete_rejection(ObsoleteReason::Scope, "snapshot");
         telemetry.record_clock_rejection(SyncError::InvalidSample);

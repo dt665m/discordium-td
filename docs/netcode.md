@@ -472,6 +472,23 @@ provide their exact commands, frozen inputs, duration, criteria and artifact pat
 Transport or browser changes also require WASM compilation and a real browser
 session; unit tests do not establish deployed connectivity or performance.
 
+`just netcode-harness` (`scripts/netcode-harness.py`) is the player-facing gate
+for the network layer. It builds the native release pair, then runs one server
+and two autoplaying rendered clients per scenario, over both native UDP and the
+browser's WebRTC data channel path (`--transport webrtc` negotiates through the
+same session and SDP endpoints a browser uses). Scenarios are a clean link, a WAN
+path (75 ms ± 10 ms and 1% loss per direction) and that path with a 500 ms
+main-thread stall every 5 s (`--inject-stall 500@5`), which reproduces the
+browser's garbage collection and shader compilation hitches. Each client measures
+its own display (`session_health` in the trace). Any disconnect, reconnect,
+client-requested recovery or teleport fails the scenario, as do more than six
+visible corrections per connected minute. A correction is a frame whose owner
+displacement exceeds dash speed × 1.25 over the frame plus one tick by 0.10 m; a
+teleport exceeds it by a metre. These gates read only `DreamView` and
+`DreamConnection`, so they stay valid whatever prediction and replication design
+runs underneath. Artifacts go to `out/netcode-harness/RUN/`; `--transports`,
+`--scenarios` and `--duration` select a subset.
+
 `scripts/playtest-spatial.py --profiles moderate --duration 120` is a single
 development spatial check with two native release clients and an explicit 12 m
 replication radius. It builds the paired native release artifacts before launch.

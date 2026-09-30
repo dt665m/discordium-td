@@ -52,17 +52,19 @@ pub(super) fn public_full_state(
 pub(super) fn receipt_runtime(session: Session) -> Runtime {
     let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     let client_id = session.model.welcome.client.0;
-    let transport = Transport::new(
-        Duration::ZERO,
-        renet_cross::ClientAuthentication::Unsecure {
-            protocol_id: PROTOCOL_ID,
-            client_id,
-            server_addr: socket.local_addr().unwrap(),
-            user_data: None,
-        },
-        socket,
-    )
-    .unwrap();
+    let transport = Transport::Udp(
+        renet_cross::UdpNetcodeClientTransport::new(
+            Duration::ZERO,
+            renet_cross::ClientAuthentication::Unsecure {
+                protocol_id: PROTOCOL_ID,
+                client_id,
+                server_addr: socket.local_addr().unwrap(),
+                user_data: None,
+            },
+            socket,
+        )
+        .unwrap(),
+    );
     // Only Renet's local outbound queue is used; no packets are transmitted.
     Runtime {
         renet: RenetClient::new(connection_config()),
@@ -487,17 +489,19 @@ fn finalized_arrival_feedback_preserves_typed_clock_recovery() {
     )
     .unwrap();
     let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-    let transport = Transport::new(
-        Duration::ZERO,
-        renet_cross::ClientAuthentication::Unsecure {
-            protocol_id: PROTOCOL_ID,
-            client_id: 1,
-            server_addr: socket.local_addr().unwrap(),
-            user_data: None,
-        },
-        socket,
-    )
-    .unwrap();
+    let transport = Transport::Udp(
+        renet_cross::UdpNetcodeClientTransport::new(
+            Duration::ZERO,
+            renet_cross::ClientAuthentication::Unsecure {
+                protocol_id: PROTOCOL_ID,
+                client_id: 1,
+                server_addr: socket.local_addr().unwrap(),
+                user_data: None,
+            },
+            socket,
+        )
+        .unwrap(),
+    );
     // The transport is only a local fixture; this test sends no packets.
     let mut runtime = Runtime {
         renet: RenetClient::new(connection_config()),

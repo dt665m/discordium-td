@@ -95,6 +95,8 @@ pub fn build_app() -> App {
     let (seed, playtest, options, connection) = startup_options();
     let view = offline_presentation(DreamSimulation::new(seed, false).snapshot());
     let traveler = identity::TravelerProfile::load(&connection.http_base);
+    #[cfg(not(target_arch = "wasm32"))]
+    let stall = playtest.stall;
     let mut app = App::new();
     app.add_plugins(DefaultPlugins.set(WindowPlugin {
         primary_window: Some(Window {
@@ -126,6 +128,11 @@ pub fn build_app() -> App {
         network::DreamNetworkPlugin,
         diagnostics::DreamDiagnosticsPlugin,
     ));
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(stall) = stall {
+        app.insert_resource(stall)
+            .insert_resource(diagnostics::stall::StallClock::new(stall));
+    }
     app
 }
 
@@ -140,6 +147,7 @@ fn startup_options() -> (u64, Playtest, network::NetworkOptions, DreamConnection
         expected_party: 1,
         hosted: false,
         max_clients: 8,
+        transport: network::NativeTransportKind::Udp,
     };
     let mut connection = DreamConnection {
         http_base: std::env::var("DREAMWAKE_HTTP_BASE")
@@ -195,6 +203,30 @@ fn startup_options() -> (u64, Playtest, network::NetworkOptions, DreamConnection
             "--wait-players" => {
                 options.expected_party = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(1)
             }
+            // A typo must not silently select UDP: a run that believes it is
+            // exercising the browser's WebRTC path would then prove nothing.
+            "--transport" => match args.get(i + 1).map(|value| value.parse()) {
+                Some(Ok(kind)) => options.transport = kind,
+                Some(Err(error)) => {
+                    eprintln!("{error}");
+                    std::process::exit(2);
+                }
+                None => {
+                    eprintln!("--transport requires udp or webrtc");
+                    std::process::exit(2);
+                }
+            },
+            "--inject-stall" => match args.get(i + 1).map(|value| value.parse()) {
+                Some(Ok(stall)) => playtest.stall = Some(stall),
+                Some(Err(error)) => {
+                    eprintln!("{error}");
+                    std::process::exit(2);
+                }
+                None => {
+                    eprintln!("--inject-stall requires MILLIS@SECONDS");
+                    std::process::exit(2);
+                }
+            },
             "--max-clients" => {
                 options.max_clients = args
                     .get(i + 1)

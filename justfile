@@ -68,3 +68,7 @@ network-foundation:
 
 network-qualification:
     python3 scripts/qualify-network.py --run workspace
+
+# Player-facing gate: UDP and WebRTC clients under clean, WAN and stalled play.
+netcode-harness *args:
+    python3 scripts/netcode-harness.py {{args}}

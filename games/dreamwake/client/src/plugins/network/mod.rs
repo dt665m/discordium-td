@@ -34,8 +34,65 @@ use std::{collections::VecDeque, time::Duration};
 
 pub(crate) const PREDICTION_MAX_SNAPSHOT_AGE: f64 = 0.30;
 
+/// Which network path a native client takes to the server. Browsers only have
+/// WebRTC; native clients default to UDP but can take the browser's path, so
+/// that path can be exercised and diagnosed without a browser.
 #[cfg(not(target_arch = "wasm32"))]
-type Transport = renet_cross::UdpNetcodeClientTransport;
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum NativeTransportKind {
+    #[default]
+    Udp,
+    WebRtc,
+}
+#[cfg(not(target_arch = "wasm32"))]
+impl std::str::FromStr for NativeTransportKind {
+    type Err = String;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "udp" => Ok(Self::Udp),
+            "webrtc" => Ok(Self::WebRtc),
+            other => Err(format!(
+                "unknown transport '{other}'; expected udp or webrtc"
+            )),
+        }
+    }
+}
+/// Both native paths behind one surface, so the session above never branches
+/// on how its bytes travel.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) enum Transport {
+    Udp(renet_cross::UdpNetcodeClientTransport),
+    WebRtc(renet_cross::NativeWebRtcNetcodeClientTransport),
+}
+#[cfg(not(target_arch = "wasm32"))]
+impl Transport {
+    /// Recorded in traces so a run can prove which path it exercised.
+    pub(crate) fn name(&self) -> &'static str {
+        match self {
+            Self::Udp(_) => "udp",
+            Self::WebRtc(_) => "webrtc",
+        }
+    }
+    pub(crate) fn update(
+        &mut self,
+        duration: Duration,
+        renet: &mut RenetClient,
+    ) -> Result<(), renet_cross::NativeClientError> {
+        match self {
+            Self::Udp(transport) => transport.update(duration, renet),
+            Self::WebRtc(transport) => transport.update(duration, renet),
+        }
+    }
+    pub(crate) fn send_packets(
+        &mut self,
+        renet: &mut RenetClient,
+    ) -> Result<(), renet_cross::NativeClientError> {
+        match self {
+            Self::Udp(transport) => transport.send_packets(renet),
+            Self::WebRtc(transport) => transport.send_packets(renet),
+        }
+    }
+}
 #[cfg(target_arch = "wasm32")]
 type Transport = renet_cross::WebRtcNetcodeClientTransport;
 type BootstrapResult = Result<(RenetClient, Transport, u64), String>;
@@ -53,6 +110,8 @@ pub struct NetworkOptions {
     pub hosted: bool,
     #[cfg(not(target_arch = "wasm32"))]
     pub max_clients: u16,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub transport: NativeTransportKind,
 }
 #[derive(Clone)]
 pub(crate) struct PendingFrame {
@@ -192,23 +251,42 @@ pub fn connect(world: &mut World, attempts: u32) {
     world.resource_mut::<DreamConnection>().status = format!("Connecting to {base}…");
     #[cfg(not(target_arch = "wasm32"))]
     {
+        let kind = world.resource::<NetworkOptions>().transport;
         let (sender, receiver) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let mut result = Err("Could not reach server".to_owned());
             for attempt in 0..attempts.max(1) {
-                result = renet_cross::connect_via_session_http_blocking(
-                    &base,
-                    PROTOCOL_ID,
-                    renet_cross::NativeConnectOptions {
-                        session_request: player_session_request(credential.clone()),
-                        require_secure: true,
-                        connection_config: connection_config(),
-                        transport: renet_cross::ClientTransportConfig {
-                            conditioner: Some(conditioner.clone()),
+                let transport = renet_cross::ClientTransportConfig {
+                    conditioner: Some(conditioner.clone()),
+                };
+                result = match kind {
+                    NativeTransportKind::Udp => renet_cross::connect_via_session_http_blocking(
+                        &base,
+                        PROTOCOL_ID,
+                        renet_cross::NativeConnectOptions {
+                            session_request: player_session_request(credential.clone()),
+                            require_secure: true,
+                            connection_config: connection_config(),
+                            transport,
+                            ..Default::default()
                         },
-                        ..Default::default()
-                    },
-                )
+                    )
+                    .map(|(renet, transport, id)| (renet, Transport::Udp(transport), id)),
+                    NativeTransportKind::WebRtc => {
+                        renet_cross::connect_webrtc_via_session_http_blocking(
+                            &base,
+                            PROTOCOL_ID,
+                            renet_cross::NativeWebRtcConnectOptions {
+                                session_request: player_session_request(credential.clone()),
+                                require_secure: true,
+                                connection_config: connection_config(),
+                                transport,
+                                ..Default::default()
+                            },
+                        )
+                        .map(|(renet, transport, id)| (renet, Transport::WebRtc(transport), id))
+                    }
+                }
                 .map_err(|e| e.to_string());
                 if result.is_ok() {
                     break;
@@ -416,6 +494,13 @@ fn request_resync(
     world
         .resource_mut::<diagnostics::Telemetry>()
         .record_issue(diagnostics::IssueKind::Recovery, reason);
+    // Diagnostics are optional for the network layer: embedders and tests may
+    // run it without them, and recovery must not panic for want of a counter.
+    if let Some(mut ledger) =
+        world.get_resource_mut::<crate::plugins::diagnostics::continuity::SessionLedger>()
+    {
+        ledger.record_recovery();
+    }
     log::warn!("Scoped session requires resynchronization: {reason}");
     if let Some(session) = &mut runtime.prediction {
         session.resync_reason = kind;
@@ -1566,6 +1651,8 @@ mod autoplay_restart_tests {
                 hosted: false,
                 #[cfg(not(target_arch = "wasm32"))]
                 max_clients: 8,
+                #[cfg(not(target_arch = "wasm32"))]
+                transport: NativeTransportKind::Udp,
             });
             world.init_resource::<crate::ui::UiActions>();
             playtest_actions(&mut world);

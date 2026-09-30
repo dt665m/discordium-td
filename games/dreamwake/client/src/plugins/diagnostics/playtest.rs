@@ -28,6 +28,8 @@ pub(crate) struct Playtest {
     pub(crate) trace_options: TraceOptions,
     #[cfg(not(target_arch = "wasm32"))]
     trace_failed: bool,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) stall: Option<super::stall::InjectedStall>,
     pub(crate) next_decision: f64,
 }
 
@@ -58,6 +60,8 @@ pub(super) fn playtest_capture(
     mut exit: MessageWriter<AppExit>,
     mut capture: ResMut<super::native_capture::NativeCapture>,
     window: Res<super::native_window::NativeWindowMetrics>,
+    ledger: Res<super::continuity::SessionLedger>,
+    stall: Option<Res<super::stall::StallClock>>,
 ) {
     if test.trace_path.is_some() && time.elapsed_secs_f64() >= test.next_trace {
         test.next_trace = time.elapsed_secs_f64() + test.trace_options.interval_seconds;
@@ -69,6 +73,8 @@ pub(super) fn playtest_capture(
             time.elapsed_secs_f64(),
             time.delta_secs_f64(),
             &window,
+            &ledger,
+            stall.map(|clock| clock.injected),
         );
     }
     if test.trace_failed {
@@ -117,6 +123,8 @@ fn record_trace(
     elapsed: f64,
     frame_delta_seconds: f64,
     window: &super::native_window::NativeWindowMetrics,
+    ledger: &super::continuity::SessionLedger,
+    stalls_injected: Option<u32>,
 ) {
     let Some(path) = test.trace_path.clone() else {
         return;
@@ -196,6 +204,14 @@ fn record_trace(
     record["predicted_ticks_this_frame"] =
         serde_json::json!(session.map(|s| s.predicted_ticks_this_frame));
     record["gameplay_tick"] = serde_json::json!(view.tick);
+    // Player-facing health, read from the display contract only. These are the
+    // fields a qualification gate may rely on; everything above describes the
+    // current network implementation and can change with it.
+    let mut health = serde_json::to_value(ledger).unwrap_or_default();
+    health["connected_seconds"] = serde_json::json!(ledger.connected_seconds_at(elapsed));
+    record["session_health"] = health;
+    record["stalls_injected"] = serde_json::json!(stalls_injected);
+    record["transport"] = serde_json::json!(runtime.map(|r| r.transport.name()));
     record["window"] = serde_json::json!(window);
     record["hp"] = serde_json::json!(view.hero.hp);
     record["enemy_scopes"] = serde_json::json!(
@@ -341,7 +357,17 @@ mod trace_tests {
             .record_obsolete_rejection(engine_net::replication::ObsoleteReason::Scope, "snapshot");
         telemetry.reset_samples();
         let window = super::super::native_window::NativeWindowMetrics::default();
-        record_trace(&mut test, &view, None, &telemetry, 1.0, 0.016, &window);
+        record_trace(
+            &mut test,
+            &view,
+            None,
+            &telemetry,
+            1.0,
+            0.016,
+            &window,
+            &Default::default(),
+            None,
+        );
         let row: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(row["trace_sequence"], 1);
@@ -368,7 +394,17 @@ mod trace_tests {
         assert!(!test.trace_failed);
         // Force a bounded failure without producing a large trace or runtime.
         test.trace_file = None;
-        record_trace(&mut test, &view, None, &telemetry, 2.0, 0.016, &window);
+        record_trace(
+            &mut test,
+            &view,
+            None,
+            &telemetry,
+            2.0,
+            0.016,
+            &window,
+            &Default::default(),
+            None,
+        );
         assert!(test.trace_failed);
         assert!(test.trace_path.is_none());
         let unchanged: serde_json::Value =

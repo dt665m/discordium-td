@@ -208,6 +208,11 @@ pub struct Reward {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HeroView {
     pub id: u64,
+    /// Advances whenever the simulation relocates this hero without motion,
+    /// such as the party placement at an encounter start or a respawn.
+    /// Presentation must not treat a change across it as movement.
+    #[serde(default)]
+    pub motion_segment: u64,
     /// Server-assigned sRGB identity, stable for this hero while it remains in the match.
     pub color: [u8; 3],
     pub position: [f32; 2],

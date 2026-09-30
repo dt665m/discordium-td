@@ -28,10 +28,12 @@ struct Sample {
 }
 
 /// Display changes that legitimately move the owner without motion: a new
-/// identity, room, match or scene, or a phase that relocates the party.
+/// identity, an authored relocation (encounter placement, respawn), room,
+/// match or scene, or a phase that relocates the party.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct ContinuityKey {
     hero: u64,
+    motion_segment: u64,
     room: usize,
     realm: usize,
     match_epoch: u32,
@@ -142,6 +144,7 @@ pub(super) fn measure_continuity(
     let view = &view.0;
     let key = ContinuityKey {
         hero: view.hero.id,
+        motion_segment: view.hero.motion_segment,
         room: view.room,
         realm: view.realm,
         match_epoch: view.stamp.match_epoch,
@@ -154,8 +157,11 @@ pub(super) fn measure_continuity(
         ledger.corrections,
         ledger.last.map(|sample| sample.position),
     );
+    // What the player waited between frames, including a hitch the frame
+    // clock has not caught up with yet.
+    let now = crate::plugins::network::network_now(&time).as_secs_f64();
     ledger.observe(
-        time.elapsed_secs_f64(),
+        now,
         connection.connected,
         key,
         view.hero.position,
@@ -167,11 +173,9 @@ pub(super) fn measure_continuity(
         let from = before.1.unwrap_or_default();
         let to = view.hero.position;
         log::info!(
-            "display discontinuity at {:.3}s: {:.2} m in {:.1} ms, worst excess {:.2} m, \
+            "display discontinuity at {now:.3}s: {:.2} m, worst excess {:.2} m, \
              dashing {} invulnerable {} memories {:?}",
-            time.elapsed_secs_f64(),
             (to[0] - from[0]).hypot(to[1] - from[1]),
-            time.delta_secs_f64() * 1000.0,
             ledger.max_excess_metres,
             view.hero.dashing,
             view.hero.invulnerable,
@@ -194,6 +198,7 @@ mod tests {
     fn key() -> ContinuityKey {
         ContinuityKey {
             hero: 1,
+            motion_segment: 1,
             room: 0,
             realm: 0,
             match_epoch: 1,

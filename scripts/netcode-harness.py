@@ -49,6 +49,7 @@ TRANSPORTS = ("udp", "webrtc")
 # Conditioner values are per direction, so "wan" is about 150 ms round trip.
 SCENARIOS = {
     "clean": {"delay_ms": 0, "jitter_ms": 0, "loss_percent": 0, "stall": None},
+    "stall": {"delay_ms": 0, "jitter_ms": 0, "loss_percent": 0, "stall": "500@5"},
     "wan": {"delay_ms": 75, "jitter_ms": 10, "loss_percent": 1, "stall": None},
     "wan-stall": {"delay_ms": 75, "jitter_ms": 10, "loss_percent": 1, "stall": "500@5"},
 }

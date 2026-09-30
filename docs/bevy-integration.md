@@ -63,7 +63,15 @@ registration order is not system execution order. See the
 Client `PreUpdate` orders receive/reconciliation, keyboard actions, UI buttons,
 action application and input capture. Buttons and capture follow `UiSystems::Focus`
 to consume current interaction state. `FixedUpdate` predicts, `Update` adapts and
-renders, and `PostUpdate` flushes network packets.
+renders, and `PostUpdate` flushes network packets every frame, so input leaves
+in the frame that authored it.
+
+Network deadlines are the one retained exception to reading `Time<Real>` as is.
+Bevy can stamp a frame with an earlier instant (with pipelined rendering, the
+previous render's), so the first frame after a hitch still reads the time from
+before it. `network::network_now` adds the time since that update, and command
+targets, input capture and receive timestamps use it. The display-continuity
+ledger uses it for the same reason. Everything else keeps the frame clock.
 
 Camera systems run in `Update`:
 

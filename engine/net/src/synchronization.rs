@@ -281,7 +281,9 @@ impl LeadController {
         self.lead
     }
     /// Slack is target_tick - authoritative_tick_at_arrival. Increase promptly on
-    /// missed deadlines; decrease only after eight consistently overbuffered samples.
+    /// missed deadlines; decrease only after eight samples that all had spare
+    /// headroom. A late command is always a misprediction, so ordinary jitter
+    /// must stay inside the margin rather than a quarter of it.
     pub fn observe_arrival_slack(&mut self, slack: i32) -> Result<u8, SyncError> {
         let bound = i32::from(MAX_COMMAND_LEAD_TICKS);
         if !(-bound..=bound).contains(&slack) {
@@ -304,9 +306,8 @@ impl LeadController {
             }
             self.samples.push_back(slack);
             if self.samples.len() >= 8 {
-                let mut sorted: Vec<_> = self.samples.iter().copied().collect();
-                sorted.sort_unstable();
-                if sorted[sorted.len() / 4] > 2 && self.lead > 1 {
+                let tightest = self.samples.iter().copied().min().expect("eight samples");
+                if tightest > 2 && self.lead > 1 {
                     self.lead -= 1;
                     self.samples.clear();
                 }

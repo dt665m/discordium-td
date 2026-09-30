@@ -282,6 +282,8 @@ impl PublicHeroView {
     pub fn presentation(&self) -> HeroView {
         HeroView {
             id: self.id,
+            // Not disclosed for remote heroes.
+            motion_segment: 0,
             color: self.color,
             position: self.position,
             elevation: self.elevation,

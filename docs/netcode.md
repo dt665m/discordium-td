@@ -414,11 +414,26 @@ a quality axis, never an admission criterion: a round trip past what lead can
 cover makes commands arrive late, which the player sees and can play through. It
 never fails the clock, ends the session, or spends a recovery attempt, because
 recovery cannot shorten the path it would be complaining about. The client
-bounds speculation to the 32-tick replay budget beyond the latest proven
-committed tick. Replies
-that repeat a stalled tick cannot refill that budget. Once exhausted, assignment
-waits without consuming input edges or command sequences; the wall-clock estimate
-and server debt remain visible. Repeated finalization controls do not apply
+bounds speculation to its retained prediction history (256 ticks, about four
+seconds) beyond the latest proven committed tick. Replies that repeat a stalled
+tick cannot refill that budget. Once exhausted, assignment waits without
+consuming input edges or command sequences; the wall-clock estimate and server
+debt remain visible.
+
+A client that stops running for a while (a garbage collection pause, shader
+compilation, a background tab) recovers in place, never through a server
+resync. The clock estimate jumps to the time that passed instead of slewing,
+and a large offset step re-anchors on the newest sample. The command head moves
+forward; the skipped ticks had no input, and the server fills them with the same
+substitutes the client forecasts. A finalized checkpoint ahead of the prediction
+becomes the new base however far ahead it is, because every command before it
+is already finalized. Replay and forecast work are bounded by retained history
+rather than a per-frame tick count; a replay that would exceed the frame's shared
+budget waits for the next frame, and a forecast gap longer than the budget is
+covered over several frames. Predicted presentation events restart their journal
+when they cannot follow a rebase. Lead only shrinks after eight arrival samples
+that all kept more than two ticks of slack, because a late command is always a
+misprediction. Repeated finalization controls do not apply
 arrival-slack feedback twice. Attack sample stamps and remote display time use
 the same simulation clock, including fractional tick phase. Newly assigned
 commands use dependencies from the latest admitted checkpoint; already recorded
@@ -477,9 +492,9 @@ for the network layer. It builds the native release pair, then runs one server
 and two autoplaying rendered clients per scenario, over both native UDP and the
 browser's WebRTC data channel path (`--transport webrtc` negotiates through the
 same session and SDP endpoints a browser uses). Scenarios are a clean link, a WAN
-path (75 ms ± 10 ms and 1% loss per direction) and that path with a 500 ms
-main-thread stall every 5 s (`--inject-stall 500@5`), which reproduces the
-browser's garbage collection and shader compilation hitches. Each client measures
+path (75 ms ± 10 ms and 1% loss per direction), and each of those with a 500 ms
+stall every 5 s (`--inject-stall 500@5`). The stall blocks the client between
+frames, as the browser's garbage collection and shader compilation hitches do. Each client measures
 its own display (`session_health` in the trace). Any disconnect, reconnect,
 client-requested recovery or teleport fails the scenario, as do more than six
 visible corrections per connected minute. A correction is a frame whose owner

@@ -54,6 +54,9 @@ fn connected_runtime() -> (Runtime, RenetServer) {
         })
         .unwrap();
     session.lead = engine_net::synchronization::LeadController::new(3).unwrap();
+    session.limit_speculation(
+        engine_net::prediction::PredictionLimits::default().replay_ticks_per_frame as u32,
+    );
     assert_eq!(session.last_input_retry_committed, None);
     let mut runtime = tests::receipt_runtime(session);
     runtime.renet.set_connected();

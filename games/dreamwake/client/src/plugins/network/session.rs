@@ -195,6 +195,16 @@ impl Session {
             .filter_map(|entity| self.scopes.state(*entity).map(|state| state.scope))
             .collect()
     }
+    /// Tests exercise the speculation ceiling without simulating the seconds
+    /// the production bound takes to reach.
+    #[cfg(test)]
+    pub(super) fn limit_speculation(&mut self, ticks: u32) {
+        let (tick, time) = self.simulation_clock.anchor();
+        let committed = self.simulation_clock.committed();
+        let rate = TickRate::new(dreamwake_sim::TICK_HZ).unwrap();
+        self.simulation_clock = CommittedClock::new(rate, tick, time, ticks).unwrap();
+        self.simulation_clock.commit(committed);
+    }
     pub(crate) fn metrics(&self) -> SessionMetrics {
         let checkpoint = self.scopes.state(self.model.welcome.owner_entity);
         let work = self.predictor.work();
@@ -274,7 +284,10 @@ impl Session {
                 rate,
                 welcome.tick,
                 Duration::from_nanos(welcome.server_time_nanos),
-                PredictionLimits::default().replay_ticks_per_frame as u32,
+                // Speculation is bounded by retained history. A tighter ceiling
+                // freezes the owner after every hitch until fresh authority
+                // arrives, then releases the backlog in one frame.
+                PredictionLimits::default().history_ticks as u32,
             )
             .map_err(err)?,
             lead: LeadController::new(3).map_err(err)?,

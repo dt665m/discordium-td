@@ -33,7 +33,7 @@ impl Plugin for DreamDiagnosticsPlugin {
         app.add_plugins(debug::DreamDebugPlugin);
         #[cfg(not(target_arch = "wasm32"))]
         app.add_systems(
-            First,
+            Last,
             stall::inject_stall.run_if(resource_exists::<stall::InjectedStall>),
         );
         #[cfg(not(target_arch = "wasm32"))]

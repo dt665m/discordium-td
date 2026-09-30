@@ -58,8 +58,9 @@ impl StallClock {
     }
 }
 
-/// Runs first in the frame so the stall shows up exactly as a hitch does:
-/// the whole frame, and everything scheduled in it, arrives late.
+/// Runs last in the frame, so the stall falls between frames as a browser
+/// hitch does: the next frame reads a clock that includes it and receives
+/// everything that arrived meanwhile, together.
 pub(super) fn inject_stall(stall: Res<InjectedStall>, mut clock: ResMut<StallClock>) {
     let now = Instant::now();
     if now < clock.next {

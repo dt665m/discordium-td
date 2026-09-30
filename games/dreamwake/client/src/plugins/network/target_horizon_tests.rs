@@ -23,6 +23,7 @@ fn active_runtime() -> Runtime {
         })
         .unwrap();
     session.lead = LeadController::new(3).unwrap();
+    session.limit_speculation(PredictionLimits::default().replay_ticks_per_frame as u32);
     let mut runtime = tests::receipt_runtime(session);
     runtime.renet.set_connected();
     generate_commands(&mut runtime, Duration::from_millis(200)).unwrap();

@@ -126,7 +126,6 @@ pub(crate) struct Runtime {
     pub(crate) pending: VecDeque<PendingFrame>,
     pub(crate) prediction: Option<Session>,
     pub(crate) last_received: f64,
-    last_send: f64,
     pub(crate) last_snapshot: Option<DreamPresentation>,
     in_flight_action: Option<CommandSeq>,
     pub(crate) outcomes: outcomes::ClientOutcomes,
@@ -484,6 +483,19 @@ fn flush_decoded_receipts(runtime: &mut Runtime) -> Result<(), String> {
     }
     Ok(())
 }
+/// The time network work actually runs, on the frame clock's timeline.
+///
+/// The frame clock can trail the wall clock by a whole frame: with pipelined
+/// rendering Bevy stamps a frame with the previous render's instant, so the
+/// first frame after a hitch still reads the time from before it. Commands
+/// authored from that clock target ticks the server has already simulated,
+/// and are then corrected. Deadlines use when the work runs instead.
+pub(crate) fn network_now(time: &Time<Real>) -> Duration {
+    time.elapsed()
+        + time
+            .last_update()
+            .map_or(Duration::ZERO, |last| last.elapsed())
+}
 fn request_resync(
     world: &mut World,
     runtime: &mut Runtime,
@@ -561,7 +573,7 @@ fn poll_network(world: &mut World) {
         world.remove_non_send::<PendingBootstrap>();
         match result {
             Ok((renet, transport, id)) => {
-                let now = world.resource::<Time<Real>>().elapsed_secs_f64();
+                let now = network_now(world.resource::<Time<Real>>()).as_secs_f64();
                 let outcomes = world
                     .remove_resource::<outcomes::ClientOutcomes>()
                     .unwrap_or_default();
@@ -573,7 +585,6 @@ fn poll_network(world: &mut World) {
                     pending: VecDeque::new(),
                     prediction: None,
                     last_received: now,
-                    last_send: 0.0,
                     last_snapshot: None,
                     in_flight_action: None,
                     outcomes,
@@ -592,7 +603,7 @@ fn poll_network(world: &mut World) {
     let Some(mut runtime) = world.remove_non_send::<Runtime>() else {
         return;
     };
-    let now = world.resource::<Time<Real>>().elapsed();
+    let now = network_now(world.resource::<Time<Real>>());
     let duration = world
         .resource::<Time<Real>>()
         .delta()
@@ -1189,7 +1200,7 @@ fn accept_state_receipt(
     Ok(())
 }
 fn journal_hardware(world: &mut World) {
-    let now = world.resource::<Time<Real>>().elapsed();
+    let now = network_now(world.resource::<Time<Real>>());
     let mut input = world.resource::<CapturedInput>().0;
     let prefs = world.resource::<DreamPreferences>();
     if prefs.paused || prefs.build_open {
@@ -1284,7 +1295,7 @@ fn predict_and_send(world: &mut World) {
     let Some(mut runtime) = world.remove_non_send::<Runtime>() else {
         return;
     };
-    let now = world.resource::<Time<Real>>().elapsed();
+    let now = network_now(world.resource::<Time<Real>>());
     let result = generate_commands(&mut runtime, now);
     if let Err(error) = result {
         request_resync(
@@ -1713,18 +1724,15 @@ mod autoplay_restart_tests {
     }
 }
 
+/// Every frame: input must leave in the frame that authored it. Holding it
+/// for a send cadence lets a hitch that follows delay it past its tick.
 fn flush_network(
-    time: Res<Time<Real>>,
     runtime: Option<NonSendMut<Runtime>>,
     mut telemetry: ResMut<diagnostics::Telemetry>,
 ) {
     let Some(mut runtime) = runtime else {
         return;
     };
-    if time.elapsed_secs_f64() - runtime.last_send < 1.0 / 60.0 {
-        return;
-    }
-    runtime.last_send = time.elapsed_secs_f64();
     let Runtime {
         transport, renet, ..
     } = &mut *runtime;

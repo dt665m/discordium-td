@@ -232,6 +232,7 @@ impl SavedHero {
     pub fn snapshot(&self) -> HeroView {
         HeroView {
             id: self.view.id,
+            motion_segment: self.combat_identity.segment,
             color: self.view.color,
             position: crate::collision::planar_position(&self.motion),
             elevation: self.motion.position[1],

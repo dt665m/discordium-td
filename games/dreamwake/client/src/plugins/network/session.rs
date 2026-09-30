@@ -153,6 +153,9 @@ pub(crate) struct Session {
     /// is the only attribution the server ever sees, so it must describe the
     /// fault that actually happened rather than a fixed placeholder.
     pub(super) resync_reason: dreamwake_protocol::live::ResyncReason,
+    /// The fault text as observed, carried to the server because a deployed
+    /// browser's own log cannot be read from there.
+    pub(super) resync_detail: String,
 }
 impl Session {
     #[cfg(not(target_arch = "wasm32"))]
@@ -306,6 +309,7 @@ impl Session {
             last_resync: None,
             resync_request: ResyncRequest::Idle,
             resync_reason: dreamwake_protocol::live::ResyncReason::InvalidCheckpoint,
+            resync_detail: String::new(),
             poses: super::presentation::RemotePoses::new(epoch, welcome.content.scene_revision)
                 .map_err(|e| format!("remote presentation: {e:?}"))?,
             model: OwnerModel::new(welcome),

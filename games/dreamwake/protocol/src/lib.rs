@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 pub mod live;
 pub mod player;
 pub mod replication;
-pub const PROTOCOL_ID: u64 = 0x4452_4541_4d00_0018;
+pub const PROTOCOL_ID: u64 = 0x4452_4541_4d00_0019;
 pub const SESSION_SERVICE: &str = "dreamwake";
 pub const SESSION_MATCH: &str = "default";
 pub const DEFAULT_MAX_PLAYERS: usize = 8;

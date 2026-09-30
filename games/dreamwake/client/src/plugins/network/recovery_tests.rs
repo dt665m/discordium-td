@@ -53,7 +53,8 @@ fn recovery_at_250ms_enqueues_its_first_request_immediately() {
     assert!(matches!(
         controls(&mut runtime, &mut server).as_slice(),
         [ClientControl::Resync {
-            reason: ResyncReason::InvalidCheckpoint
+            reason: ResyncReason::InvalidCheckpoint,
+            ..
         }]
     ));
     let session = runtime.prediction.as_ref().unwrap();

@@ -107,6 +107,19 @@ impl<const N: usize> Default for BoundedString<N> {
         Self(String::new())
     }
 }
+impl<const N: usize> serde::Serialize for BoundedString<N> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
+}
+impl<'de, const N: usize> serde::Deserialize<'de> for BoundedString<N> {
+    /// The bound is part of the type, so decoding enforces it too. A peer
+    /// cannot widen this field by sending a longer value.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        Self::new(text).map_err(serde::de::Error::custom)
+    }
+}
 impl<const N: usize> FieldValue for BoundedString<N> {
     fn inspect(s: &FieldSpec, i: &mut Inspection, _: usize) -> Result<(), SchemaError> {
         if s.range != Range::None {

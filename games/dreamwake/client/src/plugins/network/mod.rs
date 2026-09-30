@@ -419,6 +419,13 @@ fn request_resync(
     log::warn!("Scoped session requires resynchronization: {reason}");
     if let Some(session) = &mut runtime.prediction {
         session.resync_reason = kind;
+        // Truncate on a char boundary: the field is byte-bounded and the text
+        // is diagnostic, so losing the tail is better than losing the message.
+        let mut detail = reason.to_owned();
+        while detail.len() > 96 {
+            detail.pop();
+        }
+        session.resync_detail = detail;
         session.recover();
     }
     service_pending_resync(runtime, now);
@@ -438,6 +445,7 @@ fn service_pending_resync(runtime: &mut Runtime, now: Duration) {
     // Encoding/backpressure failure retains PendingEnqueue and its deadline.
     let Ok(bytes) = session.control(&ClientControl::Resync {
         reason: session.resync_reason,
+        detail: engine_net::schema::BoundedString::new(&session.resync_detail).unwrap_or_default(),
     }) else {
         return;
     };

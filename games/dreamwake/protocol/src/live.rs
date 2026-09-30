@@ -15,6 +15,7 @@ use engine_net::{
     codec::{self, BoundedVec, CodecError, FrameHeader, FrameLimit, Lane, Validate},
     commands::{Command, FinalizedReceipt, OwnerStream},
     replication::*,
+    schema::BoundedString,
     types::*,
 };
 use serde::{Deserialize, Serialize};
@@ -219,6 +220,11 @@ pub enum ClientControl {
     },
     Resync {
         reason: ResyncReason,
+        /// The fault as the client observed it. The typed reason groups these
+        /// for policy; this says which one actually happened, because a
+        /// deployed browser's own log is unreadable from the server and three
+        /// of these inside the sliding window end the connection.
+        detail: BoundedString<96>,
     },
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

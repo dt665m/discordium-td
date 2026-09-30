@@ -1081,6 +1081,7 @@ fn active_reset_expiry_recovers_after_three_second_application_stall() {
     });
     h.clients[0].control(live::ClientControl::Resync {
         reason: live::ResyncReason::ExpiredGroup,
+        detail: Default::default(),
     });
     h.pump(6);
     let peer = &h.driver.authority.peers[&41];

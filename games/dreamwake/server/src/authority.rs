@@ -470,13 +470,14 @@ impl DreamAuthority {
                     },
                 )?;
             }
-            live::ClientControl::Resync { reason } => {
+            live::ClientControl::Resync { reason, detail } => {
                 // The only signal for why an otherwise healthy session keeps
                 // rebuilding itself. Three of these inside the sliding window
                 // end the connection, so discarding it left that outcome with
                 // no attributable cause.
                 log::warn!(
-                    "Dreamwake resync peer {id}: {reason:?} (recent attempts {})",
+                    "Dreamwake resync peer {id}: {reason:?} \"{}\" (recent attempts {})",
+                    detail.as_str(),
                     self.peers
                         .get(&id)
                         .map_or(0, |peer| peer.resync_attempts.len()),

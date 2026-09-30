@@ -795,14 +795,30 @@ impl DreamReplication {
                         )
                 )
             );
+            // Members of an owner prediction group travel as baselines and
+            // deltas. A byte patch against compressed bytes is as large as the
+            // state, so these stay raw here; the group compresses a full
+            // member when it is sent whole.
+            let compression = match self.keys.get(&id) {
+                Some(
+                    Key::Global
+                    | Key::Collision
+                    | Key::Owner(_)
+                    | Key::Actor(ReplicationKey::Platform(_)),
+                ) => engine_net::CompressionPolicy {
+                    mode: engine_net::CompressionMode::Off,
+                    ..self.compression
+                },
+                _ => self.compression,
+            };
             let bytes = if canonical {
                 self.canonical
                     .encode(eligible, id, || {
-                        encode_replica_with_compression(&payload, self.compression)
+                        encode_replica_with_compression(&payload, compression)
                     })
                     .map_err(error)?
             } else {
-                encode_replica_with_compression(&payload, self.compression).map_err(error)?
+                encode_replica_with_compression(&payload, compression).map_err(error)?
             };
             peer.scopes
                 .offer(
@@ -2157,24 +2173,21 @@ mod tests {
         assert!(rep.scopes_mut(1).is_none());
     }
     #[test]
-    fn configured_compression_applies_to_shared_canonical_payloads() {
+    fn owner_group_members_stay_raw_and_shared_under_every_compression_policy() {
+        // Baselines patch these bytes; compressed bytes would make every
+        // delta as large as the state. The group compresses full members.
         let sim = party();
-        for (compression, marker) in [
-            (engine_net::CompressionPolicy::default(), 1),
-            (
-                engine_net::CompressionPolicy {
-                    mode: engine_net::CompressionMode::Off,
-                    minimum_bytes: 0,
-                },
-                0,
-            ),
-            (
-                engine_net::CompressionPolicy {
-                    mode: engine_net::CompressionMode::Auto,
-                    minimum_bytes: usize::MAX,
-                },
-                0,
-            ),
+        let marker = 0;
+        for compression in [
+            engine_net::CompressionPolicy::default(),
+            engine_net::CompressionPolicy {
+                mode: engine_net::CompressionMode::Off,
+                minimum_bytes: 0,
+            },
+            engine_net::CompressionPolicy {
+                mode: engine_net::CompressionMode::Auto,
+                minimum_bytes: usize::MAX,
+            },
         ] {
             let mut rep =
                 DreamReplication::with_compression(7, 12.0, Limits::default(), compression)

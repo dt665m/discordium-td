@@ -112,11 +112,46 @@ pub struct NetworkOptions {
     pub max_clients: u16,
     #[cfg(not(target_arch = "wasm32"))]
     pub transport: NativeTransportKind,
+    /// Impairs the WebRTC path's datagrams beneath DTLS and SCTP.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub link_impairment: Option<renet_cross::LinkImpairment>,
+}
+/// `DELAY_MS:JITTER_MS:LOSS_PERCENT`, applied in each direction.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn parse_link_impairment(
+    value: &str,
+    seed: u64,
+) -> Result<renet_cross::LinkImpairment, String> {
+    let parts: Vec<_> = value.split(':').collect();
+    let [delay, jitter, loss] = parts.as_slice() else {
+        return Err(format!(
+            "link impairment '{value}' must be DELAY_MS:JITTER_MS:LOSS_PERCENT"
+        ));
+    };
+    let millis = |text: &str| {
+        text.parse::<u64>()
+            .map(Duration::from_millis)
+            .map_err(|_| format!("'{text}' is not whole milliseconds"))
+    };
+    let loss = loss
+        .parse::<f64>()
+        .ok()
+        .filter(|percent| (0.0..=100.0).contains(percent))
+        .ok_or_else(|| format!("loss '{loss}' is not a percentage"))?;
+    Ok(renet_cross::LinkImpairment {
+        delay: millis(delay)?,
+        jitter: millis(jitter)?,
+        loss: loss / 100.0,
+        seed,
+    })
 }
 #[derive(Clone)]
 pub(crate) struct PendingFrame {
     command: Command<TickInput, DreamAction>,
+    /// First transmission, for acknowledgement latency.
     sent_at: f64,
+    /// Latest transmission, including redundancy and retries.
+    last_sent: f64,
 }
 pub(crate) struct Runtime {
     pub(crate) renet: RenetClient,
@@ -251,6 +286,7 @@ pub fn connect(world: &mut World, attempts: u32) {
     #[cfg(not(target_arch = "wasm32"))]
     {
         let kind = world.resource::<NetworkOptions>().transport;
+        let link = world.resource::<NetworkOptions>().link_impairment;
         let (sender, receiver) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let mut result = Err("Could not reach server".to_owned());
@@ -283,7 +319,10 @@ pub fn connect(world: &mut World, attempts: u32) {
                                 ..Default::default()
                             },
                         )
-                        .map(|(renet, transport, id)| (renet, Transport::WebRtc(transport), id))
+                        .map(|(renet, mut transport, id)| {
+                            transport.set_link_impairment(link);
+                            (renet, Transport::WebRtc(transport), id)
+                        })
                     }
                 }
                 .map_err(|e| e.to_string());
@@ -461,24 +500,30 @@ fn send_state_receipt(runtime: &mut Runtime, message: ClientControl) -> Result<(
     let ClientControl::Decoded { receipts } = message else {
         return send_control(runtime, message);
     };
+    let session = runtime.prediction.as_mut().ok_or("no session")?;
     for receipt in receipts.into_vec() {
-        let batch = runtime
-            .prediction
-            .as_mut()
-            .ok_or("no session")?
-            .queue_decoded_receipt(receipt);
-        if let Some(batch) = batch {
-            send_control(runtime, batch)?;
-        }
+        session.queue_decoded_receipt(receipt);
     }
     Ok(())
 }
-fn flush_decoded_receipts(runtime: &mut Runtime) -> Result<(), String> {
-    let batch = runtime
+/// Public-state acknowledgements are cumulative, so they go out five times a
+/// second rather than one per received state. At twenty publications a
+/// second for every nearby actor, per-message receipts made the client's
+/// upload larger than its download.
+const DECODED_RECEIPT_INTERVAL: Duration = Duration::from_millis(200);
+fn flush_decoded_receipts(runtime: &mut Runtime, now: Duration) -> Result<(), String> {
+    let Some(session) = runtime.prediction.as_mut() else {
+        return Ok(());
+    };
+    if now < session.next_receipt_flush {
+        return Ok(());
+    }
+    session.next_receipt_flush = now + DECODED_RECEIPT_INTERVAL;
+    while let Some(batch) = runtime
         .prediction
         .as_mut()
-        .and_then(Session::take_decoded_receipts);
-    if let Some(batch) = batch {
+        .and_then(Session::take_decoded_receipts)
+    {
         send_control(runtime, batch)?;
     }
     Ok(())
@@ -643,10 +688,9 @@ fn poll_network(world: &mut World) {
     // Recovery stops prediction/reconciliation, not request delivery. Give a
     // pending resync the first available control space after processing receives.
     service_pending_resync(&mut runtime, now);
-    // Publish the final partial public-state ACK batch in this receive pass,
-    // before PostUpdate can send transport packets. Owner/baseline proofs above
-    // remain immediate and are never held in this queue.
-    if let Err(error) = flush_decoded_receipts(&mut runtime) {
+    // Public-state ACKs coalesce on their own interval. Owner/baseline proofs
+    // above remain immediate and are never held in this queue.
+    if let Err(error) = flush_decoded_receipts(&mut runtime, now) {
         log::warn!("Could not encode decoded-state acknowledgements: {error}");
     }
     let finalized_ack = runtime
@@ -1357,6 +1401,12 @@ fn predict_and_send(world: &mut World) {
     }
     world.insert_non_send(runtime);
 }
+/// The newest command plus three predecessors: at 60 Hz that survives 50 ms
+/// of consecutive loss, and the retry path covers longer gaps. More repeats
+/// multiply the client's upload by the record count for little extra benefit,
+/// and a saturated uplink delays every command instead.
+const COMMAND_RECORDS_PER_PACKET: usize = 4;
+
 /// How many ticks toward `target` fit this frame's prediction budget. A gap
 /// longer than the budget (the client stopped running for a while) is covered
 /// over several frames rather than treated as a fault.
@@ -1405,14 +1455,14 @@ fn generate_commands(runtime: &mut Runtime, now: Duration) -> Result<(), String>
         .map_err(|e| e.to_string())?;
     session.estimated_simulation_tick = Some(estimated);
     let Some(target) = session.assign_command_target(estimated)? else {
-        return retry_pending_commands(runtime, &[]);
+        return retry_pending_commands(runtime, &[], now);
     };
     let current = session
         .predictor
         .predicted_tick(OWNER_GROUP)
         .ok_or("missing owner prediction")?;
     if target.0 <= current.0 {
-        return retry_pending_commands(runtime, &[]);
+        return retry_pending_commands(runtime, &[], now);
     }
     let reachable = prediction_ticks_this_frame(session, runtime.pending.len(), current, target)?;
     // Bootstrap or a frontier behind estimated simulation time is a forecast
@@ -1431,7 +1481,7 @@ fn generate_commands(runtime: &mut Runtime, now: Duration) -> Result<(), String>
                 .map_err(|e| e.to_string())?;
             session.events.publish(&session.predictor)?;
         }
-        return retry_pending_commands(runtime, &[]);
+        return retry_pending_commands(runtime, &[], now);
     }
     let mut covered = Vec::new();
     for tick in current.0 + 1..=target.0 {
@@ -1484,6 +1534,7 @@ fn generate_commands(runtime: &mut Runtime, now: Duration) -> Result<(), String>
         runtime.pending.push_back(PendingFrame {
             command: command.clone(),
             sent_at: now.as_secs_f64(),
+            last_sent: now.as_secs_f64(),
         });
         let older = runtime
             .pending
@@ -1497,9 +1548,13 @@ fn generate_commands(runtime: &mut Runtime, now: Duration) -> Result<(), String>
             .welcome
             .frame_limit()
             .map_err(|e| e.to_string())?;
-        let records =
-            engine_net::commands::pack_redundant(&command, &older, 8, limit.payload_bytes())
-                .map_err(|e| e.to_string())?;
+        let records = engine_net::commands::pack_redundant(
+            &command,
+            &older,
+            COMMAND_RECORDS_PER_PACKET,
+            limit.payload_bytes(),
+        )
+        .map_err(|e| e.to_string())?;
         covered.extend(records.as_slice().iter().map(|record| record.sequence));
         let bytes = encode_commands(
             &CommandBundle { records },
@@ -1518,13 +1573,30 @@ fn generate_commands(runtime: &mut Runtime, now: Duration) -> Result<(), String>
             now,
         );
     }
-    retry_pending_commands(runtime, &covered)
+    retry_pending_commands(runtime, &covered, now)
 }
 
 /// Progress can make an immutable Future command eligible after it has left
 /// normal newest-eight redundancy. Retry that bounded admission window even
 /// when command generation is paused or already sent newer records this frame.
-fn retry_pending_commands(runtime: &mut Runtime, covered: &[CommandSeq]) -> Result<(), String> {
+/// A pending command is resent at most this often. Retrying on every advance
+/// of authority grew with the number of unacknowledged commands at frame rate,
+/// so a slow uplink filled with retries of its own backlog.
+const COMMAND_RETRY_INTERVAL: Duration = engine_net::RELIABLE_RESEND_TIME;
+fn retry_pending_commands(
+    runtime: &mut Runtime,
+    covered: &[CommandSeq],
+    now: Duration,
+) -> Result<(), String> {
+    let now_seconds = now.as_secs_f64();
+    // Records carried as redundancy in this frame's packet were just sent.
+    for frame in runtime
+        .pending
+        .iter_mut()
+        .filter(|frame| covered.contains(&frame.command.sequence))
+    {
+        frame.last_sent = now_seconds;
+    }
     let Some(session) = &mut runtime.prediction else {
         return Ok(());
     };
@@ -1552,6 +1624,7 @@ fn retry_pending_commands(runtime: &mut Runtime, covered: &[CommandSeq]) -> Resu
                 && frame.command.target.0 > committed.0
                 && frame.command.target.0 <= through
                 && !covered.contains(&frame.command.sequence)
+                && now_seconds - frame.last_sent >= COMMAND_RETRY_INTERVAL.as_secs_f64()
         })
         .take(usize::from(future_ticks))
         .map(|frame| frame.command.clone())
@@ -1565,16 +1638,20 @@ fn retry_pending_commands(runtime: &mut Runtime, covered: &[CommandSeq]) -> Resu
     while !eligible.is_empty() {
         // Oldest eligible records get an opportunity first. Each individual
         // frame remains newest-first and retains the established exact byte cap.
-        let prefix = &eligible[..eligible.len().min(8)];
+        let prefix = &eligible[..eligible.len().min(COMMAND_RECORDS_PER_PACKET)];
         let newest = prefix.last().unwrap();
         let older = prefix[..prefix.len() - 1]
             .iter()
             .rev()
             .cloned()
             .collect::<Vec<_>>();
-        let records =
-            engine_net::commands::pack_redundant(newest, &older, 8, limit.payload_bytes())
-                .map_err(|e| e.to_string())?;
+        let records = engine_net::commands::pack_redundant(
+            newest,
+            &older,
+            COMMAND_RECORDS_PER_PACKET,
+            limit.payload_bytes(),
+        )
+        .map_err(|e| e.to_string())?;
         let included = records
             .as_slice()
             .iter()
@@ -1590,6 +1667,13 @@ fn retry_pending_commands(runtime: &mut Runtime, covered: &[CommandSeq]) -> Resu
             .map_err(|e| e.to_string())?,
         );
         eligible.retain(|command| !included.contains(&command.sequence));
+        for frame in runtime
+            .pending
+            .iter_mut()
+            .filter(|frame| included.contains(&frame.command.sequence))
+        {
+            frame.last_sent = now_seconds;
+        }
     }
     // Same-tick replies do not replenish the retry budget. Retransmission never
     // consumes hardware input, allocates sequences, retargets commands or creates
@@ -1680,6 +1764,8 @@ mod autoplay_restart_tests {
                 max_clients: 8,
                 #[cfg(not(target_arch = "wasm32"))]
                 transport: NativeTransportKind::Udp,
+                #[cfg(not(target_arch = "wasm32"))]
+                link_impairment: None,
             });
             world.init_resource::<crate::ui::UiActions>();
             playtest_actions(&mut world);

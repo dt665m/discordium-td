@@ -24,7 +24,8 @@ pub mod trace;
 pub mod types;
 pub mod wire;
 pub use wire::{
-    CompressionMode, CompressionPolicy, decode, decode_with_limit, encode, encode_with_compression,
+    CompressionMode, CompressionPolicy, decode, decode_with_limit, deflate, encode,
+    encode_with_compression, inflate,
 };
 pub const INPUT_CHANNEL: u8 = 0;
 pub const ACTION_CHANNEL: u8 = 2;
@@ -65,6 +66,8 @@ pub fn newer(seq: u32, previous: Option<u32>) -> bool {
     previous.is_none_or(|old| seq != old && seq.wrapping_sub(old) < (1 << 31))
 }
 
+pub const RELIABLE_RESEND_TIME: Duration = Duration::from_millis(250);
+
 pub fn connection_config() -> renet::ConnectionConfig {
     let mut config = renet::ConnectionConfig::default();
     // Bound per-tick throughput and reliable queues independently of payload types.
@@ -75,8 +78,13 @@ pub fn connection_config() -> renet::ConnectionConfig {
         .chain(config.client_channels_config.iter_mut())
     {
         channel.max_memory_usage_bytes = 4 * 1024 * 1024;
+        // Renet resends on a fixed timer, not on detected loss. A timer shorter
+        // than the round trip resends every message before its acknowledgement
+        // can arrive, and a queue that lengthens the round trip then multiplies
+        // the traffic feeding it. Stay above ordinary round trips; a real loss
+        // still recovers within a quarter second.
         if let renet::SendType::ReliableOrdered { resend_time } = &mut channel.send_type {
-            *resend_time = Duration::from_millis(80);
+            *resend_time = RELIABLE_RESEND_TIME;
         }
     }
     config

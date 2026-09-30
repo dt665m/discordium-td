@@ -424,7 +424,7 @@ fn command_envelopes_reject_wrong_lane_epoch_lengths_and_hostile_counts() {
 #[test]
 fn complete_scope_rejects_malformed_lengths_and_stale_scope_without_mutating_client() {
     let current = state(2, 2, 2, vec![7; 900]);
-    let wire = encode_state(
+    let wire = encode_state_uncompressed(
         &StateFrame::Full(current.clone()),
         ConnectionEpoch(2),
         1,
@@ -481,7 +481,7 @@ fn whole_atomic_group_has_independent_bound_and_requires_valid_complete_decode()
     let mut client =
         ClientScopes::<Vec<u8>>::new(ConnectionEpoch(2), crate::live::baselines::scope_limits())
             .unwrap();
-    let wire = encode_state(
+    let wire = encode_state_uncompressed(
         &StateFrame::Group(group.clone()),
         ConnectionEpoch(2),
         1,
@@ -712,7 +712,7 @@ fn maximum_declared_schema_envelopes_roundtrip_without_compression() {
                 encoding: engine_net::replication::baselines::BaselineEncoding::Full,
                 bytes: state.payload.clone(),
             };
-            state.payload = baselines::encode_member(&packet).unwrap();
+            state.payload = baselines::encode_member_uncompressed(&packet).unwrap();
             state
         })
         .collect();
@@ -731,7 +731,7 @@ fn maximum_declared_schema_envelopes_roundtrip_without_compression() {
     // reached GROUP_BYTES could not be published at all, and bootstrap depends
     // on publishing it atomically. A large opaque BoundedBytes field charges
     // its whole declared size here even when it is nearly empty on the wire.
-    assert_eq!(encoded.len(), 51_929);
+    assert_eq!(encoded.len(), 51_933);
     assert!(encoded.len() > 16 * 1024);
     assert!(
         encoded.len() <= baselines::GROUP_BYTES * 7 / 8,

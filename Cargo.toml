@@ -28,7 +28,7 @@ clap = { version = "4.5.53", features = ["derive", "env"] }
 env_logger = "0.11.8"
 log = "0.4.22"
 renet = "=2.0.0"
-renet-cross = { version = "=0.7.3", path = "../renet-cross" }
+renet-cross = { version = "=0.7.4", path = "../renet-cross" }
 rtrb = "0.4"
 bevy-net-debug = { path = "engine/net-debug" }
 serde = { version = "1.0.228", features = ["derive"] }
@@ -74,5 +74,7 @@ opt-level = 3
 [patch.crates-io]
 # Only the upstreamable handshake correction; Renet itself stays on crates.io.
 renetcode = { git = "https://github.com/dt665m/renet.git", branch = "fix/confirmation-keepalive-starvation" }
-sctp-proto = { git = "https://github.com/dt665m/sctp-proto.git", rev = "cb94f37991c185fb9cc2fd41fbe92965e2a1f713" }
+# The fork checkout beside this one (branch fix/partial-reliability-abandonment):
+# PR-SCTP fixes plus a congestion window floor for real-time data channels.
+sctp-proto = { path = "../sctp-proto" }
 str0m = { git = "https://github.com/dt665m/str0m.git", rev = "591de71f4588b59e4850007414c6315a93943794" }

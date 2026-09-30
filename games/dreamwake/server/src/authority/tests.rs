@@ -864,11 +864,12 @@ fn initial_expiry_retires_stream_and_recovers_within_original_deadline() {
 }
 
 #[test]
-fn initial_audit_expiry_recovers_after_six_second_application_startup_stall() {
+fn six_second_application_startup_stall_joins_without_a_new_stream() {
     let mut h = Harness::new();
     h.join();
     // Keep transport receipt ACKs flowing while rendering blocks the application
-    // from consuming Welcome, sending Ready, and acknowledging Finalized.
+    // from consuming Welcome, sending Ready, and acknowledging Finalized. The
+    // finalization audit outlasts the stall, so the original stream survives.
     h.clients[0].receive_application = false;
     h.pump(12);
     let original = h.driver.authority.peers[&41].welcome.stream;
@@ -876,10 +877,8 @@ fn initial_audit_expiry_recovers_after_six_second_application_startup_stall() {
     h.pump(348);
     let peer = &h.driver.authority.peers[&41];
     assert!(!peer.ready && !peer.active && !peer.activation_committed);
-    assert_eq!(peer.resyncs, 1);
-    assert_ne!(peer.welcome.stream.epoch, original.epoch);
     assert_eq!(peer.initial_deadline, deadline);
-    assert_eq!(peer.resync_attempts.len(), 1);
+    let _ = original;
     h.clients[0].receive_application = true;
     h.pump(60);
     assert!(h.driver.authority.peers[&41].active);
@@ -894,9 +893,15 @@ fn initial_audit_recovery_cannot_extend_admission_deadline() {
     h.clients[0].receive_application = false;
     h.pump(12);
     let deadline = h.driver.authority.peers[&41].initial_deadline;
-    h.pump(348);
-    assert_eq!(h.driver.authority.peers[&41].initial_deadline, deadline);
-    h.pump(300);
+    // Whatever recovery runs meanwhile keeps this deadline; a client that
+    // never consumes its Welcome leaves when it passes.
+    while h.now < deadline {
+        if let Some(peer) = h.driver.authority.peers.get(&41) {
+            assert_eq!(peer.initial_deadline, deadline);
+        }
+        h.pump(30);
+    }
+    h.pump(30);
     assert!(!h.driver.authority.peers.contains_key(&41));
     assert!(!h.driver.authority.sim.player_is_active(41));
 }
@@ -914,7 +919,9 @@ fn committed_owner_audit_expiry_does_not_use_initial_recovery() {
     peer.frozen = None;
     h.clients[0].active = false;
     h.clients[0].receive_application = false;
-    h.pump(360);
+    // Past the whole audit: the receipt window (16 × 32 ticks) fills, then the
+    // bounded history (1024 ticks) evicts the oldest unsent receipt.
+    h.pump(1100);
     let peer = &h.driver.authority.peers[&41];
     assert_eq!(peer.welcome.stream, original);
     assert_eq!(peer.resyncs, 0);
@@ -948,7 +955,7 @@ fn initial_recovery_keeps_absolute_deadline() {
 }
 
 #[test]
-fn recovery_limit_is_a_bounded_sliding_window_not_a_lifetime_disconnect_counter() {
+fn recovery_is_rate_limited_by_a_sliding_window_and_never_refused() {
     let mut h = Harness::new();
     h.join();
     h.pump(36);
@@ -963,13 +970,9 @@ fn recovery_limit_is_a_bounded_sliding_window_not_a_lifetime_disconnect_counter(
         );
     }
     let retained_stream = h.driver.authority.peers[&41].welcome.stream;
-    assert!(
-        h.driver
-            .authority
-            .resync(41)
-            .unwrap_err()
-            .contains("Repeated resync limit")
-    );
+    // A fourth request inside the window is postponed, not refused.
+    h.driver.authority.resync(41).unwrap();
+    assert!(h.driver.authority.peers[&41].resync_deferred);
     assert_eq!(
         h.driver.authority.peers[&41].welcome.stream,
         retained_stream
@@ -980,6 +983,7 @@ fn recovery_limit_is_a_bounded_sliding_window_not_a_lifetime_disconnect_counter(
     let peer = &h.driver.authority.peers[&41];
     assert_eq!(peer.resyncs, 4);
     assert_eq!(peer.resync_attempts.len(), 1);
+    assert!(!peer.resync_deferred);
     assert_ne!(peer.welcome.stream, retained_stream);
     assert!(h.driver.authority.sim.player_is_active(player.get()));
 }
@@ -1015,10 +1019,16 @@ fn withheld_decode_proof_never_activates_or_accepts_commands() {
     );
     h.pump(360);
     assert_eq!(h.driver.authority.peers[&41].resyncs, 3);
+    assert!(!h.driver.authority.peers[&41].active);
+    // Further recovery waits for the rate limit instead of ending the
+    // session; a client that never proves anything leaves at its deadline.
     let deadline = h.driver.authority.peers[&41].initial_deadline;
-    h.pump(90);
-    assert!(h.now < deadline);
+    while h.now < deadline {
+        h.pump(30);
+    }
+    h.pump(30);
     assert!(h.driver.authority.peers.is_empty());
+    assert!(!h.driver.authority.sim.player_is_active(41));
 }
 #[test]
 fn transient_application_stall_recovers_without_unbounded_transfer_restart() {
@@ -1048,101 +1058,55 @@ fn transient_application_stall_recovers_without_unbounded_transfer_restart() {
 }
 
 #[test]
-fn active_reset_expiry_recovers_after_three_second_application_stall() {
+fn three_second_application_stall_resumes_on_the_same_stream() {
     let mut h = Harness::new();
     h.join();
     h.pump(36);
     let original = h.clients[0].welcome.clone().unwrap();
-    let original_proofs = h.clients[0].owner_proofs.clone();
     let original_hero = h.driver.authority.sim.snapshot_for(41).hero;
     assert!(h.driver.authority.peers[&41].active);
 
     // Renet still exchanges packets and transport ACKs, but the application
     // cannot consume state or return decode/finalization receipts for 3 seconds.
+    // Proofs arrive late rather than never, so the stream is kept.
     h.clients[0].receive_application = false;
     h.pump(180);
     let peer = &h.driver.authority.peers[&41];
-    let replacement = peer.welcome.clone();
-    assert_eq!(peer.resyncs, 1);
-    assert_ne!(replacement.stream.epoch, original.stream.epoch);
-    assert_eq!(replacement.owner_entity, original.owner_entity);
+    assert_eq!(peer.resyncs, 0);
+    assert_eq!(peer.welcome.stream, original.stream);
     assert!(peer.activation_committed);
-    assert!(!peer.ready && !peer.active);
     assert!(h.driver.authority.sim.player_is_active(41));
     let retained = h.driver.authority.sim.snapshot_for(41).hero;
     assert_eq!(retained.hp, original_hero.hp);
-    assert_eq!(retained.stamina, original_hero.stamina);
     assert!(h.clients[0].renet.disconnect_reason().is_none());
-
-    // The server won the suspension/recovery race. Both delayed messages use
-    // the old wire epoch, and must neither activate nor replace the fresh stream.
-    h.clients[0].control(live::ClientControl::OwnerDecoded {
-        proofs: BoundedVec::new(original_proofs).unwrap(),
-    });
-    h.clients[0].control(live::ClientControl::Resync {
-        reason: live::ResyncReason::ExpiredGroup,
-        detail: Default::default(),
-    });
-    h.pump(6);
-    let peer = &h.driver.authority.peers[&41];
-    assert_eq!(peer.welcome.stream, replacement.stream);
-    assert_eq!(peer.resyncs, 1);
-    assert!(!peer.active);
 
     h.clients[0].receive_application = true;
-    h.clients[0].send_proofs = false;
-    h.pump(18);
+    h.pump(60);
     let peer = &h.driver.authority.peers[&41];
-    assert!(peer.ready && !peer.active);
-    assert_eq!(
-        h.clients[0].welcome.as_ref().unwrap().stream,
-        replacement.stream
-    );
-    assert!(!h.clients[0].active);
-    assert!(h.driver.authority.sim.player_is_active(41));
-    h.clients[0].resume_proofs();
-    h.pump(24);
-    assert!(h.driver.authority.peers[&41].active);
+    assert!(peer.active);
+    assert_eq!(peer.resyncs, 0);
+    assert_eq!(peer.welcome.stream, original.stream);
     assert!(h.clients[0].active);
-    assert!(h.clients[0].renet.disconnect_reason().is_none());
-    assert_eq!(h.driver.authority.peers[&41].resyncs, 1);
     assert!(h.latest(0).stamp.server_tick > original.tick.0);
-    assert!(
-        h.driver.authority.peers[&41]
-            .inbox
-            .highest_received_sequence()
-            .is_some()
-    );
 }
 
 #[test]
-fn active_reset_expiry_uses_the_shared_sliding_recovery_cap() {
+fn stall_past_the_reset_deadline_replaces_the_stream_and_play_resumes() {
     let mut h = Harness::new();
     h.join();
     h.pump(36);
-    let started = h.now;
-    for attempt in 1..=4 {
-        assert!(h.driver.authority.peers[&41].active);
-        let original = h.driver.authority.peers[&41].welcome.stream;
-        h.clients[0].receive_application = false;
-        h.pump(180);
-        if attempt == 4 {
-            assert!(!h.driver.authority.peers.contains_key(&41));
-            assert!(h.clients[0].renet.is_disconnected());
-            assert!(!h.driver.authority.sim.player_is_active(41));
-            break;
-        }
-        let peer = &h.driver.authority.peers[&41];
-        assert_eq!(peer.resyncs, attempt);
-        assert_eq!(peer.resync_attempts.len(), attempt as usize);
-        assert_ne!(peer.welcome.stream, original);
-        assert!(peer.activation_committed && !peer.active);
-        assert!(h.driver.authority.sim.player_is_active(41));
-        h.clients[0].receive_application = true;
-        h.pump(36);
-        assert!(h.clients[0].active);
-    }
-    assert!(h.now.saturating_sub(started) < Duration::from_secs(30));
+    let original = h.driver.authority.peers[&41].welcome.stream;
+    h.clients[0].receive_application = false;
+    h.pump(660);
+    let peer = &h.driver.authority.peers[&41];
+    assert_eq!(peer.resyncs, 1);
+    assert_ne!(peer.welcome.stream, original);
+    assert!(peer.activation_committed && !peer.active);
+    assert!(h.driver.authority.sim.player_is_active(41));
+    h.clients[0].receive_application = true;
+    h.pump(60);
+    assert!(h.driver.authority.peers[&41].active);
+    assert!(h.clients[0].active);
 }
 
 #[test]
@@ -1151,7 +1115,7 @@ fn active_reset_expiry_does_not_restart_an_unproven_replacement_bootstrap() {
     h.join();
     h.pump(36);
     h.clients[0].receive_application = false;
-    h.pump(180);
+    h.pump(660);
     assert_eq!(h.driver.authority.peers[&41].resyncs, 1);
     h.clients[0].receive_application = true;
     h.clients[0].send_proofs = false;
@@ -1159,7 +1123,7 @@ fn active_reset_expiry_does_not_restart_an_unproven_replacement_bootstrap() {
     let peer = &h.driver.authority.peers[&41];
     assert!(peer.ready && peer.activation_committed && !peer.active);
     assert!(peer.frozen.is_some());
-    h.pump(130);
+    h.pump(660);
     assert!(!h.driver.authority.peers.contains_key(&41));
     assert!(h.clients[0].renet.is_disconnected());
 }
@@ -1975,19 +1939,19 @@ fn finalized_receipts_are_sent_once_on_the_reliable_lane() {
         .skip(peer.inbox.receipts().len() - 32)
         .copied()
         .collect();
-    let old = live::encode_control(
-        &live::ServerControl::Finalized {
-            through: h.driver.authority.tick,
-            receipts: BoundedVec::new(repeated).unwrap(),
-            menu_applied: peer.menu_applied,
-            arrival: live::ArrivalFeedback::default(),
-        },
-        peer.welcome.stream.epoch,
-        1,
-        peer.limit(),
-    )
-    .unwrap()
-    .len();
+    // The historical frame, before control frames were deflated.
+    let old = engine_net::codec::HEADER_BYTES
+        + engine_net::codec::encode_payload(
+            &live::ServerControl::Finalized {
+                through: h.driver.authority.tick,
+                receipts: BoundedVec::new(repeated).unwrap(),
+                menu_applied: peer.menu_applied,
+                arrival: live::ArrivalFeedback::default(),
+            },
+            peer.limit().payload_bytes(),
+        )
+        .unwrap()
+        .len();
     let new_bytes = peer.egress.finalized_bytes - before.1;
     assert!(new_bytes * 4 < old as u64 * 40);
     eprintln!(
@@ -2016,8 +1980,9 @@ fn finalized_queue_coalesces_unsent_ticks_and_recovers_after_ack_stall() {
         - h.driver
             .server
             .channel_available_memory(41, wire::CONTROL_CHANNEL);
-    // Four coalesced Finalized messages plus one reliable baseline-reset fence.
-    assert!(queue < 1100, "coalesced Finalized queue bytes: {queue}");
+    // At most one window of coalesced Finalized messages plus one reliable
+    // baseline-reset fence: bounded, however long the stall.
+    assert!(queue < 2500, "coalesced Finalized queue bytes: {queue}");
     assert!(h.driver.authority.peers[&41].egress.finalized_deferred > 0);
     // Receive-only recovery isolates server finalization from client command-clock behavior.
     h.clients[0].active = false;

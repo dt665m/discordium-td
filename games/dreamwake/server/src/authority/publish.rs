@@ -146,7 +146,13 @@ fn prepare_group(
 // Limit this delivery class, not unrelated reliable controls. Clock replies and
 // scope fences must not consume finalization's four-batch progress window.
 // New committed ticks coalesce in the bounded audit while these await receipt ACK.
-const FINALIZED_CONTROL_WINDOW: usize = 4;
+// Sixteen batches of 32 receipts cover more than eight seconds of ticks per
+// round trip, so acknowledgement latency alone cannot outrun the audit.
+pub(super) const FINALIZED_CONTROL_WINDOW: usize = 16;
+/// How long an active owner may wait for its reset proof before the stream is
+/// replaced. A slow path delivers late rather than never (the group travels
+/// reliably), so this only catches a reset that genuinely cannot complete.
+const ACTIVE_RESET_PROOF_DEADLINE: Duration = Duration::from_secs(10);
 fn finalization_audit_expired(peer: &Peer, tick: ServerTick) -> bool {
     tick > peer.finalized_sent_through
         && peer
@@ -201,6 +207,11 @@ fn finalized(
     Ok(())
 }
 
+/// Remote actors within this distance of the player update at the full
+/// publication rate; farther ones at half of it.
+const NEAR_ACTOR_METRES: f64 = 16.0;
+
+#[allow(clippy::too_many_arguments)]
 fn peer_state(
     server: &mut RenetServer,
     id: u64,
@@ -209,6 +220,7 @@ fn peer_state(
     outcomes: &mut outcomes::Outcomes,
     now: Duration,
     tick: ServerTick,
+    backlog: usize,
 ) -> Result<(), String> {
     welcome(server, id, peer)?;
     if !peer.active && now >= peer.initial_deadline {
@@ -225,12 +237,17 @@ fn peer_state(
     if peer.active && peer.baselines.reset_pending.is_none() {
         peer.frozen = None;
     }
-    if peer
-        .frozen
-        .as_ref()
-        .is_some_and(|group| now.saturating_sub(group.started) >= Duration::from_secs(2))
+    // Joining peers use the bounded initial retry, and active owners wait for
+    // their proof under the reset retry. A committed owner's replacement
+    // bootstrap has neither, so it gets the same long deadline here.
+    if !peer.active
+        && peer.activation_committed
+        && peer
+            .frozen
+            .as_ref()
+            .is_some_and(|group| now.saturating_sub(group.started) >= ACTIVE_RESET_PROOF_DEADLINE)
     {
-        return Err("Frozen owner group synchronization expired".into());
+        return Err("Replacement owner synchronization expired".into());
     }
     let members = replication
         .owner_group_entities(peer.welcome.player.get())
@@ -312,7 +329,16 @@ fn peer_state(
     // browser data channel refuses writes once its buffer fills, and Renet has
     // already accounted those packets as sent. Withhold remote state until the
     // owner activates so bootstrap keeps the pipe to itself.
-    let remotes_eligible = peer.active;
+    //
+    // A saturated path gets the same treatment, as Unreal's replication does:
+    // remote actors wait while the transport is still sending earlier data,
+    // and resume with their newest state. Queueing them instead would only
+    // make every message, the owner's included, arrive later.
+    let saturated = backlog > peer.path.limit_bytes();
+    if saturated {
+        peer.egress.remote_held_publications += 1;
+    }
+    let remotes_eligible = peer.active && !saturated;
     for entry in eligible.entries().filter(|_| remotes_eligible) {
         let entity = entry.entity();
         if peer.owner_group_entities().contains(&entity) {
@@ -332,14 +358,29 @@ fn peer_state(
             peer.limit(),
         )
         .map_err(failure)?;
+        // Relevance sets cadence, as in Unreal's replication graph: actors
+        // near the player update at the publication rate, the rest at half.
+        // The client's remote-pose buffer covers either interval.
+        let near = entry
+            .nearest_observer()
+            .is_none_or(|metres| metres <= NEAR_ACTOR_METRES);
         requests.push(UnitRequest::entity(
             entity,
             admission_cost(bytes.len()),
-            Cadence {
-                period_ticks: 3,
-                maximum_age_ticks: 12,
-                priority: 100,
-                critical: false,
+            if near {
+                Cadence {
+                    period_ticks: 3,
+                    maximum_age_ticks: 12,
+                    priority: 100,
+                    critical: false,
+                }
+            } else {
+                Cadence {
+                    period_ticks: 6,
+                    maximum_age_ticks: 24,
+                    priority: 60,
+                    critical: false,
+                }
             },
         ));
         packets.insert(entity, bytes);
@@ -404,10 +445,12 @@ fn peer_state(
                         return false;
                     }
                     peer.egress.state_messages += 1;
-                    peer.egress.state_bytes += group.bytes.len() as u64;
+                    let group_len = group.bytes.len() as u64;
+                    peer.egress.state_bytes += group_len;
                     server.send_message(id, wire::OWNER_GROUP_CHANNEL, group.bytes);
                     peer.last_owner_publication = Some(group.publication);
                     peer.egress.group_messages += 1;
+                    peer.egress.group_bytes += group_len;
                     for state in &group.members {
                         if state.scope.entity == peer.welcome.owner_entity {
                             peer.combat.sent(state.receipt(), state.end_tick, tick);
@@ -547,6 +590,17 @@ pub(super) fn states(server: &mut RenetServer, authority: &mut DreamAuthority) {
             }
         }
     }
+    let deferred: Vec<_> = authority
+        .peers
+        .iter()
+        .filter_map(|(&id, peer)| peer.resync_deferred.then_some(id))
+        .collect();
+    for id in deferred {
+        if let Err(reason) = authority.resync(id) {
+            log::warn!("Dreamwake deferred resync peer {id}: {reason}");
+            authority.failed.insert(id);
+        }
+    }
     // A stalled initial client may miss an entire immutable bootstrap unit or
     // its unsent command audit before it can send Ready/application receipts.
     // Retire that stream and offer a fresh one, within the original admission
@@ -583,7 +637,7 @@ pub(super) fn states(server: &mut RenetServer, authority: &mut DreamAuthority) {
                 && peer.activation_committed
                 && peer.baselines.reset_pending.is_some()
                 && peer.frozen.as_ref().is_some_and(|group| {
-                    authority.now.saturating_sub(group.started) >= Duration::from_secs(2)
+                    authority.now.saturating_sub(group.started) >= ACTIVE_RESET_PROOF_DEADLINE
                 }))
             .then_some(id)
         })
@@ -631,6 +685,19 @@ pub(super) fn states(server: &mut RenetServer, authority: &mut DreamAuthority) {
             authority.failed.extend(authority.peers.keys());
         } else {
             for (&id, peer) in &mut authority.peers {
+                let transport = authority.transport_diagnostics.as_ref();
+                let backlog = transport
+                    .and_then(|transport| transport.peer_backlog_bytes(id).ok())
+                    .unwrap_or(0);
+                // Only a queueing transport (WebRTC) needs its path measured.
+                if let Some(written) = transport
+                    .and_then(|transport| transport.peer_egress_stats(id).ok())
+                    .and_then(|stats| stats.webrtc_logical)
+                    .map(|stats| stats.encrypted_logical_bytes)
+                {
+                    peer.path
+                        .observe(authority.now, written, backlog, server.rtt(id));
+                }
                 if let Err(reason) = peer_state(
                     server,
                     id,
@@ -639,6 +706,7 @@ pub(super) fn states(server: &mut RenetServer, authority: &mut DreamAuthority) {
                     &mut authority.outcomes,
                     authority.now,
                     authority.tick,
+                    backlog,
                 ) {
                     log::warn!("Dreamwake replication peer {id}: {reason}");
                     authority.failed.insert(id);
@@ -674,6 +742,9 @@ fn report_egress(
     let remote_bytes = wire::REMOTE_STATE_MEMORY_BYTES
         .saturating_sub(server.channel_available_memory(id, wire::STATE_CHANNEL));
     let stats = transport.and_then(|transport| transport.peer_egress_stats(id).ok());
+    let backlog = transport
+        .and_then(|transport| transport.peer_backlog_bytes(id).ok())
+        .unwrap_or(0);
     let native = stats.and_then(|stats| stats.native_udp_ip);
     let web = stats.and_then(|stats| stats.webrtc_logical);
     let pacing_drops =
@@ -684,7 +755,7 @@ fn report_egress(
     let backend_drops =
         native.map_or(0, |stats| stats.backend_drops) + web.map_or(0, |stats| stats.backend_drops);
     let line = format!(
-        "Dreamwake egress peer={id} at_ms={} finalized_through={} control_messages_total={} control_bytes_total={} finalized_messages_total={} finalized_bytes_total={} finalized_receipts_total={} finalized_deferred_total={} state_messages_total={} state_bytes_total={} control_queue_payload_bytes={} state_queue_payload_bytes={} group_queue_payload_bytes={} native_udp_ip={native:?} webrtc_logical={web:?}",
+        "Dreamwake egress peer={id} at_ms={} finalized_through={} control_messages_total={} control_bytes_total={} finalized_messages_total={} finalized_bytes_total={} finalized_receipts_total={} finalized_deferred_total={} state_messages_total={} state_bytes_total={} remote_held_publications_total={} transport_backlog_bytes={backlog} control_queue_payload_bytes={} state_queue_payload_bytes={} group_queue_payload_bytes={} native_udp_ip={native:?} webrtc_logical={web:?}",
         now.as_millis(),
         peer.finalized_sent_through.0,
         peer.egress.control_messages,
@@ -695,13 +766,15 @@ fn report_egress(
         peer.egress.finalized_deferred,
         peer.egress.state_messages,
         peer.egress.state_bytes,
+        peer.egress.remote_held_publications,
         control_bytes,
         group_bytes + remote_bytes,
         group_bytes,
     );
     let line = format!(
-        "{line} group_messages={} group_queue_deferred={} group_age_ticks={} maximum_group_age_ticks={}",
+        "{line} group_messages={} group_bytes={} group_queue_deferred={} group_age_ticks={} maximum_group_age_ticks={}",
         peer.egress.group_messages,
+        peer.egress.group_bytes,
         peer.egress.group_queue_deferred,
         peer.egress.group_age_ticks,
         peer.egress.maximum_group_age_ticks,

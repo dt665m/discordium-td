@@ -182,7 +182,10 @@ fn sustained_small_control_messages_cannot_starve_finalization_or_outcomes_at_15
             wire::CONTROL_MEMORY_BYTES - server.channel_available_memory(41, wire::CONTROL_CHANNEL);
         maximum_queued_bytes = maximum_queued_bytes.max(queued_bytes);
         assert!(queued_bytes < 32 * 1024);
-        assert!(authority.peers[&41].finalized_batches.len() <= 4);
+        assert!(
+            authority.peers[&41].finalized_batches.len()
+                <= super::publish::FINALIZED_CONTROL_WINDOW
+        );
         assert!(authority.peers[&41].outcome_batches.len() <= 4);
         if tick > 60 {
             maximum_lag = maximum_lag.max(tick - finalized.0);

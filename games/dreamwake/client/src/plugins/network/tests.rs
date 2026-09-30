@@ -107,15 +107,14 @@ fn seventy_decoded_full_states_batch_exact_receipts_across_scope_reentry() {
         };
         assert_eq!(receipts.as_slice(), &expected[expected.len() - 1..]);
         for receipt in receipts.into_vec() {
-            if let Some(batch) = session.queue_decoded_receipt(receipt) {
-                envelopes.push(session.control(&batch).unwrap());
-            }
+            session.queue_decoded_receipt(receipt);
         }
     }
-    assert_eq!(envelopes.len(), 8);
-    let partial = session.take_decoded_receipts().unwrap();
-    envelopes.push(session.control(&partial).unwrap());
-    assert!(session.take_decoded_receipts().is_none());
+    // Every scope incarnation is distinct, so none coalesce: all seventy go
+    // out, eight to a control.
+    while let Some(batch) = session.take_decoded_receipts() {
+        envelopes.push(session.control(&batch).unwrap());
+    }
     assert_eq!(envelopes.len(), 9);
     let mut decoded = Vec::new();
     for (index, envelope) in envelopes.iter().enumerate() {
@@ -126,6 +125,8 @@ fn seventy_decoded_full_states_batch_exact_receipts_across_scope_reentry() {
         assert_eq!(receipts.len(), if index < 8 { 8 } else { 6 });
         decoded.extend(receipts.into_vec());
     }
+    decoded.sort_by_key(|receipt| receipt.scope);
+    expected.sort_by_key(|receipt| receipt.scope);
     assert_eq!(decoded, expected);
     assert_eq!(session.control_sequence, 9);
 }
@@ -280,7 +281,7 @@ fn disconnection_cleanup_unlocks_identity_and_retains_outcomes_without_double_co
 
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
-fn decoded_receipts_flush_in_receive_pass_and_leave_owner_feedback_immediate() {
+fn decoded_receipts_flush_on_their_interval_and_leave_owner_feedback_immediate() {
     use engine_net::replication::baselines::BaselineRepair;
     let (session, owner_frames) = fixture();
     let epoch = session.model.welcome.stream.epoch;
@@ -327,9 +328,10 @@ fn decoded_receipts_flush_in_receive_pass_and_leave_owner_feedback_immediate() {
     assert_eq!(runtime.prediction.as_ref().unwrap().control_sequence, 1);
     send_state_receipt(&mut runtime, repair).unwrap();
     assert_eq!(runtime.prediction.as_ref().unwrap().control_sequence, 2);
-    flush_decoded_receipts(&mut runtime).unwrap();
+    flush_decoded_receipts(&mut runtime, Duration::from_millis(1)).unwrap();
     assert_eq!(runtime.prediction.as_ref().unwrap().control_sequence, 3);
-    flush_decoded_receipts(&mut runtime).unwrap();
+    // Nothing new is queued and the interval has not elapsed.
+    flush_decoded_receipts(&mut runtime, Duration::from_millis(2)).unwrap();
     assert_eq!(runtime.prediction.as_ref().unwrap().control_sequence, 3);
 
     for index in 0..8 {
@@ -343,12 +345,12 @@ fn decoded_receipts_flush_in_receive_pass_and_leave_owner_feedback_immediate() {
             &mut world,
         )
         .unwrap_or_else(|error| panic!("{error}"));
-        assert_eq!(
-            runtime.prediction.as_ref().unwrap().control_sequence,
-            if index < 7 { 3 } else { 4 }
-        );
+        // Public receipts wait for their interval instead of going out per state.
+        assert_eq!(runtime.prediction.as_ref().unwrap().control_sequence, 3);
     }
-    flush_decoded_receipts(&mut runtime).unwrap();
+    flush_decoded_receipts(&mut runtime, Duration::from_millis(100)).unwrap();
+    assert_eq!(runtime.prediction.as_ref().unwrap().control_sequence, 3);
+    flush_decoded_receipts(&mut runtime, Duration::from_millis(201)).unwrap();
     assert_eq!(runtime.prediction.as_ref().unwrap().control_sequence, 4);
 }
 
@@ -386,7 +388,7 @@ fn rejected_full_states_and_failed_dtos_never_queue_decoded_receipts() {
                 .is_none()
         );
     }
-    flush_decoded_receipts(&mut runtime).unwrap();
+    flush_decoded_receipts(&mut runtime, Duration::from_secs(1)).unwrap();
     let session = runtime.prediction.as_ref().unwrap();
     assert_eq!(session.control_sequence, 0);
     assert_eq!(session.scopes.known_entities(), 0);
@@ -397,13 +399,13 @@ fn rejected_full_states_and_failed_dtos_never_queue_decoded_receipts() {
 fn replacing_session_discards_pending_decoded_receipts() {
     let (mut session, _) = fixture();
     let old = public_full_state(&session, 100, 1).receipt();
-    assert!(session.queue_decoded_receipt(old).is_none());
+    session.queue_decoded_receipt(old);
     let mut welcome = session.model.welcome.clone();
     welcome.stream.epoch = ConnectionEpoch(2);
     session = Session::new(welcome).unwrap();
     assert!(session.take_decoded_receipts().is_none());
     let new = public_full_state(&session, 100, 1).receipt();
-    assert!(session.queue_decoded_receipt(new).is_none());
+    session.queue_decoded_receipt(new);
     let Some(ClientControl::Decoded { receipts }) = session.take_decoded_receipts() else {
         panic!("new session's pending receipt");
     };
@@ -416,7 +418,6 @@ fn replacing_session_discards_pending_decoded_receipts() {
 fn eight_maximum_width_decoded_receipts_fit_smallest_admitted_frame() {
     let (mut session, _) = fixture();
     let limit = engine_net::codec::FrameLimit::new(1088).unwrap();
-    let mut batch = None;
     for index in 0..8 {
         let receipt = StateReceipt {
             scope: ScopeIdentity {
@@ -432,10 +433,9 @@ fn eight_maximum_width_decoded_receipts_fit_smallest_admitted_frame() {
             snapshot: SnapshotId(u64::MAX),
             version: StateVersion(u64::MAX),
         };
-        batch = session.queue_decoded_receipt(receipt);
-        assert_eq!(batch.is_some(), index == 7);
+        session.queue_decoded_receipt(receipt);
     }
-    let batch = batch.unwrap();
+    let batch = session.take_decoded_receipts().unwrap();
     let bytes = encode_control(&batch, ConnectionEpoch(u64::MAX), u32::MAX, limit).unwrap();
     assert!(bytes.len() <= 1088);
     assert_eq!(

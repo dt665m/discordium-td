@@ -98,20 +98,39 @@ reliable-unordered owner groups last in stock Renet's packetizer. The transport
 reserve protects netcode control packets; application
 control messages are still charged as encrypted payload. At each 20 Hz
 publication, `Finalized` includes only committed receipts not already queued on
-the reliable channel, in batches of at most 32. Finalization and action outcomes
-each have a separate four-batch application receipt window. A validated
+the reliable channel, in batches of at most 32. Finalization has a sixteen-batch
+application receipt window over a 1,024-tick receipt history, so a round trip of
+several seconds falls behind without evicting an unsent receipt; action outcomes
+keep a four-batch window. A validated
 `FinalizedAck` or `OutcomesAck` acknowledges an exact sent batch endpoint; future
 or unsent endpoints are rejected. Unrelated clock and lifecycle controls do not
 consume either window. Unsent work coalesces in bounded authority storage.
 Exhaustion requires recovery rather than omitted receipts. These delivery
 acknowledgements do not mean a new command was executed or a checkpoint decoded.
 
-The client combines validated public-state decode receipts in batches of up to
-eight, flushing the final partial batch before the same receive pass ends. Owner
-group receipts and baseline repairs are sent immediately. The server handles at
+The client keeps only the newest validated public-state decode receipt per scope
+incarnation and sends them every 200 ms, eight to a control; the server's
+acknowledgement is cumulative per scope, and one receipt per received state made
+the client's upload larger than its download. Owner group receipts and baseline
+repairs are sent immediately. Each command packet carries the newest command
+and three predecessors, and reliable Renet channels resend after 250 ms: a
+timer below the round trip resends every message before its acknowledgement can
+arrive, and a queue that lengthens the round trip multiplies it. The server handles at
 most 64 admitted messages per peer per tick and leaves excess reliable messages
 queued for the next tick, so a legal burst of decode receipts cannot disconnect
 the peer.
+
+Remote actors near the player (within 16 m) publish at 20 Hz and others at
+10 Hz, the relevance-based cadence of Unreal's replication graph. A WebRTC data
+channel is congestion controlled and can drain slower than the server writes; the
+excess is queueing delay on every later message. Each publication therefore
+measures the channel's backlog (queued and in flight) against the path's
+bandwidth-delay product, its measured drain rate times the base round trip plus
+50 ms, between 8 and 48 KiB. While the backlog is above it, remote actors wait
+for the next publication and resume with their newest state; the owner group and
+controls still go out. Separately, the transport stops draining Renet into a data
+channel already 64 KiB behind, so Renet's timer resends cannot stack copies
+behind each other.
 
 Whole owner messages are admitted only when the graph scheduler and Renet's
 64 KiB sender queue have capacity. Unpublished state coalesces to the latest
@@ -124,9 +143,13 @@ preflight remains.
 
 Owner receive memory is 128 KiB, separately sized from the sender's 64 KiB because
 Renet rounds incomplete slices up to its 1,200-byte stride. Reliable controls use
-128 KiB per direction. Bootstrap/reset retains only exact expected receipts,
-referenced bases and a two-second deadline; ordinary owner messages need no
-application receipt admission window. Receipt and identity checks still govern
+128 KiB per direction. Bootstrap retains only exact expected receipts, referenced bases and a
+two-second deadline. An active owner's reset waits up to ten seconds for its
+proof before its stream is replaced, since a slow path delivers the reliable
+group late rather than never, and a committed owner's replacement bootstrap has
+the same deadline. Stream replacement is rate limited to three per thirty
+seconds; a further one waits for the window rather than ending the session.
+Ordinary owner messages need no application receipt admission window. Receipt and identity checks still govern
 baseline use, activation and recovery.
 
 Stock Renet's serialized packet bound is 1,300 bytes. Netcode adds at most 25
@@ -356,8 +379,13 @@ raw framing plus raw body. The minimum counts the serialized DTO and its
 eight-byte vector length, before compression framing; it is not a UDP packet
 size. No messages wait for aggregation. `off` always emits raw bodies, and both
 forms retain the same bounded decoder and exact values. These options apply to
-public actors and owner/global/collision payloads in dedicated and native-hosted
-servers. For example, `--compression auto --compression-min-bytes 256` skips
+public actor payloads in dedicated and native-hosted servers. Owner-group members
+(owner, global, collision and platform) stay raw, because their baselines are
+byte-patched and a patch against compressed bytes is as large as the state; the
+group deflates a member when it is sent whole. The baseline patch records runs of
+changed bytes, so scattered changes cost their own size. Control, command and
+state frames set an envelope flag when their payload is deflated, again only when
+that is smaller, so no frame's worst case grows. For example, `--compression auto --compression-min-bytes 256` skips
 compression attempts below that body size.
 
 This uses DEFLATE with a configurable eligibility policy following Unreal's
@@ -492,14 +520,21 @@ for the network layer. It builds the native release pair, then runs one server
 and two autoplaying rendered clients per scenario, over both native UDP and the
 browser's WebRTC data channel path (`--transport webrtc` negotiates through the
 same session and SDP endpoints a browser uses). Scenarios are a clean link, a WAN
-path (75 ms ± 10 ms and 1% loss per direction), and each of those with a 500 ms
-stall every 5 s (`--inject-stall 500@5`). The stall blocks the client between
-frames, as the browser's garbage collection and shader compilation hitches do. Each client measures
+path (75 ms ± 10 ms and 1% loss per direction), the same path with 0.3% loss, and
+the clean and lossy paths with a 500 ms stall every 5 s (`--inject-stall 500@5`).
+The stall blocks the client between frames, as the browser's garbage collection
+and shader compilation hitches do. UDP runs use the server's conditioner. WebRTC
+runs impair the client's raw datagrams beneath DTLS and SCTP
+(`--link-impairment DELAY_MS:JITTER_MS:LOSS_PERCENT`), because conditioning above
+the data channel leaves SCTP's congestion control on an ideal link. Each client measures
 its own display (`session_health` in the trace). Any disconnect, reconnect,
 client-requested recovery or teleport fails the scenario, as do more than six
 visible corrections per connected minute. A correction is a frame whose owner
 displacement exceeds dash speed × 1.25 over the frame plus one tick by 0.10 m; a
-teleport exceeds it by a metre. These gates read only `DreamView` and
+teleport exceeds it by a metre. A client's p95 round trip must also stay within
+the path's own round trip plus 150 ms (plus the stall, for stall scenarios),
+because a sender outrunning its path shows as queueing long before anything
+disconnects. These gates read only `DreamView` and
 `DreamConnection`, so they stay valid whatever prediction and replication design
 runs underneath. Artifacts go to `out/netcode-harness/RUN/`; `--transports`,
 `--scenarios` and `--duration` select a subset.

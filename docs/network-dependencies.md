@@ -27,7 +27,7 @@ assets, target-specific dependencies and notice files before release.
 | serde | 1.0.229, crates.io checksum in lock | MIT OR Apache-2.0 | Serialization derives |
 | miniz_oxide | 0.8.9 and 0.9.1, crates.io checksums in lock | MIT OR Zlib OR Apache-2.0 | Compression; engine_net declares the 0.8 line |
 | tokio | 1.53.1, crates.io checksum in lock | MIT | Existing asynchronous transport/runtime support |
-| sctp-proto | 0.10.4, `https://github.com/dt665m/sctp-proto.git`, commit `cb94f37991c185fb9cc2fd41fbe92965e2a1f713` | MIT OR Apache-2.0 | Existing transport patch; manifest and lock identify immutable commit |
+| sctp-proto | 0.10.4, fork checkout `../sctp-proto` (branch `fix/partial-reliability-abandonment`, commit `37ad2ae`) | MIT OR Apache-2.0 | PR-SCTP abandonment fixes, plus the opt-in `realtime-cwnd-floor` feature that renet-cross enables: a 16 KiB congestion window floor so random loss cannot hold an application-paced data channel near 30 KB/s. Path patch until the commit is pushed to the fork |
 | str0m | 0.23.1, `https://github.com/dt665m/str0m.git`, commit `591de71f4588b59e4850007414c6315a93943794` | MIT OR Apache-2.0 | Existing WebRTC transport patch; preserve this exact reviewed lock resolution |
 
 The str0m manifest and lock use the same immutable `rev`. A lock protects a locked

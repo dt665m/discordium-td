@@ -181,6 +181,7 @@ fn record_trace(
         "transport_issue": telemetry.transport_issue,
         "rtt_ms": runtime.map(|r| r.renet.rtt() * 1000.0),
         "renet_receive_bytes_per_second": runtime.map(|r| r.renet.bytes_received_per_sec()),
+        "renet_send_bytes_per_second": runtime.map(|r| r.renet.bytes_sent_per_sec()),
     });
     record["estimated_simulation_tick"] = serde_json::json!(
         session

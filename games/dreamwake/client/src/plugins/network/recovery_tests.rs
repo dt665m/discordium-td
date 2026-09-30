@@ -298,7 +298,9 @@ fn queued_resync_uses_reliable_retransmission_then_new_welcome_resumes_predictio
     );
     let sequence = runtime.prediction.as_ref().unwrap().control_sequence;
     assert!(!runtime.renet.get_packets_to_send().is_empty()); // drop the first transmission
-    runtime.renet.update(Duration::from_millis(100));
+    runtime
+        .renet
+        .update(engine_net::RELIABLE_RESEND_TIME + Duration::from_millis(20));
     request_resync(
         &mut world,
         &mut runtime,

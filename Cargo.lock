@@ -5796,7 +5796,7 @@ dependencies = [
 
 [[package]]
 name = "renet-cross"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "axum",
  "base64",
@@ -5808,6 +5808,7 @@ dependencies = [
  "renet",
  "renetcode",
  "reqwest",
+ "sctp-proto",
  "serde",
  "serde_json",
  "str0m",
@@ -6144,7 +6145,6 @@ dependencies = [
 [[package]]
 name = "sctp-proto"
 version = "0.10.4"
-source = "git+https://github.com/dt665m/sctp-proto.git?rev=cb94f37991c185fb9cc2fd41fbe92965e2a1f713#cb94f37991c185fb9cc2fd41fbe92965e2a1f713"
 dependencies = [
  "bytes",
  "crc",

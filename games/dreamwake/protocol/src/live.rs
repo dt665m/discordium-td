@@ -487,7 +487,7 @@ pub fn encode_control<T: Serialize + Validate>(
     limit: FrameLimit,
 ) -> Result<Vec<u8>, CodecError> {
     let payload = codec::encode_payload(value, limit.payload_bytes())?;
-    codec::encode_frame(
+    codec::encode_frame_deflated(
         FrameHeader {
             lane: Lane::Control,
             connection: epoch,
@@ -502,11 +502,11 @@ pub fn decode_control<T: serde::de::DeserializeOwned + Validate>(
     epoch: ConnectionEpoch,
     limit: FrameLimit,
 ) -> Result<T, CodecError> {
-    let (header, payload) = codec::decode_frame(bytes, epoch, limit)?;
+    let (header, payload) = codec::decode_frame_inflated(bytes, epoch, limit)?;
     if header.lane != Lane::Control {
         return Err(CodecError::InvalidLane);
     }
-    codec::decode_payload(payload, limit.payload_bytes())
+    codec::decode_payload(&payload, limit.payload_bytes())
 }
 pub fn encode_commands(
     value: &CommandBundle,
@@ -523,7 +523,7 @@ pub fn encode_commands(
         return Err(CodecError::WrongEpoch);
     }
     let payload = codec::encode_payload(value, limit.payload_bytes())?;
-    codec::encode_frame(
+    codec::encode_frame_deflated(
         FrameHeader {
             lane: Lane::Input,
             connection: epoch,
@@ -538,11 +538,11 @@ pub fn decode_commands(
     epoch: ConnectionEpoch,
     limit: FrameLimit,
 ) -> Result<CommandBundle, CodecError> {
-    let (header, payload) = codec::decode_frame(bytes, epoch, limit)?;
+    let (header, payload) = codec::decode_frame_inflated(bytes, epoch, limit)?;
     if header.lane != Lane::Input {
         return Err(CodecError::InvalidLane);
     }
-    let bundle: CommandBundle = codec::decode_payload(payload, limit.payload_bytes())?;
+    let bundle: CommandBundle = codec::decode_payload(&payload, limit.payload_bytes())?;
     if bundle
         .records
         .as_slice()
@@ -576,6 +576,25 @@ pub fn encode_state(
     sequence: u32,
     limit: FrameLimit,
 ) -> Result<Vec<u8>, CodecError> {
+    encode_state_with(value, epoch, sequence, limit, true)
+}
+/// The frame as sent before deflation, for tests that edit payload bytes.
+#[cfg(test)]
+pub(crate) fn encode_state_uncompressed(
+    value: &StateFrame,
+    epoch: ConnectionEpoch,
+    sequence: u32,
+    limit: FrameLimit,
+) -> Result<Vec<u8>, CodecError> {
+    encode_state_with(value, epoch, sequence, limit, false)
+}
+fn encode_state_with(
+    value: &StateFrame,
+    epoch: ConnectionEpoch,
+    sequence: u32,
+    limit: FrameLimit,
+    deflate: bool,
+) -> Result<Vec<u8>, CodecError> {
     let (tag, bytes, limit) = match value {
         StateFrame::Full(state) if state.scope.connection == epoch => (
             0,
@@ -593,15 +612,16 @@ pub fn encode_state(
     let mut payload = Vec::with_capacity(bytes.len() + 1);
     payload.push(tag);
     payload.extend_from_slice(&bytes);
-    codec::encode_frame(
-        FrameHeader {
-            lane: Lane::State,
-            connection: epoch,
-            sequence,
-        },
-        &payload,
-        limit,
-    )
+    let header = FrameHeader {
+        lane: Lane::State,
+        connection: epoch,
+        sequence,
+    };
+    if deflate {
+        codec::encode_frame_deflated(header, &payload, limit)
+    } else {
+        codec::encode_frame(header, &payload, limit)
+    }
 }
 pub fn decode_state(
     bytes: &[u8],
@@ -610,7 +630,7 @@ pub fn decode_state(
 ) -> Result<StateFrame, CodecError> {
     let frame_bytes = bytes.len();
     let (header, bytes) =
-        codec::decode_frame(bytes, epoch, FrameLimit::new(OWNER_GROUP_MESSAGE_BYTES)?)?;
+        codec::decode_frame_inflated(bytes, epoch, FrameLimit::new(OWNER_GROUP_MESSAGE_BYTES)?)?;
     if header.lane != Lane::State {
         return Err(CodecError::InvalidLane);
     }

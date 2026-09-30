@@ -49,8 +49,16 @@ pub struct EligibleEntry {
     reasons: EligibilityReasons,
     state_version: StateVersion,
     scene_revision: SceneRevision,
+    /// Whole centimetres, so entries stay comparable and deterministic.
+    nearest_observer_cm: Option<u32>,
 }
 impl EligibleEntry {
+    /// Distance from the entity's bounds centre to this connection's nearest
+    /// observer in the same scene, for relevance-based send cadence. `None`
+    /// when no observer shares its scene.
+    pub fn nearest_observer(&self) -> Option<f64> {
+        self.nearest_observer_cm.map(|cm| f64::from(cm) / 100.0)
+    }
     pub fn entity(&self) -> EntityId {
         self.entity
     }
@@ -212,7 +220,7 @@ impl PreparedGraph<'_> {
                 {
                     reasons = reasons.without_spatial();
                 }
-                (!reasons.is_empty()).then(|| (id, entry(entity, representation, reasons)))
+                (!reasons.is_empty()).then(|| (id, entry(entity, view, representation, reasons)))
             })
             .collect();
         let prediction = if prediction_roots.is_empty() {
@@ -307,7 +315,7 @@ impl PreparedGraph<'_> {
             }
             visited.insert(
                 id,
-                entry(entity, representation, EligibilityReasons::REQUIRED),
+                entry(entity, view, representation, EligibilityReasons::REQUIRED),
             );
             for target in &entity.dependencies {
                 if edges >= self.graph.limits.max_dependency_edges {
@@ -350,14 +358,27 @@ fn permitted(
 }
 fn entry(
     entity: &EntityRegistration,
+    view: &ConnectionView,
     representation: RepresentationGrant,
     reasons: EligibilityReasons,
 ) -> EligibleEntry {
+    let p = entity.bounds.center;
+    let nearest_observer = view
+        .observers
+        .iter()
+        .filter(|observer| observer.scene_revision == entity.scene_revision)
+        .map(|observer| {
+            let q = observer.position;
+            (p[0] - q[0]).hypot(p[1] - q[1]).hypot(p[2] - q[2])
+        })
+        .min_by(f64::total_cmp)
+        .map(|metres| (metres * 100.0).round().clamp(0.0, f64::from(u32::MAX)) as u32);
     EligibleEntry {
         entity: entity.id,
         representation,
         reasons,
         state_version: entity.state_version,
         scene_revision: entity.scene_revision,
+        nearest_observer_cm: nearest_observer,
     }
 }

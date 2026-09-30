@@ -52,6 +52,8 @@ SCENARIOS = {
     "stall": {"delay_ms": 0, "jitter_ms": 0, "loss_percent": 0, "stall": "500@5"},
     "wan": {"delay_ms": 75, "jitter_ms": 10, "loss_percent": 1, "stall": None},
     "wan-stall": {"delay_ms": 75, "jitter_ms": 10, "loss_percent": 1, "stall": "500@5"},
+    # A long path with the light loss typical of wired and good Wi-Fi links.
+    "wan-light": {"delay_ms": 75, "jitter_ms": 10, "loss_percent": 0.3, "stall": None},
 }
 PLAYERS = (2001, 2002)
 # Visible corrections are tolerated only at a rate a player would not notice
@@ -59,6 +61,8 @@ PLAYERS = (2001, 2002)
 MAX_CORRECTIONS_PER_MINUTE = 6.0
 MIN_CONNECTED_FRACTION = 0.9
 STARTUP_ALLOWANCE_SECONDS = 20.0
+# Round trip allowed above the path's own delay before it counts as queueing.
+RTT_HEADROOM_MS = 150.0
 
 
 def build(binary_dir: Path) -> None:
@@ -104,9 +108,30 @@ def transports_seen(path: Path) -> set[str]:
     return seen
 
 
+def rtt_p95(path: Path) -> float | None:
+    samples = []
+    try:
+        with path.open(encoding="utf-8") as source:
+            for line in source:
+                try:
+                    rtt = json.loads(line).get("rtt_ms")
+                except ValueError:
+                    continue
+                if isinstance(rtt, (int, float)) and rtt > 0:
+                    samples.append(rtt)
+    except OSError:
+        return None
+    return sorted(samples)[int(len(samples) * 0.95)] if samples else None
+
+
 def judge_client(side: str, trace: dict | None, seen: set[str], transport: str, stall: str | None,
-                 exit_code: int | None, duration: float) -> dict:
+                 exit_code: int | None, duration: float, rtt: float | None = None,
+                 rtt_limit: float | None = None) -> dict:
     failures: list[str] = []
+    # Queueing shows first as latency: a sender outrunning its path grows the
+    # round trip long before anything disconnects.
+    if rtt is not None and rtt_limit is not None and rtt > rtt_limit:
+        failures.append(f"p95 round trip {rtt:.0f} ms exceeds {rtt_limit:.0f} ms")
     health = (trace or {}).get("session_health") or {}
     if trace is None:
         failures.append("no trace records")
@@ -139,7 +164,7 @@ def judge_client(side: str, trace: dict | None, seen: set[str], transport: str, 
     if stall and not (trace or {}).get("stalls_injected"):
         failures.append("no stalls were injected; the stall scenario proved nothing")
     return {"side": side, "passed": not failures, "failures": failures, "health": health,
-            "corrections_per_minute": correction_rate,
+            "corrections_per_minute": correction_rate, "rtt_p95_ms": rtt,
             "stalls_injected": (trace or {}).get("stalls_injected"),
             "transports": sorted(seen), "exit_code": exit_code}
 
@@ -155,9 +180,19 @@ def run_scenario(transport: str, name: str, directory: Path, duration: float, se
         "--http-bind", f"127.0.0.1:{http}", "--public-http-base", base,
         "--udp-bind", f"127.0.0.1:{udp}", "--public-udp-addr", f"127.0.0.1:{udp}",
         "--webrtc-bind", f"127.0.0.1:{webrtc}", "--public-webrtc-addr", f"127.0.0.1:{webrtc}",
-        "--net-delay-ms", str(scenario["delay_ms"]),
-        "--net-jitter-ms", str(scenario["jitter_ms"]),
-        "--net-loss-percent", str(scenario["loss_percent"])]
+    ]
+    # UDP has no transport of its own under netcode, so the server conditioner
+    # is its network. WebRTC must be impaired beneath DTLS and SCTP instead:
+    # conditioning above the data channel leaves SCTP on an ideal link, where
+    # its congestion control never engages and no sender backlog can form.
+    link = f'{scenario["delay_ms"]}:{scenario["jitter_ms"]}:{scenario["loss_percent"]}'
+    impaired = any(scenario[key] for key in ("delay_ms", "jitter_ms", "loss_percent"))
+    if transport == "udp":
+        server_command += ["--net-delay-ms", str(scenario["delay_ms"]),
+                           "--net-jitter-ms", str(scenario["jitter_ms"]),
+                           "--net-loss-percent", str(scenario["loss_percent"])]
+    # Diagnostic only: extra server flags for one-off comparisons.
+    server_command += os.environ.get("NETCODE_HARNESS_SERVER_ARGS", "").split()
     sides = ("left", "right")
     client_commands = []
     for player, side in zip(PLAYERS, sides):
@@ -168,6 +203,8 @@ def run_scenario(transport: str, name: str, directory: Path, duration: float, se
             "--quit-after", str(duration)]
         if scenario["stall"]:
             command += ["--inject-stall", scenario["stall"]]
+        if transport == "webrtc" and impaired:
+            command += ["--link-impairment", link]
         client_commands.append(command)
     result = {"transport": transport, "scenario": name, "conditions": scenario,
               "duration": duration, "seed": seed, "server_command": server_command,
@@ -207,9 +244,14 @@ def run_scenario(transport: str, name: str, directory: Path, duration: float, se
                 stop_owned(process)
             if len(processes) == 1 + len(sides):
                 exit_codes = [process.returncode for process in processes[1:]]
+    # A stalled client answers nothing until it resumes, so its round-trip
+    # samples include the stall itself; that is not the network queueing.
+    stall_ms = float(scenario["stall"].split("@")[0]) if scenario["stall"] else 0.0
+    rtt_limit = 2 * (scenario["delay_ms"] + scenario["jitter_ms"]) + RTT_HEADROOM_MS + stall_ms
     result["clients"] = [judge_client(side, latest_trace(directory / f"{side}.ndjson"),
                                       transports_seen(directory / f"{side}.ndjson"),
-                                      transport, scenario["stall"], code, duration)
+                                      transport, scenario["stall"], code, duration,
+                                      rtt_p95(directory / f"{side}.ndjson"), rtt_limit)
                          for side, code in zip(sides, exit_codes)]
     for client, side in zip(result["clients"], sides):
         client["log_warnings"] = client_warnings(directory / f"{side}.log")
@@ -227,7 +269,8 @@ def summary_line(result: dict) -> str:
         parts.append(f"{client['side']}: conn {h.get('connected_seconds', 0):.0f}s "
                      f"rec {h.get('recoveries', 0)} disc {h.get('disconnects', 0)} "
                      f"tele {h.get('teleports', 0)} corr {h.get('corrections', 0)} "
-                     f"max {h.get('max_excess_metres', 0):.2f}m stalls {client['stalls_injected']}")
+                     f"max {h.get('max_excess_metres', 0):.2f}m stalls {client['stalls_injected']} "
+                     f"rtt95 {client['rtt_p95_ms'] or 0:.0f}ms")
     return f"{verdict} {result['transport']:>6} {result['scenario']:<10} " + " | ".join(parts)
 
 

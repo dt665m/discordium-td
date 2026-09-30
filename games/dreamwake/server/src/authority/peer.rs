@@ -41,7 +41,10 @@ pub(super) struct EgressCounters {
     pub finalized_deferred: u64,
     pub state_messages: u64,
     pub state_bytes: u64,
+    /// Publications whose remote actors waited on a saturated transport.
+    pub remote_held_publications: u64,
     pub group_messages: u64,
+    pub group_bytes: u64,
     pub group_queue_deferred: u64,
     pub group_age_ticks: u64,
     pub maximum_group_age_ticks: u64,
@@ -62,6 +65,10 @@ pub(super) struct Peer {
     /// At most three recoveries within the sliding admission window. Carried
     /// across stream replacement so requesting a new epoch cannot reset it.
     pub resync_attempts: VecDeque<Duration>,
+    /// A resync the rate limit postponed; it runs once the window allows.
+    pub resync_deferred: bool,
+    /// How much this peer's transport may hold before it is queueing.
+    pub path: super::path::PathEstimate,
     pub next_outcome_lookup: Duration,
     pub finalized_batches: engine_net::delivery::ReceiptWindow<ServerTick>,
     pub outcome_batches: engine_net::delivery::ReceiptWindow<u64>,
@@ -105,6 +112,10 @@ impl Peer {
                 welcome.tick,
                 CommandLimits {
                     held_grace_ticks: dreamwake_sim::HELD_INPUT_GRACE_TICKS,
+                    // About seventeen seconds at 60 Hz. A slow link's receipt
+                    // acknowledgements arrive late, and evicting a receipt
+                    // before it is sent ends the session.
+                    audit_records: 1024,
                     ..Default::default()
                 },
             )
@@ -129,9 +140,14 @@ impl Peer {
             activation_committed: false,
             resyncs: 0,
             resync_attempts: VecDeque::new(),
+            resync_deferred: false,
+            path: Default::default(),
             next_outcome_lookup: Duration::ZERO,
-            finalized_batches: engine_net::delivery::ReceiptWindow::new(finalized_sent_through, 4)
-                .map_err(failure)?,
+            finalized_batches: engine_net::delivery::ReceiptWindow::new(
+                finalized_sent_through,
+                super::publish::FINALIZED_CONTROL_WINDOW,
+            )
+            .map_err(failure)?,
             outcome_batches: engine_net::delivery::ReceiptWindow::new(0, 4).map_err(failure)?,
             next_outcome_batch: 0,
             outcome_lookups: BTreeSet::new(),

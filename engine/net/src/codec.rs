@@ -167,15 +167,41 @@ pub fn encode_frame(
     if payload.len() > limit.payload_bytes() {
         return Err(CodecError::Oversized);
     }
+    write_frame(header, 0, payload)
+}
+
+/// The payload was deflated with [`crate::wire::deflate`]; only
+/// [`decode_frame_inflated`] accepts it.
+const FLAG_DEFLATED: u8 = 1;
+
+/// [`encode_frame`], deflating the payload when that makes it smaller.
+/// Fixed-width fields and repeated records compress well, and a frame that
+/// does not compress is sent exactly as [`encode_frame`] would send it, so
+/// no worst case grows.
+pub fn encode_frame_deflated(
+    header: FrameHeader,
+    payload: &[u8],
+    limit: FrameLimit,
+) -> Result<Vec<u8>, CodecError> {
+    match crate::wire::deflate(payload) {
+        Some(deflated) if header.connection.0 != 0 && payload.len() <= limit.payload_bytes() => {
+            write_frame(header, FLAG_DEFLATED, &deflated)
+        }
+        _ => encode_frame(header, payload, limit),
+    }
+}
+
+fn write_frame(header: FrameHeader, flags: u8, payload: &[u8]) -> Result<Vec<u8>, CodecError> {
+    let length = u16::try_from(payload.len()).map_err(|_| CodecError::Oversized)?;
     let mut bytes = Vec::with_capacity(HEADER_BYTES + payload.len());
     bytes.extend_from_slice(&MAGIC);
     bytes.extend_from_slice(&PROTOCOL_MAJOR.to_le_bytes());
     bytes.extend_from_slice(&PROTOCOL_MINOR.to_le_bytes());
     bytes.push(header.lane as u8);
-    bytes.push(0); // All flags are reserved in this version.
+    bytes.push(flags);
     bytes.extend_from_slice(&header.connection.0.to_le_bytes());
     bytes.extend_from_slice(&header.sequence.to_le_bytes());
-    bytes.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+    bytes.extend_from_slice(&length.to_le_bytes());
     bytes.extend_from_slice(payload);
     Ok(bytes)
 }
@@ -186,6 +212,35 @@ pub fn decode_frame(
     expected: ConnectionEpoch,
     limit: FrameLimit,
 ) -> Result<(FrameHeader, &[u8]), CodecError> {
+    let (header, flags, payload) = parse_frame(bytes, expected, limit)?;
+    if flags != 0 {
+        return Err(CodecError::InvalidFlags);
+    }
+    Ok((header, payload))
+}
+
+/// [`decode_frame`] for lanes sent with [`encode_frame_deflated`]. Inflation is
+/// bounded by the frame's payload limit before any allocation.
+pub fn decode_frame_inflated(
+    bytes: &[u8],
+    expected: ConnectionEpoch,
+    limit: FrameLimit,
+) -> Result<(FrameHeader, std::borrow::Cow<'_, [u8]>), CodecError> {
+    let (header, flags, payload) = parse_frame(bytes, expected, limit)?;
+    match flags {
+        0 => Ok((header, std::borrow::Cow::Borrowed(payload))),
+        FLAG_DEFLATED => crate::wire::inflate(payload, limit.payload_bytes())
+            .map(|raw| (header, std::borrow::Cow::Owned(raw)))
+            .map_err(|error| CodecError::InvalidPayload(error.to_string())),
+        _ => Err(CodecError::InvalidFlags),
+    }
+}
+
+fn parse_frame(
+    bytes: &[u8],
+    expected: ConnectionEpoch,
+    limit: FrameLimit,
+) -> Result<(FrameHeader, u8, &[u8]), CodecError> {
     if bytes.len() > limit.0 {
         return Err(CodecError::Oversized);
     }
@@ -199,9 +254,7 @@ pub fn decode_frame(
         return Err(CodecError::ProtocolMismatch);
     }
     let lane = Lane::try_from(bytes[8])?;
-    if bytes[9] != 0 {
-        return Err(CodecError::InvalidFlags);
-    }
+    let flags = bytes[9];
     let connection = ConnectionEpoch(u64::from_le_bytes(bytes[10..18].try_into().unwrap()));
     if expected.0 == 0 || connection != expected {
         return Err(CodecError::WrongEpoch);
@@ -219,6 +272,7 @@ pub fn decode_frame(
             connection,
             sequence,
         },
+        flags,
         &bytes[HEADER_BYTES..],
     ))
 }
@@ -357,5 +411,44 @@ mod tests {
         let raw = bincode::serialize(&invalid).unwrap();
         assert!(decode_payload::<Sample>(&raw, 128).is_err());
         assert!(encode_payload(&sample, 4).is_err());
+    }
+
+    #[test]
+    fn deflated_frames_shrink_repetition_and_never_grow_a_frame() {
+        let limit = FrameLimit::new(1200).unwrap();
+        let header = FrameHeader {
+            lane: Lane::Input,
+            connection: ConnectionEpoch(3),
+            sequence: 9,
+        };
+        let repetitive = [1u8, 0, 0, 0, 0, 0, 0, 0].repeat(100);
+        let wire = encode_frame_deflated(header, &repetitive, limit).unwrap();
+        assert!(wire.len() < HEADER_BYTES + repetitive.len() / 4);
+        let (decoded, payload) = decode_frame_inflated(&wire, ConnectionEpoch(3), limit).unwrap();
+        assert_eq!(decoded, header);
+        assert_eq!(&*payload, repetitive.as_slice());
+        // The plain decoder does not accept a deflated frame.
+        assert_eq!(
+            decode_frame(&wire, ConnectionEpoch(3), limit),
+            Err(CodecError::InvalidFlags)
+        );
+        // Incompressible bytes are sent as encode_frame would send them.
+        let noise: Vec<u8> = (0..64u32)
+            .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+            .collect();
+        assert_eq!(
+            encode_frame_deflated(header, &noise, limit).unwrap(),
+            encode_frame(header, &noise, limit).unwrap()
+        );
+        // Inflation beyond the frame's payload limit is refused.
+        let mut oversized = wire.clone();
+        oversized[HEADER_BYTES..HEADER_BYTES + 4].copy_from_slice(&5000u32.to_le_bytes());
+        assert!(decode_frame_inflated(&oversized, ConnectionEpoch(3), limit).is_err());
+        let mut unknown = wire;
+        unknown[9] = 2;
+        assert_eq!(
+            decode_frame_inflated(&unknown, ConnectionEpoch(3), limit).map(|_| ()),
+            Err(CodecError::InvalidFlags)
+        );
     }
 }

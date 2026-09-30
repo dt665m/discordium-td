@@ -89,7 +89,8 @@ fn exact_decode_proof_required_and_transport_rejection_retains_nothing() {
     server.acknowledge(proof).unwrap();
     let delta = deliver(&mut server, &mut client, state(2), Some(proof));
     assert!(matches!(delta.encoding, BaselineEncoding::Delta { .. }));
-    assert_eq!(delta.bytes.len(), 13);
+    // Length, then one run: skip, length and the single changed byte.
+    assert_eq!(delta.bytes.len(), 4);
     assert_eq!(client.current(), Some(&state(2)));
     assert_eq!(client.state(full.target), Ok(&state(1)));
     let mut forged = full.target;

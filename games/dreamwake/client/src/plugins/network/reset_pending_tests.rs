@@ -214,7 +214,7 @@ fn pending_full_receive_preserves_freshness_and_receipts_until_reliable_reset() 
         .map(|scope| session.baselines.identity(scope.entity))
         .collect::<Vec<_>>();
     let pending_receipt = public_full_state(&session, 100, 1).receipt();
-    assert!(session.queue_decoded_receipt(pending_receipt).is_none());
+    session.queue_decoded_receipt(pending_receipt);
     let sequence = session.control_sequence;
     let decoded_groups = session.decoded_groups.clone();
     let resets = group

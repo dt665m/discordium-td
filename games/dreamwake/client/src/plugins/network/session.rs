@@ -142,7 +142,9 @@ pub(crate) struct Session {
     pub(super) autoplay_edges: [bool; 5],
     pub(super) frame: u64,
     pub(super) control_sequence: u32,
-    pending_decoded_receipts: BoundedVec<StateReceipt, DECODED_RECEIPTS_PER_CONTROL>,
+    /// Newest decode receipt per scope incarnation, awaiting the next flush.
+    pending_decoded_receipts: BTreeMap<ScopeIdentity, StateReceipt>,
+    pub(super) next_receipt_flush: Duration,
     pub(super) decoded_groups: BTreeMap<SnapshotId, ServerTick>,
     combat_references: std::collections::VecDeque<(StateReceipt, ServerTick)>,
     pub(super) acknowledged_active: Option<(SnapshotId, ServerTick)>,
@@ -314,7 +316,8 @@ impl Session {
             autoplay_edges: [false; 5],
             frame: 0,
             control_sequence: 0,
-            pending_decoded_receipts: BoundedVec::default(),
+            pending_decoded_receipts: BTreeMap::new(),
+            next_receipt_flush: Duration::ZERO,
             decoded_groups: BTreeMap::new(),
             combat_references: Default::default(),
             acknowledged_active: None,
@@ -674,29 +677,28 @@ impl Session {
         )
         .map_err(err)
     }
-    /// Queue only completed public-state decode proofs. Every receipt is kept,
-    /// including successive scope incarnations for the same entity.
-    pub(super) fn queue_decoded_receipt(&mut self, receipt: StateReceipt) -> Option<ClientControl> {
-        self.pending_decoded_receipts
-            .push(receipt)
-            .expect("decoded receipt batch is drained at capacity");
-        if self.pending_decoded_receipts.len() == DECODED_RECEIPTS_PER_CONTROL {
-            self.take_decoded_receipts()
-        } else {
-            None
+    /// Queue only completed public-state decode proofs. The server's
+    /// acknowledgement is cumulative per scope incarnation, so only the newest
+    /// receipt of each is kept; successive incarnations of one entity remain
+    /// distinct. Owner and baseline proofs never pass through this queue.
+    pub(super) fn queue_decoded_receipt(&mut self, receipt: StateReceipt) {
+        match self.pending_decoded_receipts.get(&receipt.scope) {
+            Some(queued) if queued.snapshot >= receipt.snapshot => {}
+            _ => {
+                self.pending_decoded_receipts.insert(receipt.scope, receipt);
+            }
         }
     }
-    /// Flush at the end of the same receive pass; batching never waits for a
-    /// future frame, tick or timer. A new Session starts with no queued proofs.
+    /// One control's worth of queued receipts, oldest scopes first. A new
+    /// Session starts with no queued proofs.
     pub(super) fn take_decoded_receipts(&mut self) -> Option<ClientControl> {
-        if self.pending_decoded_receipts.is_empty() {
-            return None;
-        }
-        Some(ClientControl::Decoded {
-            receipts: BoundedVec::new(
-                std::mem::take(&mut self.pending_decoded_receipts).into_vec(),
-            )
-            .expect("eight receipts fit the protocol's twelve-receipt capacity"),
+        let batch: Vec<_> = std::iter::from_fn(|| self.pending_decoded_receipts.pop_first())
+            .take(DECODED_RECEIPTS_PER_CONTROL)
+            .map(|(_, receipt)| receipt)
+            .collect();
+        (!batch.is_empty()).then(|| ClientControl::Decoded {
+            receipts: BoundedVec::new(batch)
+                .expect("eight receipts fit the protocol's twelve-receipt capacity"),
         })
     }
     /// Call only after publication succeeds. In particular, a new attachment

@@ -96,6 +96,9 @@ pub(super) fn valid_proof(value: &DecodedBaseline) -> bool {
 struct Member {
     generation: BaselineGeneration,
     base: Option<BaselineReceipt>,
+    /// A full member is deflated when that is smaller. Deltas are already
+    /// small, and compressing them would only add framing.
+    compressed: bool,
     bytes: BoundedVec<u8, { PAYLOAD_BYTES + 12 }>,
 }
 impl Validate for Member {
@@ -108,6 +111,16 @@ impl Validate for Member {
 }
 
 pub fn encode_member(packet: &BaselinePacket) -> Result<Vec<u8>, CodecError> {
+    encode_member_with(packet, true)
+}
+
+/// The incompressible worst case, for capacity proofs.
+#[cfg(test)]
+pub(crate) fn encode_member_uncompressed(packet: &BaselinePacket) -> Result<Vec<u8>, CodecError> {
+    encode_member_with(packet, false)
+}
+
+fn encode_member_with(packet: &BaselinePacket, deflate: bool) -> Result<Vec<u8>, CodecError> {
     if !valid_baseline(packet.target) {
         return Err(invalid("invalid baseline target"));
     }
@@ -116,11 +129,17 @@ pub fn encode_member(packet: &BaselinePacket) -> Result<Vec<u8>, CodecError> {
         BaselineEncoding::Delta { base } => Some(base),
     };
     validate_base(packet.target, base)?;
+    let deflated = (deflate && base.is_none())
+        .then(|| engine_net::deflate(&packet.bytes))
+        .flatten();
+    let compressed = deflated.is_some();
+    let bytes = deflated.unwrap_or_else(|| packet.bytes.clone());
     codec::encode_payload(
         &Member {
             generation: packet.target.generation,
             base,
-            bytes: BoundedVec::new(packet.bytes.clone()).map_err(|_| CodecError::Oversized)?,
+            compressed,
+            bytes: BoundedVec::new(bytes).map_err(|_| CodecError::Oversized)?,
         },
         MEMBER_BYTES,
     )
@@ -154,6 +173,15 @@ pub fn decode_member(
         return Err(invalid("invalid baseline target"));
     }
     validate_base(target, member.base)?;
+    if member.compressed && member.base.is_some() {
+        return Err(invalid("compressed baseline delta"));
+    }
+    let bytes = if member.compressed {
+        engine_net::inflate(member.bytes.as_slice(), PAYLOAD_BYTES)
+            .map_err(|_| invalid("invalid compressed baseline member"))?
+    } else {
+        member.bytes.as_slice().to_vec()
+    };
     Ok(BaselinePacket {
         target,
         encoding: member
@@ -161,7 +189,7 @@ pub fn decode_member(
             .map_or(BaselineEncoding::Full, |base| BaselineEncoding::Delta {
                 base,
             }),
-        bytes: member.bytes.as_slice().to_vec(),
+        bytes,
     })
 }
 
@@ -217,6 +245,7 @@ mod tests {
                 &Member {
                     generation: BaselineGeneration(1),
                     base: Some(base),
+                    compressed: false,
                     bytes: BoundedVec::new(vec![]).unwrap(),
                 },
                 MEMBER_BYTES,
@@ -224,5 +253,64 @@ mod tests {
             .unwrap();
             assert!(decode_member(&bytes, &state, publication).is_err());
         }
+    }
+
+    #[test]
+    fn full_members_travel_deflated_and_compressed_deltas_are_refused() {
+        let state = FullState {
+            scope: ScopeIdentity {
+                connection: ConnectionEpoch(1),
+                entity: EntityId {
+                    index: 1,
+                    generation: 1,
+                },
+                scope: ScopeEpoch(1),
+                representation: RepresentationRevision(1),
+            },
+            baseline_generation: BaselineGeneration(1),
+            snapshot: SnapshotId(2),
+            version: StateVersion(2),
+            end_tick: ServerTick(11),
+            payload: vec![],
+        };
+        let publication = GroupPublication {
+            connection: ConnectionEpoch(1),
+            group: OWNER_GROUP,
+            revision: GroupRevision(1),
+            snapshot: SnapshotId(2),
+        };
+        let target = target(&state, publication, BaselineGeneration(1));
+        // A repetitive state, like a static collision manifest, compresses well.
+        let payload: Vec<u8> = (0..6000).map(|i| (i % 7) as u8).collect();
+        let wire = encode_member(&BaselinePacket {
+            target,
+            encoding: BaselineEncoding::Full,
+            bytes: payload.clone(),
+        })
+        .unwrap();
+        assert!(
+            wire.len() < payload.len() / 4,
+            "full member sent as {} bytes",
+            wire.len()
+        );
+        let decoded = decode_member(&wire, &state, publication).unwrap();
+        assert_eq!(decoded.bytes, payload);
+        assert_eq!(decoded.encoding, BaselineEncoding::Full);
+
+        let base = BaselineReceipt {
+            snapshot: SnapshotId(1),
+            ..target
+        };
+        let hostile = codec::encode_payload(
+            &Member {
+                generation: BaselineGeneration(1),
+                base: Some(base),
+                compressed: true,
+                bytes: BoundedVec::new(engine_net::deflate(&payload).unwrap()).unwrap(),
+            },
+            MEMBER_BYTES,
+        )
+        .unwrap();
+        assert!(decode_member(&hostile, &state, publication).is_err());
     }
 }

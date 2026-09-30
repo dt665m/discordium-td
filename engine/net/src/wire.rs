@@ -46,17 +46,56 @@ pub fn encode<T: Serialize>(value: &T) -> Vec<u8> {
     encode_with_compression(value, CompressionPolicy::default())
 }
 
+/// Deflate `raw` behind its little-endian `u32` length, only when that is
+/// smaller than `raw` itself.
+pub fn deflate(raw: &[u8]) -> Option<Vec<u8>> {
+    let length = u32::try_from(raw.len()).ok()?;
+    let compressed = miniz_oxide::deflate::compress_to_vec(raw, 1);
+    (compressed.len() + 4 < raw.len()).then(|| {
+        let mut framed = Vec::with_capacity(compressed.len() + 4);
+        framed.extend_from_slice(&length.to_le_bytes());
+        framed.extend_from_slice(&compressed);
+        framed
+    })
+}
+
+/// Inverse of [`deflate`], refusing to allocate beyond `limit`.
+pub fn inflate(body: &[u8], limit: usize) -> Result<Vec<u8>, bincode::Error> {
+    if body.len() < 4 {
+        return Err(invalid("truncated compressed state"));
+    }
+    let size = u32::from_le_bytes(body[..4].try_into().unwrap()) as usize;
+    if size > limit {
+        return Err(invalid("oversized inflated state"));
+    }
+    use miniz_oxide::inflate::{
+        TINFLStatus,
+        core::{DecompressorOxide, decompress, inflate_flags},
+    };
+    let mut raw = vec![0; size];
+    let (status, consumed, written) = decompress(
+        &mut Box::<DecompressorOxide>::default(),
+        &body[4..],
+        &mut raw,
+        0,
+        inflate_flags::TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF,
+    );
+    if status != TINFLStatus::Done || consumed != body.len() - 4 || written != size {
+        return Err(invalid("invalid compressed state or trailing bytes"));
+    }
+    Ok(raw)
+}
+
 pub fn encode_with_compression<T: Serialize>(value: &T, policy: CompressionPolicy) -> Vec<u8> {
     let raw = serialize(value);
-    if policy.mode == CompressionMode::Auto && raw.len() >= policy.minimum_bytes {
-        let compressed = miniz_oxide::deflate::compress_to_vec(&raw, 1);
-        if compressed.len() + 5 < raw.len() + 1 {
-            let mut framed = Vec::with_capacity(compressed.len() + 5);
-            framed.push(1);
-            framed.extend_from_slice(&(raw.len() as u32).to_le_bytes());
-            framed.extend_from_slice(&compressed);
-            return framed;
-        }
+    if policy.mode == CompressionMode::Auto
+        && raw.len() >= policy.minimum_bytes
+        && let Some(compressed) = deflate(&raw)
+    {
+        let mut framed = Vec::with_capacity(compressed.len() + 1);
+        framed.push(1);
+        framed.extend_from_slice(&compressed);
+        return framed;
     }
     let mut framed = Vec::with_capacity(raw.len() + 1);
     framed.push(0);
@@ -79,28 +118,7 @@ pub fn decode_with_limit<T: DeserializeOwned>(
     }
     match bytes.split_first() {
         Some((&0, raw)) if raw.len() <= limit => deserialize(raw),
-        Some((&1, body)) if body.len() >= 4 => {
-            let size = u32::from_le_bytes(body[..4].try_into().unwrap()) as usize;
-            if size > limit {
-                return Err(invalid("oversized inflated state"));
-            }
-            use miniz_oxide::inflate::{
-                TINFLStatus,
-                core::{DecompressorOxide, decompress, inflate_flags},
-            };
-            let mut raw = vec![0; size];
-            let (status, consumed, written) = decompress(
-                &mut Box::<DecompressorOxide>::default(),
-                &body[4..],
-                &mut raw,
-                0,
-                inflate_flags::TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF,
-            );
-            if status != TINFLStatus::Done || consumed != body.len() - 4 || written != size {
-                return Err(invalid("invalid compressed state or trailing bytes"));
-            }
-            deserialize(&raw)
-        }
+        Some((&1, body)) => deserialize(&inflate(body, limit)?),
         _ => Err(invalid("invalid wire frame")),
     }
 }

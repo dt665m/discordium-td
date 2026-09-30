@@ -11,6 +11,7 @@ mod health_tests;
 mod outcome_tests;
 mod outcomes;
 mod ownership;
+mod path;
 mod peer;
 mod publish;
 #[cfg(test)]
@@ -256,7 +257,14 @@ impl DreamAuthority {
         let mut attempts = peer.resync_attempts.clone();
         attempts.retain(|attempt| self.now.saturating_sub(*attempt) < Duration::from_secs(30));
         if attempts.len() >= 3 {
-            return Err("Repeated resync limit".into());
+            // Recovery is rate limited, never refused. Ending the session
+            // would not make the next attempt succeed, so postpone it until
+            // the window allows and keep the player in the match meanwhile.
+            self.peers
+                .get_mut(&id)
+                .ok_or("Unknown peer")?
+                .resync_deferred = true;
+            return Ok(());
         }
         attempts.push_back(self.now);
         let count = peer.resyncs.saturating_add(1);

@@ -371,7 +371,7 @@ fn moving_speculation_ceiling_retries_old_eligible_edge_during_new_generation() 
         records.iter().filter(|record| ***record == action).count(),
         1
     );
-    // The ordinary newest-eight packet contains ticks 36..43. The separate
+    // The ordinary newest-four packet contains ticks 40..43. The separate
     // bounded retry also covers all nine retained commands now admissible;
     // bootstrap substitutes have no commands to retransmit.
     let new_packet = packets
@@ -383,7 +383,7 @@ fn moving_speculation_ceiling_retries_old_eligible_edge_during_new_generation() 
             .iter()
             .map(|record| record.target.0)
             .collect::<std::collections::BTreeSet<_>>(),
-        (36..=43).collect()
+        (40..=43).collect()
     );
     assert!(new_packet.iter().all(|record| record != &action));
     let eligible = records

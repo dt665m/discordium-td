@@ -5808,7 +5808,6 @@ dependencies = [
  "renet",
  "renetcode",
  "reqwest",
- "sctp-proto",
  "serde",
  "serde_json",
  "str0m",
@@ -6144,7 +6143,8 @@ dependencies = [
 
 [[package]]
 name = "sctp-proto"
-version = "0.10.4"
+version = "0.10.5"
+source = "git+https://github.com/dt665m/sctp-proto.git?branch=fix%2Fpartial-reliability-abandonment#68eb43bc8151bc6c5d3f601167b2d01a42a5da08"
 dependencies = [
  "bytes",
  "crc",

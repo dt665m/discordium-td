@@ -20,14 +20,14 @@ assets, target-specific dependencies and notice files before release.
 | Bevy | 0.19.1, crates.io checksum in lock | MIT OR Apache-2.0 | Existing ECS, schedules, headless simulation and presentation adapter |
 | renet | 2.0.0, stock crates.io checksum in lock | MIT OR Apache-2.0 | Upstream message delivery, fragmentation and retransmission with stock configuration |
 | renetcode | 2.0.0, `https://github.com/dt665m/renet.git`, branch `fix/confirmation-keepalive-starvation`, exact commit in lock | MIT OR Apache-2.0 | Minimal upstreamable handshake correction: application payload sends cannot postpone confirmation retries while the peer is unconfirmed |
-| renet-cross | 0.7.0, crates.io checksum in lock | MIT OR Apache-2.0 | Owned native/browser transport integration and secure session bootstrap; published from commit `b5dc558a3e851347225f8c7bc799028089a973ec` |
+| renet-cross | 0.7.4, sibling checkout `../renet-cross` (path dependency) | MIT OR Apache-2.0 | Owned native/browser transport integration and secure session bootstrap; publish and switch to the registry release before shipping |
 | bincode | 1.3.3, crates.io checksum in lock | MIT | Existing binary serde codec; schema and bounds remain application responsibilities |
 | blake3 | 1.8.7, crates.io checksum in lock | CC0-1.0 OR Apache-2.0 OR Apache-2.0 WITH LLVM-exception | Canonical checkpoint and ruleset digests |
 | parry3d | 0.30.2, immutable registry version | Apache-2.0 | Capsule collision queries with enhanced determinism; continuation still requires qualification |
 | serde | 1.0.229, crates.io checksum in lock | MIT OR Apache-2.0 | Serialization derives |
 | miniz_oxide | 0.8.9 and 0.9.1, crates.io checksums in lock | MIT OR Zlib OR Apache-2.0 | Compression; engine_net declares the 0.8 line |
 | tokio | 1.53.1, crates.io checksum in lock | MIT | Existing asynchronous transport/runtime support |
-| sctp-proto | 0.10.4, fork checkout `../sctp-proto` (branch `fix/partial-reliability-abandonment`, commit `37ad2ae`) | MIT OR Apache-2.0 | PR-SCTP abandonment fixes, plus the opt-in `realtime-cwnd-floor` feature that renet-cross enables: a 16 KiB congestion window floor so random loss cannot hold an application-paced data channel near 30 KB/s. Path patch until the commit is pushed to the fork |
+| sctp-proto | 0.10.5, fork [`dt665m/sctp-proto`](https://github.com/dt665m/sctp-proto) branch `fix/partial-reliability-abandonment` on latest upstream | MIT OR Apache-2.0 | PR-SCTP abandonment fixes pending [algesten/sctp-proto#57](https://github.com/algesten/sctp-proto/pull/57). Remove the patch once a release includes them |
 | str0m | 0.23.1, `https://github.com/dt665m/str0m.git`, commit `591de71f4588b59e4850007414c6315a93943794` | MIT OR Apache-2.0 | Existing WebRTC transport patch; preserve this exact reviewed lock resolution |
 
 The str0m manifest and lock use the same immutable `rev`. A lock protects a locked
@@ -36,9 +36,9 @@ workspace declaration currently absent from Cargo.lock, not an integrated or
 license-reviewed selected dependency. If activated, record its exact resolution
 and inspect its license before claiming that gate complete.
 
-The game consumes the published renet-cross crate; a sibling checkout is not
-required. Cargo.lock records its registry checksum. Local transport development
-may temporarily use a path patch, but a lockfile does not pin local source bytes.
+The game currently builds renet-cross from the sibling checkout while transport
+changes are in progress. A lockfile does not pin local source bytes, so release
+builds must switch back to a published version with a registry checksum.
 
 The game patches only `renetcode` from the Renet fork. The renet-cross repository
 uses the same patch for its own tests. A crates.io package cannot retain a Git

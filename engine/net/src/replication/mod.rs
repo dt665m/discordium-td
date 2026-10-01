@@ -13,6 +13,7 @@ mod codec;
 mod groups;
 pub mod regions;
 mod server;
+pub mod stream;
 use crate::types::*;
 pub use client::*;
 pub use codec::*;

@@ -236,7 +236,10 @@ impl DreamReplication {
         if owner == 0 {
             return Err(error("invalid owner"));
         }
-        Ok((self.identity(Key::Global)?, self.identity(Key::Owner(owner))?))
+        Ok((
+            self.identity(Key::Global)?,
+            self.identity(Key::Owner(owner))?,
+        ))
     }
     #[cfg(test)]
     pub fn global_entity(&self) -> Option<EntityId> {
@@ -439,7 +442,6 @@ impl DreamReplication {
             if self.graph.entity(id).is_some() {
                 self.graph.apply(tick, Change::Remove(id)).map_err(error)?;
             }
-
         }
         self.present = present;
         for (&connection, peer) in &self.peers {

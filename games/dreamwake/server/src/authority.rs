@@ -451,7 +451,10 @@ impl DreamAuthority {
             live::InputPacket {
                 ack,
                 records: BoundedVec::new(
-                    commands.iter().map(live::InputRecord::from_command).collect(),
+                    commands
+                        .iter()
+                        .map(live::InputRecord::from_command)
+                        .collect(),
                 )
                 .map_err(failure)?,
             },
@@ -975,9 +978,7 @@ impl engine_server::Authority for DreamAuthority {
                 .peers
                 .values()
                 .filter(|peer| {
-                    peer.welcome.player == player
-                        && peer.welcome.client.0 != id
-                        && !peer.active
+                    peer.welcome.player == player && peer.welcome.client.0 != id && !peer.active
                 })
                 .map(|peer| peer.welcome.client.0)
                 .collect();

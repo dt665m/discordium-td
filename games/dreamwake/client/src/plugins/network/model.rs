@@ -110,7 +110,12 @@ impl RewindModel for OwnerModel {
                 command_sequence: command.sequence.0,
                 action_slot: slot,
             };
-            if let Some(edge) = command.actions.as_slice().iter().min_by_key(|edge| edge.slot) {
+            if let Some(edge) = command
+                .actions
+                .as_slice()
+                .iter()
+                .min_by_key(|edge| edge.slot)
+            {
                 action = match edge.action {
                     DreamAction::Cast { slot, aim } => {
                         held.aim = aim;

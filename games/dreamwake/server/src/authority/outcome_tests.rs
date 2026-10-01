@@ -20,9 +20,7 @@ fn command(
     }
 }
 fn submit(authority: &mut DreamAuthority, command: Command<live::TickInput, DreamAction>) {
-    authority
-        .receive_commands(41, vec![command])
-        .unwrap();
+    authority.receive_commands(41, vec![command]).unwrap();
 }
 #[test]
 fn terminal_duplicate_late_and_reconnect_lookup_do_not_reexecute() {

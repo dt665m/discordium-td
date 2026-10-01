@@ -5,8 +5,10 @@ use crate::{
         Admission, Command, CommandInbox, CommandLimits, CommandRules, FinalizedReceipt,
         FinalizedStatus, OwnerStream, pack_redundant,
     },
-    prediction::PredictionLimits,
-    types::{CommandSeq, CommandStream, ConnectionEpoch, ConnectionId, EntityId, OwnershipEpoch},
+    types::{
+        CommandSeq, CommandStream, ConnectionEpoch, ConnectionId, EntityId,
+        MAX_COMMAND_HORIZON_TICKS, OwnershipEpoch,
+    },
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -15,7 +17,7 @@ fn ms(value: u64) -> Duration {
 }
 
 fn replay_budget() -> u32 {
-    u32::try_from(PredictionLimits::default().replay_ticks_per_frame).unwrap()
+    u32::from(MAX_COMMAND_HORIZON_TICKS)
 }
 
 #[test]

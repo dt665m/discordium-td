@@ -63,7 +63,10 @@ fn owner_uses_private_checkpoint_without_duplicate_public_hero() {
         find(&first, rep.global_entity().unwrap()),
         Some(Replica::Global(_))
     ));
-    assert!(find(&first, one).is_none(), "no public copy of one's own hero");
+    assert!(
+        find(&first, one).is_none(),
+        "no public copy of one's own hero"
+    );
     assert!(find(&second, two).is_none());
     assert!(find(&first, two).is_some());
     assert!(find(&second, one).is_some());
@@ -238,8 +241,7 @@ fn owner_platform_dependency_is_projected_with_the_owner() {
     {
         let world = sim.world_mut();
         let mut query = world.query::<&mut engine_core::KinematicState>();
-        *query.single_mut(world).unwrap() =
-            engine_core::KinematicState::new([1.0, 0.25, -10.0], 1);
+        *query.single_mut(world).unwrap() = engine_core::KinematicState::new([1.0, 0.25, -10.0], 1);
     }
     sim.step(DreamInput::default());
     let mut rep = adapter();
@@ -262,8 +264,14 @@ fn owner_continuity_must_match_the_capture_tick() {
     let mut rep = adapter();
     join(&mut rep, 1);
     rep.prepare(capture(&sim, 3), &[1, 2]).unwrap();
-    assert!(rep.gather_peer(1, ServerTick(2), &Default::default()).is_err());
-    assert!(rep.gather_peer(1, ServerTick(3), &Default::default()).is_ok());
+    assert!(
+        rep.gather_peer(1, ServerTick(2), &Default::default())
+            .is_err()
+    );
+    assert!(
+        rep.gather_peer(1, ServerTick(3), &Default::default())
+            .is_ok()
+    );
 }
 
 #[test]

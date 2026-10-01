@@ -213,7 +213,14 @@ mod tests {
         let mut forged = view;
         forged.reference = 6;
         assert_eq!(
-            peer.validate(CONNECTION, forged, ServerTick(19), ServerTick(20), &clock, 1),
+            peer.validate(
+                CONNECTION,
+                forged,
+                ServerTick(19),
+                ServerTick(20),
+                &clock,
+                1
+            ),
             Err(TimingError::UnknownReference)
         );
         assert_eq!(
@@ -248,13 +255,22 @@ mod tests {
             Ok((ServerTick(11), 11, 32768, false))
         );
         view.viewed_at = ServerTick(14);
-        assert_eq!(validate(&peer, view, &clock), Ok((ServerTick(14), 12, 0, false)));
+        assert_eq!(
+            validate(&peer, view, &clock),
+            Ok((ServerTick(14), 12, 0, false))
+        );
         view.viewed_at = ServerTick(1);
-        assert_eq!(validate(&peer, view, &clock), Err(TimingError::OutsidePolicy));
+        assert_eq!(
+            validate(&peer, view, &clock),
+            Err(TimingError::OutsidePolicy)
+        );
         view.viewed_at = ServerTick(11);
         clock
             .entries
             .retain(|(_, server, _)| *server != ServerTick(12));
-        assert_eq!(validate(&peer, view, &clock), Err(TimingError::MissingHistory));
+        assert_eq!(
+            validate(&peer, view, &clock),
+            Err(TimingError::MissingHistory)
+        );
     }
 }

@@ -281,10 +281,7 @@ class Limits:
     trace_gap_seconds: float = 10.0
     phase_halt_seconds: float = 60.0
     motion_halt_seconds: float = 120.0
-    history_bytes: int = 64 * MIB
-    scope_bytes: int = 4 * MIB
-    staging_bytes: int = 16 * MIB
-    baseline_bytes: int = 16 * MIB
+    entities: int = 4096
     interpolation_bytes: int = 16 * MIB
     pending_commands: int = 256
     known_scopes: int = 8192
@@ -302,7 +299,7 @@ class ClientAudit:
         self.previous_gameplay_tick = None
         self.transport_connection = None
         self.decode_counters = {'decode_errors': 0, 'stale_epoch_rejections': 0,
-                                'clock_resync_rejections': 0, 'obsolete_rejections': 0, 'decode_failures': 0}
+                                'clock_resync_rejections': 0, 'decode_failures': 0}
         self.phase_since = 0.0
         self.previous_phase = None
         self.previous_elapsed = None
@@ -339,8 +336,7 @@ class ClientAudit:
         self.latest = row
         counters = {key: integer(row.get(key), key) for key in self.decode_counters}
         if counters['decode_errors'] != (counters['stale_epoch_rejections']
-                                         + counters['clock_resync_rejections']
-                                         + counters['obsolete_rejections'] + counters['decode_failures']):
+                                         + counters['clock_resync_rejections'] + counters['decode_failures']):
             raise Failure(f'{self.name}: decode counter partition is inconsistent')
         if any(counters[key] < self.decode_counters[key] for key in counters):
             raise Failure(f'{self.name}: lifetime decode counters regressed')
@@ -399,7 +395,7 @@ class ClientAudit:
         self.previous_gameplay_tick = gameplay_tick
         if measurement_elapsed is not None and self.first_tick is None:
             self.first_tick, self.first_tick_elapsed = tick, measurement_elapsed
-        for key in ('history_bytes', 'scope_bytes', 'staging_bytes', 'baseline_bytes', 'pending_commands'):
+        for key in ('entities', 'pending_commands'):
             value = integer(row.get(key), key)
             if value > getattr(self.limits, key):
                 raise Failure(f'{self.name}: {key} budget exceeded')
@@ -416,7 +412,6 @@ class ClientAudit:
         replay = integer(row.get('replay_ticks'), 'replay_ticks')
         if replay > self.limits.replay_ticks:
             raise Failure(f'{self.name}: replay tick limit exceeded')
-        self.measurement('replay_requested', integer(delivery.get('maximum_replay_requested'), 'maximum_replay_requested'))
         self.measurement('replay_ticks', replay)
         self.measurement('replay_cpu_micros', number(delivery.get('replay_cpu_micros'), 'replay_cpu_micros', minimum=0))
         estimated = integer(row.get('estimated_server_tick'), 'estimated_server_tick')

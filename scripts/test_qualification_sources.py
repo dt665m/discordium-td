@@ -88,22 +88,5 @@ class FrozenSourcesTests(unittest.TestCase):
         self.assertFalse(HELPERS['unchanged'](self.base, files))
 
 
-class WorkloadCoverageTests(unittest.TestCase):
-    def test_whole_message_delivery_requires_all_applicable_workload_paths(self):
-        counters = dict.fromkeys([
-            'scope_exits', 'destroyed_generations', 'dormant_offers', 'dropped',
-            'reordered', 'groups_published', 'baseline_retirements', 'event_records',
-            'full_history_windows', 'retired_history_checks',
-        ], 1)
-        self.assertTrue(HELPERS['workload_coverage'](counters))
-        self.assertTrue(HELPERS['workload_coverage']({**counters, 'partial_groups': 0}))
-        for name in counters:
-            with self.subTest(counter=name):
-                self.assertFalse(HELPERS['workload_coverage']({**counters, name: 0}))
-                self.assertFalse(HELPERS['workload_coverage']({key: value for key, value in counters.items() if key != name}))
-        self.assertFalse(HELPERS['workload_coverage'](None))
-        self.assertFalse(HELPERS['workload_coverage']({}))
-
-
 if __name__ == '__main__':
     unittest.main()

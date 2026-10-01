@@ -50,7 +50,7 @@ MIN_OBSERVED_CELLS = 3
 RECOVERY_DEADLINE_SECONDS = 10.0
 END_ACTIVE_WINDOW_SECONDS = 3.0
 DECODE_COUNTERS = ("decode_errors", "stale_epoch_rejections", "clock_resync_rejections",
-                   "obsolete_rejections", "decode_failures")
+                   "decode_failures")
 
 
 def save_json(path: Path, value: object) -> None:
@@ -351,7 +351,7 @@ def analyze_records(left: list[dict], right: list[dict], expected_pids: list[int
         if len(cells) < MIN_OBSERVED_CELLS:
             failures.append(f"player {owner} visited only {len(cells)} authoritative graph cells; require {MIN_OBSERVED_CELLS}")
         maxima = {}
-        for name in ("pending_commands", "history_bytes", "scope_bytes", "staging_bytes", "rtt_ms"):
+        for name in ("pending_commands", "entities", "rtt_ms"):
             values = [row[name] for row in active if isinstance(row.get(name), (int, float))
                       and math.isfinite(row[name])]
             maxima[name] = max(values) if values else None
@@ -372,8 +372,8 @@ def analyze_records(left: list[dict], right: list[dict], expected_pids: list[int
                          "maximum_inactive_after_activation_seconds": RECOVERY_DEADLINE_SECONDS,
                          "active_within_seconds_of_run_end": END_ACTIVE_WINDOW_SECONDS,
                          "maximum_lifetime_hard_decode_failures": 0,
-                         "decode_counter_partition": "decode_errors = stale_epoch_rejections + clock_resync_rejections + obsolete_rejections + decode_failures",
-                         "decode_counter_method": "Every observation, including inactive startup and recovery, requires nonnegative integer monotonic lifetime counters with an exact partition. Expected stale-epoch, typed clock-resync and obsolete rejections remain separate. Latest issue text cannot classify earlier failures; missing legacy classification is unverifiable and fails.",
+                         "decode_counter_partition": "decode_errors = stale_epoch_rejections + clock_resync_rejections + decode_failures",
+                         "decode_counter_method": "Every observation, including inactive startup and recovery, requires nonnegative integer monotonic lifetime counters with an exact partition. Expected stale-epoch and typed clock-resync rejections remain separate. Latest issue text cannot classify earlier failures; missing legacy classification is unverifiable and fails.",
                          "active_duration_method": "Sample state held until next observation; fraction uses requested run duration. Initial admission is excluded only from recovery deadline gating."}}
 
 
@@ -398,7 +398,7 @@ def analyze_profile(directory: Path, process_run: dict) -> dict:
         report["pause_recovery"] = pause
         if (not pause.get("passed") or not recovered_after_pause(pause.get("before", {}), pause.get("after"))
                 or pause.get("observed_recovery_seconds", math.inf) > RECOVERY_DEADLINE_SECONDS):
-            report["failures"].append("controlled pause lacks proven fresh-stream recovery within 10 seconds")
+            report["failures"].append("controlled pause lacks proven in-place recovery within 10 seconds")
     report["failures"].extend(process_run.get("errors", []))
     report["passed"] = not report["failures"]
     save_json(directory / "analysis.json", report)
@@ -527,11 +527,11 @@ def latest_trace(path: Path) -> dict | None:
 
 
 def recovered_after_pause(before: dict, after: dict | None) -> bool:
-    """Require a new active game stream in the same process and server instance."""
+    """Require the same active game stream to resume: a pause recovers locally."""
     return bool(after and before.get("active") and after.get("active")
         and integer(before.get("connection_epoch"), 1)
         and integer(after.get("connection_epoch"), 1)
-        and after["connection_epoch"] != before["connection_epoch"]
+        and after["connection_epoch"] == before["connection_epoch"]
         and integer(before.get("pid"), 1) and after.get("pid") == before["pid"]
         and before.get("server_instance") is not None
         and after.get("server_instance") == before["server_instance"]
@@ -642,7 +642,7 @@ def run_profile(name: str, directory: Path, duration: float, seed: int, binaries
                     resumed_at = now
                     result["pause_recovery"]["resumed_at_process_elapsed"] = now - start
                     save_json(directory / "processes.json", result)
-                    print(f"{name}: left client resumed; awaiting a fresh active stream", flush=True)
+                    print(f"{name}: left client resumed; awaiting the stream to resume", flush=True)
                 recovery = result.get("pause_recovery")
                 if resumed_at is not None and recovery and not recovery["passed"]:
                     after = latest_trace(directory / "left.ndjson")
@@ -652,10 +652,10 @@ def run_profile(name: str, directory: Path, duration: float, seed: int, binaries
                             "observed_recovery_seconds": elapsed, "after": after})
                         save_json(directory / "processes.json", result)
                         if recovery["passed"]:
-                            print(f"{name}: fresh stream recovered in {elapsed:.2f}s", flush=True)
+                            print(f"{name}: stream resumed in {elapsed:.2f}s", flush=True)
                     if not recovery["passed"] and elapsed > RECOVERY_DEADLINE_SECONDS:
                         recovery["last_observation"] = after
-                        raise RuntimeError("paused client did not activate a fresh stream within 10 seconds")
+                        raise RuntimeError("paused client did not resume its stream within 10 seconds")
                 if now >= next_update:
                     print(f"{name}: {now-start:.0f}s elapsed; client exits {[p.poll() for p in clients]}", flush=True)
                     next_update = now + 15
@@ -753,7 +753,7 @@ def main() -> int:
     parser.add_argument("--duration", type=float, default=120, help="client lifetime in seconds, 30–600 (default 120)")
     parser.add_argument("--seed", type=int, default=8192)
     parser.add_argument("--pause-at", type=float,
-        help="stop the left client for 3 seconds at this process elapsed time; require fresh-stream recovery within 10 seconds")
+        help="stop the left client for 3 seconds at this process elapsed time; require its stream to resume within 10 seconds")
     parser.add_argument("--no-build", action="store_true", help="reuse a captured pair with --binary-dir; target/release fallback requires target/native-provenance.json")
     parser.add_argument("--binary-dir", type=Path, help="captured release binaries with sibling native-provenance.json; requires --no-build")
     parser.add_argument("--output-root", type=Path, default=ROOT / "out" / "spatial-playtest")

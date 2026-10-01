@@ -11,9 +11,8 @@ use std::time::Duration;
 /// a server that admits less rejects a lead the client legitimately chose.
 ///
 /// This is a quality bound, not a reachability bound. It caps how far
-/// prediction may speculate, so it stays well under
-/// `PredictionLimits::replay_ticks_per_frame` and one correction cannot consume
-/// a whole frame's replay budget. At 60 Hz it covers 400 ms of one-way
+/// prediction may speculate, and so how many ticks one correction replays.
+/// At 60 Hz it covers 400 ms of one-way
 /// headroom, so an ordinary intercontinental round trip needs no special
 /// handling.
 pub const MAX_COMMAND_LEAD_TICKS: u8 = 24;

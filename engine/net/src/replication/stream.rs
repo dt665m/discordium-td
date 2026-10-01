@@ -330,9 +330,7 @@ impl<K: Copy + Ord, S: Clone> ClientStream<K, S> {
     }
     /// Whether a packet with this sequence would be accepted.
     pub fn accepts(&self, seq: u32) -> bool {
-        seq != 0
-            && !self.ack.covers(seq)
-            && seq.saturating_add(STREAM_WINDOW) > self.ack.latest
+        seq != 0 && !self.ack.covers(seq) && seq.saturating_add(STREAM_WINDOW) > self.ack.latest
     }
     /// How to decode the entry for `key` in packet `seq`, which names `base`.
     pub fn base(&self, key: K, base: Option<u32>, seq: u32) -> Result<Base<'_, S>, StreamError> {

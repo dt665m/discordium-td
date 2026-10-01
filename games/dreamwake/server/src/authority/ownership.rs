@@ -185,9 +185,7 @@ mod tests {
             .unwrap(),
         };
         let key = queued.action_key(0);
-        authority
-            .receive_commands(41, vec![queued])
-            .unwrap();
+        authority.receive_commands(41, vec![queued]).unwrap();
         assert!(authority.outcomes.lookup(41, key).is_none());
         authority.step(Duration::from_millis(34));
         assert!(authority.peers.contains_key(&41));

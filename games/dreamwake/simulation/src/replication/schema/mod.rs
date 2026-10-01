@@ -14,12 +14,12 @@ mod public;
 use collision::Collision;
 use components::*;
 use enums::*;
+pub use live::{Replica, ReplicaKind, ReplicaState};
 use marker::CoverMarker;
 use motion::*;
 use owner::Owner;
 use platform::Platform;
 use public::*;
-pub use live::{Replica, ReplicaKind, ReplicaState};
 
 const F: Range = Range::Float32 {
     minimum: -f32::MAX,

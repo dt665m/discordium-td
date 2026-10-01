@@ -107,11 +107,7 @@ fn peer_state(
         let near = entry
             .distance
             .is_none_or(|metres| metres <= NEAR_ACTOR_METRES);
-        if !owner
-            && !global
-            && !near
-            && (peer.publications + entry.entity.index) % 2 != 0
-        {
+        if !owner && !global && !near && (peer.publications + entry.entity.index) % 2 != 0 {
             continue;
         }
         let state = ReplicaState::capture(&entry.replica).map_err(failure)?;
@@ -214,9 +210,12 @@ fn peer_state(
                 .map_err(failure)?;
             size += entry_size;
         }
-        let bytes = live::encode_state(&packet, peer.welcome.stream.epoch, limit).map_err(failure)?;
+        let bytes =
+            live::encode_state(&packet, peer.welcome.stream.epoch, limit).map_err(failure)?;
         let cost = budget.map(|(_, overhead)| bytes.len() as u64 + overhead);
-        if budget.zip(cost).is_some_and(|((left, _), cost)| cost > left)
+        if budget
+            .zip(cost)
+            .is_some_and(|((left, _), cost)| cost > left)
             || !server.can_send_message(id, wire::STATE_CHANNEL, bytes.len())
         {
             // Not ready for more this tick: drop the packet's bookkeeping and

@@ -129,9 +129,7 @@ fn queued_owner_keeps_same_capture_input_continuity_while_authority_advances() {
     let mut client = renet::RenetClient::new(wire::connection_config());
     client.set_connected();
     let first = held_command(&authority, 1, 2, [1.0, 0.0]);
-    authority
-        .receive_commands(41, vec![first])
-        .unwrap();
+    authority.receive_commands(41, vec![first]).unwrap();
     authority.step(Duration::from_millis(34));
     authority.step(Duration::from_millis(51));
     let captured_continuity = authority.peers[&41]
@@ -155,9 +153,7 @@ fn queued_owner_keeps_same_capture_input_continuity_while_authority_advances() {
 
     // Leave the packet undelivered while authority advances.
     let second = held_command(&authority, 2, 4, [0.0, 1.0]);
-    authority
-        .receive_commands(41, vec![second])
-        .unwrap();
+    authority.receive_commands(41, vec![second]).unwrap();
     authority.step(Duration::from_millis(68));
     let current_continuity = authority.peers[&41]
         .inbox

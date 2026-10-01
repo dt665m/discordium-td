@@ -164,7 +164,10 @@ fn input_packets_round_trip_and_reject_invalid_records() {
             3 => bad.input.held.dash = true,
             4 => bad.sequence = CommandSeq(0),
             5 => bad.target = TargetTick(0),
-            6 => bad.actions.push(record(1).actions.as_slice()[0].clone()).unwrap(),
+            6 => bad
+                .actions
+                .push(record(1).actions.as_slice()[0].clone())
+                .unwrap(),
             7 => {
                 bad.actions = BoundedVec::new(vec![ActionEdge {
                     slot: 9,
@@ -181,7 +184,10 @@ fn input_packets_round_trip_and_reject_invalid_records() {
             }
         }
         let packet = input(vec![bad]);
-        assert!(encode_input(&packet, ConnectionEpoch(2), 1, limit()).is_err(), "{change}");
+        assert!(
+            encode_input(&packet, ConnectionEpoch(2), 1, limit()).is_err(),
+            "{change}"
+        );
         let payload = codec::encode_payload(&Unchecked(&packet), limit().payload_bytes()).unwrap();
         let frame = codec::encode_frame(
             FrameHeader {
@@ -193,7 +199,10 @@ fn input_packets_round_trip_and_reject_invalid_records() {
             limit(),
         )
         .unwrap();
-        assert!(decode_input(&frame, ConnectionEpoch(2), limit()).is_err(), "{change}");
+        assert!(
+            decode_input(&frame, ConnectionEpoch(2), limit()).is_err(),
+            "{change}"
+        );
     }
     let repeated = input(vec![record(1), record(1)]);
     assert!(encode_input(&repeated, ConnectionEpoch(2), 1, limit()).is_err());

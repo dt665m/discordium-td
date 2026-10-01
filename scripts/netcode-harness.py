@@ -6,7 +6,7 @@ over each transport the browser and native builds use. Every scenario is gated
 on player-facing outcomes the client measures from its display, not on the
 network implementation's own invariants:
 
-  * the session never disconnects or asks the server to recover it;
+  * the session never disconnects or reconnects;
   * the owner's character never moves further in a frame than physics allows
     by a metre or more (a teleport), and rarely by a visible margin at all;
   * the client stays connected for the run.
@@ -57,7 +57,7 @@ SCENARIOS = {
 }
 PLAYERS = (2001, 2002)
 # Visible corrections are tolerated only at a rate a player would not notice
-# as a pattern; any teleport, disconnect or recovery fails the scenario.
+# as a pattern; any teleport or disconnect fails the scenario.
 MAX_CORRECTIONS_PER_MINUTE = 6.0
 MIN_CONNECTED_FRACTION = 0.9
 STARTUP_ALLOWANCE_SECONDS = 20.0
@@ -148,8 +148,6 @@ def judge_client(side: str, trace: dict | None, seen: set[str], transport: str, 
     # reconnect shows up as lost connected time instead.
     if health.get("disconnects", 0) > 1:
         failures.append(f"disconnected {health['disconnects']} time(s)")
-    if health.get("recoveries", 0) > 0:
-        failures.append(f"requested {health['recoveries']} recovery resync(s)")
     if health.get("teleports", 0) > 0:
         failures.append(f"{health['teleports']} teleport frame(s), worst "
                         f"{health.get('max_excess_metres', 0):.2f} m beyond physics")
@@ -267,7 +265,7 @@ def summary_line(result: dict) -> str:
     for client in result["clients"]:
         h = client["health"]
         parts.append(f"{client['side']}: conn {h.get('connected_seconds', 0):.0f}s "
-                     f"rec {h.get('recoveries', 0)} disc {h.get('disconnects', 0)} "
+                     f"disc {h.get('disconnects', 0)} "
                      f"tele {h.get('teleports', 0)} corr {h.get('corrections', 0)} "
                      f"max {h.get('max_excess_metres', 0):.2f}m stalls {client['stalls_injected']} "
                      f"rtt95 {client['rtt_p95_ms'] or 0:.0f}ms")

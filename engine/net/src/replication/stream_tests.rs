@@ -269,7 +269,8 @@ fn random_loss_and_reordering_converge() {
                 receive(&mut client, &packet).unwrap();
             }
         }
-        if lossy && next(5) == 0
+        if lossy
+            && next(5) == 0
             && let Some(old) = delayed.pop()
         {
             // Late packets may be refused (base aged out) but never corrupt.
@@ -298,5 +299,9 @@ fn in_flight_states_are_lost_only_when_a_later_packet_is_acknowledged() {
     server.acknowledge(client.ack()).unwrap();
     assert!(server.lost(first.seq));
     assert!(!server.lost(second.seq));
-    assert_eq!(server.in_flight(2), None, "acknowledged states become the base");
+    assert_eq!(
+        server.in_flight(2),
+        None,
+        "acknowledged states become the base"
+    );
 }

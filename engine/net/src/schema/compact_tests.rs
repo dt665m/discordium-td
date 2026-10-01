@@ -621,7 +621,12 @@ fn deltas_carry_only_changed_fields_and_rebuild_the_value() {
     let delta = codec.encode_compact_delta(&moved, &base).unwrap();
     let full = codec.encode_compact(&moved).unwrap();
     assert!(delta.len() <= 5, "{delta:?}");
-    assert!(delta.len() < full.len() / 3, "{} vs {}", delta.len(), full.len());
+    assert!(
+        delta.len() < full.len() / 3,
+        "{} vs {}",
+        delta.len(),
+        full.len()
+    );
     assert_eq!(codec.decode_compact_delta(&base, &delta).unwrap(), moved);
     // Variable-size fields are resent whole when they change.
     let mut tagged = moved.clone();

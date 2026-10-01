@@ -1,16 +1,17 @@
 # Networking and authority
 
 `engine_net` provides typed timelines, bounded codecs, immutable target-tick
-commands, persistent interest graphs, scoped replication, byte scheduling and
-transactional prediction. Games supply simulation rules, representation policies,
-payloads, readiness requirements and admission policy. `PeerInbox<I, A>` remains
-available for simpler integrations; Dreamwake uses the target-tick command inbox.
+commands, persistent interest graphs, an acknowledged per-connection entity state
+stream, compact schema deltas and a rollback predictor. Games supply simulation
+rules, representation policies, payloads and admission policy. `PeerInbox<I, A>`
+remains available for simpler integrations; Dreamwake uses the target-tick
+command inbox.
 
-The [network integration contracts](network-contracts.md) define persistent graph
-gathering, scoped delivery and immutable target-tick input.
-The graph and scope primitives live in `engine_net::interest` and
-`engine_net::replication`. Dreamwake's live server and client use those APIs;
-the offline complete-world checkpoint has a separate purpose and codec.
+The [network integration contracts](network-contracts.md) define graph
+gathering, disclosure and immutable target-tick input. The graph lives in
+`engine_net::interest`; the state stream in `engine_net::replication::stream`;
+the predictor in `engine_net::prediction::rewind`. The offline complete-world
+checkpoint has a separate purpose and codec.
 
 `just network-plan` reads the supplied implementation backlog in milestone order.
 `just network-foundation` runs the available kernel/simulation contracts and the
@@ -80,133 +81,73 @@ already queued. The owned dependency correction is recorded in the
 [network dependency register](network-dependencies.md).
 
 Dreamwake paces each connection at 160,000 bytes per second with a 16,000-byte
-burst; 2,400 bytes of that burst are reserved for transport control. Its graph
-scheduler uses the same rate with 36 KiB of admission credit so one bounded
-owner message can enter Renet and be sent across multiple flushes. The reusable engine's generic defaults remain
-60,000 bytes per second and a 6,000-byte burst.
+burst; 2,400 bytes of that burst are reserved for transport control. The reusable
+engine's generic defaults remain 60,000 bytes per second and a 6,000-byte burst.
 The `--egress-bytes-per-second`, `--egress-burst-bytes` and
 `--egress-control-reserve-bytes` flags override these values. Pacing uses monotonic
-wall time and charges retransmissions and conditioned duplicates at the final
-send boundary. Native UDP accounting includes IP and UDP headers. WebRTC counts
-encrypted logical packets; browser-managed framing and congestion prevent an
-equivalent physical-byte guarantee. `SharedNet::egress_stats` and
-`peer_egress_stats` expose these two bases separately. These transport limits are
-independent of the graph scheduler's estimated wire-byte allowance.
+wall time and charges retransmissions at the final send boundary. Native UDP
+accounting includes IP and UDP headers; WebRTC counts encrypted logical packets.
+`SharedNet::egress_stats` and `peer_egress_stats` expose the two bases separately.
 
-Dreamwake orders reliable controls first, unreliable remote actors second, and
-reliable-unordered owner groups last in stock Renet's packetizer. The transport
-reserve protects netcode control packets; application
-control messages are still charged as encrypted payload. At each 20 Hz
-publication, `Finalized` includes only committed receipts not already queued on
-the reliable channel, in batches of at most 32. Finalization has a sixteen-batch
-application receipt window over a 1,024-tick receipt history, so a round trip of
-several seconds falls behind without evicting an unsent receipt; action outcomes
-keep a four-batch window. A validated
-`FinalizedAck` or `OutcomesAck` acknowledges an exact sent batch endpoint; future
-or unsent endpoints are rejected. Unrelated clock and lifecycle controls do not
-consume either window. Unsent work coalesces in bounded authority storage.
-Exhaustion requires recovery rather than omitted receipts. These delivery
-acknowledgements do not mean a new command was executed or a checkpoint decoded.
+Renet carries controls on its reliable-ordered channel and every state and input
+packet on its unreliable channel, with Renet's stock resend timer. Controls are
+packetized first. State and input messages are built to fit one Renet packet
+(1,100-byte application frames), so a lost datagram loses one message and nothing
+waits behind it. WebRTC data channels are unordered with a 150 ms
+`maxPacketLifeTime`, and their MTU carries one netcode packet in one SCTP chunk:
+SCTP drops a packet it could not deliver in time instead of queueing newer traffic
+behind it. SCTP keeps its stock RFC congestion control. The SCTP timed-reliability
+fix this relies on is recorded in the [dependency register](network-dependencies.md).
 
-The client keeps only the newest validated public-state decode receipt per scope
-incarnation and sends them every 200 ms, eight to a control; the server's
-acknowledgement is cumulative per scope, and one receipt per received state made
-the client's upload larger than its download. Owner group receipts and baseline
-repairs are sent immediately. Each command packet carries the newest command
-and three predecessors, and reliable Renet channels resend after 250 ms: a
-timer below the round trip resends every message before its acknowledgement can
-arrive, and a queue that lengthens the round trip multiplies it. The server handles at
-most 64 admitted messages per peer per tick and leaves excess reliable messages
-queued for the next tick, so a legal burst of decode receipts cannot disconnect
-the peer.
-
-Remote actors near the player (within 16 m) publish at 20 Hz and others at
-10 Hz, the relevance-based cadence of Unreal's replication graph. A WebRTC data
-channel is congestion controlled and can drain slower than the server writes; the
-excess is queueing delay on every later message. Each publication therefore
-measures the channel's backlog (queued and in flight) against the path's
-bandwidth-delay product, its measured drain rate times the base round trip plus
-50 ms, between 8 and 48 KiB. While the backlog is above it, remote actors wait
-for the next publication and resume with their newest state; the owner group and
-controls still go out. Separately, the transport stops draining Renet into a data
-channel already 64 KiB behind, so Renet's timer resends cannot stack copies
-behind each other.
-
-Whole owner messages are admitted only when the graph scheduler and Renet's
-64 KiB sender queue have capacity. Unpublished state coalesces to the latest
-committed capture. Each accepted identity is enqueued once; stock Renet owns all
-slicing, packet acknowledgements and retransmission. Packetization allows 7,000
-payload bytes per flush, accommodating the 20 Hz remote publication burst.
-Final egress independently charges every encrypted send, including retries and
-ACKs, under the transport pacer. No application fragment prefix or retransmission
-preflight remains.
-
-Owner receive memory is 128 KiB, separately sized from the sender's 64 KiB because
-Renet rounds incomplete slices up to its 1,200-byte stride. Reliable controls use
-128 KiB per direction. Bootstrap retains only exact expected receipts, referenced bases and a
-two-second deadline. An active owner's reset waits up to ten seconds for its
-proof before its stream is replaced, since a slow path delivers the reliable
-group late rather than never, and a committed owner's replacement bootstrap has
-the same deadline. Stream replacement is rate limited to three per thirty
-seconds; a further one waits for the window rather than ending the session.
-Ordinary owner messages need no application receipt admission window. Receipt and identity checks still govern
-baseline use, activation and recovery.
+Publication stops where the connection's egress allowance ends
+(`SharedNet::peer_egress_allowance`), as Unreal's `IsNetReady` does: state that
+does not fit waits for the next publication and then goes out with its newest
+value, so the server never queues stale state behind the transport. The browser
+drops a send that would take the data channel's `bufferedAmount` past 64 KiB;
+Renet resends reliable controls and the next input packet repeats unacknowledged
+commands. Nothing else sheds, throttles or holds back traffic.
 
 Stock Renet's serialized packet bound is 1,300 bytes. Netcode adds at most 25
 bytes and base IPv6/UDP adds 48, for a 1,373-byte native data-packet allowance.
-This replaces the former 1,200-byte IP policy. WebRTC counts encrypted logical
-messages; its physical packet sizes remain browser/SCTP managed.
 
-The server's once-per-second `Dreamwake egress` log reports cumulative application
-bytes/messages for control and state, finalization batches/receipts/deferred
-publications, Renet retained payload bytes per channel, and the
-transport's independent native UDP/IP or WebRTC logical-byte counters. Healthy
-samples use info level; new pacing drops, new transport backend drops or a full
-finalization control window use warn level. A backend drop is a send the
-transport refused outright, which a full WebRTC data channel does after Renet
-has already accounted the packet as sent; it never appears as a pacing or
-capacity drop, and sustained backend loss stalls reliable bootstrap. Queued bytes come from Renet's public available-memory API and
-include sent reliable messages awaiting transport ACKs. They are not decode proofs.
+The server's once-per-second `Dreamwake egress` log reports cumulative control and
+state bytes and messages, state entries, publications cut short by the allowance,
+unacknowledged stream packets and the transport's native UDP/IP or WebRTC
+logical-byte counters. New pacing or backend drops raise it to warn level; a
+backend drop is a send the transport refused outright.
 
 ## Input and acknowledgement invariants
 
 - Gameplay commands bind a connection epoch, command stream, ownership epoch,
   sequence and immutable target tick. Validate channels, counts and finite
-  directions before admission. Redundant bundles retain the original commands.
-  Each committed tick permits at most eight dequeued input bundles, reserving
-  eight records per bundle against the 64-record admission budget. A stalled
-  receive loop leaves excess bundles in the bounded transport queue for later
-  ticks; duplicate records still consume work and message flood limits still apply.
+  directions before admission. The server handles at most 64 messages per peer
+  per tick and leaves the rest queued in Renet for the next tick.
 - Hardware sampling journals held intent and one-shot edges separately. Missing
   commands use a bounded held-input grace; substitute ticks do not repeat edges.
   The atomic owner checkpoint includes the committed held-input state and missing
   streak used by that policy. Local substitution forecasts start from that same
   checkpoint and use the shared policy without creating network commands.
-  Packets carry recent immutable commands. When authenticated committed progress
-  advances, up to 12 older retained commands inside the admission window
-  also receive a bounded retry, including frames that generate new input.
-  Commands already packed in that pass are excluded. A repeated committed tick
-  grants no additional retry; resending consumes no journal samples or sequences.
-- Finalized input receipts follow committed simulation ticks. They are separate
-  from transport receipt, decoded scoped-state receipts and action outcomes.
-  A high received sequence cannot acknowledge a command that never executed.
-  Arrival feedback uses the minimum slack among newly accepted or newly late
-  commands since publication. The bounded admission audit excludes duplicate
-  late deliveries while retaining first late arrivals below a newer sequence.
-  Each sample identifies its command and arrival tick. The client changes lead
-  only from commands that could have benefited from its current lead policy;
-  earlier samples remain lateness evidence. Cumulative unique-observation and
-  late-command counts remain visible even when a sample cannot tune lead.
-  Advancing finalization alone does not establish that a sample measures a new
-  policy.
+- Every fixed tick the client sends one unreliable input packet: its stream
+  acknowledgement and up to six commands — the newest, the three most recent
+  pending and the three oldest pending. Pending commands repeat until a state
+  packet reports them finalized, so a lost packet costs nothing and old commands
+  are never starved by new ones. There is no retry timer.
+- Finalized input follows committed simulation ticks and rides in every state
+  packet's owner status, with the applied menu sequence and arrival feedback.
+  It is separate from transport receipt, state acknowledgement and action
+  outcomes. A high received sequence cannot acknowledge a command that never
+  executed. Arrival feedback uses the minimum slack among newly accepted or newly
+  late commands since publication. The client changes lead only from commands
+  that could have benefited from its current lead policy; earlier samples remain
+  lateness evidence.
 - Menu actions use a separate bounded reliable sequence and at most one menu
   action per player per tick. An unavailable choice is still finalized.
-- Epoch resets clear pending commands and acknowledgements. Stale generations,
-  scope epochs and representation revisions cannot replace current client state.
+- A new connection epoch clears pending commands and acknowledgements. Stale
+  epochs and entity generations cannot replace current client state.
 
 Dreamlance and channeled beams capture an immutable estimated sample time E,
-displayed remote pose time R and exact decoded owner reference at the hardware
-edge. Command target C and first accepted server arrival A remain separate.
+displayed remote pose time R and the state packet that carried the owner state
+displayed at the hardware edge. Command target C and first accepted server arrival A remain separate.
 These stamps and combat history use committed simulation ticks; server scheduling
 debt does not convert arrival into a later wall-clock tick.
 The server intersects the retained reference, clock and arrival bounds with a
@@ -245,7 +186,8 @@ saved schedule and committed combat tick determine one height for both public
 presentation and collision. Normal phase changes preserve interpolation continuity;
 removal still ends the collision segment. Held beam samples never inherit the
 missing-input grace of ordinary held movement. Terminal action outcomes are
-reliable and idempotent, independently of input finalization. Retained client
+reliable controls, acknowledged with `OutcomesAck` and idempotent, independently
+of input finalization. Retained client
 lookups survive reconnects within one server
 instance and clear when the authenticated instance identity changes.
 
@@ -260,38 +202,19 @@ client ID, expiry and application grant. Native and browser clients require secu
 bootstrap and cannot fall back to an insecure connection. Bootstrap delivery
 requires HTTPS or loopback HTTP; trusted LAN HTTP requires an explicit server flag.
 
-The Welcome binds content identity and owner identity. The client validates both
-before Ready. A joining hero remains inactive until the required initial owner
-group has exact decode receipts. Activation commits on a simulation tick, then
-the client receives and proves the active checkpoint before enabling commands.
-Pending players cannot move, receive rewards, take damage or block party readiness.
-They also receive no remote public actors until activation commits, so the owner
-group keeps the connection to itself while it bootstraps. A fresh authenticated
-stream displaces a peer that never committed activation for the same profile,
-rather than being refused until that stalled bootstrap expires.
-The advertised owner identity survives ticks between Welcome and Ready while
-its connection grant remains absent. Initial synchronization has a ten-second
-absolute deadline. If an immutable initial owner group expires after two seconds
-or a loading client outlives the bounded unsent finalization audit before it can
-acknowledge application messages, a never-activated owner can receive a fresh
-stream and Welcome, sharing the
-resynchronization limit of three requests per sliding thirty-second window.
-The bounded window survives stream replacement; healthy long sessions can recover
-again after earlier attempts expire. Recovery preserves the original deadline
-and does not change health, invulnerability or participation. Expired groups and
-old stream proofs cannot activate the replacement stream. This retires the old
-audit namespace rather than skipping missing receipts. Already participating
-owners retain strict finalization continuity and cannot use this initial retry.
+The Welcome binds content identity, owner identity and the global and owner
+entity IDs. The client validates them before Ready and builds its collision
+scene locally from the content identity's scene revision. A joining hero stays
+inactive until the client acknowledges a state packet carrying its owner state;
+activation then commits on a simulation tick. Pending players cannot move,
+receive rewards, take damage or block party readiness, and receive only their
+owner state and the match summary until activation commits. A fresh
+authenticated stream displaces a peer that never committed activation for the
+same profile.
 
-An already active owner whose frozen baseline-reset checkpoint expires receives
-a fresh stream through the same bounded resynchronization path. The server keeps
-the authoritative hero and participation, closes the old command/outcome
-namespace, and requires fresh Welcome, Ready and decoded checkpoint proofs.
-Old queued messages remain transport-owned and cannot satisfy the new epoch.
-This recovery applies only to an active baseline reset; expired finalization
-audits and expired replacement bootstrap checkpoints retain their existing
-failure behavior. The two-second checkpoint deadline and three-per-thirty-second
-resynchronization cap remain unchanged.
+Nothing in the session asks the server to start over. A lost packet is covered
+by the next one, a stalled client resumes from the newest state, and the
+connection ends only on authentication or protocol failure.
 
 ### Stable Traveler IDs
 
@@ -329,108 +252,69 @@ at a time. Back up it and the client profiles to retain reconnect capability.
 The client caps saved profiles at 64 and the server caps registrations at 4096;
 live and retained current-run participant limits are separate.
 
-## Scoped state and prediction
+## Replicated state and prediction
 
 The server captures one committed simulation state and prepares the persistent
-graph once per replication frame. Each connection gathers from global, owner and
-spatial nodes under the game's disclosure policy. Only approved representations
-reach encoding. Per-connection scope entry, exit, death, dormancy and decoded
-receipts retain their own identities and independent capacity limits. Scheduler
-priority and budget operate after eligibility and cannot grant disclosure.
+graph once per publication. Each connection gathers from global, owner and
+spatial nodes under the game's disclosure policy; only approved representations
+reach encoding. The owner checkpoint, the match summary and every relevant actor
+are entities in one per-connection stream.
 
 Current component capture is shared with the full checkpoint writer. Live
-publication validates current identities, collision, populations and nested
-state, without cloning or round-tripping the offline combat archive. Full
-checkpoint creation and restore retain the complete archive checks.
-`cargo run -p dreamwake_sim --example replication_capture` runs a bounded
-120-capture probe with two heroes, populated enemies and 32 history frames;
-its timing excludes the rest of the server and does not qualify throughput.
+publication validates current identities, populations and nested state without
+cloning the offline combat archive. `cargo run -p dreamwake_sim --example
+replication_capture` runs a bounded 120-capture probe; its timing excludes the
+rest of the server and does not qualify throughput.
 
 Public actor views contain approved presentation data. Private loadouts,
 progression and latent owner state appear only in that owner's checkpoint.
 World RNG, allocation state, future encounters and complete server state are
-absent from live public/global payloads. The owner, global summary, collision
-scene and any required rotating base form one bounded message of at most 64 KiB
-on a dedicated reliable-unordered channel, published atomically. Each member
-uses a bounded full or delta encoding against an exact
-retained decode receipt in the same scope and baseline generation. All
-reconstructed payloads and group identities must validate before any replica or
-baseline is published and before a combined receipt is sent. A complete validated
-group may precede its baseline reset on the independent control channel. The
-client retains one such message, applies it when the reset arrives, and requests
-recovery if the original two-second deadline expires. Newer pending messages
-cannot extend that deadline; malformed replacements cannot evict valid data.
-Remote actors use
-complete scoped states with compact headers: canonical variable-length integers
-preserve every identity and tick, and the authenticated frame supplies the
-connection epoch. Public actor fields use their agreed schema order without
-repeating field IDs, fixed-array lengths or schema fingerprints in each update.
-The content handshake must match the exact schema registry before this encoding
-is accepted. Every value and the usual decode bounds remain validated. Protocol
-identity changes require rebuilding clients and servers together.
+absent from live payloads.
 
-State compression is configured at server startup with `--compression auto|off`
-and `--compression-min-bytes N`. The corresponding environment variables are
-`DREAMWAKE_COMPRESSION` and `DREAMWAKE_COMPRESSION_MIN_BYTES`; these also configure
-servers started by the native client's host action. Defaults are `auto` and `0`: consider every
-serialized state body immediately and use lossless DEFLATE level 1 only when its
-five-byte compression framing plus compressed body is smaller than the one-byte
-raw framing plus raw body. The minimum counts the serialized DTO and its
-eight-byte vector length, before compression framing; it is not a UDP packet
-size. No messages wait for aggregation. `off` always emits raw bodies, and both
-forms retain the same bounded decoder and exact values. These options apply to
-public actor payloads in dedicated and native-hosted servers. Owner-group members
-(owner, global, collision and platform) stay raw, because their baselines are
-byte-patched and a patch against compressed bytes is as large as the state; the
-group deflates a member when it is sent whole. The baseline patch records runs of
-changed bytes, so scattered changes cost their own size. Control, command and
-state frames set an envelope flag when their payload is deflated, again only when
-that is smaller, so no frame's worst case grows. For example, `--compression auto --compression-min-bytes 256` skips
-compression attempts below that body size.
+At each 20 Hz publication the server sends an entity only when its state differs
+from the newest state the client acknowledged, and not when that exact state is
+already in flight and not yet known lost. Packets carry the owner first, then
+the match summary, then actors nearest first; actors farther than 16 m go out on
+every other publication, the relevance-based cadence of Unreal's replication
+graph. Each entry is either whole or the changed fields against the newest
+acknowledged state, which the entry names by packet sequence. Removals repeat
+until a packet carrying them is acknowledged.
 
-This uses DEFLATE with a configurable eligibility policy following Unreal's
-documented minimum-size and immediate packet-processing approach. See
-[Unreal's Oodle minimum-size setting](https://dev.epicgames.com/documentation/unreal-engine/unreal-engine-console-variables-reference)
-and [Oodle Network's independent UDP processing](https://www.radgametools.com/oodlenetwork.htm).
+The client acknowledges with the newest packet sequence and a 64-packet received
+bitmask in every input packet. A packet older than that window, or one whose
+named base the client no longer holds, is ignored and covered by a later packet.
+A sent packet missing from an acknowledgement that covers it is lost; its
+entities become eligible again and go out with their current values. Nothing is
+retransmitted as such, and a lost packet costs nothing until it is reported.
 
-Client retirement proposals retain their promised states until a reliable server
-fence arrives. Missing bases request a rate-limited reset; a new generation needs
-full seeds, and repeated loss cannot advance generations indefinitely. Exit,
-revocation and identity changes close the relevant caches. Member caches share
-explicit resident and staging limits separate from prediction history. Application
-frame limits remain distinct from transport datagram and WebRTC overhead
-qualification.
+Public schemas quantize positions to 1/1,024 m, directions to 1/4,096, speeds to
+1/256 m/s and durations to 1/1,024 s, and encode them as zig-zag variable-length
+integers whose deltas are differences. The owner checkpoint is not quantized:
+prediction restores it exactly, so a quantized owner would differ from the
+authority by up to the step on every correction. Booleans cost only their
+change-mask bit. Compact encoding follows the schema registry's field order and
+is accepted only after the content handshake matches the registry.
 
-Reordered state is discarded as obsolete only when a retained scope, publication
-or baseline fence proves it has been superseded. It cannot refresh connection
-freshness, change displayed state or produce a decode receipt. Malformed payloads,
-conflicting metadata and clock regressions remain hard decode failures.
-A complete validated owner group for exactly the next baseline generation may
-wait for its reliable reset under the same context. Waiting grants no retention
-proof and does not refresh connection freshness.
+A typical session needs tens of KB/s per client. Protocol identity changes
+require rebuilding clients and servers together.
 
 Client prediction restores the admitted owner and its transient components into
 a reusable `DreamSimulation` runner. The same `DreamwakePlugin` systems execute
 movement, skills, delayed actions, companions, projectiles and graphics on the
 server and during owner replay. Authority-only systems retain ownership of enemy
-decisions, contacts, damage resolution and encounter progression. Complete group
-identities authorize bootstrap;
-correction restores tick K and replays K+1 onward under aggregate memory and
-work limits. Missing history, revoked dependencies and excess work request
-bounded recovery. Before the first authored command, with no retained command or
-substitute transitions, a fresh complete owner group may advance a pure
-authoritative checkpoint without replay, including when the group topology
-changes. Identity, dependency, memory and generation validation still apply.
-Retained local transitions continue to require bounded replay. At bootstrap, or
-when the predicted frontier has
-fallen behind the estimated simulation tick, the client forecasts substitutes through the tick
-before the fresh command target and authors input only for that target. These
-forecast transitions retain replay history and consume the usual work and memory budgets;
-they do not allocate command sequences, drain the hardware journal or create
-action edges. When the frontier remains at or ahead of estimated simulation
-time, ordinary contiguous batches retain their historical hardware deadlines.
+decisions, contacts, damage resolution and encounter progression. The newest
+owner state wins: the predictor restores it at its tick and replays retained
+local input after it. A state older than the retained 256-tick history, or
+ahead of the prediction, becomes the new base. Nothing in correction ends or
+resets the session.
+
+At bootstrap, or when the predicted frontier has fallen behind the estimated
+simulation tick, the client forecasts substitutes through the tick before the
+fresh command target and authors input only for that target. Forecast
+transitions do not allocate command sequences, drain the hardware journal or
+create action edges.
 Timestamped clock replies anchor a separate estimate of the
-server's committed simulation tick; delayed checkpoints and finalization receipts
+server's committed simulation tick; delayed owner states and finalization status
 advance its proven lower bound without pretending they describe receipt time.
 Adaptive command lead saturates at `MAX_COMMAND_LEAD_TICKS`, and the server
 independently enforces the wider `MAX_COMMAND_HORIZON_TICKS` admission window.
@@ -440,8 +324,8 @@ server's finalized tick, so the window sits above the lead cap and an ordinary
 finalization lag does not push a legitimately led command outside it. Latency is
 a quality axis, never an admission criterion: a round trip past what lead can
 cover makes commands arrive late, which the player sees and can play through. It
-never fails the clock, ends the session, or spends a recovery attempt, because
-recovery cannot shorten the path it would be complaining about. The client
+never fails the clock or ends the session, because starting over cannot shorten
+the path. The client
 bounds speculation to its retained prediction history (256 ticks, about four
 seconds) beyond the latest proven committed tick. Replies that repeat a stalled
 tick cannot refill that budget. Once exhausted, assignment waits without
@@ -455,18 +339,15 @@ and a large offset step re-anchors on the newest sample. The command head moves
 forward; the skipped ticks had no input, and the server fills them with the same
 substitutes the client forecasts. A finalized checkpoint ahead of the prediction
 becomes the new base however far ahead it is, because every command before it
-is already finalized. Replay and forecast work are bounded by retained history
-rather than a per-frame tick count; a replay that would exceed the frame's shared
-budget waits for the next frame, and a forecast gap longer than the budget is
-covered over several frames. Predicted presentation events restart their journal
+is already finalized. Replay and forecast work are bounded by retained history; a forecast gap longer
+than the frame's budget is covered over several frames. Predicted presentation events restart their journal
 when they cannot follow a rebase. Lead only shrinks after eight arrival samples
 that all kept more than two ticks of slack, because a late command is always a
-misprediction. Repeated finalization controls do not apply
-arrival-slack feedback twice. Attack sample stamps and remote display time use
+misprediction. A feedback sample is reported once, so it is
+never applied twice. Attack sample stamps and remote display time use
 the same simulation clock, including fractional tick phase. Newly assigned
-commands use dependencies from the latest admitted checkpoint; already recorded
-commands retain their original dependency
-frames for replay. This refreshes bounded platform samples without rewriting
+commands use dependencies from the latest owner state; already recorded commands
+retain their original dependency frames for replay. This refreshes bounded platform samples without rewriting
 historical reads. Skills and reversible graphics use the admitted owner state;
 remote damage and hit resolution remain authoritative. The
 [moving-base contract](moving-bases.md) describes platform dependency and rider
@@ -477,10 +358,8 @@ uses the complete `DreamCheckpoint` codec. See
 Each newly authored or forecast frame also retains up to 64 nearest independently
 disclosed enemy poses as optional companion targeting inputs. Samples newer than
 the frame are excluded. Replay uses those recorded values rather than live
-replicas; a scope exit removes the target from subsequent frames. They supply
-neither an authoritative damage decision nor enemy AI. Owner state charges a
-64 KiB decoded allocation envelope, with an 80 KiB per-checkpoint limit including
-inline state and metadata, under the existing aggregate history budget.
+replicas; an entity leaving the view removes the target from subsequent frames.
+They supply neither an authoritative damage decision nor enemy AI.
 
 The current protocol identity is defined in the [game protocol crate](../games/dreamwake/protocol/src/lib.rs).
 Bump it when serialized authoritative layout changes, and rebuild clients and
@@ -507,7 +386,7 @@ controls and RTT calibration. Server configuration also supports conditioning.
 The renderer smooths correction targets without feeding those transforms back
 into simulation. Remote pose history has a separate delayed presentation cursor.
 Graphs leave unavailable samples as gaps; instrumentation must not substitute a
-transport ACK for a decoded-state or finalized-input metric.
+transport ACK for a state acknowledgement or finalized-input metric.
 
 Run the affected short crate tests during development. Full campaigns, extended
 matrices and soaks are manual handoffs after implementation and integration;
@@ -527,8 +406,8 @@ and shader compilation hitches do. UDP runs use the server's conditioner. WebRTC
 runs impair the client's raw datagrams beneath DTLS and SCTP
 (`--link-impairment DELAY_MS:JITTER_MS:LOSS_PERCENT`), because conditioning above
 the data channel leaves SCTP's congestion control on an ideal link. Each client measures
-its own display (`session_health` in the trace). Any disconnect, reconnect,
-client-requested recovery or teleport fails the scenario, as do more than six
+its own display (`session_health` in the trace). Any disconnect, reconnect
+or teleport fails the scenario, as do more than six
 visible corrections per connected minute. A correction is a frame whose owner
 displacement exceeds dash speed × 1.25 over the frame plus one tick by 0.10 m; a
 teleport exceeds it by a metre. A client's p95 round trip must also stay within
@@ -545,8 +424,8 @@ replication radius. It builds the paired native release artifacts before launch.
 Travelers alternate between
 80-metre side waypoints and the center on the shared gameplay clock. Qualification
 requires at least three observed 32-metre cells per Traveler, authoritative
-same-tick separation, no fresh remote disclosure while far, a newer scope on
-return, and bounded recovery through the end. The larger demo also contains 45
+same-tick separation, no fresh remote disclosure while far, a fresh entry on
+return, and continuous activity through the end. The larger demo also contains 45
 replicated props and 45 ambient enemies. An enemy acquires a living Traveler
 within 24 metres and keeps pursuing that target outside the detection radius.
 It reacquires a nearby target when its previous target leaves or is defeated.
@@ -561,9 +440,9 @@ already frozen paired build with its matching release provenance; see
 The normal 80 m two-client workload needs its own short integration check before
 manual endurance validation. The full profile matrix is an extended manual run.
 Add `--pause-at 45` to the single 120-second check to stop its left client process
-for three seconds. The runner requires an active new connection epoch within ten
-seconds of resuming, with the same process and server instance and an advancing
-authoritative checkpoint. It records the signals and before/after observations
+for three seconds. The runner requires the same connection epoch to be active
+again within ten seconds of resuming, with the same process and server instance
+and an advancing authoritative checkpoint. It records the signals and before/after observations
 in `processes.json`. Window focus, visibility, size and reported OS occlusion are
 included in the native trace to help investigate rendering stalls.
 

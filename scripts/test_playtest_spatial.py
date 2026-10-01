@@ -27,7 +27,7 @@ def record(side, tick, separated, incarnation=1):
     return {"format": 1, "line": tick, "pid": 101 + side, "elapsed": tick / 60,
             "owner": owner, "match_epoch": 1, "server_tick": tick,
             "decode_errors": 0, "stale_epoch_rejections": 0, "clock_resync_rejections": 0,
-            "obsolete_rejections": 0, "decode_failures": 0, "decode_issue": None,
+            "decode_failures": 0, "decode_issue": None,
             "phase": "Combat", "active": True, "separated": separated,
             "position": position.copy(), "authoritative_owner_position": position.copy(),
             "owner_checkpoint_tick": tick,
@@ -50,7 +50,7 @@ class TraceAnalysis(unittest.TestCase):
             if index >= 1:
                 row.update(decode_errors=1, decode_failures=1, decode_issue="MalformedClock")
             if index >= 2:
-                row.update(decode_errors=22, obsolete_rejections=21, decode_issue="Obsolete")
+                row.update(decode_errors=22, stale_epoch_rejections=21, decode_issue="WrongEpoch")
         result = spatial.analyze_records(left, right)
         self.assertFalse(result["passed"])
         self.assertTrue(all(result["reentries"]))
@@ -60,27 +60,27 @@ class TraceAnalysis(unittest.TestCase):
         self.assertEqual(health["first_issues"]["hard_failure"]["line"], right[1]["line"])
         self.assertIn("player 1002: lifetime hard decode_failures reached 1", "\n".join(result["failures"]))
 
-    def test_benign_clock_stale_epoch_and_obsolete_counters_remain_distinct(self):
+    def test_benign_clock_and_stale_epoch_counters_remain_distinct(self):
         left, right = traces()
         startup = record(1, 600, False)
         startup.update(active=False, decode_errors=1, clock_resync_rejections=1, decode_issue="Clock(ResyncRequested)")
         right.insert(0, startup)
         for index, row in enumerate(right[1:]):
-            row.update(decode_errors=3 + index, clock_resync_rejections=1, stale_epoch_rejections=2,
-                       obsolete_rejections=index, decode_issue="Obsolete" if index else "WrongEpoch")
+            row.update(decode_errors=3 + index, clock_resync_rejections=1,
+                       stale_epoch_rejections=2 + index, decode_issue="WrongEpoch")
         result = spatial.analyze_records(left, right)
         self.assertTrue(result["passed"], result["failures"])
         health = result["metrics"][1]["decode_health"]
         self.assertTrue(health["classification_verified"])
-        self.assertEqual(health["observed_maxima"], {"decode_errors": 7, "stale_epoch_rejections": 2,
-                         "clock_resync_rejections": 1, "obsolete_rejections": 4, "decode_failures": 0})
+        self.assertEqual(health["observed_maxima"], {"decode_errors": 7, "stale_epoch_rejections": 6,
+                         "clock_resync_rejections": 1, "decode_failures": 0})
 
     def test_inconsistent_decode_partition_fails_even_with_zero_hard_counter(self):
         for total in (2, 4):
             with self.subTest(total=total):
                 left, right = traces()
                 for row in right:
-                    row.update(decode_errors=total, obsolete_rejections=3, decode_issue="Obsolete")
+                    row.update(decode_errors=total, stale_epoch_rejections=3, decode_issue="WrongEpoch")
                 result = spatial.analyze_records(left, right)
                 self.assertFalse(result["passed"])
                 health = result["metrics"][1]["decode_health"]
@@ -122,13 +122,13 @@ class TraceAnalysis(unittest.TestCase):
         self.assertFalse(health["classification_verified"])
         self.assertIn("lifetime decode counters regressed", "\n".join(result["failures"]))
 
-    def test_pause_recovery_requires_same_process_server_and_new_active_stream(self):
+    def test_pause_recovery_requires_same_process_server_and_stream(self):
         before = record(0, 800, False)
         before.update(connection_epoch=7, server_instance=123)
         after = record(0, 1000, False)
-        after.update(connection_epoch=8, server_instance=123)
+        after.update(connection_epoch=7, server_instance=123)
         self.assertTrue(spatial.recovered_after_pause(before, after))
-        for changes in ({"active": False}, {"connection_epoch": 7},
+        for changes in ({"active": False}, {"connection_epoch": 8},
                         {"connection_epoch": None}, {"pid": 102},
                         {"server_instance": 456}, {"owner_checkpoint_tick": 800},
                         {"authoritative_owner_position": None}, {"elapsed": 0}):

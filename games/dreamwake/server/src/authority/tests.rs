@@ -302,7 +302,11 @@ impl TestClient {
             let mut decoded = Vec::new();
             let mut restored = Vec::new();
             for entry in &packet.entries {
-                let base = match self.stream.base(entry.entity, entry.base, packet.seq).unwrap() {
+                let base = match self
+                    .stream
+                    .base(entry.entity, entry.base, packet.seq)
+                    .unwrap()
+                {
                     Base::Superseded => continue,
                     Base::Whole => None,
                     Base::Delta(base) => Some(base),
@@ -687,7 +691,10 @@ fn unchanged_actors_cost_nothing_once_acknowledged() {
         "idle intro state bytes/s={per_second} packets={} entries={}",
         peer.egress.state_packets, peer.egress.state_entries
     );
-    assert!(per_second < 4_000, "{per_second} bytes per second while idle");
+    assert!(
+        per_second < 4_000,
+        "{per_second} bytes per second while idle"
+    );
 }
 
 #[test]
@@ -718,7 +725,10 @@ fn moving_world_stays_within_tens_of_kilobytes_per_second() {
     for (client, start) in h.clients.iter().zip(start) {
         let per_second = (client.state_bytes - start) / 5;
         eprintln!("combat state bytes/s={per_second}");
-        assert!(per_second < 30_000, "{per_second} bytes per second in combat");
+        assert!(
+            per_second < 30_000,
+            "{per_second} bytes per second in combat"
+        );
     }
 }
 
@@ -1514,4 +1524,3 @@ fn reliable_action_outcome_arrives_alongside_continuing_finalization() {
     h.pump(18);
     assert_eq!(h.clients[0].outcomes.get(&outcome.key), Some(&outcome));
 }
-

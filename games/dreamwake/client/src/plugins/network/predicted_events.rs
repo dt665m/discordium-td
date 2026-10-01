@@ -135,7 +135,8 @@ impl PredictedEvents {
                 .and_then(|input| input.command())
             {
                 retained_command_head = Some(
-                    retained_command_head.map_or(command.sequence, |head| head.min(command.sequence)),
+                    retained_command_head
+                        .map_or(command.sequence, |head| head.min(command.sequence)),
                 );
             }
             if let Some(state) = predictor.history_state(ServerTick(tick)) {

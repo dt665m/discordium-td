@@ -130,7 +130,9 @@ pub(super) fn owner_and_global(sim: &DreamSimulation, tick: u64) -> Vec<(EntityI
                     index: 100 + index as u64,
                     generation: 1,
                 },
-                Replica::Actor(PublicReplica::Platform(capture.project_platform(id).unwrap())),
+                Replica::Actor(PublicReplica::Platform(
+                    capture.project_platform(id).unwrap(),
+                )),
             ));
         }
     }
@@ -349,7 +351,12 @@ fn input_packets_carry_newest_and_oldest_unconsumed_commands_with_the_ack() {
         panic!("one input packet per tick: {}", sent.len());
     };
     assert_eq!(packet.ack, session.stream_ack());
-    let sequences: Vec<_> = packet.records.as_slice().iter().map(|r| r.sequence.0).collect();
+    let sequences: Vec<_> = packet
+        .records
+        .as_slice()
+        .iter()
+        .map(|r| r.sequence.0)
+        .collect();
     assert_eq!(sequences, vec![10, 9, 8, 1, 2, 3]);
 }
 
@@ -374,10 +381,9 @@ fn cover_markers_render_only_beside_their_present_cover() {
     sim.continue_run();
     let capture = capture(&sim, 11);
     let cover_id = sim.snapshot().covers[0].id;
-    let Some(PublicReplica::Cover(cover)) = capture.project(
-        ReplicationKey::Cover(cover_id),
-        &Default::default(),
-    ) else {
+    let Some(PublicReplica::Cover(cover)) =
+        capture.project(ReplicationKey::Cover(cover_id), &Default::default())
+    else {
         panic!("cover");
     };
     let cover_entity = EntityId {

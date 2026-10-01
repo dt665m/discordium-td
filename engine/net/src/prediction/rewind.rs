@@ -208,7 +208,10 @@ impl<M: RewindModel> Rewind<M> {
         }
         let index = usize::try_from(tick.0 - first.0).unwrap_or(usize::MAX);
         self.frames.drain(..index);
-        let base = self.frames.front_mut().expect("frame at the corrected tick");
+        let base = self
+            .frames
+            .front_mut()
+            .expect("frame at the corrected tick");
         base.state = state;
         base.input = None;
         base.dependencies = dependencies;
@@ -286,13 +289,23 @@ mod tests {
         );
         assert_eq!(rewind.state(), Some(&(56, 2)));
         assert_eq!(rewind.base_tick(), Some(ServerTick(12)));
-        assert_eq!(rewind.history_input(ServerTick(13)), Some(&RewindInput::Command(2)));
+        assert_eq!(
+            rewind.history_input(ServerTick(13)),
+            Some(&RewindInput::Command(2))
+        );
         // Replay reads each tick's recorded dependency, not today's.
         let mut walled = Rewind::new(Mover, 8);
         walled.reset(ServerTick(0), (0, 0), 1000);
-        walled.predict(ServerTick(1), RewindInput::Command(5), 3).unwrap();
-        walled.predict(ServerTick(2), RewindInput::Substitute, 1000).unwrap();
-        assert_eq!(walled.correct(ServerTick(0), (1, 0), 1000), Ok(Correction::Replayed(2)));
+        walled
+            .predict(ServerTick(1), RewindInput::Command(5), 3)
+            .unwrap();
+        walled
+            .predict(ServerTick(2), RewindInput::Substitute, 1000)
+            .unwrap();
+        assert_eq!(
+            walled.correct(ServerTick(0), (1, 0), 1000),
+            Ok(Correction::Replayed(2))
+        );
         assert_eq!(walled.state(), Some(&(8, 5)));
     }
 
@@ -316,8 +329,14 @@ mod tests {
         let mut far = predicted(20);
         assert_eq!(far.base_tick(), Some(ServerTick(22)));
         assert_eq!(far.remaining_ticks(), 0);
-        assert_eq!(far.correct(ServerTick(15), (0, 0), 1000), Ok(Correction::Stale));
-        assert_eq!(far.correct(ServerTick(25), (0, 2), 1000), Ok(Correction::Replayed(5)));
+        assert_eq!(
+            far.correct(ServerTick(15), (0, 0), 1000),
+            Ok(Correction::Stale)
+        );
+        assert_eq!(
+            far.correct(ServerTick(25), (0, 2), 1000),
+            Ok(Correction::Replayed(5))
+        );
     }
 
     #[test]
@@ -332,7 +351,10 @@ mod tests {
             empty.predict(ServerTick(1), RewindInput::Substitute, 0),
             Err(RewindError::Uninitialized)
         );
-        assert_eq!(empty.correct(ServerTick(5), (1, 1), 0), Ok(Correction::Rebased));
+        assert_eq!(
+            empty.correct(ServerTick(5), (1, 1), 0),
+            Ok(Correction::Rebased)
+        );
     }
 
     #[test]
@@ -344,7 +366,10 @@ mod tests {
         rewind
             .predict(ServerTick(13), RewindInput::Command(3), 1000)
             .unwrap();
-        assert_eq!(rewind.correct(ServerTick(11), (0, 0), 1000), Ok(Correction::Replayed(2)));
+        assert_eq!(
+            rewind.correct(ServerTick(11), (0, 0), 1000),
+            Ok(Correction::Replayed(2))
+        );
         assert_eq!(rewind.predicted_tick(), Some(ServerTick(13)));
     }
 }

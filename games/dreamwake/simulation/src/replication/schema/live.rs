@@ -241,7 +241,12 @@ mod tests {
         let mut delta = Vec::new();
         after.encode(Some(&before), &mut delta).unwrap();
         assert!(delta.len() <= 10, "{delta:?}");
-        assert!(delta.len() * 4 < whole.len(), "{} vs {}", delta.len(), whole.len());
+        assert!(
+            delta.len() * 4 < whole.len(),
+            "{} vs {}",
+            delta.len(),
+            whole.len()
+        );
         let decoded = ReplicaState::decode(&delta, Some(&before)).unwrap();
         assert_eq!(decoded, after);
         assert_eq!(ReplicaState::decode(&whole, None).unwrap(), after);

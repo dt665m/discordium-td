@@ -25,11 +25,10 @@ ServerAudit = MODULE['ServerAudit']
 def row(sequence=1, segment=0, elapsed=1.0, tick=100, scope=1, x=0.0):
     return {'trace_sequence': sequence, 'trace_segment': segment, 'pid': 77, 'owner': 1001,
             'elapsed': elapsed, 'active': True, 'authority_error': None, 'decode_errors': 0,
-            'transport_errors': 0, 'stale_epoch_rejections': 0, 'clock_resync_rejections': 0, 'obsolete_rejections': 0, 'decode_failures': 0, 'transport_connection': 1, 'server_instance': 888, 'connection_epoch': 1, 'match_epoch': 1,
+            'transport_errors': 0, 'stale_epoch_rejections': 0, 'clock_resync_rejections': 0, 'decode_failures': 0, 'transport_connection': 1, 'server_instance': 888, 'connection_epoch': 1, 'match_epoch': 1,
             'server_tick': tick, 'estimated_server_tick': tick + 6, 'predicted_tick': tick + 12,
-            'gameplay_tick': tick, 'history_bytes': 100, 'scope_bytes': 100, 'staging_bytes': 100,
-            'baseline_bytes': 100, 'pending_commands': 2, 'interpolation': {'bytes': 100},
-            'delivery': {'maximum_replay_requested': 2, 'replay_cpu_micros': 4}, 'replay_ticks': 2,
+            'gameplay_tick': tick, 'entities': 100, 'pending_commands': 2, 'interpolation': {'bytes': 100},
+            'delivery': {'replay_cpu_micros': 4}, 'replay_ticks': 2,
             'rtt_ms': 100, 'phase': 'Combat', 'room': 1, 'position': [x, 0], 'action_traces': [],
             'scopes': [{'connection': 1, 'entity': {'index': 1, 'generation': 1}, 'scope': scope}]}
 
@@ -169,7 +168,7 @@ class AuditTests(unittest.TestCase):
         self.assertEqual(self.audit.stream_changes, 1)
 
     def test_wrong_owner_pid_epoch_budget_clock_and_executed_replay_fail(self):
-        mutations = [('owner', 1002), ('pid', 88), ('history_bytes', 65 * 1024**2),
+        mutations = [('owner', 1002), ('pid', 88), ('entities', 4097),
                      ('decode_errors', 1), ('estimated_server_tick', 1000), ('replay_ticks', 33)]
         for key, value in mutations:
             with self.subTest(key=key):
@@ -210,21 +209,20 @@ class AuditTests(unittest.TestCase):
                 bad.update(active=False, **counters)
                 with self.assertRaises(Failure): audit.receive(bad, 5, 5, 0)
 
-    def test_obsolete_partition_survives_inactive_rows_and_cannot_hide_failures(self):
+    def test_stale_partition_survives_inactive_rows_and_cannot_hide_failures(self):
         first = row()
-        first.update(active=False, decode_errors=3, obsolete_rejections=3)
+        first.update(active=False, decode_errors=3, stale_epoch_rejections=3)
         self.receive(first)
         active = row(2, elapsed=3, tick=220)
-        active.update(decode_errors=6, obsolete_rejections=4, stale_epoch_rejections=1,
-                      clock_resync_rejections=1)
+        active.update(decode_errors=6, stale_epoch_rejections=5, clock_resync_rejections=1)
         self.receive(active, 3)
-        self.assertEqual(self.audit.summary(3)['decode_counters']['obsolete_rejections'], 4)
-        for counters in [dict(decode_errors=7, obsolete_rejections=4, stale_epoch_rejections=1,
+        self.assertEqual(self.audit.summary(3)['decode_counters']['stale_epoch_rejections'], 5)
+        for counters in [dict(decode_errors=7, stale_epoch_rejections=5,
                               clock_resync_rejections=1, decode_failures=1),
-                         dict(decode_errors=7, obsolete_rejections=4, stale_epoch_rejections=1,
+                         dict(decode_errors=7, stale_epoch_rejections=5,
                               clock_resync_rejections=1),
-                         dict(decode_errors=6, obsolete_rejections=3, stale_epoch_rejections=2,
-                              clock_resync_rejections=1)]:
+                         dict(decode_errors=6, stale_epoch_rejections=4,
+                              clock_resync_rejections=2)]:
             with self.subTest(counters=counters):
                 audit = ClientAudit('left', 77, 1001, Limits())
                 audit.receive(active, 3, 3, 0)
@@ -264,13 +262,6 @@ class AuditTests(unittest.TestCase):
         self.assertFalse(audit.ready(6))
         audit.check_liveness(7)
         with self.assertRaises(Failure): audit.check_liveness(17)
-
-    def test_requested_over_budget_replay_can_be_correctly_rejected(self):
-        good = row()
-        good['delivery']['maximum_replay_requested'] = 100
-        good['replay_ticks'] = 0
-        self.receive(good)
-        self.assertEqual(self.audit.distributions['replay_ticks'].high, 0)
 
     def test_sampling_gap_inactive_and_terminal_halt_fail(self):
         self.receive(row())

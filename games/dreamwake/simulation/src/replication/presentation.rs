@@ -155,9 +155,9 @@ impl DreamPresentation {
                     Some(v.id)
                 }
                 PublicReplica::Projectile(v) => {
-                    // Independently delivered scopes may precede their source
-                    // or outlive its exit. Retain them in ClientScopes but omit
-                    // their visuals until that source is published again.
+                    // Independently delivered entities may precede their
+                    // source or outlive its exit. Keep them but omit their
+                    // visuals until that source is published again.
                     if v.owner.is_none_or(|id| sources.contains(&id)) {
                         result.projectiles.push(ProjectileView {
                             id: v.id,
@@ -215,8 +215,8 @@ impl DreamPresentation {
                     }
                     Some(v.id)
                 }
-                // Exact parent scope resolution belongs to the connection's
-                // published ClientScopes, before adding resolved marker output.
+                // Markers resolve against their parent cover entity before
+                // adding resolved marker output.
                 PublicReplica::CoverMarker(_) => None,
                 PublicReplica::Damage(v) => {
                     result.damage_numbers.push(DamageNumber {

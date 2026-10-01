@@ -24,9 +24,9 @@ mod outcomes;
 pub(crate) mod predicted_events;
 mod presentation;
 mod session;
+use model::InputCommand;
 pub(crate) use presentation::RemotePoseMetrics;
 use renet::RenetClient;
-use model::InputCommand;
 use session::Session;
 pub(crate) use session::SessionMetrics;
 use std::{collections::VecDeque, time::Duration};
@@ -857,7 +857,9 @@ fn receive_message(
                     now.as_secs_f64(),
                 );
             }
-            runtime.pending.retain(|frame| frame.command.target.0 > finalized.0);
+            runtime
+                .pending
+                .retain(|frame| frame.command.target.0 > finalized.0);
             if runtime
                 .in_flight_action
                 .is_some_and(|sequence| menu_applied.is_some_and(|applied| sequence <= applied))
@@ -1112,7 +1114,10 @@ fn send_input(runtime: &mut Runtime, commands: &[InputCommand]) -> Result<(), St
         if records.len() == MAX_INPUT_RECORDS {
             break;
         }
-        if !records.iter().any(|record| record.sequence == command.sequence) {
+        if !records
+            .iter()
+            .any(|record| record.sequence == command.sequence)
+        {
             records.push(InputRecord::from_command(command));
         }
     }

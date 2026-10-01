@@ -4,8 +4,7 @@
 captured native rendered clients under 50 ms delay, 15 ms jitter and 3% independent
 loss in each direction. It never builds, recaptures source, or restarts a process.
 It prepares the real-UDP bot/resource evidence for T104; its scope is separate from
-[N073's generic 50,000-actor resource soak](network-soak.md), the
-[bot and human network-profile matrix](network-profile-qualification.md), and the
+the [bot and human network-profile matrix](network-profile-qualification.md), and the
 [clock drift qualification](network-clock-qualification.md).
 
 The runner's implementation and fake-process/file tests are preparation, not a
@@ -189,9 +188,8 @@ reference-hardware performance claims:
 | Per-process RSS | 2 GiB |
 | Post-300-second-warmup RSS growth | 128 MiB |
 | Post-warmup RSS linear growth trend | 4 MiB/hour |
-| Client prediction history | 64 MiB |
-| Client scope payload | 4 MiB |
-| Client staging / baselines / interpolation | 16 MiB each |
+| Client replicated entities | 4,096 |
+| Client interpolation samples | 16 MiB |
 | Pending commands / sampled scope identities per stream | 256 / 8,192 |
 | Sampled actual replay work | 32 ticks |
 | Server control/state queue payload | 16 MiB each |
@@ -213,9 +211,7 @@ write error, hard decode failure or unavailable current transport telemetry fail
 qualification. Source/binary/provenance drift also fails.
 
 The lifetime decode counters must satisfy `decode_errors = stale_epoch_rejections
-+ clock_resync_rejections + obsolete_rejections + decode_failures`; hard failures
-must stay zero. Retired replication scopes, publications and baselines have their
-own `obsolete_rejections` counter.
++ clock_resync_rejections + decode_failures`; hard failures must stay zero.
 Expected `WrongEpoch` and typed clock resynchronization rejections remain visible
 as separate monotonic counters, including during inactive startup and recovery.
 Clock resynchronization is not malformed clock data: invalid clock messages still

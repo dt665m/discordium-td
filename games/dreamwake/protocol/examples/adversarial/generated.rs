@@ -155,7 +155,11 @@ fn is_actor(root: &str) -> bool {
     !matches!(root, "global" | "owner" | "collision")
 }
 /// The root's real canonical decoder.
-pub fn decode(root: &str, bytes: &[u8], expected: OwnerExpectation) -> Result<(), ReplicationError> {
+pub fn decode(
+    root: &str,
+    bytes: &[u8],
+    expected: OwnerExpectation,
+) -> Result<(), ReplicationError> {
     match root {
         "global" => DreamGlobalView::decode(bytes).map(|_| ()),
         "owner" => OwnerCheckpoint::decode(bytes, expected).map(|_| ()),

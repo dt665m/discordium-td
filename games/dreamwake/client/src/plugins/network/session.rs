@@ -7,8 +7,8 @@
 use super::model::*;
 use dreamwake_protocol::{DreamAction, live::*};
 use dreamwake_sim::replication::{
-    DreamPresentation, OwnerCheckpoint, OwnerPredictionState, PublicReplica, Replica,
-    ReplicaKind, ReplicaState,
+    DreamPresentation, OwnerCheckpoint, OwnerPredictionState, PublicReplica, Replica, ReplicaKind,
+    ReplicaState,
 };
 use engine_net::{
     codec::{BoundedVec, FrameLimit},
@@ -150,9 +150,12 @@ impl Session {
         self.replicas
             .iter()
             .filter_map(|(entity, entry)| match &entry.replica {
-                Replica::Actor(PublicReplica::Enemy(enemy)) => {
-                    Some((enemy.id, self.scope_for(*entity), entry.tick, enemy.position))
-                }
+                Replica::Actor(PublicReplica::Enemy(enemy)) => Some((
+                    enemy.id,
+                    self.scope_for(*entity),
+                    entry.tick,
+                    enemy.position,
+                )),
                 _ => None,
             })
             .collect()
@@ -177,10 +180,16 @@ impl Session {
             estimated_simulation_tick: self.estimated_simulation_tick,
             committed_server_tick: self.simulation_clock.committed(),
             clock_anchor_tick: self.simulation_clock.anchor().0,
-            owner_tick: self.replicas.get(&self.welcome.owner_entity).map(|e| e.tick),
+            owner_tick: self
+                .replicas
+                .get(&self.welcome.owner_entity)
+                .map(|e| e.tick),
             finalized_tick: self.status.finalized,
             predicted_tick: self.predictor.predicted_tick(),
-            gameplay_tick: self.predictor.state().map(|state| state.stamp().gameplay_tick),
+            gameplay_tick: self
+                .predictor
+                .state()
+                .map(|state| state.stamp().gameplay_tick),
             combat_view_tick: self.poses.combat_view_tick(),
             entities: self.replicas.len(),
             stream_latest: self.stream.ack().latest,
@@ -452,7 +461,10 @@ impl Session {
                 Replica::Actor(PublicReplica::Enemy(enemy))
                     if entry.tick <= at && enemy.hp > 0.0 =>
                 {
-                    targets.push((engine_core::spatial::distance(enemy.position, owner), *enemy));
+                    targets.push((
+                        engine_core::spatial::distance(enemy.position, owner),
+                        *enemy,
+                    ));
                 }
                 _ => {}
             }
@@ -579,10 +591,7 @@ impl Session {
     }
     /// Decode and keep one state packet. A packet that cannot be decoded is
     /// not acknowledged, and the server covers it in a later packet.
-    pub(super) fn receive_state(
-        &mut self,
-        bytes: &[u8],
-    ) -> Result<bool, super::ReceiveRejection> {
+    pub(super) fn receive_state(&mut self, bytes: &[u8]) -> Result<bool, super::ReceiveRejection> {
         let limit = FrameLimit::new(MAX_STATE_FRAME_BYTES).map_err(err)?;
         let packet = decode_state(bytes, self.welcome.stream.epoch, limit).map_err(err)?;
         if !self.stream.accepts(packet.seq) {
@@ -610,7 +619,9 @@ impl Session {
             }
             match &replica {
                 Replica::Actor(actor) => {
-                    if let Err(error) = self.poses.receive(self.scope_for(entity), packet.tick, actor)
+                    if let Err(error) =
+                        self.poses
+                            .receive(self.scope_for(entity), packet.tick, actor)
                     {
                         log::debug!("remote pose {entity:?}: {error:?}");
                     }
@@ -723,7 +734,8 @@ impl Session {
             .correct(tick, state.clone(), dependencies.clone());
         let micros = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
         self.delivery.replay_cpu_micros = micros;
-        self.delivery.maximum_replay_cpu_micros = self.delivery.maximum_replay_cpu_micros.max(micros);
+        self.delivery.maximum_replay_cpu_micros =
+            self.delivery.maximum_replay_cpu_micros.max(micros);
         match correction {
             Ok(Correction::Replayed(_)) => self.delivery.replayed += 1,
             Ok(Correction::Rebased) => self.delivery.rebased += 1,
@@ -747,14 +759,16 @@ impl Session {
             .flat_map(|state| state.starfall_flights())
             .filter_map(|flight| {
                 let id = flight.authority_id?;
-                self.replicas.iter().find_map(|(entity, entry)| match &entry.replica {
-                    Replica::Actor(PublicReplica::Projectile(p))
-                        if p.id == id && p.owner == Some(self.welcome.player.get()) =>
-                    {
-                        Some((flight.key, *entity))
-                    }
-                    _ => None,
-                })
+                self.replicas
+                    .iter()
+                    .find_map(|(entity, entry)| match &entry.replica {
+                        Replica::Actor(PublicReplica::Projectile(p))
+                            if p.id == id && p.owner == Some(self.welcome.player.get()) =>
+                        {
+                            Some((flight.key, *entity))
+                        }
+                        _ => None,
+                    })
             })
             .collect::<Vec<_>>();
         for (key, entity) in bindings {
@@ -917,7 +931,10 @@ fn err(error: impl std::fmt::Display) -> String {
 }
 
 /// The newest owner state the client held at a displayed tick.
-fn reference_for_view(references: &VecDeque<(u32, ServerTick)>, viewed_at: ServerTick) -> Option<u32> {
+fn reference_for_view(
+    references: &VecDeque<(u32, ServerTick)>,
+    viewed_at: ServerTick,
+) -> Option<u32> {
     references
         .iter()
         .rev()

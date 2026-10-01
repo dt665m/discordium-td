@@ -191,8 +191,12 @@ pub fn run(mut args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
         dreamwake_protocol::PROTOCOL_ID,
         admission::GuestAdmission::open(args.identity_store)?,
     )?;
-    let mut app =
-        build_app_with_replication_distance(shared, args.seed, args.lucid, args.replication_distance);
+    let mut app = build_app_with_replication_distance(
+        shared,
+        args.seed,
+        args.lucid,
+        args.replication_distance,
+    );
     if let Some(file) = trace_file {
         plugins::server::trace::install(&mut app, file)?;
     }

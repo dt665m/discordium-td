@@ -4,11 +4,11 @@ This guide selects the Bevy integration of the normative
 [engineering specification](../todo/ENGINEERING_SPEC.md),
 [spatial contract](../todo/SPATIAL_REPLICATION.md), and
 [protocol addendum](../todo/PROTOCOL_ADDENDUM.md). Those documents define the
-release requirements; this guide maps them to Dreamwake and records conservative
-integration defaults. Dreamwake's live adapter uses the scoped protocol. Complete
-world snapshots remain an offline checkpoint and replay format.
+release requirements; this guide maps them to Dreamwake and records its
+integration choices. Complete world snapshots remain an offline checkpoint and
+replay format.
 
-## Authority, ticks and receipts
+## Authority, ticks and acknowledgements
 
 `S[K]` means the committed state after tick K. Command `U[K]` advances
 `S[K-1]` to `S[K]`. Restore K, compare against predicted K, and replay K+1
@@ -20,72 +20,29 @@ advancing gameplay; consumers must not infer a simulation step from publication.
 
 Live gameplay input carries immutable target ticks and stream identities. Menu
 actions use a separate bounded reliable sequence. The live protocol keeps four
-independent receipts:
+independent acknowledgements:
 
-| Receipt | Exact fact | Permitted consequence |
+| Acknowledgement | Exact fact | Permitted consequence |
 |---|---|---|
 | Transport | Transport received bytes | Transport retry accounting only |
-| Decoded baseline | Exact scoped snapshot validated, published and retained | That exact identity may become a delta base |
-| Finalized input | Target ticks through a watermark committed, with bounded exceptions for substitution/rejection | Retire commands only with an authoritative checkpoint covering their effects |
+| State stream | The client received and decoded state packet N (newest sequence plus a 64-packet bitmask) | Entities in N may become delta bases; entities in a covered missing packet are resent with current values |
+| Finalized input | Target ticks through a watermark committed, with bounded exceptions for substitution/rejection | Retire commands only with an authoritative owner state covering their effects |
 | Action outcome | Stable action key accepted, rejected or expired, with execution tick/reason and optional entity binding | Resolve the matching provisional effect; repeated delivery returns the same terminal result |
-
-Scope exits and destructions enqueue once on the reliable control lane. After
-transport acceptance, reliable retransmission owns delivery; the application
-fence remains pending until its exact acknowledgement arrives. Stream resync
-preserves the transport's ordered delivery state and closes old action outcomes
-before creating the new stream. It does not discard one endpoint's send queue.
 
 Receipt of a newer input sequence does not prove earlier commands executed.
 Keep one control sample per owner per tick and the existing stricter one-action
 per-player-per-tick admission until a tested ruleset explicitly changes it.
-Redundant commands retain their original sequence, target tick and action keys;
+Repeated commands retain their original sequence, target tick and action keys;
 late commands cannot purchase additional simulation steps. Substitute held input
-only within its bounded grace, with all one-shot edges cleared. Dreamwake reserves
-work for a maximum eight-record input bundle before dequeueing, permitting eight
-bundles per committed tick against the 64-record admission budget. Excess queued
-bundles remain in the bounded transport queue until another tick commits.
-Duplicate records consume this budget; message flood limits remain independent.
+only within its bounded grace, with all one-shot edges cleared. The server handles
+at most 64 messages per peer per tick; the rest wait in Renet for the next tick.
 
-Scope identity includes connection epoch, entity generation, scope epoch and
-representation revision. Group state adds the group revision and complete member
-manifest. Re-entry or a narrower field grant requires new scope identity and
-full state. A delta requires a decoded and retained matching baseline; failed or
-partial decode changes no published state and produces no decoded receipt.
-A Ready handshake removes the connection grant while preserving the advertised
-owner entity identity for a retained authoritative owner. Initial recovery follows
-the [admission and readiness contract](netcode.md#admission-and-readiness): it
-retires an expired startup stream within the existing deadline and retry cap,
-without skipping receipts or changing participation. Only fresh stream proofs
-can activate it; already participating owners do not use this initial retry.
-An active owner's expired baseline-reset checkpoint instead retires its stream
-through bounded resynchronization, preserving authoritative participation and
-requiring fresh proofs. This does not relax finalization-audit continuity or
-extend checkpoint deadlines; see the same admission and readiness contract.
-
-Retirement fences stop new use before a baseline is evicted. Old control and
-state lanes may reorder independently. A delayed owner-group retirement may
-refer to an optional member removed by a newer group publication. Reject it as
-obsolete only when a retained member proves the older owner-group revision and
-the removed member's exact entity generation and connection are covered by a
-bounded scope fence. Validate every control in the batch before classifying it:
-unrelated, malformed and conflicting identities remain hard errors. Rejection
-must preserve current caches and pending retirements atomically.
-Owner publications use one bounded reliable-unordered message; stock Renet owns
-its slices and retries. Game decode receipts remain separate from transport ACKs.
-A complete, validated future baseline generation can wait for its control-lane
-reset in one 64 KiB slot, with the original two-second deadline. Applying the
-reset retries local publication without requiring another message from the server.
-A validated older owner-group context is obsolete after a newer topology reset
-or publication. Its delayed deltas cannot replace the current baseline cache or
-request a repair. Check every baseline envelope before considering age, using
-the original caches before pruning the manifest. Removed or reentered delta
-members require a covering scope fence; a changed manifest within one topology
-revision remains a conflict. Full members still undergo schema, role and session
-validation before being discarded, with complete group validation when all
-members are Full. Delta dependency versions and ticks must not exceed their target.
-Interest exit retires a replica without
-signaling death; authoritative destruction ends its entity generation. Dormancy
-completion is each connection's decoded state version, not a global sleep flag.
+Entity identity includes the entity generation; a recreated actor has a new
+generation and arrives whole. Leaving relevance removes the entity from the
+client without signaling death; authoritative destruction ends its generation.
+A delta names its base by packet sequence and applies only to that exact
+retained state; otherwise it is ignored and a later packet covers the entity.
+A packet that fails to decode changes no state and is not acknowledged.
 
 ## Controller replacement
 
@@ -101,11 +58,11 @@ At the boundary, the existing epoch allocator advances connection and ownership
 identity while preserving the stable actor. Old queued actions receive
 `OwnershipDenied` only if they have no final verdict; earlier terminal outcomes
 remain immutable. The previous controller stops before that tick, including held
-input and charge motion. The replacement starts neutral with a fresh Welcome and
-normal Ready/full-group decode. Its baseline is published from committed state
+input and charge motion. The replacement starts neutral with a fresh Welcome, Ready
+and an acknowledged owner state. Its owner state is published from committed state
 after the cutover. Gameplay resumes only after ordinary activation, preserving
 stamina, cooldowns, health and loadout. This intentionally permits a neutral
-interval while the replacement loads its full checkpoint.
+interval while the replacement receives its owner state.
 
 The reusable `engine_net::ownership::OwnershipHandoff` validates effective-tick
 stream fences without authenticating or allocating identities. Command inboxes
@@ -119,8 +76,8 @@ assigned command sequence as the episode identity; later edges reference that
 identity and the simulation verifies the complete stream key. Continuous held
 input cannot carry a charge command or client-supplied elapsed duration. The
 client retains a bounded FIFO of 32 action edges and sends one per simulation
-tick, so a press and release captured together remain separate commands. Stream
-recovery clears this queue and its local episode reference. Shared simulation
+tick, so a press and release captured together remain separate commands. A new
+connection epoch clears this queue and its local episode reference. Shared simulation
 owns charge duration, stamina cost, motion and interruption; snapshots carry the
 resulting state for authoritative restore and owner replay.
 
@@ -138,10 +95,10 @@ relationships, transforms or change detection with parallel implementations.
 ```text
 Authenticated transport -> bounded command inbox -> Dreamwake admission
     -> one DreamStep -> committed authoritative state
-    -> shared graph prepare -> per-connection gather/policy/dependencies
-    -> scoped lifecycle -> budget/encode -> transport
+    -> shared graph prepare -> per-connection gather/policy
+    -> changed entities against acknowledged state -> egress allowance -> transport
 
-Decoded owner group -> transactional restore -> bounded shared owner replay
+Newest owner state -> restore at its tick -> bounded shared owner replay
     -> read-only presentation extraction -> renderer correction offset
 ```
 
@@ -154,8 +111,8 @@ simulation state before render smoothing. Input capture performs the sole
 camera-to-world conversion; replay reads recorded input, never live devices.
 
 Use ordered public system sets and normal deferred-command barriers. Capture
-engine components and game payloads together. Restore an entire validated group
-transactionally and rebuild Bevy ownership relationships from stable IDs before
+engine components and game payloads together. Restore a validated owner state
+completely and rebuild Bevy ownership relationships from stable IDs before
 stepping. Cached target indices are derived again from restored components.
 Graph workers read one frozen committed world/policy revision; newer permission
 revocations fence queued unsent work before encoding. A spatial index is an
@@ -194,36 +151,34 @@ specific contracts; they do not establish undocumented control algorithms.
 |---|---|---|
 | Shared capability prediction | [CMC/Mover comparison](https://dev.epicgames.com/documentation/en-us/unreal-engine/comparing-mover-and-character-movement-component-in-unreal-engine) describes Mover/Network Prediction's shared simulation timeline, client prediction and rollback; [Network Prediction model services](https://dev.epicgames.com/documentation/en-us/unreal-engine/API/Plugins/NetworkPrediction) separate model ticking, rollback, cues and smoothing. The reviewed documentation is UE 5.8 and still describes Mover as experimental. | Owner replay runs the shared Bevy gameplay schedule over the admitted owner checkpoint and owned transient components. Optional disclosed target proxies are retained with each prediction frame and can guide companion presentation; they cannot resolve damage or run undisclosed AI. Remote presentation advances replicated motion and lifetime capabilities independently of packet arrivals. Checkpoint bounds, public proxy policy and prediction horizons are Dreamwake choices, not claimed Epic algorithms or Fortnite settings. |
 | Player color identity | [Networking overview](https://dev.epicgames.com/documentation/en-us/unreal-engine/networking-overview-for-unreal-engine) describes replicated properties flowing from authoritative actors to their remote proxies. This is the established server-authoritative replication model. | Assign each concurrent hero a unique color identity in the authoritative simulation and carry it through complete snapshots, owner checkpoints and public hero replicas. Restore/replay preserves the assignment; clients render the same identity for local and remote heroes. Color allocation and palette are Dreamwake policy, not an Epic algorithm. Existing scoped state delivery and ACK rules apply; color needs no separate event or delivery lane. |
-| Whole group delivery and cross-channel dependencies | [Reliable RPCs](https://dev.epicgames.com/documentation/en-us/unreal-engine/remote-procedure-calls-in-unreal-engine#reliability) separate reliable retransmission from application execution; [replicated object execution order](https://dev.epicgames.com/documentation/en-us/unreal-engine/replicated-object-execution-order-in-unreal-engine) recommends retaining dependent values until usable and limits ordering guarantees to specific scopes. | Enqueue each owner publication once on stock Renet reliable-unordered transport. Validate the complete group and retain exact decoded receipts independently of packet ACKs. Stage one complete message if its baseline reset has not arrived; reject valid older topology contexts without replacing current caches when the newer reset or publication arrives first. The generic synthetic harness counts validated superseded standalone states and groups without acknowledging or republishing them; malformed states and conflicting watermarks remain failures. Its whole-message workload does not require partial-group delivery. Channel selection, 64/128 KiB memory budgets, the two-second deadline and atomic owner-group protocol are local decisions, not Epic wire behavior or tuning. |
+| State delivery and loss | Unreal's property replication compares each actor with the state last sent to the connection and sends changed properties; [UNetConnection](https://dev.epicgames.com/documentation/en-us/unreal-engine/API/Runtime/Engine/Engine/UNetConnection) tracks packet acknowledgements and NAKs, and a lost packet's properties are sent again with their current values rather than retransmitting the old bytes. | Each connection has one acknowledged entity stream. An entity is sent when it differs from its newest acknowledged state, unless that exact state is in flight and not reported lost. Entries are whole or changed fields against an acknowledged base named by packet sequence. A packet absent from an acknowledgement that covers it is lost, and its entities go out with current values. Removals repeat until acknowledged. The 64-packet window, the bitmask acknowledgement carried in input packets and the per-entity encoding are our design, not Unreal wire formats. |
 | Handshake confirmation retries | [StatelessConnectHandlerComponent](https://dev.epicgames.com/documentation/unreal-engine/API/Runtime/Engine/StatelessConnectHandlerComponent?lang=en-US) exposes handshake-specific send timestamps and explicit challenge completion. | Keep handshake retry timing in renetcode: before authenticated client confirmation, outgoing application payloads cannot reset the KeepAlive retry timestamp. Both UDP and WebRTC exercise loss of the initial KeepAlive under continuous payload sends. This is a correction to renetcode's existing protocol, not an Unreal handshake algorithm or retry setting; no transport pacing workaround or Renet packet configuration extension is required. |
-| Client identity replacement | [Actor relevancy](https://dev.epicgames.com/documentation/en-us/unreal-engine/actor-relevancy-in-unreal-engine) ties client actor lifetimes to the connection's current relevant set; [replicated object execution order](https://dev.epicgames.com/documentation/en-us/unreal-engine/replicated-object-execution-order-in-unreal-engine) does not guarantee relative reliable/unreliable order. | After a standalone state or complete atomic group publishes a newer entity generation, retire older generations at that index from client membership and combat-pose bookkeeping. Delayed old Exit/Destroy controls retain the replacement. Rejected or incomplete publications cannot retire it. The numeric generation fence and combat cohort are local contracts, not Epic identity or wire formats. |
-| Recovery request ownership | [Reliable RPCs](https://dev.epicgames.com/documentation/en-us/unreal-engine/remote-procedure-calls-in-unreal-engine#reliability) retransmit until acknowledged, and their send policy separates enqueue from network dispatch. [Networked character movement](https://dev.epicgames.com/documentation/unreal-engine/understanding-networked-movement-in-the-character-movement-component-for-unreal-engine) distinguishes server acknowledgements/corrections from saved client moves and warns about reliable buffer overflow. | Recovery retains one pending resync request until control encoding and reliable enqueue succeed. Poll services it while prediction is stopped; an enqueued request waits for replacement Welcome while Renet owns retransmission. The server may also retire an expired active baseline-reset stream through the same capped resynchronization path, preserving authoritative participation and requiring fresh proofs. Old queued controls/state remain transport-owned and are fenced by epoch. Finalization-audit expiry remains strict. The one-second request throttle, two-second checkpoint deadline, three-per-thirty-second cap and Welcome handshake are local mechanisms, not an Epic recovery algorithm or tuning. |
-| Effect bindings across delivery lanes | [Replicated object execution order](https://dev.epicgames.com/documentation/en-us/unreal-engine/replicated-object-execution-order-in-unreal-engine) does not guarantee relative reliable/unreliable execution order; [Network Prediction cue dispatch](https://dev.epicgames.com/documentation/unreal-engine/API/Plugins/NetworkPrediction/TNetSimCueDispatcher) separates saved cue delivery, pruning and rollback. | A validated binding for a strictly newer entity generation retires the older journal token atomically, even if its removal checkpoint has not arrived. Cancel the old presentation without creating the replacement from receive; retain its tombstone through replay. Same-generation conflicts and lower-generation bindings for different events remain errors. Generation reuse and this journal transition are our contract, not an Epic cue algorithm or Fortnite behavior. |
-| Retired optional group members | [Replication Graph](https://dev.epicgames.com/documentation/en-us/unreal-engine/replication-graph-in-unreal-engine) builds changing actor lists per connection; [actor relevancy](https://dev.epicgames.com/documentation/en-us/unreal-engine/actor-relevancy-in-unreal-engine) removes client replicas when actors cease to be relevant. | Keep bounded scope fences after local replica removal so delayed controls can be checked against connection, entity generation, scope and group revision. A proven old owner-group retirement is obsolete and cannot mutate current caches; an unknown member without that proof remains a hard failure. The atomic baseline-retirement protocol and proof rule are our design, not an Epic wire contract. |
-| Effect source visibility | [Actor relevancy](https://dev.epicgames.com/documentation/unreal-engine/actor-relevancy-in-unreal-engine) is decided per connection, and [Replication Graph](https://dev.epicgames.com/documentation/unreal-engine/replication-graph-in-unreal-engine) builds per-connection actor lists for players and AI-controlled actors. | Independently eligible heroes and enemies both authorize their public source references. A visible projectile or effect never grants visibility to its source. Source visibility changes replace only that source's projectile/wisp/effect scopes, even when publication cadence would otherwise freeze them. Separate event-origin approval and anonymous 8 m proxies are Dreamwake policy, not an Unreal projection mechanism. |
-| Saved input and correction | [CMC's movement lifecycle](https://dev.epicgames.com/documentation/en-us/unreal-engine/understanding-networked-movement-in-the-character-movement-component-for-unreal-engine) applies corrections before local input, retains saved moves until acknowledgement/correction and replays after authoritative correction. This is also source S08 in the specification. | Retain immutable input/edge history until authoritative finalization. Restore the authorized owner group and replay its recorded transitions before render smoothing. Before the first authored command, with no retained prediction transitions, adopting a newer complete group requires no replay, including at a topology change. This bootstrap rule is our adaptation; CMC's client-move delta-time calculation does not replace our global fixed-step scheduler. |
+| Client identity replacement | [Actor relevancy](https://dev.epicgames.com/documentation/en-us/unreal-engine/actor-relevancy-in-unreal-engine) ties client actor lifetimes to the connection's current relevant set. | A state entry carrying a newer generation for an entity index replaces the older one and its combat-pose bookkeeping. Removals name an exact generation, so a delayed removal cannot remove the replacement. The numeric generation fence is a local contract, not an Epic identity or wire format. |
+| Owner corrections | [CMC's movement lifecycle](https://dev.epicgames.com/documentation/en-us/unreal-engine/understanding-networked-movement-in-the-character-movement-component-for-unreal-engine) corrects the owning client with the server's current state (`ClientAdjustPosition`), unreliably; the client applies the newest correction and replays saved moves after it. | State packets are unreliable and the newest owner state wins. The client restores it at its tick and replays retained input; a state outside the 256-tick history, or ahead of the prediction, becomes the new base. No correction, loss or stall asks the server to restart the stream. The owner state is sent exactly rather than quantized: replay restores it, and a quantized owner would differ from the authority by up to the quantization step on every correction. Public actors are quantized because only presentation reads them. |
+| Effect bindings across replacements | [Network Prediction cue dispatch](https://dev.epicgames.com/documentation/unreal-engine/API/Plugins/NetworkPrediction/TNetSimCueDispatcher) separates saved cue delivery, pruning and rollback. | A validated binding for a strictly newer entity generation retires the older journal token atomically. Cancel the old presentation without creating the replacement from receive; retain its tombstone through replay. Same-generation conflicts and lower-generation bindings for different events remain errors. Generation reuse and this journal transition are our contract, not an Epic cue algorithm. |
+| Effect source visibility | [Actor relevancy](https://dev.epicgames.com/documentation/unreal-engine/actor-relevancy-in-unreal-engine) is decided per connection, and [Replication Graph](https://dev.epicgames.com/documentation/unreal-engine/replication-graph-in-unreal-engine) builds per-connection actor lists for players and AI-controlled actors. | Independently eligible heroes and enemies both authorize their public source references. A visible projectile or effect never grants visibility to its source, and the client withholds its visuals until the source is present. Separate event-origin approval and anonymous 8 m proxies are Dreamwake policy, not an Unreal projection mechanism. |
+| Saved input and correction | [CMC's movement lifecycle](https://dev.epicgames.com/documentation/en-us/unreal-engine/understanding-networked-movement-in-the-character-movement-component-for-unreal-engine) applies corrections before local input, retains saved moves until acknowledgement or correction and replays after authoritative correction. This is also source S08 in the specification. | Retain immutable input and edge history until authoritative finalization. Restore the newest owner state and replay recorded transitions before render smoothing. CMC's client-move delta-time calculation does not replace our global fixed-step scheduler. |
 | Simulation progress, frame batching and wall time | [Fixed tick state](https://dev.epicgames.com/documentation/en-us/unreal-engine/API/Plugins/NetworkPrediction/FFixedTickState) allows multiple simulation ticks per engine frame and separates confirmed/pending frames, authority-to-local offset, simulation step, accumulated real time and optional time dilation. | Use timestamped committed ticks for prediction and combat time. Preserve fractional phase across steady committed progress; sampling an integer tick later within its interval must not pause remote playback. Genuine authority stalls still constrain advancement, up to retained history. Prediction catch-up must not author new input for committed ticks or consume queued action edges. Preserve ordinary batched input and keep transport clock/RTT diagnostics separate. Our phase estimator, substitution forecast and replay bound are local choices; they are not Epic's time-dilation algorithm. |
-| Input retransmission | [Network Prediction settings](https://dev.epicgames.com/documentation/en-us/unreal-engine/API/Plugins/NetworkPrediction/FNetworkPredictionSettings) specify sending several recent commands per update. | Test the same bounded redundant packets as production, with immutable command identities and targets. Eight records is our setting, not an asserted Unreal default. |
-| Selective old-command retry | [Saved moves](https://dev.epicgames.com/documentation/unreal-engine/API/Runtime/Engine/FSavedMove_Character) identify important unacknowledged moves to resend; the [packed move container](https://dev.epicgames.com/documentation/en-us/unreal-engine/API/Runtime/Engine/FCharacterNetworkMoveDataContain-) includes an optional important old move. | Give retained commands a bounded resend opportunity when committed progress makes their unchanged targets eligible, including commands displaced from the newest-eight packet. This progress-triggered rule is our adaptation; the cited CMC docs do not specify a standalone resend timer during suspended generation. |
+| Input retransmission | [Network Prediction settings](https://dev.epicgames.com/documentation/en-us/unreal-engine/API/Plugins/NetworkPrediction/FNetworkPredictionSettings) specify sending several recent commands per update; CMC's [packed move container](https://dev.epicgames.com/documentation/en-us/unreal-engine/API/Runtime/Engine/FCharacterNetworkMoveDataContain-) carries the new move, a pending move and an optional important old unacknowledged move. | Every fixed tick sends one unreliable packet with the newest command, the three most recent pending and the three oldest pending, at most six, until finalization retires them. The oldest unacknowledged commands therefore always travel, and there is no retry timer. The record counts are our setting, not an Unreal default. |
 | Receipt, consumption and feedback causality | [Fixed server receive data](https://dev.epicgames.com/documentation/en-us/unreal-engine/API/Plugins/NetworkPrediction/TServerRecvData_Fixed) separates received and consumed client frames from the server's pending frame. [CMC server prediction data](https://dev.epicgames.com/documentation/en-us/unreal-engine/API/Runtime/Engine/FNetworkPredictionData_Server_Ch-) separately tracks processed timestamps, received timestamps including rejections, and time discrepancy. | Transport receipt cannot finalize gameplay. Feedback identifies the observed command; the client distinguishes commands issued before and after a lead change. Count unique missed deadlines even when their old-policy feedback cannot tune the new policy. Our minimum-slack aggregation and policy boundary are local controller rules, not Epic-documented formulas. |
 | Starved remote interpolation | [Fixed interpolation service](https://dev.epicgames.com/documentation/en-us/unreal-engine/API/Plugins/NetworkPrediction/IFixedInterpolateService) requires valid frame continuity and explicit starvation handling; it stores server frame numbers independently of the prediction offset. | Render from authoritative sample history in simulation time. Preserve scope/segment continuity and bounded starvation behavior; additional prediction cannot create missing remote authority. |
 | Remote motion and animation | [CMC's simulated-proxy smoothing](https://dev.epicgames.com/documentation/en-us/unreal-engine/understanding-networked-movement-in-the-character-movement-component-for-unreal-engine) separates replicated movement from visual cleanup. | Enemy gait measures travel between presented positions over the matching display-frame duration, before transform correction. The owner's integer prediction tick does not measure remote travel. Veil shutters interpolate continuous authoritative geometry, with the same motion recorded in combat history; regular endpoints preserve the combat segment. The gait sampler and 30-tick shutter travel are Dreamwake choices. |
 | Recovery buffers | [Network Prediction settings](https://dev.epicgames.com/documentation/en-us/unreal-engine/API/Plugins/NetworkPrediction/FNetworkPredictionSettings) expose interpolation buffering and a cap on input buffering after faults. | Keep admission, prediction history and recovery work explicitly bounded. The lead, admission-window and replay limits belong to this implementation and need direct local qualification. |
-| Hitches recover locally | [CMC's movement lifecycle](https://dev.epicgames.com/documentation/en-us/unreal-engine/understanding-networked-movement-in-the-character-movement-component-for-unreal-engine) has a client that stopped sending simply resume with new saved moves; the server corrects with `ClientAdjustPosition`, and nothing in the lifecycle ends the connection for a pause. [Fixed tick state](https://dev.epicgames.com/documentation/en-us/unreal-engine/API/Plugins/NetworkPrediction/FFixedTickState) separates accumulated real time from simulation frames, so several frames can run after a long engine frame. Unity's [NetworkTimeSystem](https://docs.unity3d.com/Packages/com.unity.netcode.gameobjects@2.7/api/Unity.Netcode.NetworkTimeSystem.html) re-anchors at `hardResetThresholdSec` instead of failing. | A suspended clock, an offset step, a forward command-target jump, a checkpoint ahead of prediction, or replay longer than one frame's budget re-anchor or defer locally; none requests a server resync. Earlier local rules latched `Suspension`, `OffsetJump`, `TargetDiscontinuity`, `CheckpointAhead` and `ReplayBudget` into stream replacement, and a bounded 32-tick speculation ceiling froze the owner after every hitch; those rules were ours, had no precedent in either engine, and are gone. The history-length bounds, the budget deferral and the minimum-slack lead rule are local choices qualified by `scripts/netcode-harness.py`, not Epic or Unity tuning. |
-| Saturation sheds, it does not queue | Unreal's [Replication Graph](https://dev.epicgames.com/documentation/en-us/unreal-engine/replication-graph-in-unreal-engine) gathers actors per connection with relevance-driven frequency, and a saturated connection stops replicating further actors that frame rather than queueing them; reliable data is retransmitted on detected loss, not on a short timer. | Remote actors near the player publish at 20 Hz and others at 10 Hz. A WebRTC peer whose data-channel backlog exceeds its measured bandwidth-delay product (drain rate × base round trip + 50 ms, 8–48 KiB) skips remote actors that publication; they resume with their newest state. Renet resends on a 250 ms timer, above ordinary round trips. The thresholds, the estimator and the timer are local choices qualified by `scripts/netcode-harness.py`, not Unreal tuning. |
-| Latency is a quality axis, not an admission criterion | Neither engine refuses to play above a latency threshold. [CMC's movement lifecycle](https://dev.epicgames.com/documentation/en-us/unreal-engine/understanding-networked-movement-in-the-character-movement-component-for-unreal-engine), the model Epic describes as established in shipped projects, has no command lead at all: clients send timestamped saved moves, the server executes them on arrival and corrects, so a longer path means more correction and never a refusal. Unity's [NetworkTimeSystem](https://docs.unity3d.com/Packages/com.unity.netcode.gameobjects@2.7/api/Unity.Netcode.NetworkTimeSystem.html) does run client local time ahead of the server, but expresses it as buffer seconds adjusted continuously, and its `hardResetThresholdSec` re-anchors rather than failing. | Dreamwake keeps target-tick commands, which follow Epic's fixed-tick prediction model rather than CMC's execute-on-arrival one, because its checkpoint, replay and combat-rewind contracts require a canonical tick both sides agree on. From CMC and NetworkTimeSystem it takes the posture, not the mechanism: lead saturates instead of erroring, and a saturated lead is not a recovery trigger. An earlier local rule made exceeding a 12-tick lead a typed `LeadExceeded` recovery, which disconnected slow links after three attempts in the sliding window; that rule was ours, had no precedent in either engine, and is gone. The horizon values, their client/server relationship and the discarding of a probe whose round trip was inflated by a local stall remain local decisions needing local qualification, not Epic or Unity behaviour. |
-| Transport saturation during initial replication | [Actor relevancy](https://dev.epicgames.com/documentation/en-us/unreal-engine/actor-relevancy-in-unreal-engine) keeps a connection's own pawn relevant and uses relevancy and priority to decide which actors a bandwidth-limited connection services; [Replication Graph](https://dev.epicgames.com/documentation/en-us/unreal-engine/replication-graph-in-unreal-engine) gathers per-connection lists and applies priority before bandwidth is spent. | Withhold remote public actors from an owner that has not committed activation, so the atomic owner group does not compete for a connection whose real ceiling is below the scheduler's budget. A refused WebRTC data channel write is a saturation signal, not a completed send: Renet has already accounted the packet, so the loss cannot appear as a pacing or capacity drop and is reported on its own at warn level. Pre-activation withholding, the browser inbox retention size and the byte-rate defaults are Dreamwake choices; Epic's documentation does not specify them, and neither the cited pages nor this design establish a data channel backpressure algorithm. |
+| Hitches recover locally | [CMC's movement lifecycle](https://dev.epicgames.com/documentation/en-us/unreal-engine/understanding-networked-movement-in-the-character-movement-component-for-unreal-engine) has a client that stopped sending simply resume with new saved moves; the server corrects with `ClientAdjustPosition`, and nothing in the lifecycle ends the connection for a pause. [Fixed tick state](https://dev.epicgames.com/documentation/en-us/unreal-engine/API/Plugins/NetworkPrediction/FFixedTickState) separates accumulated real time from simulation frames, so several frames can run after a long engine frame. Unity's [NetworkTimeSystem](https://docs.unity3d.com/Packages/com.unity.netcode.gameobjects@2.7/api/Unity.Netcode.NetworkTimeSystem.html) re-anchors at `hardResetThresholdSec` instead of failing. | A suspended clock, an offset step, a forward command-target jump, an owner state ahead of prediction, or a forecast longer than one frame's budget re-anchor or defer locally; nothing restarts the stream. The history length, the budget deferral and the minimum-slack lead rule are local choices qualified by `scripts/netcode-harness.py`, not Epic or Unity tuning. |
+| Never queue stale state | Unreal paces each connection to a configured rate and stops replicating further actors in a frame once the connection is saturated ([`UNetConnection::IsNetReady`](https://dev.epicgames.com/documentation/en-us/unreal-engine/API/Runtime/Engine/Engine/UNetConnection/IsNetReady)); [Replication Graph](https://dev.epicgames.com/documentation/en-us/unreal-engine/replication-graph-in-unreal-engine) gathers actors per connection with relevance-driven frequency. | The server paces each connection with a byte-rate cap, and publication stops at the transport's remaining egress allowance; what did not fit goes out with its newest value at the next publication. Actors farther than 16 m publish every other time. WebRTC channels are unordered with a 150 ms `maxPacketLifeTime`, so SCTP drops what it could not deliver in time rather than queueing it, and the browser drops a send that would take `bufferedAmount` past 64 KiB. The rate cap, distance, lifetime and buffer size are local choices qualified by `scripts/netcode-harness.py`, not Unreal tuning. |
+| Congestion control | Unreal's netcode paces to a configured per-connection rate over UDP; its documentation describes no separate congestion controller. WebRTC data channels use SCTP's standard congestion control ([RFC 9260 §7](https://www.rfc-editor.org/rfc/rfc9260#section-7)). | Native UDP uses the rate cap alone. WebRTC keeps stock SCTP congestion control with timed reliability ([RFC 3758](https://www.rfc-editor.org/rfc/rfc3758)) that expires messages still queued behind the congestion window. No floor, threshold or game-specific controller sits on top; add one only if harness runs show the stock controller cannot hold the round-trip gate. |
+| Latency is a quality axis, not an admission criterion | Neither engine refuses to play above a latency threshold. [CMC's movement lifecycle](https://dev.epicgames.com/documentation/en-us/unreal-engine/understanding-networked-movement-in-the-character-movement-component-for-unreal-engine), the model Epic describes as established in shipped projects, has no command lead at all: clients send timestamped saved moves, the server executes them on arrival and corrects, so a longer path means more correction and never a refusal. Unity's [NetworkTimeSystem](https://docs.unity3d.com/Packages/com.unity.netcode.gameobjects@2.7/api/Unity.Netcode.NetworkTimeSystem.html) does run client local time ahead of the server, but expresses it as buffer seconds adjusted continuously, and its `hardResetThresholdSec` re-anchors rather than failing. | Dreamwake keeps target-tick commands, which follow Epic's fixed-tick prediction model rather than CMC's execute-on-arrival one, because its checkpoint, replay and combat-rewind contracts require a canonical tick both sides agree on. From CMC and NetworkTimeSystem it takes the posture, not the mechanism: lead saturates instead of erroring, and a saturated lead is not a recovery trigger. The horizon values, their client/server relationship and the discarding of a probe whose round trip was inflated by a local stall remain local decisions needing local qualification, not Epic or Unity behaviour. |
+| Initial replication | [Actor relevancy](https://dev.epicgames.com/documentation/en-us/unreal-engine/actor-relevancy-in-unreal-engine) keeps a connection's own pawn relevant and uses relevancy and priority to decide which actors a bandwidth-limited connection services. | A joining client receives only its owner state and the match summary until activation commits; the server activates once the client acknowledges a packet carrying its owner state. Packets are filled owner first, then the summary, then actors nearest first. Pre-activation withholding is a Dreamwake choice. |
 | Impaired-network verification | [Network emulation](https://dev.epicgames.com/documentation/en-us/unreal-engine/using-network-emulation-in-unreal-engine) covers directional lag/loss, jitter, reordering and duplication; ideal local connections conceal defects. | Deterministic fixtures must exercise actual command generation and model frame batching, startup checkpoint age, reliable/unreliable lanes and redundant packets. Real client/server tests must match the intended build profiles, replication workload and render configuration as well as impairment. Measure frame duration separately from transport RTT: slow frame processing can exhaust command-arrival headroom without oscillator drift. Dreamwake qualifies captured native release artifacts at its normal 80 m radius separately from its 12 m disclosure fixture; these are local qualification choices. A short moderate-profile pass does not qualify every impairment case. |
 
 See [netcode](netcode.md) for the current algorithms, configuration and validation
 commands. Before changing a mechanism, update this mapping when its Epic basis or
 local difference changes; do not append a history of failed attempts.
-The [clock/feedback regressions](../engine/net/src/synchronization/committed_tests.rs),
-[client pacing regressions](../games/dreamwake/client/src/plugins/network/target_horizon_tests.rs)
-and [client command-generation regressions](../games/dreamwake/client/src/plugins/network/feedback_causality_tests.rs)
-exercise clock and input boundaries. The
-[bootstrap topology regressions](../games/dreamwake/client/src/plugins/network/bootstrap_topology_tests.rs)
-separate adoption without local history from bounded replay after prediction starts. The
+The [clock/feedback regressions](../engine/net/src/synchronization/committed_tests.rs)
+exercise clock boundaries. The [state stream tests](../engine/net/src/replication/stream_tests.rs)
+cover acknowledgement, loss and delta bases; the
+[client network tests](../games/dreamwake/client/src/plugins/network/tests.rs)
+cover receive, reconciliation and input packets. The
 [authority outcome regressions](../games/dreamwake/server/src/authority/outcome_tests.rs)
 cover committed timing and immutable outcomes. Test results and real transport captures are
 separate evidence from the reference designs.
@@ -249,59 +204,42 @@ dormancy still advance at the committed barrier while the reverse memberships ar
 retained. Exact distance checks use the updated pose, including vertical motion;
 an unchanged cell rectangle does not imply unchanged eligibility.
 
-Public canonical payload reuse is bounded to one committed capture. The cache
-requires the current opaque eligibility result before lookup and keys exact entity
-generation, state/scene revision, schema, field selection, representation revision
-and prediction permission, within the frame/tick/world/policy barrier. A cache hit
-still passes through the recipient's scope authorization. Capacity exhaustion
-encodes normally without retaining more bytes; every new capture clears the cache.
-
-Dreamwake opts in only global, collision, public hero/enemy, damage, cover and
-platform payloads. Owner checkpoints, source-dependent projectile/wisp/effect
-views, marker parent-scope records, connection baselines and encrypted packets
-remain recipient-specific. Cache counters distinguish hits, encodes, bypasses and
-retained allocation bytes; reduced encoder calls do not establish lower wall time.
-
 ## Dreamwake routing and disclosure
 
-This table defines scoped representations. The live adapter uses positively
+This table defines replicated representations. The live adapter uses positively
 selected public and owner DTOs. The complete offline `DreamSnapshot.state`
 remains serialized despite being Rust-private, and `select_player` changes display
 fields while retaining every saved actor. Never feed that offline payload to a
-scoped encoder. New representation schemas must select fields positively and
+live encoder. New representation schemas must select fields positively and
 reject unregistered fields/classes. Unknown event classes have no audience by default.
 
 | Class | Route and audience | Representation and prediction policy |
 |---|---|---|
 | Run/session summary | Global within admitted match | Public phase, room/realm, encounter label, kills, elapsed, lucid, paused, cleared, active party count and fixed approved phase message; no arbitrary server message, RNG, allocator or future encounter state |
 | Hero | Owner connection plus spatial dynamic route | Owner receives complete permitted prediction state; others receive public pose, health/shield, level, visible action and cosmetic state. Private loadout, cooldowns, rewards, XP, shards and tuning stats remain owner-only |
-| Collision scene | Explicit required dependency of the admitted owner | Bounded immutable collider descriptors and movement profile, with scene revision and canonical identity. The owner, public summary and collision scope enter as one complete same-tick group. No actor state or world seed |
-| Rotating platform | Spatial dynamic, plus complete required owner dependency | Stable collider generation, scene/motion revision and bounded deterministic trajectory; admitted history survives leaving render interest. See [moving bases](moving-bases.md) |
+| Collision scene | Not replicated | Both sides build the immutable collider descriptors and movement profile from the content identity's scene revision; the client checks the result against the Welcome's canonical identity. No actor state or world seed |
+| Rotating platform | Spatial dynamic, plus the platform an owner rides | Stable collider generation, scene/motion revision and bounded deterministic trajectory; admitted history survives leaving render interest. See [moving bases](moving-bases.md) |
 | Enemy | Spatial dynamic; explicit dormant route only when immutable | Visible pose, kind, health, committed windup/target/warning, phase, slow/flash. AI decision state, attack index and random state are server-only; interpolate by default |
-| Projectile | Spatial dynamic, owner reason for admitted predicted projectile | Visible identity, permitted owner reference, pose/direction/radius/faction/essence. Full collision/lifetime/hit history only in an authorized complete prediction group |
+| Projectile | Spatial dynamic, owner reason for admitted predicted projectile | Visible identity, permitted owner reference, pose/direction/radius/faction/essence. Full collision/lifetime/hit history only in the owner state |
 | Wisp | Spatial dynamic and entitled owner connection | Visible pose/lifetime/essence and permitted owner reference. Orbit/fire/target state requires complete authorized dependencies for prediction |
 | Delayed cast | Owner connection only when prediction is admitted | Scheduled payload remains private; publish a separately approved visible warning when game rules expose it |
 | GraphicsInstance | Independently approved spatial event audience, plus entitled predicted owner | Effects from independently eligible heroes and enemies retain stable identity and geometry. Hidden-source radial pulses inside the arena use an anonymous 8 m cell proxy; hidden beams/orbs and prohibited origins are omitted. Proxy identity contains no source or command identity |
 | DamageNumber | Spatial event audience | Approved amount, critical/friendly flags and visible position/lifetime. No hidden source/target identifiers or exact hidden location |
 | Reward/menu action outcome | Owner connection | Reward options, selection/ready outcome and terminal action result; shared party readiness is a separate minimal semantic representation |
 | Veil cover region | Spatial current state, retained after authority removal | Geometry, open state and present/absent flag; current absence survives complete authority restore and scope re-entry. No client removal command or transition schedule |
-| Cover marker | Independently eligible spatial public attachment | Exact parent connection/entity generation/scope/representation, local offset and current phase. Stage until that exact present cover is published; never acquire carrier inventory visibility |
+| Cover marker | Independently eligible spatial public attachment | Exact parent cover entity and generation, local offset and current phase. Shown only while that exact cover is present; never acquire carrier inventory visibility |
 | Future props and attachments | Denied until registered | Must declare bounds, static/dynamic/dormant route, scene revision, fields and dependency behavior before admission |
 
 `EventAudience` binds each approval to the connection and current policy revision;
 anonymous projection cannot bypass an event-origin denial. Its result still goes
-through the existing graph grant and scope barrier. Independently delivered
-source-dependent roots remain in bounded `ClientScopes`; render assembly withholds
-them until their source actor is published, including after a source exits.
-This withholding preserves payload, epoch and duplicate-identity validation and
-does not block the complete owner view or grant visibility to the source.
-`Attachment` resolves against
-published `ClientScopes`, including parent generation and scope incarnation, and
-permits a standalone transform only when the game explicitly supplies one.
-`RegionManifest` carries bounded current map-slot presence through ordinary full
-state. Missing regions, missing slots and mismatched generations remain unavailable;
-they never authorize reconstruction of a cached map default. Dreamwake's
-45 authored veil slots each use a retained cover root as their region descriptor.
+through the graph grant. Source-dependent projectiles, wisps and effects are kept
+by the client, but their visuals are withheld until their source actor is present,
+including after a source leaves. This does not grant visibility to the source.
+`RegionManifest` carries bounded current map-slot presence through ordinary
+state. Missing regions, missing slots and mismatched generations remain
+unavailable; they never authorize reconstruction of a cached map default.
+Dreamwake's 45 authored veil slots each use a retained cover root as their
+region descriptor.
 
 Initial spatial classes use the profile's 80 m base cull limit, 10 m leave margin
 and 8 m maximum prefetch; effect/projectile bounds come from authoritative radius,
@@ -319,31 +257,13 @@ offset, scene readiness, update rate and expiry. Grant changes revoke old fields
 at the policy barrier. In the existing open cooperative arena, authorized
 spatial public state does not imply an occlusion/anti-wallhack guarantee.
 
-Required dependencies bypass distance but never disclosure. Closure uses stable
-IDs, a visited set and atomic group admission. Missing, denied, oversized or
-unavailable historical dependencies disable the whole prediction group. Send an
-independent allowed presentation replica and continue authoritative execution;
-do not copy secret AI/RNG state, invent a dependency, or truncate a group. In
-particular, all-world DreamSimulation replay cannot run on a filtered snapshot.
-Dreamwake uses a restricted owner model sharing the authority's owner intent and
-transition functions; remote AI and hit resolution stay authoritative. New groups
-need their own restricted systems and complete permitted dependencies. Replay
-retention has its own bounded immutable
-samples, separate from current scope membership. Revocation invalidates affected
-prediction even if an old history sample exists.
-
-`PredictionManager::replace_groups` atomically retires an exact set of current
-prediction identities and accepts complete replacement `PublishedGroup` proofs
-at one authoritative tick. Every manifest member has one writable group;
-unaffected groups keep their state, commands, dependencies, and work accounting.
-Decoded replacements coexist with old histories under the aggregate memory
-budget until admission succeeds. Bounded identity high-water metadata prevents
-stale group revisions, owner streams, scenes, and entity generations from
-returning after a merge and split. Incompatible histories are discarded, and the
-result explicitly reports an authoritative rebase: it supplies no invented
-commands, dependencies, or replay. Keep the connection's existing `EventJournal`
-through this operation. Post-checkpoint absence is speculative; confirmed events
-and one-shot delivery receipts remain governed by that journal.
+Required dependencies bypass distance but never disclosure: the platform an
+owner rides travels with that owner. Dreamwake uses a restricted owner model
+sharing the authority's owner intent and transition functions; remote AI and hit
+resolution stay authoritative, and all-world DreamSimulation replay cannot run on
+a filtered state. Do not copy secret AI/RNG state or invent a dependency. Each
+prediction frame retains its own immutable dependency samples, separate from the
+client's current entities, so replay reads what the frame read.
 
 ## Field classification and restoration
 
@@ -369,16 +289,16 @@ does not predict actor pushes or damage from remote collisions.
 | Run.rewards, party_size, reinforcements | Rewards owner projection; party count admitted semantic summary; future reinforcement state server-only | Bounded collections and exact scalar restore; no future-state leak |
 | HeroBody.id, shards, combo, hit_flash, attack_flash, attack_power, ability_power, movement_speed, critical_chance, recovery, defense; Hero.ready/rewards | ID and visible combo/flashes public; remaining stats/rewards owner; ready via minimal party policy | Exact scalar/bounded reward state; flashes remain simulation-owned until explicitly migrated to presentation |
 | Hero.critical_rng (entity/domain key and counter) | Owner prediction only; never part of the public hero representation | Exact saved stream state with checked counter exhaustion; unrelated actors and cosmetic randomness cannot advance this stream |
-| Hero.active | Server readiness gate, included in owner checkpoint; inactive heroes have no public actor representation | Exact bool in offline and owner checkpoints; activation commits only after initial group decode proof, and the owner decodes the active checkpoint before issuing commands |
+| Hero.active | Server readiness gate, included in owner checkpoint; inactive heroes have no public actor representation | Exact bool in offline and owner checkpoints; activation commits once the client acknowledges a packet carrying its owner state, and the owner receives the active state before issuing commands |
 | Health.hp/max_hp; CombatState.shield/shield_remaining/invulnerability_remaining/statuses(id,magnitude,remaining) | Public health and visible shield/status projection; owner complete defense state | Finite f32 and bounded status list; restore timers as well as amounts |
-| Hero KinematicState.position/velocity/facing/stance/ground support/jump and coyote timers/dash state/movement lock/snap suppression/base state | Owner predicted; remote XZ pose, elevation, crouched stance and visible dash only | Exact canonical XYZ values with +Y up, tick counters, contact identity and complete base state; validate against the group's exact immutable collision scene and restore every field |
+| Hero KinematicState.position/velocity/facing/stance/ground support/jump and coyote timers/dash state/movement lock/snap suppression/base state | Owner predicted; remote XZ pose, elevation, crouched stance and visible dash only | Exact canonical XYZ values with +Y up, tick counters, contact identity and complete base state; validate against the owner's exact immutable collision scene and restore every field |
 | Enemy MotorState.position/facing/velocity/movement_lock/dash_direction/dash_remaining/dash_cooldown/dash_speed | Server-only motion; remote pose and visible action | Finite canonical XZ f32 arrays and timers; complete offline restore |
 | SavedState collision manifest | Server-owned immutable map/profile; approved owner dependency | Full offline checkpoints restore the actual bounded manifest. Live owner checkpoints bind its canonical identity and require the matching entered collision scope; replay never substitutes the renderer's current geometry |
 | ActionState.target/windup/recovery/sequence/due | Owner predicted; enemy committed warning and public phase only | Exact sequence/flag and finite target/timers, including due flag |
 | AbilitySlot.kind/level/modifier/cooldown/max_cooldown and Loadout vector | Owner predicted/private; visible cast is separate public effect | Bounded slots, exact enums/level and finite timers; restore all slots |
 | Progression.level/xp/xp_next/pending_levels | Level public, remainder owner; server decides rewards | Exact level/count and finite XP values, restore pending levels |
 | EnemyBody.id/kind/warn_radius/phase/hit_flash; Enemy.attack_index | Visible body public; attack_index server-only | Exact enum/integers and finite floats; complete server restore |
-| Projectile payload.damage/essence; ProjectileState.id/owner/faction/position/previous_position/direction/speed/remaining/radius/hits_remaining/hit_ids/max_distance/source_policy/expired/pending_impacts(target_id,distance) | Public view only by default; full state only in approved owner group | Restore all saved fields, bounded hit/impact lists and optional distance; rebuild runtime owner relationship |
+| Projectile payload.damage/essence; ProjectileState.id/owner/faction/position/previous_position/direction/speed/remaining/radius/hits_remaining/hit_ids/max_distance/source_policy/expired/pending_impacts(target_id,distance) | Public view only by default; full state only in the owner state | Restore all saved fields, bounded hit/impact lists and optional distance; rebuild runtime owner relationship |
 | Wisp payload.damage/essence; CompanionState.id/owner/faction/position/remaining/orbit_angle/orbit_radius/orbit_speed/fire_remaining/fire_interval/range/expired/pending_shot | Public view by default; full state requires permitted target dependencies | Finite floats, exact optional shot and identity; restore all fields and owner relationship |
 | DelayedAction.remaining/ready/payload; CastPayload.action_sequence/presentation_slot/owner/id/kind/essence/power/origin/direction | Owner-only predicted if dependencies allowed | Restore complete delayed schedule and payload; never reallocate identity on replay |
 | GraphicsInstance.id(match_epoch,owner,action_seq,slot,scope)/kind/pos/radius/age_ticks/duration_ticks | Simulation-owned, public only under effect policy | Exact stable identity and ticks, including source/control epoch, stream and generation for scoped input; replay regenerates the same identity |
@@ -387,8 +307,9 @@ does not predict actor pushes or damage from remote collisions.
 | DreamInput.movement/aim/attack/dash/casts/action_sequences | Client intent, server validated; immutable replay journal | Finite normalized axes, exact bounded flags/sequences; no live input during replay |
 | Bevy Entity owner links, target indices, renderer meshes/materials/offsets | Derived runtime/presentation state | Excluded from wire; rebuild links/indices from stable IDs and keep render offsets outside simulation |
 
-Live command/control envelopes use bounded bincode. Group manifests and scoped
-headers use explicit binary fields. All positive Dreamwake payload roots
+Live control envelopes use bounded bincode. Input and state packets use explicit
+binary fields with canonical variable-length integers, and obtain the connection
+epoch from the authenticated frame. All positive Dreamwake payload roots
 (global, owner, collision, hero, enemy, projectile, wisp, effect, damage, cover,
 platform and cover marker) use
 `engine_net::schema!` field codecs with explicit stable IDs, exact canonical
@@ -399,20 +320,19 @@ preallocation budget. Registry construction proves the maximum encoded root fits
 the sorted registry fingerprint through `replication::schema_identity()`.
 
 The tagged canonical codec remains the inspection and schema-probe format.
-After exact protocol and registry negotiation, live public actors use the same
+After exact protocol and registry negotiation, live state uses the same
 generated fields and validators in compact schema order. Fixed arrays omit
 redundant counts and element lengths; bounded variable collections retain their
-counts. Compact decoding still stages complete values, charges its work and
-allocation budgets, and rejects trailing bytes. It is not a self-describing
-format and must not be accepted before the matching content handshake. Scoped
-live headers use canonical variable-length integers, retaining all identity and
-tick fields while obtaining the connection epoch from the authenticated frame.
+counts. A delta carries a change mask and only the changed fields against an
+exact acknowledged base. Compact decoding still stages complete values, charges
+its work and allocation budgets, and rejects trailing bytes. It is not a
+self-describing format and must not be accepted before the matching content
+handshake.
 
 Capture and staged restore convert every field to and from game models, then run
-game cross-field validation before replacement. Owner dependency policy 1 is
-external: authenticated group assembly must bind the current global state and
-collision identity at the common tick. A schema declaration alone does not grant
-access or close that dependency graph. Public roots cannot include owner records;
+game cross-field validation before replacement. The owner state binds the
+collision identity agreed in the Welcome. A schema declaration alone does not
+grant access or close a dependency graph. Public roots cannot include owner records;
 private change diagnostics require an owner grant. Complete offline checkpoints
 retain their separate versioned codec.
 The reproducible codec probe is
@@ -424,12 +344,13 @@ worker bundle. Serve that output directory, open
 verify the browser runtime. The page reports only canonical digests and a boolean
 result; the generated manifest records browser verification as pending.
 
-Decoders reject non-finite gameplay values and validate complete group manifests
-before mutation. Round-trip f32 values preserve their exact value after canonical
-zero normalization; no lossy quantization is silently introduced. A future
-quantizer must define rounding/range behavior
-and run identically before authority/prediction comparisons. This choice alone
-does not prove cross-platform floating-point determinism.
+Decoders reject non-finite gameplay values before mutation. The owner state and
+offline checkpoints preserve every f32 exactly after canonical zero
+normalization. Public actor positions, directions, speeds and durations are
+declared `Quantized` fields with a fixed step (1/1,024 m, 1/4,096, 1/256 m/s and
+1/1,024 s), rounded to nearest on capture; only presentation reads them, never
+prediction. Exact round trips do not by themselves prove cross-platform
+floating-point determinism.
 
 ## Ruleset and qualification envelope
 
@@ -477,51 +398,20 @@ The declared targets remain unqualified: server p99 below 8 ms and p99.9 below
 the 16.667 ms tick deadline, client replay p99 below 2 ms, static correction
 p95/p99 below 0.02/0.10 m, and 24-hour soak. The 100-connection/50,000-potential-
 actor sparse/dense/dormant/wake/teleport workloads are separate scale gates,
-not supported player counts or performance results. The [persistent resource soak workflow](network-soak.md)
-records actual wall time and immutable source evidence separately from game/transport qualification.
+not supported player counts or performance results.
 The [game-soak workflow](network-game-soak.md) prepares persistent native UDP bots,
 the [clock workflow](network-clock-qualification.md) prepares controlled clock
 drift and rational deadline checks, and the [manual profile workflow](network-profile-qualification.md)
 provides external impairment configuration. Their commands produce evidence;
 their presence is not a qualification result.
 Two separated real clients
-must receive different authorized sets, recover from lost entry/exit/wake and
-retain complete dependencies before the prediction vertical slice passes.
+must receive different authorized sets and recover from lost entry and exit
+before the prediction vertical slice passes.
 Python contract tests establish only their modeled contracts, not these gates:
 
 ```sh
 python3 -m unittest discover -s todo/reference_model -v
 ```
-
-Run `python3 scripts/qualify-graph.py` for the actual Rust graph, scopes, group
-codec and scheduler workload. It compares sparse gathers against an independent
-visibility oracle and records timings, allocation accounting, bounded entry
-resets and dense overload under `out/network-qualification`. Its immediate
-synthetic transport excludes socket behavior, game simulation and rendering;
-those measurements require the separate process and browser workflows.
-
-For bounded component measurements, run `python3 scripts/qualify-graph.py
---probe maintenance` or `--probe canonical`. The maintenance probe performs all
-50,000 entity upserts plus 100 observer updates in each of five version-only,
-within-cell-motion and cell-crossing frames; oracle work is excluded from timers.
-The canonical probe compares identical bytes across sparse, shared dense, dormant
-and waking layouts with five frames each. These probes have a four-minute runtime
-ceiling, record source/build/hardware evidence, and remain separate from the full
-scheduler/transport workload. Five observations cannot establish tail-latency or
-30 Hz capacity. Distance-frequency throttling remains deferred: measured
-cell-crossing maintenance dominates delivery work, and postponing public sends
-cannot reduce that cost. The game retains its current cadence and critical
-owner/combat freshness rules while geometry maintenance and feasible-load
-scheduling remain separate qualification gates.
-
-To measure the actual game's positive JSON encoder separately, create an output
-directory and set `DREAMWAKE_CANONICAL_PROBE_OUTPUT` to an absolute CSV path, then
-run `cargo test -p dreamwake_server --lib canonical_dream_json_probe -- --ignored`.
-This opt-in five-frame, eight-peer probe alternates cached/uncached order and
-asserts identical bytes. Its default test profile is debug; it excludes capture,
-gather, owner payloads and transport. Cheap synthetic field packing can cost less
-than a cache lookup, so codec-call savings alone do not justify enabling reuse for
-an arbitrary payload type.
 
 Dependency pins and source exclusions are recorded in
 [network dependencies](network-dependencies.md). Any new actor or state field

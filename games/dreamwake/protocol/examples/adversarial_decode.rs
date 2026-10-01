@@ -182,9 +182,7 @@ fn run(family: usize, bytes: &[u8], case: usize, c: &Corpus) -> Outcome {
                 state.encode(None, &mut roundtrip).unwrap();
                 assert_eq!(ReplicaState::decode(&roundtrip, None).unwrap(), *state);
             }
-            let result = value
-                .and_then(|state| state.restore(None))
-                .map(|_| ());
+            let result = value.and_then(|state| state.restore(None)).map(|_| ());
             Outcome {
                 accepted: result.is_ok(),
                 published: false,
@@ -193,7 +191,10 @@ fn run(family: usize, bytes: &[u8], case: usize, c: &Corpus) -> Outcome {
         }
         5 => {
             let owner = ReplicaState::decode(&c.owner_state, None).unwrap();
-            assert!(owner.restore(None).is_err(), "owner restored without expectation");
+            assert!(
+                owner.restore(None).is_err(),
+                "owner restored without expectation"
+            );
             let mut wrong = c.expected;
             match case % 5 {
                 0 => wrong.owner += 1,
@@ -206,7 +207,8 @@ fn run(family: usize, bytes: &[u8], case: usize, c: &Corpus) -> Outcome {
                 owner.restore(Some(wrong)).is_err(),
                 "forged owner expectation accepted"
             );
-            let result = ReplicaState::decode(bytes, None).and_then(|state| state.restore(Some(c.expected)));
+            let result =
+                ReplicaState::decode(bytes, None).and_then(|state| state.restore(Some(c.expected)));
             if let Ok(Replica::Owner(owner)) = &result {
                 assert_eq!(owner.expectation().owner, c.expected.owner);
             }
@@ -227,7 +229,10 @@ fn run(family: usize, bytes: &[u8], case: usize, c: &Corpus) -> Outcome {
         }
         7 => {
             let mut stream = client(c);
-            let before = (stream.ack(), stream.current(entity(7)).map(|(seq, s)| (seq, s.clone())));
+            let before = (
+                stream.ack(),
+                stream.current(entity(7)).map(|(seq, s)| (seq, s.clone())),
+            );
             let result = live::decode_state(bytes, EPOCH, state_limit())
                 .map_err(|_| "packet_rejected")
                 .and_then(|packet| {
@@ -252,7 +257,10 @@ fn run(family: usize, bytes: &[u8], case: usize, c: &Corpus) -> Outcome {
                 });
             if result.is_err() {
                 assert_eq!(
-                    (stream.ack(), stream.current(entity(7)).map(|(seq, s)| (seq, s.clone()))),
+                    (
+                        stream.ack(),
+                        stream.current(entity(7)).map(|(seq, s)| (seq, s.clone()))
+                    ),
                     before,
                     "a rejected packet changed the stream"
                 );
@@ -263,9 +271,7 @@ fn run(family: usize, bytes: &[u8], case: usize, c: &Corpus) -> Outcome {
                 reason: result.err().unwrap_or("accepted"),
             }
         }
-        8 => {
-            accepted(engine_net::decode_with_limit::<BoundedVec<u8, 16384>>(bytes, 16384).is_ok())
-        }
+        8 => accepted(engine_net::decode_with_limit::<BoundedVec<u8, 16384>>(bytes, 16384).is_ok()),
         9 => {
             for invalid in &c.nonfinite {
                 assert!(

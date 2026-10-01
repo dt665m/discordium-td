@@ -104,6 +104,35 @@ macro_rules! schema {
                 }
                 Ok(Self{$($field:$field.ok_or($crate::schema::SchemaError::MissingField($crate::schema::FieldId($id)))?),+})
             }
+            fn write_compact_delta(&self,base:&Self,out:&mut Vec<u8>,work:&mut $crate::schema::Work,depth:usize)->Result<(),$crate::schema::SchemaError>{
+                work.node(depth)?;
+                let (ids,count)=$crate::schema::ordered(<Self as $crate::schema::Schema>::FIELDS,work.limits.fields)?;
+                let mut mask=$crate::schema::ChangeMask::new(count)?;
+                for (index,id) in ids[..count].iter().enumerate() {
+                    #[allow(unreachable_patterns)]
+                    let changed=match id.0 {$($id=>self.$field!=base.$field,)+_=>unreachable!()};
+                    if changed {mask.set(index);}
+                }
+                work.append(out,mask.bytes())?;
+                for (index,id) in ids[..count].iter().enumerate() {
+                    if !mask.get(index) {continue;}
+                    #[allow(unreachable_patterns)]
+                    match id.0 {$($id=><$ty as $crate::schema::CompactValue>::write_compact_delta(&self.$field,&base.$field,out,work,depth+1)?,)+_=>unreachable!()}
+                }
+                Ok(())
+            }
+            fn read_compact_delta(base:&Self,reader:&mut $crate::schema::Reader<'_>,work:&mut $crate::schema::Work,depth:usize)->Result<Self,$crate::schema::SchemaError>{
+                work.node(depth)?;
+                let (ids,count)=$crate::schema::ordered(<Self as $crate::schema::Schema>::FIELDS,work.limits.fields)?;
+                let mask=$crate::schema::ChangeMask::read(reader,count)?;
+                let mut value=base.clone();
+                for (index,id) in ids[..count].iter().enumerate() {
+                    if !mask.get(index) {continue;}
+                    #[allow(unreachable_patterns)]
+                    match id.0 {$($id=>{value.$field=<$ty as $crate::schema::CompactValue>::read_compact_delta(&base.$field,reader,work,depth+1)?;},)+_=>unreachable!()}
+                }
+                Ok(value)
+            }
         }
     };
 }
@@ -176,6 +205,26 @@ macro_rules! schema_enum {
                 let tag=reader.u16()?;
                 #[allow(unreachable_patterns)]
                 match tag {$($id=><$ty as $crate::schema::CompactValue>::read_compact(reader,work,depth+1).map(Self::$variant),)+_=>Err($crate::schema::SchemaError::InvalidEncoding)}
+            }
+            /// The same variant carries only its changed fields; a different
+            /// variant is sent whole, and the tag tells the reader which.
+            fn write_compact_delta(&self,base:&Self,out:&mut Vec<u8>,work:&mut $crate::schema::Work,depth:usize)->Result<(),$crate::schema::SchemaError>{
+                work.node(depth)?;
+                #[allow(unreachable_patterns)]
+                match (self,base) {
+                    $((Self::$variant(value),Self::$variant(base))=>{work.append(out,&($id as u16).to_le_bytes())?;<$ty as $crate::schema::CompactValue>::write_compact_delta(value,base,out,work,depth+1)},)+
+                    _=>match self {$(Self::$variant(value)=>{work.append(out,&($id as u16).to_le_bytes())?;<$ty as $crate::schema::CompactValue>::write_compact(value,out,work,depth+1)}),+},
+                }
+            }
+            fn read_compact_delta(base:&Self,reader:&mut $crate::schema::Reader<'_>,work:&mut $crate::schema::Work,depth:usize)->Result<Self,$crate::schema::SchemaError>{
+                work.node(depth)?;
+                let tag=reader.u16()?;
+                #[allow(unreachable_patterns)]
+                match (tag,base) {
+                    $(($id,Self::$variant(base))=><$ty as $crate::schema::CompactValue>::read_compact_delta(base,reader,work,depth+1).map(Self::$variant),)+
+                    $(($id,_)=><$ty as $crate::schema::CompactValue>::read_compact(reader,work,depth+1).map(Self::$variant),)+
+                    _=>Err($crate::schema::SchemaError::InvalidEncoding),
+                }
             }
         }
     };

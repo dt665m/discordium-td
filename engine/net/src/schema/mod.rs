@@ -13,6 +13,7 @@ mod composites;
 mod inspection;
 mod macros;
 mod model;
+mod quantized;
 mod registry;
 #[cfg(test)]
 mod tests;
@@ -20,6 +21,9 @@ mod value;
 mod wire;
 use crate::types::SchemaId;
 pub use compact::CompactValue;
+#[doc(hidden)]
+pub use compact::ChangeMask;
+pub use quantized::Quantized;
 #[doc(hidden)]
 pub use composites::enum_ids;
 pub use composites::{BoundedBytes, BoundedString};

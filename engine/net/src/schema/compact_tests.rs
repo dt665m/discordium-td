@@ -577,3 +577,126 @@ fn compact_codec_retains_registration_and_input_wire_budgets() {
         Err(SchemaError::WireBudget)
     );
 }
+
+crate::schema! { struct Pose(SchemaId(140),1,Representation::PublicPresentation) {
+    1 => position: [Quantized<1024>; 2] = [Quantized::ZERO; 2] => FLOAT,
+    2 => crouched: bool = false => PLAIN,
+}}
+crate::schema! { struct Mover(SchemaId(141),1,Representation::PublicPresentation) {
+    1 => id: u64 = 1 => unsigned(u64::MAX),
+    2 => pose: Pose = Pose::defaults() => PLAIN,
+    3 => hp: f32 = 1.0 => FLOAT,
+    4 => tags: BoundedVec<u16, 4> = BoundedVec::default() => unsigned(u16::MAX as u64),
+    5 => label: BoundedString<16> = BoundedString::default() => PLAIN,
+}}
+crate::schema! { struct Marker(SchemaId(142),1,Representation::PublicPresentation) {
+    1 => slot: u8 = 0 => unsigned(255),
+}}
+crate::schema_enum! {enum Thing {1=>Mover(Mover),2=>Marker(Marker)}}
+crate::schema! { struct ThingRoot(SchemaId(143),1,Representation::PublicPresentation) {
+    1 => thing: Thing = Thing::Marker(Marker::defaults()) => PLAIN,
+}}
+
+fn mover(x: f32, crouched: bool) -> Mover {
+    Mover {
+        pose: Pose {
+            position: Quantized::array([x, -3.25]).unwrap(),
+            crouched,
+        },
+        ..Mover::defaults()
+    }
+}
+
+#[test]
+fn deltas_carry_only_changed_fields_and_rebuild_the_value() {
+    let schema = registered::<Mover>();
+    let codec = schema.codec();
+    let base = mover(10.0, false);
+    // Unchanged: one mask byte for five fields.
+    assert_eq!(codec.encode_compact_delta(&base, &base).unwrap(), [0]);
+    assert_eq!(codec.decode_compact_delta(&base, &[0]).unwrap(), base);
+    // Moving 0.25 m on one axis: field mask, nested mask, element mask and a
+    // one-step varint pair, rather than the whole record.
+    let moved = mover(10.25, true);
+    let delta = codec.encode_compact_delta(&moved, &base).unwrap();
+    let full = codec.encode_compact(&moved).unwrap();
+    assert!(delta.len() <= 5, "{delta:?}");
+    assert!(delta.len() < full.len() / 3, "{} vs {}", delta.len(), full.len());
+    assert_eq!(codec.decode_compact_delta(&base, &delta).unwrap(), moved);
+    // Variable-size fields are resent whole when they change.
+    let mut tagged = moved.clone();
+    tagged.tags = BoundedVec::new(vec![1, 2, 3]).unwrap();
+    tagged.label = BoundedString::new("veil").unwrap();
+    tagged.hp = 0.5;
+    let delta = codec.encode_compact_delta(&tagged, &moved).unwrap();
+    assert_eq!(codec.decode_compact_delta(&moved, &delta).unwrap(), tagged);
+    // A delta applied to the wrong base yields a different, still valid value:
+    // the stream, not the codec, guarantees both sides hold the same base.
+    assert_ne!(codec.decode_compact_delta(&base, &delta).unwrap(), tagged);
+}
+
+#[test]
+fn delta_masks_have_one_encoding() {
+    let schema = registered::<Mover>();
+    let codec = schema.codec();
+    let base = mover(1.0, false);
+    // Five fields use the low five bits; any higher bit is malformed.
+    assert_eq!(
+        codec.decode_compact_delta(&base, &[0b0010_0000]),
+        Err(SchemaError::InvalidEncoding)
+    );
+    assert_eq!(
+        codec.decode_compact_delta(&base, &[0, 0]),
+        Err(SchemaError::TrailingBytes)
+    );
+    assert_eq!(
+        codec.decode_compact_delta(&base, &[0b0000_0001]),
+        Err(SchemaError::Truncated)
+    );
+}
+
+#[test]
+fn enum_deltas_switch_to_whole_values_when_the_variant_changes() {
+    let schema = registered::<ThingRoot>();
+    let codec = schema.codec();
+    let marker = ThingRoot {
+        thing: Thing::Marker(Marker { slot: 3 }),
+    };
+    let first = ThingRoot {
+        thing: Thing::Mover(mover(2.0, false)),
+    };
+    let second = ThingRoot {
+        thing: Thing::Mover(mover(2.5, false)),
+    };
+    for (value, base) in [(&first, &marker), (&second, &first), (&marker, &second)] {
+        let delta = codec.encode_compact_delta(value, base).unwrap();
+        assert_eq!(&codec.decode_compact_delta(base, &delta).unwrap(), value);
+    }
+    let same_variant = codec.encode_compact_delta(&second, &first).unwrap();
+    let new_variant = codec.encode_compact_delta(&first, &marker).unwrap();
+    assert!(same_variant.len() < new_variant.len());
+}
+
+#[test]
+fn quantized_fields_round_to_their_declared_step() {
+    let schema = registered::<Pose>();
+    let codec = schema.codec();
+    let pose = Pose {
+        position: Quantized::array([1.0 / 3.0, -2.0]).unwrap(),
+        crouched: false,
+    };
+    let decoded = codec
+        .decode_compact(&codec.encode_compact(&pose).unwrap())
+        .unwrap();
+    assert_eq!(decoded, pose);
+    assert_eq!(decoded.position[0].get(), 341.0 / 1024.0);
+    // The schema fingerprint records the scale, so peers cannot disagree on it.
+    crate::schema! { struct Coarse(SchemaId(140),1,Representation::PublicPresentation) {
+        1 => position: [Quantized<16>; 2] = [Quantized::ZERO; 2] => FLOAT,
+        2 => crouched: bool = false => PLAIN,
+    }}
+    assert_ne!(
+        registered::<Pose>().codec().identity(),
+        registered::<Coarse>().codec().identity()
+    );
+}

@@ -19,6 +19,28 @@ pub trait CompactValue: FieldValue {
         work: &mut Work,
         depth: usize,
     ) -> Result<Self, SchemaError>;
+    /// Encode `self` against a `base` both peers already hold. Callers invoke
+    /// this only when the values differ; the default resends the whole value,
+    /// while records, arrays and quantized numbers send only what changed.
+    #[doc(hidden)]
+    fn write_compact_delta(
+        &self,
+        _base: &Self,
+        out: &mut Vec<u8>,
+        work: &mut Work,
+        depth: usize,
+    ) -> Result<(), SchemaError> {
+        self.write_compact(out, work, depth)
+    }
+    #[doc(hidden)]
+    fn read_compact_delta(
+        _base: &Self,
+        reader: &mut Reader<'_>,
+        work: &mut Work,
+        depth: usize,
+    ) -> Result<Self, SchemaError> {
+        Self::read_compact(reader, work, depth)
+    }
 }
 
 impl<S: Schema + CompactValue> SchemaCodec<S> {
@@ -46,6 +68,29 @@ impl<S: Schema + CompactValue> SchemaCodec<S> {
         record_size(&value, &mut Work::new(self.limits), 0)?;
         Ok(value)
     }
+
+    /// Encode only the fields of `value` that differ from `base`, which the
+    /// receiver must hold exactly. Equal values encode as an empty change set.
+    pub fn encode_compact_delta(&self, value: &S, base: &S) -> Result<Vec<u8>, SchemaError> {
+        let size = record_size(value, &mut Work::new(self.limits), 0)?;
+        record_size(base, &mut Work::new(self.limits), 0)?;
+        let mut bytes = Vec::with_capacity(size);
+        value.write_compact_delta(base, &mut bytes, &mut Work::new(self.limits), 0)?;
+        Ok(bytes)
+    }
+
+    /// Rebuild a value from `base` and its changed fields, then apply the same
+    /// field policies and budgets as a complete decode.
+    pub fn decode_compact_delta(&self, base: &S, bytes: &[u8]) -> Result<S, SchemaError> {
+        if bytes.len() > self.limits.wire_bytes {
+            return Err(SchemaError::WireBudget);
+        }
+        let mut reader = Reader::new(bytes);
+        let value = S::read_compact_delta(base, &mut reader, &mut Work::new(self.limits), 0)?;
+        reader.finish()?;
+        record_size(&value, &mut Work::new(self.limits), 0)?;
+        Ok(value)
+    }
 }
 
 macro_rules! scalar {
@@ -60,7 +105,44 @@ macro_rules! scalar {
         }
     )+};
 }
-scalar!(u8, u16, u32, u64, i8, i16, i32, i64, bool, f32, f64);
+scalar!(u8, u16, u32, u64, i8, i16, i32, i64, f32, f64);
+
+impl CompactValue for bool {
+    fn write_compact(
+        &self,
+        out: &mut Vec<u8>,
+        work: &mut Work,
+        depth: usize,
+    ) -> Result<(), SchemaError> {
+        self.write(out, work, depth)
+    }
+    fn read_compact(
+        reader: &mut Reader<'_>,
+        work: &mut Work,
+        depth: usize,
+    ) -> Result<Self, SchemaError> {
+        Self::read(reader.take(1)?, work, depth)
+    }
+    /// A changed boolean is the other value, so its delta carries no bytes.
+    fn write_compact_delta(
+        &self,
+        _: &Self,
+        _: &mut Vec<u8>,
+        work: &mut Work,
+        depth: usize,
+    ) -> Result<(), SchemaError> {
+        work.node(depth)
+    }
+    fn read_compact_delta(
+        base: &Self,
+        _: &mut Reader<'_>,
+        work: &mut Work,
+        depth: usize,
+    ) -> Result<Self, SchemaError> {
+        work.node(depth)?;
+        Ok(!base)
+    }
+}
 
 impl<T: CompactValue, const N: usize> CompactValue for [T; N] {
     fn write_compact(
@@ -87,6 +169,49 @@ impl<T: CompactValue, const N: usize> CompactValue for [T; N] {
         let mut values = Vec::with_capacity(N);
         for _ in 0..N {
             values.push(T::read_compact(reader, work, depth + 1)?);
+        }
+        values.try_into().map_err(|_| SchemaError::CountBudget)
+    }
+    fn write_compact_delta(
+        &self,
+        base: &Self,
+        out: &mut Vec<u8>,
+        work: &mut Work,
+        depth: usize,
+    ) -> Result<(), SchemaError> {
+        work.node(depth)?;
+        work.count(N)?;
+        let mut mask = ChangeMask::new(N)?;
+        for (index, (value, base)) in self.iter().zip(base).enumerate() {
+            if value != base {
+                mask.set(index);
+            }
+        }
+        work.append(out, mask.bytes())?;
+        for (index, (value, base)) in self.iter().zip(base).enumerate() {
+            if mask.get(index) {
+                value.write_compact_delta(base, out, work, depth + 1)?;
+            }
+        }
+        Ok(())
+    }
+    fn read_compact_delta(
+        base: &Self,
+        reader: &mut Reader<'_>,
+        work: &mut Work,
+        depth: usize,
+    ) -> Result<Self, SchemaError> {
+        work.node(depth)?;
+        work.count(N)?;
+        work.reserve::<T>(N)?;
+        let mask = ChangeMask::read(reader, N)?;
+        let mut values = Vec::with_capacity(N);
+        for (index, base) in base.iter().enumerate() {
+            values.push(if mask.get(index) {
+                T::read_compact_delta(base, reader, work, depth + 1)?
+            } else {
+                base.clone()
+            });
         }
         values.try_into().map_err(|_| SchemaError::CountBudget)
     }
@@ -223,5 +348,42 @@ impl CompactValue for () {
         depth: usize,
     ) -> Result<Self, SchemaError> {
         work.node(depth)
+    }
+}
+
+/// One bit per field or element, in wire order, naming what a delta carries.
+#[doc(hidden)]
+pub struct ChangeMask {
+    bytes: [u8; 32],
+    count: usize,
+}
+impl ChangeMask {
+    pub fn new(count: usize) -> Result<Self, SchemaError> {
+        if count > 256 {
+            return Err(SchemaError::CountBudget);
+        }
+        Ok(Self {
+            bytes: [0; 32],
+            count,
+        })
+    }
+    pub fn set(&mut self, index: usize) {
+        self.bytes[index / 8] |= 1 << (index % 8);
+    }
+    pub fn get(&self, index: usize) -> bool {
+        self.bytes[index / 8] & (1 << (index % 8)) != 0
+    }
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes[..self.count.div_ceil(8)]
+    }
+    /// Bits past `count` are rejected so every delta has one encoding.
+    pub fn read(reader: &mut Reader<'_>, count: usize) -> Result<Self, SchemaError> {
+        let mut mask = Self::new(count)?;
+        let bytes = reader.take(count.div_ceil(8))?;
+        mask.bytes[..bytes.len()].copy_from_slice(bytes);
+        if count % 8 != 0 && bytes.last().is_some_and(|last| last >> (count % 8) != 0) {
+            return Err(SchemaError::InvalidEncoding);
+        }
+        Ok(mask)
     }
 }

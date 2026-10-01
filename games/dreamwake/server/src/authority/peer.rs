@@ -37,6 +37,40 @@ pub(super) struct EgressCounters {
     pub allowance_limited: u64,
 }
 
+/// Late actions a connection may have waiting at once; more expire.
+pub(super) const MAX_LATE_ACTIONS: usize = 4;
+
+/// Which commands have reached the server: every sequence through a
+/// watermark, plus a bounded set of later ones that arrived first.
+#[derive(Debug, Default)]
+pub(super) struct Received {
+    through: u64,
+    above: BTreeSet<u64>,
+}
+impl Received {
+    /// Sequences tracked beyond the watermark; a gap wider than this is far
+    /// outside anything the client still repeats.
+    const WINDOW: u64 = 256;
+    pub fn through(&self) -> CommandSeq {
+        CommandSeq(self.through)
+    }
+    pub fn mark(&mut self, sequence: CommandSeq) {
+        let sequence = sequence.0;
+        if sequence <= self.through {
+            return;
+        }
+        if sequence > self.through + Self::WINDOW {
+            // The client has moved on past a gap that can never fill.
+            self.through = sequence - Self::WINDOW;
+            self.above.retain(|&seen| seen > sequence - Self::WINDOW);
+        }
+        self.above.insert(sequence);
+        while self.above.remove(&(self.through + 1)) {
+            self.through += 1;
+        }
+    }
+}
+
 /// Entities a connection can hold at once: every relevant actor plus the
 /// owner and match summary.
 const MAX_STREAM_ENTITIES: usize = 4096;
@@ -65,6 +99,14 @@ pub(super) struct Peer {
     pub last_backend_drops: u64,
     pub menu_received: CommandSeq,
     pub menu_applied: Option<CommandSeq>,
+    pub received: Received,
+    /// Late actions waiting for a tick without one of its own, with whether
+    /// their outcome was reserved on the overload ledger.
+    pub late_actions: VecDeque<(
+        CommandSeq,
+        engine_net::commands::ActionEdge<DreamAction>,
+        bool,
+    )>,
     pub menus: VecDeque<(CommandSeq, DreamAction)>,
     pub messages: usize,
     pub input_messages: usize,
@@ -102,6 +144,8 @@ impl Peer {
             last_backend_drops: 0,
             menu_received: CommandSeq(0),
             menu_applied: None,
+            received: Received::default(),
+            late_actions: VecDeque::new(),
             menus: VecDeque::new(),
             messages: 0,
             input_messages: 0,
@@ -135,5 +179,28 @@ impl Peer {
     /// state can start replacing prediction.
     pub fn holds_owner(&self) -> bool {
         self.stream.base(self.welcome.owner_entity).is_some()
+    }
+}
+
+#[cfg(test)]
+mod received_tests {
+    use super::*;
+
+    #[test]
+    fn the_watermark_advances_only_through_contiguous_arrivals() {
+        let mut received = Received::default();
+        received.mark(CommandSeq(2));
+        assert_eq!(received.through(), CommandSeq(0));
+        received.mark(CommandSeq(1));
+        assert_eq!(received.through(), CommandSeq(2));
+        received.mark(CommandSeq(2));
+        received.mark(CommandSeq(4));
+        assert_eq!(received.through(), CommandSeq(2));
+        received.mark(CommandSeq(3));
+        assert_eq!(received.through(), CommandSeq(4));
+        // A gap the client can no longer fill is passed rather than held.
+        received.mark(CommandSeq(1_000));
+        assert_eq!(received.through(), CommandSeq(1_000 - Received::WINDOW));
+        assert!(received.above.len() <= Received::WINDOW as usize);
     }
 }

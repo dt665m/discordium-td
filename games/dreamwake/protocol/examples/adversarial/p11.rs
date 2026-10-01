@@ -43,7 +43,7 @@ pub fn cases(command: &live::InputRecord) -> (Vec<SchemaCase>, Vec<SchemaCase>) 
         "valid_beam_hold",
         "valid_beam_stop",
         "future_beam_hold",
-        "nonfinite_beam_hold",
+        "overlong_beam_hold",
     ] {
         let mut view = view;
         let mut aim = [1.0, 0.0];
@@ -52,7 +52,9 @@ pub fn cases(command: &live::InputRecord) -> (Vec<SchemaCase>, Vec<SchemaCase>) 
             "future_view" | "future_beam_hold" => view.viewed_at = ServerTick(11),
             "zero_sample" => view.sampled_at = ServerTick(0),
             "zero_reference" => view.reference = 0,
-            "nonfinite_aim" | "nonfinite_beam_hold" => aim[0] = f32::NAN,
+            "nonfinite_aim" => aim[0] = f32::NAN,
+            // A held beam aim has no non-finite wire form.
+            "overlong_beam_hold" => aim[0] = 2.0,
             "invalid_slot" => slot = 8,
             _ => {}
         }
@@ -78,13 +80,16 @@ pub fn cases(command: &live::InputRecord) -> (Vec<SchemaCase>, Vec<SchemaCase>) 
             }])
             .unwrap();
         }
-        let bytes = framed(
+        let bytes = live::encode_input_unvalidated(
             &live::InputPacket {
                 ack: StreamAck::default(),
                 records: BoundedVec::new(vec![record]).unwrap(),
             },
-            Lane::Input,
-        );
+            EPOCH,
+            1,
+            limit(),
+        )
+        .unwrap();
         commands.push(SchemaCase {
             root: "dreamlance",
             mutation,

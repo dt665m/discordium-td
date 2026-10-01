@@ -257,14 +257,6 @@ fn startup_options() -> (u64, Playtest, network::NetworkOptions, DreamConnection
     {
         panic!("trace chunk/interval options require --network-trace PATH");
     }
-    // Only the WebRTC path has datagrams beneath its own transport to impair;
-    // silently ignoring the flag would make a UDP run look like a WAN run.
-    if options.link_impairment.is_some()
-        && options.transport != network::NativeTransportKind::WebRtc
-    {
-        eprintln!("--link-impairment requires --transport webrtc");
-        std::process::exit(2);
-    }
     if playtest.autoplay && !options.auto_connect {
         options.auto_host = true;
     }

@@ -1,14 +1,5 @@
 use super::*;
 
-// Form hostile wire payloads without letting the safe encoder reject them first.
-#[derive(Serialize)]
-struct Unchecked<T>(T);
-impl<T> Validate for Unchecked<T> {
-    fn validate(&self) -> Result<(), CodecError> {
-        Ok(())
-    }
-}
-
 fn entity(index: u64) -> EntityId {
     EntityId {
         index,
@@ -44,13 +35,15 @@ fn record(sequence: u64) -> InputRecord {
     InputRecord {
         sequence: CommandSeq(sequence),
         target: TargetTick(10 + sequence),
-        input: DreamInput {
-            movement: [0.6, 0.8],
-            aim: [1.0, 0.0],
-            attack: true,
-            ..Default::default()
-        }
-        .into(),
+        input: quantize_tick_input(
+            DreamInput {
+                movement: [0.6, 0.8],
+                aim: [1.0, 0.0],
+                attack: true,
+                ..Default::default()
+            }
+            .into(),
+        ),
         actions: BoundedVec::new(vec![ActionEdge {
             slot: 0,
             action: DreamAction::Dash {
@@ -76,6 +69,7 @@ fn state() -> StatePacket {
         status: OwnerStatus {
             finalized: ServerTick(1230),
             menu_applied: Some(CommandSeq(3)),
+            received: CommandSeq(8),
             arrival: ArrivalFeedback {
                 sample: Some(ArrivalSample {
                     sequence: CommandSeq(9),
@@ -188,21 +182,15 @@ fn input_packets_round_trip_and_reject_invalid_records() {
             encode_input(&packet, ConnectionEpoch(2), 1, limit()).is_err(),
             "{change}"
         );
-        let payload = codec::encode_payload(&Unchecked(&packet), limit().payload_bytes()).unwrap();
-        let frame = codec::encode_frame(
-            FrameHeader {
-                lane: Lane::Input,
-                connection: ConnectionEpoch(2),
-                sequence: 1,
-            },
-            &payload,
-            limit(),
-        )
-        .unwrap();
-        assert!(
-            decode_input(&frame, ConnectionEpoch(2), limit()).is_err(),
-            "{change}"
-        );
+        // Non-finite axes have no wire form, and held edges are not carried;
+        // whatever does reach the wire never decodes into the invalid record.
+        if let Ok(frame) = encode_input_unvalidated(&packet, ConnectionEpoch(2), 1, limit()) {
+            assert!(
+                decode_input(&frame, ConnectionEpoch(2), limit())
+                    .map_or(true, |decoded| decoded != packet),
+                "{change}"
+            );
+        }
     }
     let repeated = input(vec![record(1), record(1)]);
     assert!(encode_input(&repeated, ConnectionEpoch(2), 1, limit()).is_err());
@@ -303,4 +291,68 @@ fn charge_is_an_explicit_edge_and_never_a_held_duration() {
     }])
     .unwrap();
     assert!(edge.valid());
+}
+
+#[test]
+fn a_full_input_packet_fits_one_application_frame() {
+    // Every record distinct, aimed differently and carrying an action: the
+    // least compressible packet the client sends.
+    let records = (1..=MAX_INPUT_RECORDS as u64)
+        .map(|sequence| {
+            let angle = sequence as f32 * 0.37;
+            let mut record = record(sequence);
+            record.input = quantize_tick_input(
+                DreamInput {
+                    movement: [angle.cos(), angle.sin()],
+                    aim: [(angle * 1.7).sin(), (angle * 1.7).cos()],
+                    attack: sequence % 2 == 0,
+                    ..Default::default()
+                }
+                .into(),
+            );
+            record
+        })
+        .collect();
+    let packet = input(records);
+    let wire = encode_input(&packet, ConnectionEpoch(2), 3, input_limit()).unwrap();
+    assert!(
+        wire.len() <= APPLICATION_FRAME_BYTES,
+        "{} bytes",
+        wire.len()
+    );
+    assert_eq!(
+        decode_input(&wire, ConnectionEpoch(2), input_limit()).unwrap(),
+        packet
+    );
+}
+
+#[test]
+fn repeated_input_records_cost_a_few_bytes_each() {
+    // A player holding one direction: contiguous commands, newest first, with
+    // the same input and no actions.
+    let records = (1..=MAX_INPUT_RECORDS as u64)
+        .rev()
+        .map(|sequence| {
+            let mut record = record(sequence);
+            record.actions = BoundedVec::default();
+            record
+        })
+        .collect();
+    let packet = input(records);
+    let wire = encode_input(&packet, ConnectionEpoch(2), 3, input_limit()).unwrap();
+    assert!(wire.len() <= 200, "{} bytes", wire.len());
+    assert_eq!(
+        decode_input(&wire, ConnectionEpoch(2), input_limit()).unwrap(),
+        packet
+    );
+}
+
+#[test]
+fn input_off_the_grid_is_not_encoded() {
+    let mut off = record(1);
+    off.input.held.movement = [0.6, 0.8];
+    assert!(encode_input(&input(vec![off]), ConnectionEpoch(2), 1, input_limit()).is_err());
+    let on = quantize_direction([0.6, 0.8]);
+    assert!(f64::from(on[0]).hypot(f64::from(on[1])) <= 1.0);
+    assert_eq!(quantize_direction(on), on);
 }

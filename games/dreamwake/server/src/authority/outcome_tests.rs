@@ -48,17 +48,20 @@ fn terminal_duplicate_late_and_reconnect_lookup_do_not_reexecute() {
         Some(terminal.clone())
     );
     assert_eq!(authority.sim.snapshot_for(owner), snapshot);
+    // A late action is not discarded: it runs on the next tick without an
+    // action of its own and receives the game's verdict there, once.
     let late = command(&authority, 2, 1);
     let late_key = late.action_key(0);
+    submit(&mut authority, late.clone());
+    assert!(authority.outcomes.lookup(owner, late_key).is_none());
+    authority.step(Duration::from_millis(51));
+    let late_terminal = authority.outcomes.lookup(owner, late_key).unwrap();
+    assert_ne!(late_terminal.data.status, live::TerminalStatus::Expired);
     submit(&mut authority, late);
+    authority.step(Duration::from_millis(68));
     assert_eq!(
-        authority
-            .outcomes
-            .lookup(owner, late_key)
-            .unwrap()
-            .data
-            .status,
-        live::TerminalStatus::Expired
+        authority.outcomes.lookup(owner, late_key),
+        Some(late_terminal)
     );
     authority.disconnect(41);
     assert_eq!(authority.outcomes.lookup(owner, key), Some(terminal));

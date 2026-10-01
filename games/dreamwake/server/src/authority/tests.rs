@@ -384,7 +384,7 @@ impl TestClient {
             self.unconsumed.push_back(live::InputRecord {
                 sequence: CommandSeq(self.commands),
                 target,
-                input: self.held.into(),
+                input: live::quantize_tick_input(self.held.into()),
                 actions: BoundedVec::new(actions).unwrap(),
             });
             while self.unconsumed.len() > 64 {

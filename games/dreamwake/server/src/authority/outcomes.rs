@@ -62,8 +62,8 @@ impl Outcomes {
             .map(wire)
     }
     pub fn can_consume_bundle(&self, owner: u64) -> bool {
-        // A legal bundle may introduce 8 commands with 8 edges each. Existing
-        // duplicates need less, but this gate reserves the conservative new work.
+        // Room for a bundle's new commands; one that runs out partway stops
+        // there, and its remaining commands repeat in the next packet.
         self.normal.available_for(owner) >= 64 || self.overload.available_for(owner) >= 64
     }
     pub fn expire(&mut self, tick: ServerTick) {

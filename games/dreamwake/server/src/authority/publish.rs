@@ -149,6 +149,7 @@ fn peer_state(
     let status = live::OwnerStatus {
         finalized: peer.inbox.finalized_through(),
         menu_applied: peer.menu_applied,
+        received: peer.received.through(),
         arrival: peer.arrival,
     };
     let target = live::APPLICATION_FRAME_BYTES;

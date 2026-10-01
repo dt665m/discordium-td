@@ -91,6 +91,12 @@ impl Transport {
             Self::WebRtc(transport) => transport.send_packets(renet),
         }
     }
+    pub(crate) fn egress_stats(&self) -> renet_cross::EgressStats {
+        match self {
+            Self::Udp(transport) => transport.egress_stats(),
+            Self::WebRtc(transport) => transport.egress_stats(),
+        }
+    }
 }
 #[cfg(target_arch = "wasm32")]
 type Transport = renet_cross::WebRtcNetcodeClientTransport;
@@ -115,16 +121,20 @@ pub struct NetworkOptions {
     #[cfg(not(target_arch = "wasm32"))]
     pub link_impairment: Option<renet_cross::LinkImpairment>,
 }
-/// `DELAY_MS:JITTER_MS:LOSS_PERCENT`, applied in each direction.
+/// `DELAY_MS:JITTER_MS:LOSS_PERCENT` followed by optional comma-separated
+/// `burst=MEAN_DATAGRAMS`, `rate=BYTES_PER_SECOND`, `queue=BYTES` and
+/// `spike=EVERY_MS/LASTING_MS/DELAY_MS[/JITTER_MS]`, applied in each direction.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn parse_link_impairment(
     value: &str,
     seed: u64,
 ) -> Result<renet_cross::LinkImpairment, String> {
-    let parts: Vec<_> = value.split(':').collect();
+    let mut fields = value.split(',');
+    let base = fields.next().unwrap_or_default();
+    let parts: Vec<_> = base.split(':').collect();
     let [delay, jitter, loss] = parts.as_slice() else {
         return Err(format!(
-            "link impairment '{value}' must be DELAY_MS:JITTER_MS:LOSS_PERCENT"
+            "link impairment '{value}' must start DELAY_MS:JITTER_MS:LOSS_PERCENT"
         ));
     };
     let millis = |text: &str| {
@@ -137,12 +147,55 @@ pub fn parse_link_impairment(
         .ok()
         .filter(|percent| (0.0..=100.0).contains(percent))
         .ok_or_else(|| format!("loss '{loss}' is not a percentage"))?;
-    Ok(renet_cross::LinkImpairment {
+    let mut link = renet_cross::LinkImpairment {
         delay: millis(delay)?,
         jitter: millis(jitter)?,
         loss: loss / 100.0,
         seed,
-    })
+        ..Default::default()
+    };
+    for field in fields {
+        let (key, value) = field
+            .split_once('=')
+            .ok_or_else(|| format!("'{field}' is not KEY=VALUE"))?;
+        let whole = |text: &str| {
+            text.parse::<u64>()
+                .map_err(|_| format!("'{text}' is not a whole number"))
+        };
+        match key {
+            "burst" => {
+                link.loss_burst = value
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|burst| burst.is_finite() && *burst >= 1.0)
+                    .ok_or_else(|| format!("burst '{value}' must be at least 1"))?
+            }
+            "rate" => link.rate_bytes_per_second = whole(value)?,
+            "queue" => {
+                link.queue_bytes = usize::try_from(whole(value)?).map_err(|e| e.to_string())?
+            }
+            "spike" => {
+                let parts: Vec<_> = value.split('/').collect();
+                let (every, lasting, delay, jitter) = match parts.as_slice() {
+                    [every, lasting, delay] => (every, lasting, delay, &"0"),
+                    [every, lasting, delay, jitter] => (every, lasting, delay, jitter),
+                    _ => {
+                        return Err(format!(
+                            "spike '{value}' must be EVERY_MS/LASTING_MS/DELAY_MS[/JITTER_MS]"
+                        ));
+                    }
+                };
+                link.spike = Some(renet_cross::DelaySpike {
+                    every: millis(every)?,
+                    lasting: millis(lasting)?,
+                    delay: millis(delay)?,
+                    jitter: millis(jitter)?,
+                });
+            }
+            _ => return Err(format!("unknown link impairment field '{key}'")),
+        }
+    }
+    Ok(link)
 }
 #[derive(Clone)]
 pub(crate) struct PendingFrame {
@@ -303,7 +356,12 @@ pub fn connect(world: &mut World, attempts: u32) {
                             ..Default::default()
                         },
                     )
-                    .map(|(renet, transport, id)| (renet, Transport::Udp(transport), id)),
+                    .and_then(|(renet, mut transport, id)| {
+                        transport
+                            .set_link_impairment(link)
+                            .map_err(renet_cross::NativeClientError::from)?;
+                        Ok((renet, Transport::Udp(transport), id))
+                    }),
                     NativeTransportKind::WebRtc => {
                         renet_cross::connect_webrtc_via_session_http_blocking(
                             &base,
@@ -316,9 +374,11 @@ pub fn connect(world: &mut World, attempts: u32) {
                                 ..Default::default()
                             },
                         )
-                        .map(|(renet, mut transport, id)| {
-                            transport.set_link_impairment(link);
-                            (renet, Transport::WebRtc(transport), id)
+                        .and_then(|(renet, mut transport, id)| {
+                            transport
+                                .set_link_impairment(link)
+                                .map_err(renet_cross::NativeClientError::from)?;
+                            Ok((renet, Transport::WebRtc(transport), id))
                         })
                     }
                 }
@@ -1076,18 +1136,17 @@ fn predict_and_send(world: &mut World) {
     }
     world.insert_non_send(runtime);
 }
-/// Commands the newest input packet repeats right behind the newest one, so a
-/// short burst of loss costs nothing.
-const RECENT_RECORDS: usize = 3;
-/// Commands the server has not consumed yet, oldest first, repeated in every
-/// packet until it confirms them, as Unreal resends its oldest unacknowledged
-/// important move.
-const OLDEST_RECORDS: usize = 3;
-
-/// One input packet per simulation tick: the acknowledgement of state received
-/// so far, the newest commands and the oldest the server has not consumed. A
-/// tick without commands, such as while joining, still sends the
+/// One input packet every other simulation tick: the acknowledgement of state received
+/// so far and every command the server has not yet reported receiving and can
+/// still use, newest first, up to the lead cap (the input redundancy Overwatch
+/// describes). A
+/// burst of loss costs nothing as long as a later packet arrives before the
+/// lost commands' targets, and a command stops travelling once the server has
+/// it. A tick without commands, such as while joining, still sends the
 /// acknowledgement the server uses to send deltas and to activate the hero.
+/// Ticks behind the estimated server tick a command's target may be and still
+/// be sent: the estimate is only an estimate.
+const USABLE_TARGET_MARGIN_TICKS: u64 = 2;
 fn send_input(runtime: &mut Runtime, commands: &[InputCommand]) -> Result<(), String> {
     let Some(session) = &mut runtime.prediction else {
         return Ok(());
@@ -1098,29 +1157,32 @@ fn send_input(runtime: &mut Runtime, commands: &[InputCommand]) -> Result<(), St
     if !runtime.renet.is_connected() {
         return Ok(());
     }
-    let mut records: Vec<InputRecord> = Vec::new();
-    let recent = runtime
+    // Every other tick: each packet repeats the commands still unreceived, so
+    // halving the packets halves their header cost (about 80 bytes each over
+    // WebRTC) without losing a command. A new action goes out at once.
+    let urgent = commands
+        .iter()
+        .any(|command| !command.actions.as_slice().is_empty());
+    if session.input_sent_last_tick && !urgent {
+        session.input_sent_last_tick = false;
+        return Ok(());
+    }
+    session.input_sent_last_tick = true;
+    let received = session.status.received;
+    // A command whose target the server has already passed can no longer be
+    // used, whatever the acknowledgements say. Bounding by target keeps the
+    // packet at about the lead even while status packets are being lost.
+    let usable = session
+        .estimated_server_tick
+        .map_or(0, |tick| tick.0.saturating_sub(USABLE_TARGET_MARGIN_TICKS));
+    let records: Vec<InputRecord> = runtime
         .pending
         .iter()
         .rev()
-        .take(RECENT_RECORDS)
-        .map(|frame| &frame.command);
-    let oldest = runtime
-        .pending
-        .iter()
-        .take(OLDEST_RECORDS)
-        .map(|frame| &frame.command);
-    for command in commands.iter().rev().chain(recent).chain(oldest) {
-        if records.len() == MAX_INPUT_RECORDS {
-            break;
-        }
-        if !records
-            .iter()
-            .any(|record| record.sequence == command.sequence)
-        {
-            records.push(InputRecord::from_command(command));
-        }
-    }
+        .take_while(|frame| frame.command.sequence > received && frame.command.target.0 > usable)
+        .take(MAX_INPUT_RECORDS)
+        .map(|frame| InputRecord::from_command(&frame.command))
+        .collect();
     let bytes = session.input(records)?;
     runtime.renet.send_message(INPUT_CHANNEL, bytes);
     Ok(())
@@ -1215,7 +1277,9 @@ fn generate_commands(runtime: &mut Runtime, now: Duration) -> Result<Vec<InputCo
             owner: session.welcome.stream,
             sequence: session.sequence,
             target: TargetTick(tick),
-            input: sample.held,
+            // On the input grid, so this prediction and the server read the
+            // same input.
+            input: quantize_tick_input(sample.held),
             actions,
         };
         runtime

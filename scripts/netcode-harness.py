@@ -46,7 +46,9 @@ latest_trace = SPATIAL["latest_trace"]
 save_json = SPATIAL["save_json"]
 
 TRANSPORTS = ("udp", "webrtc")
-# Conditioner values are per direction, so "wan" is about 150 ms round trip.
+# Link values are per direction, so "wan" is about 150 ms round trip. `link`
+# adds the client's optional impairment fields; `path_rtt_ms` is the worst
+# round trip the path itself imposes, when it differs from its base delay.
 SCENARIOS = {
     "clean": {"delay_ms": 0, "jitter_ms": 0, "loss_percent": 0, "stall": None},
     "stall": {"delay_ms": 0, "jitter_ms": 0, "loss_percent": 0, "stall": "500@5"},
@@ -54,6 +56,20 @@ SCENARIOS = {
     "wan-stall": {"delay_ms": 75, "jitter_ms": 10, "loss_percent": 1, "stall": "500@5"},
     # A long path with the light loss typical of wired and good Wi-Fi links.
     "wan-light": {"delay_ms": 75, "jitter_ms": 10, "loss_percent": 0.3, "stall": None},
+    # An access link far slower than the server's configured rate, with a
+    # quarter second of buffer each way. Only its base delay counts toward the
+    # round-trip gate: a sender that fills the buffer shows as queueing.
+    "capped": {"delay_ms": 40, "jitter_ms": 5, "loss_percent": 0, "stall": None,
+               "link": "rate=24000,queue=6000"},
+    # Losses in runs of about six datagrams.
+    "burst": {"delay_ms": 50, "jitter_ms": 5, "loss_percent": 2, "stall": None,
+              "link": "burst=6"},
+    # Round trip rising from about 110 to 610 ms for 1.5 s of every 8 s.
+    "spikes": {"delay_ms": 50, "jitter_ms": 5, "loss_percent": 0.5, "stall": None,
+               "link": "spike=8000/1500/250", "path_rtt_ms": 610},
+    # Short delay, bursty loss and periodic jitter bursts, like a busy Wi-Fi.
+    "wifi": {"delay_ms": 15, "jitter_ms": 10, "loss_percent": 1, "stall": None,
+             "link": "burst=4,spike=6000/600/40/60", "path_rtt_ms": 250},
 }
 PLAYERS = (2001, 2002)
 # Visible corrections are tolerated only at a rate a player would not notice
@@ -179,16 +195,15 @@ def run_scenario(transport: str, name: str, directory: Path, duration: float, se
         "--udp-bind", f"127.0.0.1:{udp}", "--public-udp-addr", f"127.0.0.1:{udp}",
         "--webrtc-bind", f"127.0.0.1:{webrtc}", "--public-webrtc-addr", f"127.0.0.1:{webrtc}",
     ]
-    # UDP has no transport of its own under netcode, so the server conditioner
-    # is its network. WebRTC must be impaired beneath DTLS and SCTP instead:
-    # conditioning above the data channel leaves SCTP on an ideal link, where
-    # its congestion control never engages and no sender backlog can form.
+    # Both transports are impaired as raw datagrams at the client, beneath
+    # netcode, DTLS and SCTP, on a thread that keeps running while the client
+    # stalls. Conditioning above the data channel would leave SCTP on an ideal
+    # link, where its congestion control never engages.
     link = f'{scenario["delay_ms"]}:{scenario["jitter_ms"]}:{scenario["loss_percent"]}'
-    impaired = any(scenario[key] for key in ("delay_ms", "jitter_ms", "loss_percent"))
-    if transport == "udp":
-        server_command += ["--net-delay-ms", str(scenario["delay_ms"]),
-                           "--net-jitter-ms", str(scenario["jitter_ms"]),
-                           "--net-loss-percent", str(scenario["loss_percent"])]
+    if scenario.get("link"):
+        link += "," + scenario["link"]
+    impaired = bool(scenario.get("link")) or any(
+        scenario[key] for key in ("delay_ms", "jitter_ms", "loss_percent"))
     # Diagnostic only: extra server flags for one-off comparisons.
     server_command += os.environ.get("NETCODE_HARNESS_SERVER_ARGS", "").split()
     sides = ("left", "right")
@@ -201,7 +216,7 @@ def run_scenario(transport: str, name: str, directory: Path, duration: float, se
             "--quit-after", str(duration)]
         if scenario["stall"]:
             command += ["--inject-stall", scenario["stall"]]
-        if transport == "webrtc" and impaired:
+        if impaired:
             command += ["--link-impairment", link]
         client_commands.append(command)
     result = {"transport": transport, "scenario": name, "conditions": scenario,
@@ -245,7 +260,8 @@ def run_scenario(transport: str, name: str, directory: Path, duration: float, se
     # A stalled client answers nothing until it resumes, so its round-trip
     # samples include the stall itself; that is not the network queueing.
     stall_ms = float(scenario["stall"].split("@")[0]) if scenario["stall"] else 0.0
-    rtt_limit = 2 * (scenario["delay_ms"] + scenario["jitter_ms"]) + RTT_HEADROOM_MS + stall_ms
+    path_rtt = scenario.get("path_rtt_ms", 2 * (scenario["delay_ms"] + scenario["jitter_ms"]))
+    rtt_limit = path_rtt + RTT_HEADROOM_MS + stall_ms
     result["clients"] = [judge_client(side, latest_trace(directory / f"{side}.ndjson"),
                                       transports_seen(directory / f"{side}.ndjson"),
                                       transport, scenario["stall"], code, duration,

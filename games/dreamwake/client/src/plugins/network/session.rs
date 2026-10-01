@@ -122,6 +122,8 @@ pub(crate) struct Session {
     pub(super) autoplay_edges: [bool; 5],
     pub(super) control_sequence: u32,
     pub(super) input_sequence: u32,
+    /// The last tick sent an input packet; this one may wait for the next.
+    pub(super) input_sent_last_tick: bool,
     pub(super) last_probe: Duration,
 }
 impl Session {
@@ -262,6 +264,7 @@ impl Session {
             autoplay_edges: [false; 5],
             control_sequence: 0,
             input_sequence: 0,
+            input_sent_last_tick: false,
             last_probe: Duration::ZERO,
             poses: super::presentation::RemotePoses::new(epoch, welcome.content.scene_revision)
                 .map_err(|e| format!("remote presentation: {e:?}"))?,
@@ -564,18 +567,30 @@ impl Session {
         .map_err(err)
     }
     /// One input packet: the stream acknowledgement and the given records.
-    pub(super) fn input(&mut self, records: Vec<InputRecord>) -> Result<Vec<u8>, String> {
+    /// One input packet: the stream acknowledgement and as many of the given
+    /// records, newest first, as fit one application frame.
+    pub(super) fn input(&mut self, mut records: Vec<InputRecord>) -> Result<Vec<u8>, String> {
         self.input_sequence = self.input_sequence.wrapping_add(1);
-        encode_input(
-            &InputPacket {
-                ack: self.stream.ack(),
-                records: BoundedVec::new(records).map_err(err)?,
-            },
-            self.welcome.stream.epoch,
-            self.input_sequence,
-            self.welcome.frame_limit().map_err(err)?,
-        )
-        .map_err(err)
+        let frame = usize::from(self.welcome.application_frame_bytes);
+        loop {
+            let encoded = encode_input(
+                &InputPacket {
+                    ack: self.stream.ack(),
+                    records: BoundedVec::new(records.clone()).map_err(err)?,
+                },
+                self.welcome.stream.epoch,
+                self.input_sequence,
+                input_limit(),
+            );
+            match encoded {
+                Ok(bytes) if bytes.len() <= frame => return Ok(bytes),
+                Ok(_) | Err(engine_net::codec::CodecError::Oversized) if records.len() > 1 => {
+                    records.pop();
+                }
+                Ok(_) => return Err("input record exceeds the application frame".into()),
+                Err(error) => return Err(err(error)),
+            }
+        }
     }
     #[cfg(test)]
     pub(super) fn stream_ack(&self) -> engine_net::replication::stream::StreamAck {

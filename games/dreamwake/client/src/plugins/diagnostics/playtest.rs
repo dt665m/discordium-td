@@ -201,6 +201,16 @@ fn record_trace(
     record["predicted_ticks_this_frame"] =
         serde_json::json!(session.map(|s| s.predicted_ticks_this_frame));
     record["gameplay_tick"] = serde_json::json!(view.tick);
+    // The client's own sending: what its delay controller allows and what it
+    // dropped for that.
+    record["egress"] = serde_json::json!(runtime.map(|r| {
+        let egress = r.transport.egress_stats();
+        serde_json::json!({
+            "controlled_bytes_per_second": egress.controlled_bytes_per_second,
+            "pacing_drops": egress.pacing_drops,
+            "sent_packets": egress.sent_packets,
+        })
+    }));
     // Player-facing health, read from the display contract only. These are the
     // fields a qualification gate may rely on; everything above describes the
     // current network implementation and can change with it.

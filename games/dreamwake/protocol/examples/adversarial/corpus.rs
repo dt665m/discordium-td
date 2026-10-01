@@ -105,13 +105,15 @@ impl Corpus {
         let base_record = live::InputRecord {
             sequence: CommandSeq(1),
             target: TargetTick(11),
-            input: DreamInput {
-                movement: [0.6, 0.8],
-                aim: [1.0, 0.0],
-                attack: true,
-                ..Default::default()
-            }
-            .into(),
+            input: live::quantize_tick_input(
+                DreamInput {
+                    movement: [0.6, 0.8],
+                    aim: [1.0, 0.0],
+                    attack: true,
+                    ..Default::default()
+                }
+                .into(),
+            ),
             actions: BoundedVec::new(vec![ActionEdge {
                 slot: 0,
                 action: DreamAction::Dash {
@@ -195,6 +197,7 @@ impl Corpus {
                 status: live::OwnerStatus {
                     finalized: ServerTick(9),
                     menu_applied: Some(CommandSeq(1)),
+                    received: CommandSeq(1),
                     arrival: Default::default(),
                 },
                 entries: vec![
@@ -217,16 +220,23 @@ impl Corpus {
         .unwrap();
         let compressed = engine_net::encode(&BoundedVec::<u8, 16384>::new(vec![0; 8192]).unwrap());
         let mut nonfinite = Vec::new();
-        for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, f32::MAX] {
+        // Non-finite axes have no wire form; these are on the grid but longer
+        // than a unit direction, out to the furthest the wire can express.
+        for invalid in [[1.0, 1.0], [2.0, 0.0], [-1000.0, 0.0], [0.0, 500_000.0]] {
             let mut bad = base_record.clone();
-            bad.input.held.movement[0] = invalid;
-            nonfinite.push(p11::framed(
-                &live::InputPacket {
-                    ack: StreamAck::default(),
-                    records: BoundedVec::new(vec![bad]).unwrap(),
-                },
-                Lane::Input,
-            ));
+            bad.input.held.movement = invalid;
+            nonfinite.push(
+                live::encode_input_unvalidated(
+                    &live::InputPacket {
+                        ack: StreamAck::default(),
+                        records: BoundedVec::new(vec![bad]).unwrap(),
+                    },
+                    EPOCH,
+                    1,
+                    limit(),
+                )
+                .unwrap(),
+            );
         }
         Self {
             welcome_bytes: live::encode_welcome(&welcome).unwrap(),

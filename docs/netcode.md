@@ -104,8 +104,19 @@ Publication stops where the connection's egress allowance ends
 does not fit waits for the next publication and then goes out with its newest
 value, so the server never queues stale state behind the transport. The browser
 drops a send that would take the data channel's `bufferedAmount` past 64 KiB;
-Renet resends reliable controls and the next input packet repeats unacknowledged
-commands. Nothing else sheds, throttles or holds back traffic.
+Renet resends reliable controls and the next input packet repeats unreceived
+commands.
+
+The server's allowance also follows the path. A delay-based controller in each
+peer's egress bucket (renet-cross, in the manner of LEDBAT) watches Renet's
+round trip. While the lowest round trip seen in a decision interval stays more
+than 60 ms above the lowest seen in the last 10 s, it lowers the rate to 80% of
+what is actually being sent, once per round trip, down to 8 KB/s. Otherwise it
+raises the rate by an eighth per round trip, up to twice what is being sent and
+the configured cap. Its burst is about 100 ms of data at the current rate, so a
+publication cannot dump a burst into a slow link. Round-trip delay cannot tell
+which direction is queueing, so clients do not run it: their input is small,
+and dropping it would turn delay into late commands.
 
 Stock Renet's serialized packet bound is 1,300 bytes. Netcode adds at most 25
 bytes and base IPv6/UDP adds 48, for a 1,373-byte native data-packet allowance.
@@ -123,15 +134,29 @@ backend drop is a send the transport refused outright.
   directions before admission. The server handles at most 64 messages per peer
   per tick and leaves the rest queued in Renet for the next tick.
 - Hardware sampling journals held intent and one-shot edges separately. Missing
-  commands use a bounded held-input grace; substitute ticks do not repeat edges.
+  commands repeat the last held movement, aim and attack for 15 ticks (250 ms)
+  before falling to neutral, on the server and in the client's forecast alike;
+  substitute ticks do not repeat edges. Players usually keep holding what they
+  held, so a delay spike or loss burst within the grace costs no correction.
   The atomic owner checkpoint includes the committed held-input state and missing
   streak used by that policy. Local substitution forecasts start from that same
   checkpoint and use the shared policy without creating network commands.
-- Every fixed tick the client sends one unreliable input packet: its stream
-  acknowledgement and up to six commands — the newest, the three most recent
-  pending and the three oldest pending. Pending commands repeat until a state
-  packet reports them finalized, so a lost packet costs nothing and old commands
-  are never starved by new ones. There is no retry timer.
+- Every other fixed tick, and at once when a new command carries an action, the
+  client sends one unreliable input packet: its stream acknowledgement and every
+  command the server has not yet reported receiving whose target is still ahead
+  of the estimated server tick, newest first, up to the 24-tick lead cap. Each
+  state packet's owner status carries the received watermark. A command thus
+  travels until it arrives or can no longer be used, so a lost packet costs
+  nothing, and the packet stays small even while status packets are lost. There
+  is no retry timer. Held movement and aim are quantized to 1/4,096 when the
+  client creates a command, so prediction and the server read the same values;
+  records carry them as small integer changes from the record before, and one
+  that repeats its predecessor costs a few bytes.
+- A late command's movement is replaced by the grace above. Its dash, cast or
+  charge edges still run, on the first tick without an action of its own, as
+  Unreal's character movement executes a move when it arrives, so lateness
+  shifts an action by a few ticks rather than discarding it. At most four wait at
+  once. Rays judged against a view time keep their own rewind limit and expire.
 - Finalized input follows committed simulation ticks and rides in every state
   packet's owner status, with the applied menu sequence and arrival feedback.
   It is separate from transport receipt, state acknowledgement and action
@@ -295,7 +320,7 @@ authority by up to the step on every correction. Booleans cost only their
 change-mask bit. Compact encoding follows the schema registry's field order and
 is accepted only after the content handshake matches the registry.
 
-A typical session needs tens of KB/s per client. Protocol identity changes
+On a WAN path a client typically receives about 10 KB/s and sends 6–8 KB/s. Protocol identity changes
 require rebuilding clients and servers together.
 
 Client prediction restores the admitted owner and its transient components into
@@ -341,9 +366,11 @@ substitutes the client forecasts. A finalized checkpoint ahead of the prediction
 becomes the new base however far ahead it is, because every command before it
 is already finalized. Replay and forecast work are bounded by retained history; a forecast gap longer
 than the frame's budget is covered over several frames. Predicted presentation events restart their journal
-when they cannot follow a rebase. Lead only shrinks after eight arrival samples
-that all kept more than two ticks of slack, because a late command is always a
-misprediction. A feedback sample is reported once, so it is
+when they cannot follow a rebase. A late or just-in-time arrival raises lead at once by
+enough to have covered it. Lead falls only after 200 samples (about 10 s) that
+all kept more than two ticks of slack, and then to keep two ticks at the tightest
+of them, so recurring delay spikes and jitter bursts stay covered. A late command
+is always a misprediction; a larger lead only costs replay work. A feedback sample is reported once, so it is
 never applied twice. Attack sample stamps and remote display time use
 the same simulation clock, including fractional tick phase. Newly assigned
 commands use dependencies from the latest owner state; already recorded commands
@@ -400,18 +427,24 @@ and two autoplaying rendered clients per scenario, over both native UDP and the
 browser's WebRTC data channel path (`--transport webrtc` negotiates through the
 same session and SDP endpoints a browser uses). Scenarios are a clean link, a WAN
 path (75 ms ± 10 ms and 1% loss per direction), the same path with 0.3% loss, and
-the clean and lossy paths with a 500 ms stall every 5 s (`--inject-stall 500@5`).
-The stall blocks the client between frames, as the browser's garbage collection
-and shader compilation hitches do. UDP runs use the server's conditioner. WebRTC
-runs impair the client's raw datagrams beneath DTLS and SCTP
-(`--link-impairment DELAY_MS:JITTER_MS:LOSS_PERCENT`), because conditioning above
-the data channel leaves SCTP's congestion control on an ideal link. Each client measures
+the clean and lossy paths with a 500 ms stall every 5 s (`--inject-stall 500@5`);
+then an access link capped at 24 KB/s each way with a quarter second of buffer,
+2% loss in runs of about six datagrams, round trips rising from 110 to 610 ms
+for 1.5 s of every 8 s, and a busy Wi-Fi mix of short delay, bursty loss and
+periodic jitter bursts. The stall blocks the client between frames, as the
+browser's garbage collection and shader compilation hitches do. Both transports
+impair the client's raw datagrams beneath netcode, DTLS and SCTP
+(`--link-impairment DELAY_MS:JITTER_MS:LOSS_PERCENT[,burst=N][,rate=B/S][,queue=BYTES][,spike=EVERY/LASTING/DELAY[/JITTER]]`),
+on a thread that keeps carrying datagrams while the client is stalled, as a real
+network does; conditioning above the data channel would leave SCTP's congestion
+control on an ideal link. Each client measures
 its own display (`session_health` in the trace). Any disconnect, reconnect
 or teleport fails the scenario, as do more than six
 visible corrections per connected minute. A correction is a frame whose owner
 displacement exceeds dash speed × 1.25 over the frame plus one tick by 0.10 m; a
 teleport exceeds it by a metre. A client's p95 round trip must also stay within
-the path's own round trip plus 150 ms (plus the stall, for stall scenarios),
+the path's own round trip plus 150 ms (plus the stall, for stall scenarios; a
+capped link's buffer is not part of the path's own round trip),
 because a sender outrunning its path shows as queueing long before anything
 disconnects. These gates read only `DreamView` and
 `DreamConnection`, so they stay valid whatever prediction and replication design

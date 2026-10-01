@@ -291,6 +291,7 @@ fn owner_status_is_latest_wins_and_feedback_tunes_lead_once() {
     let status = |finalized, observed, sample| OwnerStatus {
         finalized: ServerTick(finalized),
         menu_applied: None,
+        received: CommandSeq(0),
         arrival: ArrivalFeedback {
             sample,
             observed_commands: observed,
@@ -319,9 +320,10 @@ fn owner_status_is_latest_wins_and_feedback_tunes_lead_once() {
 
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
-fn input_packets_carry_newest_and_oldest_unconsumed_commands_with_the_ack() {
+fn input_packets_carry_every_unfinalized_command_newest_first_with_the_ack() {
     let (session, _) = fixture();
-    let commands: Vec<_> = (1..=10).map(|n| command(&session, n, 10 + n)).collect();
+    let count = MAX_INPUT_RECORDS as u64 + 4;
+    let commands: Vec<_> = (1..=count).map(|n| command(&session, n, 10 + n)).collect();
     let mut runtime = receipt_runtime(session);
     for command in &commands {
         runtime.pending.push_back(PendingFrame {
@@ -329,7 +331,7 @@ fn input_packets_carry_newest_and_oldest_unconsumed_commands_with_the_ack() {
             sent_at: 0.0,
         });
     }
-    send_input(&mut runtime, &commands[9..]).unwrap();
+    send_input(&mut runtime, &commands[commands.len() - 1..]).unwrap();
     let session = runtime.prediction.as_ref().unwrap();
     let mut sent = Vec::new();
     for packet in runtime.renet.get_packets_to_send() {
@@ -337,14 +339,7 @@ fn input_packets_carry_newest_and_oldest_unconsumed_commands_with_the_ack() {
         server.add_connection(1);
         server.process_packet_from(&packet, 1).unwrap();
         while let Some(bytes) = server.receive_message(1, INPUT_CHANNEL) {
-            sent.push(
-                decode_input(
-                    &bytes,
-                    session.welcome.stream.epoch,
-                    session.welcome.frame_limit().unwrap(),
-                )
-                .unwrap(),
-            );
+            sent.push(decode_input(&bytes, session.welcome.stream.epoch, input_limit()).unwrap());
         }
     }
     let [packet] = sent.as_slice() else {
@@ -357,7 +352,9 @@ fn input_packets_carry_newest_and_oldest_unconsumed_commands_with_the_ack() {
         .iter()
         .map(|r| r.sequence.0)
         .collect();
-    assert_eq!(sequences, vec![10, 9, 8, 1, 2, 3]);
+    // The oldest four are behind the lead cap: the server has them or can no
+    // longer use them.
+    assert_eq!(sequences, (5..=count).rev().collect::<Vec<_>>());
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -641,5 +638,37 @@ fn disconnection_cleanup_unlocks_identity_and_retains_outcomes_without_double_co
         let retained = world.resource::<outcomes::ClientOutcomes>().trace(1, 2);
         assert_eq!(retained.len(), 1);
         assert_eq!(retained[0].key, command.action_key(0));
+    }
+}
+
+#[test]
+fn link_impairment_parses_rate_burst_and_spike_fields() {
+    let link = parse_link_impairment(
+        "50:5:2,burst=4,rate=16000,queue=4000,spike=8000/1500/250/20",
+        9,
+    )
+    .unwrap();
+    assert_eq!(link.delay, Duration::from_millis(50));
+    assert_eq!(link.loss, 0.02);
+    assert_eq!(link.loss_burst, 4.0);
+    assert_eq!(link.rate_bytes_per_second, 16_000);
+    assert_eq!(link.queue_bytes, 4_000);
+    assert_eq!(
+        link.spike,
+        Some(renet_cross::DelaySpike {
+            every: Duration::from_secs(8),
+            lasting: Duration::from_millis(1500),
+            delay: Duration::from_millis(250),
+            jitter: Duration::from_millis(20),
+        })
+    );
+    assert_eq!(parse_link_impairment("75:10:1", 9).unwrap().loss_burst, 1.0);
+    for bad in [
+        "75:10",
+        "75:10:1,burst=0.5",
+        "75:10:1,spike=1/2",
+        "75:10:1,colour=red",
+    ] {
+        assert!(parse_link_impairment(bad, 9).is_err(), "{bad}");
     }
 }

@@ -188,7 +188,6 @@ impl<I: Clone + Serialize, A: Clone + Serialize> CommandInbox<I, A> {
     ) -> Result<Self, CommandError> {
         if limits.future_ticks == 0
             || limits.future_ticks > crate::types::MAX_COMMAND_HORIZON_TICKS
-            || limits.held_grace_ticks > 3
             || limits.audit_records < usize::from(limits.future_ticks)
             || limits.sequence_ahead < u64::from(limits.future_ticks)
             || limits.max_command_bytes == 0

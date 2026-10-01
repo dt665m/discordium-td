@@ -166,7 +166,7 @@ fn client(c: &Corpus) -> ClientStream<EntityId, ReplicaState> {
 }
 fn run(family: usize, bytes: &[u8], case: usize, c: &Corpus) -> Outcome {
     match family {
-        0 => accepted(live::decode_input(bytes, EPOCH, limit()).is_ok()),
+        0 => accepted(live::decode_input(bytes, EPOCH, live::input_limit()).is_ok()),
         1 => accepted(live::decode_control::<live::ClientControl>(bytes, EPOCH, limit()).is_ok()),
         2 => accepted(live::decode_control::<live::ServerControl>(bytes, EPOCH, limit()).is_ok()),
         3 => accepted(live::decode_welcome(bytes).is_ok()),
@@ -275,7 +275,7 @@ fn run(family: usize, bytes: &[u8], case: usize, c: &Corpus) -> Outcome {
         9 => {
             for invalid in &c.nonfinite {
                 assert!(
-                    live::decode_input(invalid, EPOCH, limit()).is_err(),
+                    live::decode_input(invalid, EPOCH, live::input_limit()).is_err(),
                     "nonfinite/unbounded intent accepted"
                 );
             }
@@ -286,7 +286,7 @@ fn run(family: usize, bytes: &[u8], case: usize, c: &Corpus) -> Outcome {
             let mut count = vec![0];
             count.extend_from_slice(&u64::MAX.to_le_bytes());
             assert!(engine_net::decode_with_limit::<BoundedVec<u8, 16384>>(&count, 16384).is_err());
-            accepted(live::decode_input(bytes, EPOCH, limit()).is_ok())
+            accepted(live::decode_input(bytes, EPOCH, live::input_limit()).is_ok())
         }
         10 => {
             let item = &c.schema_cases[(case / NAMES.len()) % c.schema_cases.len()];
@@ -306,7 +306,7 @@ fn run(family: usize, bytes: &[u8], case: usize, c: &Corpus) -> Outcome {
         }
         11 => {
             let item = &c.combat_cases[(case / NAMES.len()) % c.combat_cases.len()];
-            let result = live::decode_input(bytes, EPOCH, limit());
+            let result = live::decode_input(bytes, EPOCH, live::input_limit());
             assert_eq!(
                 result.is_err(),
                 item.rejected,
@@ -390,7 +390,7 @@ fn main() {
             .is_ok()
     );
     assert!(c.welcome.compatible(ConnectionId(9)));
-    assert!(live::decode_input(&c.input, EPOCH, limit()).is_ok());
+    assert!(live::decode_input(&c.input, EPOCH, live::input_limit()).is_ok());
     assert_eq!(run(7, &c.state_packet, 0, &c).published, true);
     assert_eq!(run(6, &c.delta, 0, &c).accepted, true);
     assert_eq!(c.schema_seeds.len(), generated::ROOT_NAMES.len());

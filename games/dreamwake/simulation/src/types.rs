@@ -102,8 +102,12 @@ pub const AMBIENT_ENEMY_POSITIONS: [[f32; 2]; 45] = {
 pub const TOTAL_ROOMS: usize = 10;
 /// Dreamwake balance: stamina spent once when a valid charge releases.
 pub const CHARGE_STAMINA_COST: f32 = 30.0;
-/// Missing transport input holds movement/aim/attack briefly; edges never repeat.
-pub const HELD_INPUT_GRACE_TICKS: u8 = 3;
+/// While commands are missing, the server repeats the last held movement, aim
+/// and attack for this long, and the client forecasts the same. Edges never
+/// repeat. Players usually keep holding what they held, so a delay spike or
+/// burst of loss up to this long costs no visible correction; one that hides a
+/// release overshoots by at most this much movement.
+pub const HELD_INPUT_GRACE_TICKS: u8 = 15;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct DreamInput {

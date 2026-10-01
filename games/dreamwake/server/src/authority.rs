@@ -321,13 +321,15 @@ impl DreamAuthority {
             } else {
                 match self.outcomes.normal.reserve(owner, &keys) {
                     Ok(keys) => (false, keys),
-                    Err(engine_net::outcomes::OutcomeError::Capacity) => (
-                        true,
-                        self.outcomes
-                            .overload
-                            .reserve(owner, &keys)
-                            .map_err(failure)?,
-                    ),
+                    Err(engine_net::outcomes::OutcomeError::Capacity) => {
+                        match self.outcomes.overload.reserve(owner, &keys) {
+                            Ok(keys) => (true, keys),
+                            // The rest of this bundle repeats in the next
+                            // packet; take it then.
+                            Err(engine_net::outcomes::OutcomeError::Capacity) => break,
+                            Err(error) => return Err(failure(error)),
+                        }
+                    }
                     Err(error) => return Err(failure(error)),
                 }
             };
@@ -339,16 +341,52 @@ impl DreamAuthority {
             let previous_admission = peer.inbox.retained_admission(command.sequence);
             let admission = match peer.inbox.admit(ConnectionId(id), command.clone(), &rules) {
                 Ok(admission) => admission,
+                // This tick's admission work is spent; the remaining records
+                // repeat in the next packet.
+                Err(engine_net::commands::CommandError::RateLimit) => {
+                    ledger.cancel_reservations(&reservations);
+                    break;
+                }
                 Err(error) => {
                     ledger.cancel_reservations(&reservations);
                     return Err(failure(error));
                 }
             };
+            // A command too far ahead must come again once it fits.
+            if admission != Admission::Future {
+                peer.received.mark(command.sequence);
+            }
             match admission {
                 Admission::Accepted { .. } if overload => {
                     peer.overload_commands.insert(command.sequence);
                 }
                 Admission::Accepted { .. } => {}
+                // A late action still runs, on the first tick without one of
+                // its own, as Unreal's character movement executes a move when
+                // it arrives. Lateness then shifts the action by a few ticks
+                // instead of discarding it. Rays judged against a view time
+                // keep their own rewind limit and still expire.
+                Admission::Late
+                    if previous_admission.is_none()
+                        && !command.actions.as_slice().is_empty()
+                        && command.actions.as_slice().iter().all(|edge| {
+                            matches!(
+                                edge.action,
+                                DreamAction::Dash { .. }
+                                    | DreamAction::Cast { .. }
+                                    | DreamAction::ChargeBegin
+                                    | DreamAction::ChargeRelease { .. }
+                                    | DreamAction::ChargeCancel { .. }
+                            )
+                        })
+                        && peer.late_actions.len() + command.actions.as_slice().len()
+                            <= peer::MAX_LATE_ACTIONS =>
+                {
+                    for edge in command.actions.as_slice() {
+                        peer.late_actions
+                            .push_back((command.sequence, edge.clone(), overload));
+                    }
+                }
                 Admission::Late | Admission::TargetOccupied => {
                     for key in reservations {
                         let status = if admission == Admission::Late {
@@ -681,11 +719,27 @@ impl DreamAuthority {
                         .sequence()
                         .and_then(|sequence| peer.combat.take_arrival(sequence));
                     let input = *prepared.input();
-                    if let Some(sequence) = prepared.sequence() {
-                        let overloaded = peer.overload_commands.remove(&sequence);
-                        let owner = peer.welcome.player.get();
-                        let generation = self.sim.combat_generation(owner);
-                        for edge in prepared.actions() {
+                    let owner = peer.welcome.player.get();
+                    let generation = self.sim.combat_generation(owner);
+                    let prepared_command = prepared
+                        .sequence()
+                        .map(|sequence| (sequence, peer.overload_commands.remove(&sequence)));
+                    let mut edges: Vec<_> = prepared_command
+                        .map(|(sequence, overloaded)| {
+                            prepared
+                                .actions()
+                                .iter()
+                                .map(|edge| (sequence, edge.clone(), overloaded))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    // One action per player per tick: a late one waits for a
+                    // tick without its own.
+                    if edges.is_empty() {
+                        edges.extend(peer.late_actions.pop_front());
+                    }
+                    {
+                        for (sequence, edge, overloaded) in edges {
                             let action_key = ActionKey {
                                 connection: peer.welcome.stream.epoch,
                                 stream: peer.welcome.stream.stream,
@@ -815,8 +869,12 @@ impl DreamAuthority {
                             };
                             explicit.push(action);
                         }
-                        if let (Some(sample), Some(arrival), Some(generation)) =
-                            (input.beam, arrival, generation)
+                        if let (
+                            Some((sequence, overloaded)),
+                            Some(sample),
+                            Some(arrival),
+                            Some(generation),
+                        ) = (prepared_command, input.beam, arrival, generation)
                         {
                             if !overloaded && peer.active && explicit.len() < 64 {
                                 if let Ok((query, gameplay, fraction, _)) = peer.combat.validate(
@@ -1062,7 +1120,7 @@ impl engine_server::Authority for DreamAuthority {
                             Err(error) => Err(failure(error)),
                         }
                     } else {
-                        match live::decode_input(&bytes, epoch, limit) {
+                        match live::decode_input(&bytes, epoch, live::input_limit()) {
                             Ok(message) => self.receive_input(id, message),
                             Err(engine_net::codec::CodecError::WrongEpoch) => Ok(()),
                             Err(error) => Err(failure(error)),

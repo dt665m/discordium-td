@@ -35,9 +35,10 @@ use serde::{Deserialize, Serialize};
 pub const APPLICATION_FRAME_BYTES: usize = 1100;
 const WELCOME_MAGIC: &[u8; 4] = b"DW17";
 pub const WELCOME_BYTES: usize = 1024;
-/// Commands per input packet: the newest, the two before it, and the oldest
-/// ones the server has not consumed yet.
-pub const MAX_INPUT_RECORDS: usize = 6;
+/// Commands per input packet: every unfinalized command, newest first, up to
+/// the client's lead cap, so each command still ahead of the server travels in
+/// every packet until its target passes.
+pub const MAX_INPUT_RECORDS: usize = engine_net::types::MAX_COMMAND_LEAD_TICKS as usize;
 /// A state packet is normally kept within [`APPLICATION_FRAME_BYTES`]; one
 /// entity's whole state that alone exceeds it, such as a joining owner's
 /// first checkpoint, travels in a larger packet that Renet slices.
@@ -421,13 +422,259 @@ impl Validate for InputPacket {
         Ok(())
     }
 }
+/// Steps per unit for movement and aim on the wire. The client quantizes held
+/// input when it creates a command, so prediction and the server read the
+/// same values, and consecutive records differ by small integers.
+pub const INPUT_AXIS_STEPS: f32 = 4096.0;
+
+/// Round a direction toward zero onto the input grid, which never lengthens it.
+pub fn quantize_direction(direction: [f32; 2]) -> [f32; 2] {
+    direction.map(|axis| (axis * INPUT_AXIS_STEPS).trunc() / INPUT_AXIS_STEPS)
+}
+/// The held input a command carries, on the input grid.
+pub fn quantize_tick_input(mut input: TickInput) -> TickInput {
+    input.held.movement = quantize_direction(input.held.movement);
+    input.held.aim = quantize_direction(input.held.aim);
+    if let Some(beam) = &mut input.beam {
+        beam.aim = quantize_direction(beam.aim);
+    }
+    input
+}
+/// `bounded` refuses steps beyond a unit axis; unbounded encoding exists only
+/// so codec tests can send what the decoder must reject.
+fn axis_steps(axis: f32, bounded: bool) -> Result<i64, CodecError> {
+    let steps = axis * INPUT_AXIS_STEPS;
+    let limit = if bounded {
+        INPUT_AXIS_STEPS
+    } else {
+        i32::MAX as f32
+    };
+    if !steps.is_finite() || steps.fract() != 0.0 || steps.abs() > limit {
+        return Err(invalid("input axis off the input grid"));
+    }
+    Ok(steps as i64)
+}
+fn zigzag(value: i64) -> u64 {
+    ((value << 1) ^ (value >> 63)) as u64
+}
+fn unzigzag(value: u64) -> i64 {
+    ((value >> 1) as i64) ^ -((value & 1) as i64)
+}
+fn put_offset(out: &mut Vec<u8>, first: u64, this: u64) -> Result<(), CodecError> {
+    let offset = i64::try_from(i128::from(first) - i128::from(this))
+        .map_err(|_| invalid("input records too far apart"))?;
+    codec::put_varint(out, zigzag(offset));
+    Ok(())
+}
+fn read_offset(input: &mut ByteReader, first: u64) -> Result<u64, CodecError> {
+    let offset = unzigzag(input.varint()?);
+    u64::try_from(i128::from(first) - i128::from(offset))
+        .map_err(|_| invalid("input record outside the stream"))
+}
+const INPUT_CHANGED: u8 = 1;
+const INPUT_ATTACK: u8 = 2;
+const INPUT_BEAM: u8 = 4;
+const INPUT_ACTIONS: u8 = 8;
+const INPUT_ACTION_BYTES: usize = 512;
+
+/// The input packet as sent: the acknowledgement, then each record as offsets
+/// from the first record's sequence and target, and its movement and aim as
+/// grid steps relative to the record before it. A record whose movement and
+/// aim repeat the one before carries neither, so a held direction costs a few
+/// bytes per command before deflate.
+fn input_body(value: &InputPacket, bounded: bool) -> Result<Vec<u8>, CodecError> {
+    let records = value.records.as_slice();
+    let mut out = Vec::with_capacity(16 + records.len() * 8);
+    codec::put_varint(&mut out, u64::from(value.ack.latest));
+    codec::put_varint(&mut out, value.ack.received);
+    out.push(records.len() as u8);
+    let Some(first) = records.first() else {
+        return Ok(out);
+    };
+    codec::put_varint(&mut out, first.sequence.0);
+    codec::put_varint(&mut out, first.target.0);
+    let mut previous: Option<[i64; 4]> = None;
+    for record in records {
+        put_offset(&mut out, first.sequence.0, record.sequence.0)?;
+        put_offset(&mut out, first.target.0, record.target.0)?;
+        let held = &record.input.held;
+        let steps = [
+            axis_steps(held.movement[0], bounded)?,
+            axis_steps(held.movement[1], bounded)?,
+            axis_steps(held.aim[0], bounded)?,
+            axis_steps(held.aim[1], bounded)?,
+        ];
+        let changed = previous != Some(steps);
+        let mut flags = 0;
+        if changed {
+            flags |= INPUT_CHANGED;
+        }
+        if held.attack {
+            flags |= INPUT_ATTACK;
+        }
+        if record.input.beam.is_some() {
+            flags |= INPUT_BEAM;
+        }
+        if !record.actions.as_slice().is_empty() {
+            flags |= INPUT_ACTIONS;
+        }
+        out.push(flags);
+        if changed {
+            let base = previous.unwrap_or_default();
+            for (step, base) in steps.iter().zip(base) {
+                codec::put_varint(&mut out, zigzag(step - base));
+            }
+        }
+        previous = Some(steps);
+        if let Some(beam) = record.input.beam {
+            for axis in beam.aim {
+                codec::put_varint(&mut out, zigzag(axis_steps(axis, bounded)?));
+            }
+            let view = beam.view;
+            codec::put_varint(&mut out, u64::from(view.sampled_fraction));
+            codec::put_varint(&mut out, u64::from(view.viewed_fraction));
+            codec::put_varint(&mut out, view.sampled_at.0);
+            codec::put_varint(&mut out, view.viewed_at.0);
+            codec::put_varint(&mut out, u64::from(view.reference));
+        }
+        if !record.actions.as_slice().is_empty() {
+            let actions = engine_net::encode(&record.actions);
+            if actions.len() > INPUT_ACTION_BYTES {
+                return Err(invalid("input actions too large"));
+            }
+            codec::put_varint(&mut out, actions.len() as u64);
+            out.extend_from_slice(&actions);
+        }
+    }
+    Ok(out)
+}
+fn read_input_body(bytes: &[u8]) -> Result<InputPacket, CodecError> {
+    let mut input = ByteReader::new(bytes);
+    let ack = StreamAck {
+        latest: input.varint_u32()?,
+        received: input.varint()?,
+    };
+    let count = usize::from(input.u8()?);
+    if count > MAX_INPUT_RECORDS {
+        return Err(invalid("too many input records"));
+    }
+    let mut records = Vec::with_capacity(count);
+    if count > 0 {
+        let first_sequence = input.varint()?;
+        let first_target = input.varint()?;
+        let mut previous = [0_i64; 4];
+        for index in 0..count {
+            let sequence = CommandSeq(read_offset(&mut input, first_sequence)?);
+            let target = TargetTick(read_offset(&mut input, first_target)?);
+            let flags = input.u8()?;
+            if flags & !(INPUT_CHANGED | INPUT_ATTACK | INPUT_BEAM | INPUT_ACTIONS) != 0
+                || (index == 0 && flags & INPUT_CHANGED == 0)
+            {
+                return Err(invalid("invalid input record flags"));
+            }
+            if flags & INPUT_CHANGED != 0 {
+                for step in &mut previous {
+                    *step = step
+                        .checked_add(unzigzag(input.varint()?))
+                        .ok_or_else(|| invalid("input axis overflow"))?;
+                }
+            }
+            let axis = |steps: i64| steps as f32 / INPUT_AXIS_STEPS;
+            let held = dreamwake_sim::DreamInput {
+                movement: [axis(previous[0]), axis(previous[1])],
+                aim: [axis(previous[2]), axis(previous[3])],
+                attack: flags & INPUT_ATTACK != 0,
+                ..Default::default()
+            };
+            let beam = if flags & INPUT_BEAM != 0 {
+                let aim = [
+                    axis(unzigzag(input.varint()?)),
+                    axis(unzigzag(input.varint()?)),
+                ];
+                let fraction =
+                    |value: u64| u16::try_from(value).map_err(|_| invalid("invalid beam fraction"));
+                Some(BeamAimSample {
+                    aim,
+                    view: CombatViewStamp {
+                        sampled_fraction: fraction(input.varint()?)?,
+                        viewed_fraction: fraction(input.varint()?)?,
+                        sampled_at: ServerTick(input.varint()?),
+                        viewed_at: ServerTick(input.varint()?),
+                        reference: input.varint_u32()?,
+                    },
+                })
+            } else {
+                None
+            };
+            let actions = if flags & INPUT_ACTIONS != 0 {
+                let length = usize::try_from(input.varint()?)
+                    .ok()
+                    .filter(|length| *length <= INPUT_ACTION_BYTES)
+                    .ok_or_else(|| invalid("input actions too large"))?;
+                engine_net::decode_with_limit(input.take(length)?, INPUT_ACTION_BYTES)
+                    .map_err(|_| invalid("invalid input actions"))?
+            } else {
+                BoundedVec::default()
+            };
+            records.push(InputRecord {
+                sequence,
+                target,
+                input: TickInput { held, beam },
+                actions,
+            });
+        }
+    }
+    input.finish()?;
+    let packet = InputPacket {
+        ack,
+        records: BoundedVec::new(records)?,
+    };
+    packet.validate()?;
+    Ok(packet)
+}
+
+/// Input records before deflate; the client keeps each encoded frame within
+/// one application frame.
+pub const INPUT_PAYLOAD_BYTES: usize = 4096;
+pub fn input_limit() -> FrameLimit {
+    FrameLimit::new(INPUT_PAYLOAD_BYTES).expect("input frame allowance")
+}
+/// Encode without validating the records, so codec tests can confirm the
+/// decoder rejects what a well-behaved client would never send.
+/// Encode without validating the records, so codec tests can confirm the
+/// decoder rejects what a well-behaved client would never send.
+#[doc(hidden)]
+pub fn encode_input_unvalidated(
+    value: &InputPacket,
+    epoch: ConnectionEpoch,
+    sequence: u32,
+    limit: FrameLimit,
+) -> Result<Vec<u8>, CodecError> {
+    let payload = input_body(value, false)?;
+    if payload.len() > limit.payload_bytes() {
+        return Err(CodecError::Oversized);
+    }
+    codec::encode_frame(
+        FrameHeader {
+            lane: Lane::Input,
+            connection: epoch,
+            sequence,
+        },
+        &payload,
+        limit,
+    )
+}
 pub fn encode_input(
     value: &InputPacket,
     epoch: ConnectionEpoch,
     sequence: u32,
     limit: FrameLimit,
 ) -> Result<Vec<u8>, CodecError> {
-    let payload = codec::encode_payload(value, limit.payload_bytes())?;
+    value.validate()?;
+    let payload = input_body(value, true)?;
+    if payload.len() > limit.payload_bytes() {
+        return Err(CodecError::Oversized);
+    }
     codec::encode_frame_deflated(
         FrameHeader {
             lane: Lane::Input,
@@ -447,7 +694,10 @@ pub fn decode_input(
     if header.lane != Lane::Input {
         return Err(CodecError::InvalidLane);
     }
-    codec::decode_payload(&payload, limit.payload_bytes())
+    if payload.len() > limit.payload_bytes() {
+        return Err(CodecError::Oversized);
+    }
+    read_input_body(&payload)
 }
 
 /// The owner's command progress, repeated in every state packet so the
@@ -458,6 +708,9 @@ pub struct OwnerStatus {
     /// replaced; the client stops sending them.
     pub finalized: ServerTick,
     pub menu_applied: Option<CommandSeq>,
+    /// Every command up to this sequence has reached the server, whether or
+    /// not it could still be used; the client stops repeating them.
+    pub received: CommandSeq,
     pub arrival: ArrivalFeedback,
 }
 
@@ -509,6 +762,7 @@ impl StatePacket {
         codec::put_varint(&mut out, self.tick.0);
         codec::put_varint(&mut out, self.status.finalized.0);
         codec::put_varint(&mut out, self.status.menu_applied.map_or(0, |seq| seq.0));
+        codec::put_varint(&mut out, self.status.received.0);
         let arrival = &self.status.arrival;
         codec::put_varint(&mut out, arrival.observed_commands);
         codec::put_varint(&mut out, arrival.late_commands);
@@ -551,6 +805,7 @@ impl StatePacket {
         let tick = ServerTick(input.varint()?);
         let finalized = ServerTick(input.varint()?);
         let menu = input.varint()?;
+        let received = CommandSeq(input.varint()?);
         let observed_commands = input.varint()?;
         let late_commands = input.varint()?;
         let sample = match input.u8()? {
@@ -603,6 +858,7 @@ impl StatePacket {
             status: OwnerStatus {
                 finalized,
                 menu_applied: (menu != 0).then_some(CommandSeq(menu)),
+                received,
                 arrival,
             },
             entries,

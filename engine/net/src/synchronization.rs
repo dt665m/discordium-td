@@ -239,6 +239,13 @@ fn duration(nanoseconds: i128) -> Result<Duration, SyncError> {
     Ok(Duration::new(seconds, (nanoseconds % 1_000_000_000) as u32))
 }
 
+/// Arrival samples a lead decrease must cover: about ten seconds at one
+/// sample per 20 Hz publication.
+pub const LEAD_DECAY_SAMPLES: usize = 200;
+/// Spare ticks every command keeps at its tightest arrival in a decay window.
+pub const LEAD_MARGIN_TICKS: i32 = 2;
+
+#[derive(Debug, Clone)]
 pub struct LeadController {
     lead: u8,
     samples: VecDeque<i32>,
@@ -280,10 +287,14 @@ impl LeadController {
     pub fn lead(&self) -> u8 {
         self.lead
     }
-    /// Slack is target_tick - authoritative_tick_at_arrival. Increase promptly on
-    /// missed deadlines; decrease only after eight samples that all had spare
-    /// headroom. A late command is always a misprediction, so ordinary jitter
-    /// must stay inside the margin rather than a quarter of it.
+    /// Slack is target_tick - authoritative_tick_at_arrival. A late or
+    /// just-in-time sample raises lead at once by enough to have covered it.
+    /// Lead falls only once a full decay window of samples all kept more than
+    /// [`LEAD_MARGIN_TICKS`] spare, and then by as much as the tightest of them
+    /// allows. Lateness that recurs within the window, as delay spikes and
+    /// jitter bursts on wireless links do, therefore stays covered instead of
+    /// being forgotten between occurrences. A late command is always a
+    /// misprediction; a larger lead only costs replay work.
     pub fn observe_arrival_slack(&mut self, slack: i32) -> Result<u8, SyncError> {
         let bound = i32::from(MAX_COMMAND_LEAD_TICKS);
         if !(-bound..=bound).contains(&slack) {
@@ -293,22 +304,20 @@ impl LeadController {
             // Saturate rather than fail. A round trip this controller cannot
             // cover makes commands arrive late, which is a quality outcome the
             // player can see and play through. Ending the session instead
-            // fixes nothing: recovery cannot shorten the path, and each attempt
-            // spends one of the three the sliding window allows, so a slow link
-            // would be disconnected for being slow.
-            if self.lead < MAX_COMMAND_LEAD_TICKS {
-                self.lead += 1;
-                self.samples.clear();
-            }
+            // fixes nothing: starting over cannot shorten the path.
+            let raised = i32::from(self.lead) + 1 - slack;
+            self.lead = raised.min(bound) as u8;
+            self.samples.clear();
         } else {
-            if self.samples.len() == 32 {
+            if self.samples.len() == LEAD_DECAY_SAMPLES {
                 self.samples.pop_front();
             }
             self.samples.push_back(slack);
-            if self.samples.len() >= 8 {
-                let tightest = self.samples.iter().copied().min().expect("eight samples");
-                if tightest > 2 && self.lead > 1 {
-                    self.lead -= 1;
+            if self.samples.len() == LEAD_DECAY_SAMPLES {
+                let tightest = self.samples.iter().copied().min().expect("full window");
+                let spare = tightest - LEAD_MARGIN_TICKS;
+                if spare > 0 && self.lead > 1 {
+                    self.lead -= spare.min(i32::from(self.lead) - 1) as u8;
                     self.samples.clear();
                 }
             }
@@ -477,9 +486,16 @@ mod tests {
             lead.assign_target(ServerTick(10)).unwrap(),
             Some(TargetTick(13))
         );
-        for _ in 0..8 {
-            lead.observe_arrival_slack(4).unwrap();
+        // Seven ticks late raises lead enough to have covered it at once.
+        let mut late = lead.clone();
+        assert_eq!(late.observe_arrival_slack(-7).unwrap(), 11);
+        // A decrease needs a whole window with spare slack, and then keeps the
+        // margin at the tightest arrival.
+        for _ in 0..LEAD_DECAY_SAMPLES - 1 {
+            lead.observe_arrival_slack(3).unwrap();
         }
+        assert_eq!(lead.lead(), 3);
+        lead.observe_arrival_slack(3).unwrap();
         assert_eq!(lead.lead(), 2);
         assert_eq!(lead.assign_target(ServerTick(10)).unwrap(), None);
         assert_eq!(lead.assign_target(ServerTick(11)).unwrap(), None);

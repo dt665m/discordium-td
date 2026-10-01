@@ -6,6 +6,7 @@
 //! state and dependency history are independently owned, never replica pointers.
 mod history;
 mod manager;
+pub mod rewind;
 #[cfg(test)]
 mod tests;
 pub use history::*;

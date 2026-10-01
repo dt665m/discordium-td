@@ -74,6 +74,6 @@ opt-level = 3
 [patch.crates-io]
 # Only the upstreamable handshake correction; Renet itself stays on crates.io.
 renetcode = { git = "https://github.com/dt665m/renet.git", branch = "fix/confirmation-keepalive-starvation" }
-# PR-SCTP abandonment fixes on latest upstream, pending algesten/sctp-proto#57.
-sctp-proto = { git = "https://github.com/dt665m/sctp-proto.git", branch = "fix/partial-reliability-abandonment" }
-str0m = { git = "https://github.com/dt665m/str0m.git", rev = "591de71f4588b59e4850007414c6315a93943794" }
+# PR-SCTP fixes on latest upstream: abandonment (algesten/sctp-proto#57) and,
+# stacked on it, timed reliability that expires queued messages.
+sctp-proto = { git = "https://github.com/dt665m/sctp-proto.git", branch = "fix/timed-reliability-lifetime" }

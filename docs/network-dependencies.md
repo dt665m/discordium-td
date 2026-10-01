@@ -27,11 +27,10 @@ assets, target-specific dependencies and notice files before release.
 | serde | 1.0.229, crates.io checksum in lock | MIT OR Apache-2.0 | Serialization derives |
 | miniz_oxide | 0.8.9 and 0.9.1, crates.io checksums in lock | MIT OR Zlib OR Apache-2.0 | Compression; engine_net declares the 0.8 line |
 | tokio | 1.53.1, crates.io checksum in lock | MIT | Existing asynchronous transport/runtime support |
-| sctp-proto | 0.10.5, fork [`dt665m/sctp-proto`](https://github.com/dt665m/sctp-proto) branch `fix/partial-reliability-abandonment` on latest upstream | MIT OR Apache-2.0 | PR-SCTP abandonment fixes pending [algesten/sctp-proto#57](https://github.com/algesten/sctp-proto/pull/57). Remove the patch once a release includes them |
-| str0m | 0.23.1, `https://github.com/dt665m/str0m.git`, commit `591de71f4588b59e4850007414c6315a93943794` | MIT OR Apache-2.0 | Existing WebRTC transport patch; preserve this exact reviewed lock resolution |
+| sctp-proto | 0.10.5, fork [`dt665m/sctp-proto`](https://github.com/dt665m/sctp-proto) branch `fix/timed-reliability-lifetime`, exact commit in lock | MIT OR Apache-2.0 | PR-SCTP abandonment fixes pending [algesten/sctp-proto#57](https://github.com/algesten/sctp-proto/pull/57), and stacked on them timed reliability that expires messages still queued behind the congestion window (RFC 3758 §4.1). Remove the patch once a release includes both |
+| str0m | 0.24.0, crates.io checksum in lock | MIT OR Apache-2.0 | WebRTC (ICE, DTLS, SCTP data channels) for the server and native WebRTC client |
 
-The str0m manifest and lock use the same immutable `rev`. A lock protects a locked
-build, while the explicit commit also protects regeneration. `rtrb = "0.4"` is a
+`rtrb = "0.4"` is a
 workspace declaration currently absent from Cargo.lock, not an integrated or
 license-reviewed selected dependency. If activated, record its exact resolution
 and inspect its license before claiming that gate complete.

@@ -2790,9 +2790,9 @@ dependencies = [
 
 [[package]]
 name = "dimpl"
-version = "0.7.3"
+version = "0.7.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7fa936d6931067b24f3467ae6d1747a7985b5713aec477aacea2d1d8995234e8"
+checksum = "07d467d37bfdcc290bb8dcbedc8ca356eb730e46459b1687f98c3bae28aa6814"
 dependencies = [
  "aes",
  "arrayvec",
@@ -4125,8 +4125,9 @@ checksum = "6a756c3fac73139e83f14c2d742155dd2b78d3ee56597b419a0579b7bdd6dd78"
 
 [[package]]
 name = "is"
-version = "0.11.0"
-source = "git+https://github.com/dt665m/str0m.git?rev=591de71f4588b59e4850007414c6315a93943794#591de71f4588b59e4850007414c6315a93943794"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6edbbdc611843e8c65878ee735f68c495cede11ae5a9582b17fe0369c456ef5"
 dependencies = [
  "crc",
  "serde",
@@ -6144,7 +6145,7 @@ dependencies = [
 [[package]]
 name = "sctp-proto"
 version = "0.10.5"
-source = "git+https://github.com/dt665m/sctp-proto.git?branch=fix%2Fpartial-reliability-abandonment#68eb43bc8151bc6c5d3f601167b2d01a42a5da08"
+source = "git+https://github.com/dt665m/sctp-proto.git?branch=fix%2Ftimed-reliability-lifetime#cc640ba7fc5821f51e8527de63629750aa1ed584"
 dependencies = [
  "bytes",
  "crc",
@@ -6472,8 +6473,9 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "str0m"
-version = "0.23.1"
-source = "git+https://github.com/dt665m/str0m.git?rev=591de71f4588b59e4850007414c6315a93943794#591de71f4588b59e4850007414c6315a93943794"
+version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "018e4267976f45bf568c146b559bbabd2e823a9dc8c10b5b86e83118b597b89c"
 dependencies = [
  "arrayvec",
  "base64ct",
@@ -6493,7 +6495,8 @@ dependencies = [
 [[package]]
 name = "str0m-aws-lc-rs"
 version = "0.6.0"
-source = "git+https://github.com/dt665m/str0m.git?rev=591de71f4588b59e4850007414c6315a93943794#591de71f4588b59e4850007414c6315a93943794"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "73269314334fc6bfa8024f09dd652b9f5068360bf623c871e3d8d18e26d8035a"
 dependencies = [
  "aws-lc-rs",
  "dimpl",
@@ -6504,7 +6507,8 @@ dependencies = [
 [[package]]
 name = "str0m-proto"
 version = "0.7.0"
-source = "git+https://github.com/dt665m/str0m.git?rev=591de71f4588b59e4850007414c6315a93943794#591de71f4588b59e4850007414c6315a93943794"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e8f3d99f2cf6c76a502e45feb896ea71e54787ede8744bcdb215acfbfcb905dd"
 dependencies = [
  "base64ct",
  "dimpl",

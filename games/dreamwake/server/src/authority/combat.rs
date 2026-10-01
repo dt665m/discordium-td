@@ -1,16 +1,17 @@
 //! Authority-owned timing evidence; none of these records originate from a client.
 use super::*;
 use engine_net::combat_timing::{self, SentReference, TimingContext, TimingError, TimingPolicy};
-use engine_net::replication::StateReceipt;
+use engine_net::replication::stream::StreamAck;
 
 const REFERENCE_LIMIT: usize = 64;
 const CLOCK_LIMIT: usize = 64;
+/// A state packet that carried the owner's hero, and when.
 #[derive(Clone, Copy)]
 struct Reference {
-    receipt: StateReceipt,
+    seq: u32,
     state_at: ServerTick,
     sent_at: ServerTick,
-    decoded: bool,
+    received: bool,
 }
 #[derive(Default)]
 pub(super) struct PeerCombat {
@@ -18,27 +19,24 @@ pub(super) struct PeerCombat {
     arrivals: BTreeMap<CommandSeq, ServerTick>,
 }
 impl PeerCombat {
-    pub fn sent(&mut self, receipt: StateReceipt, state_at: ServerTick, sent_at: ServerTick) {
-        if self.references.iter().any(|entry| entry.receipt == receipt) {
+    pub fn sent(&mut self, seq: u32, state_at: ServerTick, sent_at: ServerTick) {
+        if self.references.iter().any(|entry| entry.seq == seq) {
             return;
         }
         if self.references.len() == REFERENCE_LIMIT {
             self.references.pop_front();
         }
         self.references.push_back(Reference {
-            receipt,
+            seq,
             state_at,
             sent_at,
-            decoded: false,
+            received: false,
         });
     }
-    pub fn decoded(&mut self, receipt: StateReceipt) {
-        if let Some(entry) = self
-            .references
-            .iter_mut()
-            .find(|entry| entry.receipt == receipt)
-        {
-            entry.decoded = true;
+    /// A view may name only owner state the client confirmed receiving.
+    pub fn acknowledge(&mut self, ack: StreamAck) {
+        for entry in &mut self.references {
+            entry.received |= ack.covers(entry.seq);
         }
     }
     pub fn admit(&mut self, sequence: CommandSeq, arrival: ServerTick) -> Result<(), String> {
@@ -58,8 +56,10 @@ impl PeerCombat {
     pub fn take_arrival(&mut self, sequence: CommandSeq) -> Option<ServerTick> {
         self.arrivals.remove(&sequence)
     }
+    #[allow(clippy::too_many_arguments)]
     pub fn validate(
         &self,
+        connection: ConnectionEpoch,
         view: live::CombatViewStamp,
         arrival: ServerTick,
         execution: ServerTick,
@@ -69,13 +69,13 @@ impl PeerCombat {
         let reference = self
             .references
             .iter()
-            .find(|entry| entry.receipt == view.reference && entry.decoded)
+            .find(|entry| entry.seq == view.reference && entry.received)
             .ok_or(TimingError::UnknownReference)?;
         let (oldest, newest) = clock.bounds(epoch).ok_or(TimingError::MissingHistory)?;
         let result = combat_timing::validate_view(
             policy(),
             TimingContext {
-                connection: reference.receipt.scope.connection,
+                connection,
                 scene: SCENE,
                 arrival,
                 execution,
@@ -87,11 +87,11 @@ impl PeerCombat {
                 sampled_fraction: view.sampled_fraction,
                 viewed_at: view.viewed_at,
                 viewed_fraction: view.viewed_fraction,
-                reference: view.reference.snapshot,
+                reference: SnapshotId(u64::from(view.reference)),
             },
             |_| {
                 Some(SentReference {
-                    connection: reference.receipt.scope.connection,
+                    connection,
                     scene: SCENE,
                     state_at: reference.state_at,
                     sent_at: reference.sent_at,
@@ -172,24 +172,15 @@ fn policy() -> TimingPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn receipt() -> StateReceipt {
-        StateReceipt {
-            scope: ScopeIdentity {
-                connection: ConnectionEpoch(1),
-                entity: EntityId {
-                    index: 1,
-                    generation: 1,
-                },
-                scope: ScopeEpoch(1),
-                representation: RepresentationRevision(1),
-            },
-            baseline_generation: BaselineGeneration(1),
-            snapshot: SnapshotId(1),
-            version: StateVersion(1),
+    const CONNECTION: ConnectionEpoch = ConnectionEpoch(1);
+    fn ack(seq: u32) -> StreamAck {
+        StreamAck {
+            latest: seq,
+            received: 0,
         }
     }
     #[test]
-    fn duplicate_arrival_stays_first_and_reference_requires_exact_decoded_proof() {
+    fn duplicate_arrival_stays_first_and_reference_requires_received_owner_state() {
         let mut peer = PeerCombat::default();
         peer.admit(CommandSeq(1), ServerTick(10)).unwrap();
         peer.admit(CommandSeq(1), ServerTick(12)).unwrap();
@@ -207,26 +198,26 @@ mod tests {
             sampled_fraction: 0,
             viewed_at: ServerTick(14),
             viewed_fraction: 0,
-            reference: receipt(),
+            reference: 5,
         };
-        peer.sent(receipt(), ServerTick(10), ServerTick(11));
+        peer.sent(5, ServerTick(10), ServerTick(11));
         assert_eq!(
-            peer.validate(view, ServerTick(19), ServerTick(20), &clock, 1),
+            peer.validate(CONNECTION, view, ServerTick(19), ServerTick(20), &clock, 1),
             Err(TimingError::UnknownReference)
         );
-        peer.decoded(receipt());
+        peer.acknowledge(ack(5));
         assert_eq!(
-            peer.validate(view, ServerTick(19), ServerTick(20), &clock, 1),
+            peer.validate(CONNECTION, view, ServerTick(19), ServerTick(20), &clock, 1),
             Ok((ServerTick(14), 12, 0, false))
         );
         let mut forged = view;
-        forged.reference.version = StateVersion(2);
+        forged.reference = 6;
         assert_eq!(
-            peer.validate(forged, ServerTick(19), ServerTick(20), &clock, 1),
+            peer.validate(CONNECTION, forged, ServerTick(19), ServerTick(20), &clock, 1),
             Err(TimingError::UnknownReference)
         );
         assert_eq!(
-            peer.validate(view, ServerTick(19), ServerTick(20), &clock, 2),
+            peer.validate(CONNECTION, view, ServerTick(19), ServerTick(20), &clock, 2),
             Err(TimingError::MissingHistory)
         );
         clock.record(2, ServerTick(21), 0);
@@ -236,8 +227,8 @@ mod tests {
     #[test]
     fn fractional_clock_mapping_requires_exact_neighbors_and_never_clamps() {
         let mut peer = PeerCombat::default();
-        peer.sent(receipt(), ServerTick(10), ServerTick(11));
-        peer.decoded(receipt());
+        peer.sent(5, ServerTick(10), ServerTick(11));
+        peer.acknowledge(ack(5));
         let mut clock = GameplayClock::default();
         for tick in 1..=20 {
             clock.record(1, ServerTick(tick), (tick as u32).min(12));
@@ -247,29 +238,23 @@ mod tests {
             sampled_fraction: 32768,
             viewed_at: ServerTick(11),
             viewed_fraction: 32768,
-            reference: receipt(),
+            reference: 5,
+        };
+        let validate = |peer: &PeerCombat, view, clock: &GameplayClock| {
+            peer.validate(CONNECTION, view, ServerTick(19), ServerTick(20), clock, 1)
         };
         assert_eq!(
-            peer.validate(view, ServerTick(19), ServerTick(20), &clock, 1),
+            validate(&peer, view, &clock),
             Ok((ServerTick(11), 11, 32768, false))
         );
         view.viewed_at = ServerTick(14);
-        assert_eq!(
-            peer.validate(view, ServerTick(19), ServerTick(20), &clock, 1),
-            Ok((ServerTick(14), 12, 0, false))
-        );
+        assert_eq!(validate(&peer, view, &clock), Ok((ServerTick(14), 12, 0, false)));
         view.viewed_at = ServerTick(1);
-        assert_eq!(
-            peer.validate(view, ServerTick(19), ServerTick(20), &clock, 1),
-            Err(TimingError::OutsidePolicy)
-        );
+        assert_eq!(validate(&peer, view, &clock), Err(TimingError::OutsidePolicy));
         view.viewed_at = ServerTick(11);
         clock
             .entries
             .retain(|(_, server, _)| *server != ServerTick(12));
-        assert_eq!(
-            peer.validate(view, ServerTick(19), ServerTick(20), &clock, 1),
-            Err(TimingError::MissingHistory)
-        );
+        assert_eq!(validate(&peer, view, &clock), Err(TimingError::MissingHistory));
     }
 }

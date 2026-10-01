@@ -65,14 +65,9 @@ pub fn fixture() -> Result<String, Box<dyn std::error::Error>> {
             "cover_marker",
             PublicReplica::CoverMarker(PublicCoverMarkerView {
                 id: 13,
-                parent: engine_net::types::ScopeIdentity {
-                    connection: engine_net::types::ConnectionEpoch(1),
-                    entity: engine_net::types::EntityId {
-                        index: 12,
-                        generation: 1,
-                    },
-                    scope: engine_net::types::ScopeEpoch(2),
-                    representation: engine_net::types::RepresentationRevision(1),
+                parent: engine_net::types::EntityId {
+                    index: 12,
+                    generation: 1,
                 },
                 revision: 2,
                 local_offset: [0.0, 1.35, 0.0],

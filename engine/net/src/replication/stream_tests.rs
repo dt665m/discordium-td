@@ -285,3 +285,18 @@ fn random_loss_and_reordering_converge() {
         .collect();
     assert_eq!(held, live);
 }
+
+#[test]
+fn in_flight_states_are_lost_only_when_a_later_packet_is_acknowledged() {
+    let mut server = ServerStream::<u8, u32>::new(8);
+    let mut client = ClientStream::<u8, u32>::new(8);
+    let first = send(&mut server, &[(1, 10)]);
+    assert_eq!(server.in_flight(1), Some((first.seq, &10)));
+    assert!(!server.lost(first.seq), "nothing has been reported yet");
+    let second = send(&mut server, &[(2, 20)]);
+    receive(&mut client, &second).unwrap();
+    server.acknowledge(client.ack()).unwrap();
+    assert!(server.lost(first.seq));
+    assert!(!server.lost(second.seq));
+    assert_eq!(server.in_flight(2), None, "acknowledged states become the base");
+}

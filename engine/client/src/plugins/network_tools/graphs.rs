@@ -13,7 +13,7 @@ pub enum DebugMetric {
     Sent,
     Received,
     SnapshotAge,
-    BaselineMisses,
+    StateRejections,
     DecodeErrors,
     TransportErrors,
     BrowserDrops,
@@ -24,7 +24,6 @@ pub enum DebugMetric {
     InputBuffer,
     Correction,
     DecodeIssue,
-    RecoveryIssue,
     TransportIssue,
 }
 
@@ -162,7 +161,7 @@ pub fn spawn(commands: &mut Commands) {
                     ("Pending inputs", DebugMetric::InputBuffer),
                     ("Correction", DebugMetric::Correction),
                     ("Snapshots", DebugMetric::Messages),
-                    ("Baseline misses", DebugMetric::BaselineMisses),
+                    ("State rejected", DebugMetric::StateRejections),
                     ("Decode errors", DebugMetric::DecodeErrors),
                     ("Transport errors", DebugMetric::TransportErrors),
                     ("Drops S/R/size", DebugMetric::BrowserDrops),
@@ -197,7 +196,6 @@ pub fn spawn(commands: &mut Commands) {
             });
             for (label, metric) in [
                 ("Last decode issue: --", DebugMetric::DecodeIssue),
-                ("Last recovery issue: --", DebugMetric::RecoveryIssue),
                 ("Last transport issue: --", DebugMetric::TransportIssue),
             ] {
                 p.spawn((

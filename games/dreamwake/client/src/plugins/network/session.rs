@@ -1,37 +1,39 @@
-//! Authenticated scoped session state, independent of Bevy and hardware polling.
+//! The connection's live state, independent of Bevy and hardware polling.
+//!
+//! State packets arrive unreliably. Each entry is decoded against the state
+//! this client acknowledged, the newest owner state replaces prediction from
+//! its tick, and nothing waits for anything to be resent: a lost packet is
+//! covered by the next one.
 use super::model::*;
-use dreamwake_protocol::live::baselines as baseline_wire;
-use dreamwake_protocol::{
-    DreamAction,
-    live::*,
-    replication::{ReplicaPayload, decode_replica},
+use dreamwake_protocol::{DreamAction, live::*};
+use dreamwake_sim::replication::{
+    DreamPresentation, OwnerCheckpoint, OwnerPredictionState, PublicReplica, Replica,
+    ReplicaKind, ReplicaState,
 };
-use dreamwake_sim::replication::DreamPresentation;
-use engine_net::replication::baselines::BaselineEncoding;
 use engine_net::{
-    codec::BoundedVec,
+    codec::{BoundedVec, FrameLimit},
     input::InputJournal,
-    prediction::*,
-    replication::*,
+    prediction::rewind::Correction,
+    replication::stream::{Base, ClientStream},
     synchronization::{
         ClockConfig, ClockEstimator, ClockSample, CommittedClock, LeadController, ResyncReason,
         SyncError, TimeExchange,
     },
     types::*,
 };
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    time::Duration,
-};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::time::Duration;
+
+/// Entities this client can hold at once.
+const MAX_ENTITIES: usize = 4096;
 
 #[derive(Debug, Clone, Copy, Default, serde::Serialize)]
 pub(crate) struct DeliveryMetrics {
-    pub group_messages: u64,
-    pub groups_completed: u64,
-    pub baseline_stale: u64,
-    pub baseline_reset_pending: u64,
-    pub replay_requested: u64,
-    pub maximum_replay_requested: u64,
+    pub state_packets: u64,
+    pub rejected_packets: u64,
+    pub replayed: u64,
+    pub rebased: u64,
+    pub stale: u64,
     pub replay_cpu_micros: u64,
     pub maximum_replay_cpu_micros: u64,
 }
@@ -42,41 +44,30 @@ pub(crate) struct SessionMetrics {
     /// Server transport peer identity; stream epochs may change independently.
     pub transport_connection: u64,
     pub active: bool,
-    pub recovering: bool,
     pub connection_epoch: ConnectionEpoch,
     pub match_epoch: u32,
     pub estimated_server_tick: Option<ServerTick>,
     pub estimated_simulation_tick: Option<ServerTick>,
     pub committed_server_tick: ServerTick,
     pub clock_anchor_tick: ServerTick,
-    pub checkpoint_server_tick: Option<ServerTick>,
+    pub owner_tick: Option<ServerTick>,
     pub finalized_tick: ServerTick,
     pub predicted_tick: Option<ServerTick>,
     pub gameplay_tick: Option<u32>,
     pub combat_view_tick: Option<ServerTick>,
-    pub known_scopes: usize,
-    pub live_scopes: usize,
-    pub incomplete_groups: usize,
-    pub prediction_groups: usize,
+    pub entities: usize,
+    pub stream_latest: u32,
     pub lead_ticks: u8,
     pub arrival_slack: Option<u8>,
     pub arrival_feedback: ArrivalFeedback,
     pub arrival_feedback_applied: u64,
     pub arrival_feedback_ignored: u64,
     pub lead_policy: u64,
-    pub scope_bytes: usize,
-    pub group_bytes: usize,
-    pub baseline_bytes: usize,
-    pub baseline_repairs: u64,
     pub delivery: DeliveryMetrics,
-    pub prediction_bytes: usize,
     pub replay_ticks: usize,
     pub predicted_ticks_this_frame: usize,
     pub interpolation: super::RemotePoseMetrics,
 }
-// Eight maximum-width StateReceipts fit the minimum admitted 1088-byte frame.
-// Each receive pass drains its final partial batch before transport publication.
-const DECODED_RECEIPTS_PER_CONTROL: usize = 8;
 
 #[derive(Clone, Copy)]
 struct CommandIssuance {
@@ -86,43 +77,34 @@ struct CommandIssuance {
     feedback_seen: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ResyncRequest {
-    Idle,
-    PendingEnqueue,
-    AwaitingWelcome,
-}
-
-/// A complete reliable message may precede its reset on the control channel.
-/// Renet has already acknowledged its bytes, so keep one validated message until
-/// that control arrives. This is not byte assembly or application retransmission.
-struct PendingResetGroup {
-    publication: GroupPublication,
-    bytes: Box<[u8]>,
-    received_at: Duration,
-    started_at: Duration,
+/// One entity's newest state, and when the server captured it.
+struct Entry {
+    tick: ServerTick,
+    replica: Replica,
 }
 
 pub(crate) struct Session {
-    pub(super) model: OwnerModel,
-    pub(super) baselines: super::baselines::OwnerBaselines,
-    baseline_repairs: u64,
+    pub(super) welcome: Welcome,
+    pub(super) predictor: Predictor,
+    stream: ClientStream<EntityId, ReplicaState>,
+    replicas: BTreeMap<EntityId, Entry>,
+    /// How many times each entity has entered this connection's view.
+    incarnations: BTreeMap<EntityId, u64>,
     delivery: DeliveryMetrics,
     pub(super) poses: super::presentation::RemotePoses,
-    pub(super) scopes: ClientScopes<Vec<u8>>,
-    pub(super) groups: GroupAssembler<Vec<u8>>,
-    pending_reset_group: Option<PendingResetGroup>,
-    pub(super) predictor: PredictionManager<OwnerModel>,
     pub(crate) events: super::predicted_events::PredictedEvents,
     pub(super) journal: InputJournal<TickInput, DreamAction>,
     pub(super) input_deadline: Option<Duration>,
     pub(super) clock: ClockEstimator,
     pub(super) simulation_clock: CommittedClock,
     pub(super) lead: LeadController,
-    pub(super) entities: BTreeSet<EntityId>,
-    pub(super) finalized: ServerTick,
-    pub(super) finalized_ack_pending: Option<ServerTick>,
+    pub(super) status: OwnerStatus,
+    status_seq: u32,
     pub(super) outcomes_ack_pending: Option<u64>,
+    /// The newest owner state received and not yet applied to prediction.
+    pending_owner: Option<(u32, ServerTick, OwnerCheckpoint)>,
+    /// State packets that carried owner state, newest last, for combat stamps.
+    combat_references: VecDeque<(u32, ServerTick)>,
     pub(super) estimated_server_tick: Option<ServerTick>,
     pub(super) estimated_simulation_tick: Option<ServerTick>,
     pub(super) arrival_slack: Option<u8>,
@@ -131,130 +113,85 @@ pub(crate) struct Session {
     arrival_feedback_ignored: u64,
     lead_policy: u64,
     lead_policy_head: Option<TargetTick>,
-    issued_commands: std::collections::VecDeque<CommandIssuance>,
+    issued_commands: VecDeque<CommandIssuance>,
     retired_issuance_through: CommandSeq,
     pub(super) active: bool,
-    pub(super) recovering: bool,
     pub(super) sequence: CommandSeq,
-    pub(super) last_input_retry_committed: Option<ServerTick>,
     pub(super) charge_episode: Option<u64>,
-    pub(super) action_backlog: std::collections::VecDeque<DreamAction>,
+    pub(super) action_backlog: VecDeque<DreamAction>,
     pub(super) autoplay_edges: [bool; 5],
-    pub(super) frame: u64,
     pub(super) control_sequence: u32,
-    /// Newest decode receipt per scope incarnation, awaiting the next flush.
-    pending_decoded_receipts: BTreeMap<ScopeIdentity, StateReceipt>,
-    pub(super) next_receipt_flush: Duration,
-    pub(super) decoded_groups: BTreeMap<SnapshotId, ServerTick>,
-    combat_references: std::collections::VecDeque<(StateReceipt, ServerTick)>,
-    pub(super) acknowledged_active: Option<(SnapshotId, ServerTick)>,
+    pub(super) input_sequence: u32,
     pub(super) last_probe: Duration,
-    pub(super) last_resync: Option<Duration>,
-    pub(super) resync_request: ResyncRequest,
-    /// Why recovery was requested. The protocol carries a typed reason and it
-    /// is the only attribution the server ever sees, so it must describe the
-    /// fault that actually happened rather than a fixed placeholder.
-    pub(super) resync_reason: dreamwake_protocol::live::ResyncReason,
-    /// The fault text as observed, carried to the server because a deployed
-    /// browser's own log cannot be read from there.
-    pub(super) resync_detail: String,
 }
 impl Session {
+    fn scope_for(&self, entity: EntityId) -> ScopeIdentity {
+        ScopeIdentity {
+            connection: self.welcome.stream.epoch,
+            entity,
+            scope: ScopeEpoch(self.incarnations.get(&entity).copied().unwrap_or(1)),
+            representation: RepresentationRevision(1),
+        }
+    }
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn public_hero_scopes(&self) -> Vec<(u64, ScopeIdentity, ServerTick, [f32; 2])> {
-        self.entities
+        self.replicas
             .iter()
-            .filter_map(|entity| {
-                let state = self.scopes.state(*entity)?;
-                match decode_replica(&state.payload, None).ok()? {
-                    ReplicaPayload::Actor(dreamwake_sim::replication::PublicReplica::Hero(
-                        hero,
-                    )) => Some((hero.id, state.scope, state.end_tick, hero.position)),
-                    _ => None,
+            .filter_map(|(entity, entry)| match &entry.replica {
+                Replica::Actor(PublicReplica::Hero(hero)) => {
+                    Some((hero.id, self.scope_for(*entity), entry.tick, hero.position))
                 }
+                _ => None,
             })
             .collect()
     }
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn public_enemy_scopes(&self) -> Vec<(u64, ScopeIdentity, ServerTick, [f32; 2])> {
-        self.entities
+        self.replicas
             .iter()
-            .filter_map(|entity| {
-                let state = self.scopes.state(*entity)?;
-                match decode_replica(&state.payload, None).ok()? {
-                    ReplicaPayload::Actor(dreamwake_sim::replication::PublicReplica::Enemy(
-                        enemy,
-                    )) => Some((enemy.id, state.scope, state.end_tick, enemy.position)),
-                    _ => None,
+            .filter_map(|(entity, entry)| match &entry.replica {
+                Replica::Actor(PublicReplica::Enemy(enemy)) => {
+                    Some((enemy.id, self.scope_for(*entity), entry.tick, enemy.position))
                 }
+                _ => None,
             })
             .collect()
     }
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn scope_identities(&self) -> Vec<ScopeIdentity> {
-        self.entities
+        self.replicas
             .iter()
-            .filter_map(|entity| self.scopes.state(*entity).map(|state| state.scope))
+            .filter(|(_, entry)| matches!(entry.replica, Replica::Actor(_)))
+            .map(|(entity, _)| self.scope_for(*entity))
             .collect()
     }
-    /// Tests exercise the speculation ceiling without simulating the seconds
-    /// the production bound takes to reach.
-    #[cfg(test)]
-    pub(super) fn limit_speculation(&mut self, ticks: u32) {
-        let (tick, time) = self.simulation_clock.anchor();
-        let committed = self.simulation_clock.committed();
-        let rate = TickRate::new(dreamwake_sim::TICK_HZ).unwrap();
-        self.simulation_clock = CommittedClock::new(rate, tick, time, ticks).unwrap();
-        self.simulation_clock.commit(committed);
-    }
     pub(crate) fn metrics(&self) -> SessionMetrics {
-        let checkpoint = self.scopes.state(self.model.welcome.owner_entity);
         let work = self.predictor.work();
         SessionMetrics {
-            server_instance: self.model.welcome.server_instance,
-            transport_connection: self.model.welcome.client.0,
+            server_instance: self.welcome.server_instance,
+            transport_connection: self.welcome.client.0,
             active: self.active,
-            recovering: self.recovering,
-            connection_epoch: self.model.welcome.stream.epoch,
-            match_epoch: self.model.welcome.match_epoch,
+            connection_epoch: self.welcome.stream.epoch,
+            match_epoch: self.welcome.match_epoch,
             estimated_server_tick: self.estimated_server_tick,
             estimated_simulation_tick: self.estimated_simulation_tick,
             committed_server_tick: self.simulation_clock.committed(),
             clock_anchor_tick: self.simulation_clock.anchor().0,
-            checkpoint_server_tick: checkpoint.map(|v| v.end_tick),
-            finalized_tick: self.finalized,
-            predicted_tick: self.predictor.predicted_tick(OWNER_GROUP),
-            gameplay_tick: self
-                .predictor
-                .state(OWNER_GROUP)
-                .map(|v| v.0.stamp().gameplay_tick),
+            owner_tick: self.replicas.get(&self.welcome.owner_entity).map(|e| e.tick),
+            finalized_tick: self.status.finalized,
+            predicted_tick: self.predictor.predicted_tick(),
+            gameplay_tick: self.predictor.state().map(|state| state.stamp().gameplay_tick),
             combat_view_tick: self.poses.combat_view_tick(),
-            known_scopes: self.scopes.known_entities(),
-            live_scopes: self
-                .entities
-                .iter()
-                .filter(|entity| self.scopes.state(**entity).is_some())
-                .count(),
-            incomplete_groups: self.groups.incomplete()
-                + usize::from(self.pending_reset_group.is_some()),
-            prediction_groups: self.predictor.group_count(),
+            entities: self.replicas.len(),
+            stream_latest: self.stream.ack().latest,
             lead_ticks: self.lead.lead(),
             arrival_slack: self.arrival_slack,
             arrival_feedback: self.arrival_feedback,
             arrival_feedback_applied: self.arrival_feedback_applied,
             arrival_feedback_ignored: self.arrival_feedback_ignored,
             lead_policy: self.lead_policy,
-            scope_bytes: self.scopes.retained_bytes(),
-            group_bytes: self.groups.staged_bytes()
-                + self
-                    .pending_reset_group
-                    .as_ref()
-                    .map_or(0, |group| group.bytes.len()),
-            baseline_bytes: self.baselines.retained_bytes(),
-            baseline_repairs: self.baseline_repairs,
             delivery: self.delivery,
-            prediction_bytes: self.predictor.retained_bytes(),
-            replay_ticks: work.replay_ticks,
+            replay_ticks: work.replayed_ticks,
             predicted_ticks_this_frame: work.predicted_ticks,
             interpolation: self.poses.metrics(),
         }
@@ -266,13 +203,11 @@ impl Session {
         let server_epoch = Duration::from_nanos(welcome.server_time_nanos)
             .saturating_sub(rate.deadline(welcome.tick).ok_or("clock range")?);
         Ok(Self {
-            baselines: Default::default(),
-            baseline_repairs: 0,
+            predictor: Predictor::new(OwnerModel::new(welcome.clone())?, HISTORY_TICKS),
+            stream: ClientStream::new(MAX_ENTITIES),
+            replicas: BTreeMap::new(),
+            incarnations: BTreeMap::new(),
             delivery: DeliveryMetrics::default(),
-            scopes: ClientScopes::new(epoch, baseline_wire::scope_limits()).map_err(err)?,
-            groups: GroupAssembler::new(epoch, group_limits()).map_err(err)?,
-            pending_reset_group: None,
-            predictor: new_predictor(epoch)?,
             events: super::predicted_events::PredictedEvents::new(
                 engine_net::events::JournalScope {
                     connection: epoch,
@@ -289,14 +224,18 @@ impl Session {
                 // Speculation is bounded by retained history. A tighter ceiling
                 // freezes the owner after every hitch until fresh authority
                 // arrives, then releases the backlog in one frame.
-                PredictionLimits::default().history_ticks as u32,
+                HISTORY_TICKS as u32,
             )
             .map_err(err)?,
             lead: LeadController::new(3).map_err(err)?,
-            entities: BTreeSet::new(),
-            finalized: welcome.tick,
-            finalized_ack_pending: None,
+            status: OwnerStatus {
+                finalized: welcome.tick,
+                ..Default::default()
+            },
+            status_seq: 0,
             outcomes_ack_pending: None,
+            pending_owner: None,
+            combat_references: VecDeque::new(),
             estimated_server_tick: None,
             estimated_simulation_tick: None,
             arrival_slack: None,
@@ -305,30 +244,19 @@ impl Session {
             arrival_feedback_ignored: 0,
             lead_policy: 0,
             lead_policy_head: None,
-            issued_commands: Default::default(),
+            issued_commands: VecDeque::new(),
             retired_issuance_through: CommandSeq(0),
             active: false,
-            recovering: false,
             sequence: CommandSeq(0),
-            last_input_retry_committed: None,
             charge_episode: None,
-            action_backlog: Default::default(),
+            action_backlog: VecDeque::new(),
             autoplay_edges: [false; 5],
-            frame: 0,
             control_sequence: 0,
-            pending_decoded_receipts: BTreeMap::new(),
-            next_receipt_flush: Duration::ZERO,
-            decoded_groups: BTreeMap::new(),
-            combat_references: Default::default(),
-            acknowledged_active: None,
+            input_sequence: 0,
             last_probe: Duration::ZERO,
-            last_resync: None,
-            resync_request: ResyncRequest::Idle,
-            resync_reason: dreamwake_protocol::live::ResyncReason::InvalidCheckpoint,
-            resync_detail: String::new(),
             poses: super::presentation::RemotePoses::new(epoch, welcome.content.scene_revision)
                 .map_err(|e| format!("remote presentation: {e:?}"))?,
-            model: OwnerModel::new(welcome),
+            welcome,
         })
     }
     /// Returns whether this probe initialized or advanced the clock. A probe
@@ -346,16 +274,9 @@ impl Session {
                 Duration::from_millis(20),
             ) {
                 Ok(lead) => Some(lead),
-                // A local renderer or asset stall delays this reply after the
-                // server sent it, so the round trip it reports is the stall,
-                // not the network. Discard the probe and wait for the next
-                // one, exactly as the coupled-initialization rule above
-                // requires. Escalating instead would reject the reply, leave
-                // the clock uninitialized, and spend a recovery attempt that
-                // cannot make a stalled frame arrive sooner; three of those
-                // inside the sliding window end the connection. A round trip
-                // that is genuinely past the horizon still stops the join at
-                // the bootstrap deadline.
+                // A local stall delays this reply after the server sent it, so
+                // its round trip is the stall, not the network. Wait for the
+                // next probe rather than treating it as a fault.
                 Err(SyncError::ResyncRequired(ResyncReason::LeadExceeded)) => return Ok(false),
                 Err(error) => return Err(error),
             }
@@ -382,11 +303,6 @@ impl Session {
         self.simulation_clock = simulation_clock;
         Ok(())
     }
-    /// Choose the fresh command head from authenticated committed progress.
-    /// Forecast ticks before that head use checkpointed missing-input state;
-    /// authored ticks consume hardware samples at their own capture deadlines.
-    /// Lead changes may pause the input deadline but cannot drain it backward.
-    /// This never edits an already assigned command or its target.
     /// Choose the fresh command head. Forecast ticks before that head use
     /// checkpointed missing-input state; authored ticks consume hardware
     /// samples at their own capture deadlines. This never edits an already
@@ -401,7 +317,7 @@ impl Session {
         self.sequence == CommandSeq(0)
             || self
                 .predictor
-                .predicted_tick(OWNER_GROUP)
+                .predicted_tick()
                 .is_some_and(|tick| tick < estimated)
     }
     pub(super) fn record_command_issuance(
@@ -425,69 +341,55 @@ impl Session {
             feedback_seen: false,
         });
     }
-    pub(super) fn observe_arrival_feedback(
-        &mut self,
-        feedback: ArrivalFeedback,
-    ) -> Result<(), SyncError> {
-        if !feedback.validate()
-            || feedback.observed_commands < self.arrival_feedback.observed_commands
+    /// Arrival feedback rides every state packet. Only a sample the server
+    /// has not reported before, about a command issued under the current lead
+    /// policy, tunes the lead.
+    pub(super) fn observe_arrival_feedback(&mut self, feedback: ArrivalFeedback) {
+        if feedback.observed_commands < self.arrival_feedback.observed_commands
             || feedback.late_commands < self.arrival_feedback.late_commands
-            || (feedback.sample.is_some()
-                && feedback.observed_commands == self.arrival_feedback.observed_commands)
         {
-            return Err(SyncError::InvalidSample);
-        }
-        if feedback.late_commands - self.arrival_feedback.late_commands
-            > feedback.observed_commands - self.arrival_feedback.observed_commands
-        {
-            return Err(SyncError::InvalidSample);
+            return;
         }
         let Some(sample) = feedback.sample else {
             self.arrival_feedback = feedback;
-            self.arrival_slack = None;
-            return Ok(());
+            return;
         };
-        if sample.sequence > self.sequence {
-            return Err(SyncError::InvalidSample);
+        if feedback.observed_commands == self.arrival_feedback.observed_commands
+            || sample.sequence > self.sequence
+        {
+            return;
         }
-        let index = self
-            .issued_commands
-            .iter()
-            .position(|issued| issued.sequence == sample.sequence);
-        let eligible = if let Some(index) = index {
-            let issued = &self.issued_commands[index];
-            if issued.target != sample.target || issued.feedback_seen {
-                return Err(SyncError::InvalidSample);
-            }
-            issued.policy == Some(self.lead_policy)
-        } else if sample.sequence <= self.retired_issuance_through {
-            false
-        } else {
-            return Err(SyncError::InvalidSample);
-        };
         self.arrival_feedback = feedback;
         self.arrival_slack = Some(sample.slack);
-        if let Some(index) = index {
-            self.issued_commands[index].feedback_seen = true;
-        }
+        let issued = self
+            .issued_commands
+            .iter_mut()
+            .find(|issued| issued.sequence == sample.sequence && issued.target == sample.target);
+        let eligible = match issued {
+            Some(issued) if !issued.feedback_seen => {
+                issued.feedback_seen = true;
+                issued.policy == Some(self.lead_policy)
+            }
+            _ => false,
+        };
         if !eligible {
             self.arrival_feedback_ignored = self.arrival_feedback_ignored.saturating_add(1);
-            return Ok(());
+            return;
         }
         self.arrival_feedback_applied = self.arrival_feedback_applied.saturating_add(1);
         let previous = self.lead.lead();
-        self.lead.observe_arrival_slack(i32::from(sample.slack))?;
-        if self.lead.lead() != previous {
-            self.lead_policy = self
-                .lead_policy
-                .checked_add(1)
-                .ok_or(SyncError::TimeRange)?;
+        if self
+            .lead
+            .observe_arrival_slack(i32::from(sample.slack))
+            .is_ok()
+            && self.lead.lead() != previous
+        {
+            self.lead_policy = self.lead_policy.saturating_add(1);
             self.lead_policy_head = None;
         }
-        Ok(())
     }
     pub(super) fn capture_combat_view(&mut self, at: Duration) -> Option<CombatViewStamp> {
-        if !self.active || self.recovering {
+        if !self.active {
             return None;
         }
         let rate = TickRate::new(dreamwake_sim::TICK_HZ)?;
@@ -512,8 +414,10 @@ impl Session {
         })
     }
     pub(super) fn advance_presentation_clock(&mut self, at: Duration) {
-        if let Some(state) = self.scopes.state(self.model.welcome.global_entity)
-            && let Ok(ReplicaPayload::Global(global)) = decode_replica(&state.payload, None)
+        if let Some(Entry {
+            replica: Replica::Global(global),
+            ..
+        }) = self.replicas.get(&self.welcome.global_entity)
         {
             self.poses
                 .set_paused(global.paused, ServerTick(global.stamp.server_tick));
@@ -532,56 +436,37 @@ impl Session {
             self.poses.advance_time(elapsed);
         }
     }
-    /// Capture optional public targeting inputs once. Replay reads the retained
-    /// dependency frame, never a newer or retired presentation replica.
-    pub(super) fn prediction_dependencies(
-        &self,
-        at: ServerTick,
-    ) -> Result<DependencyFrame<CollisionDependency>, String> {
-        let mut dependencies = self
-            .predictor
-            .checkpoint_dependencies(OWNER_GROUP)
-            .cloned()
-            .ok_or("missing admitted checkpoint dependencies")?;
+    /// What a tick at `at` reads: the scene, the platforms the client knows,
+    /// and the nearest disclosed enemies sampled no later than `at`.
+    pub(super) fn prediction_dependencies(&self, at: ServerTick) -> Dependencies {
         let owner = self
             .predictor
-            .state(OWNER_GROUP)
-            .ok_or("missing owner prediction")?
-            .0
-            .hero_view()
-            .position;
+            .state()
+            .map(|state| state.hero_view().position)
+            .unwrap_or_default();
+        let mut platforms = Vec::new();
         let mut targets = Vec::new();
-        for entity in &self.entities {
-            let Some(state) = self.scopes.state(*entity) else {
-                continue;
-            };
-            if state.end_tick > at {
-                continue;
+        for entry in self.replicas.values() {
+            match &entry.replica {
+                Replica::Actor(PublicReplica::Platform(view)) => platforms.push(view.clone()),
+                Replica::Actor(PublicReplica::Enemy(enemy))
+                    if entry.tick <= at && enemy.hp > 0.0 =>
+                {
+                    targets.push((engine_core::spatial::distance(enemy.position, owner), *enemy));
+                }
+                _ => {}
             }
-            let ReplicaPayload::Actor(dreamwake_sim::replication::PublicReplica::Enemy(target)) =
-                decode_replica(&state.payload, Some(self.model.expectation())).map_err(err)?
-            else {
-                continue;
-            };
-            if target.hp <= 0.0 {
-                continue;
-            }
-            let distance = engine_core::spatial::distance(target.position, owner);
-            targets.push((distance, state.scope, state.version, target));
         }
-        targets.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.entity.cmp(&b.1.entity)));
-        for (_, scope, version, target) in targets.into_iter().take(MAX_PRESENTATION_TARGETS) {
-            dependencies.records.insert(
-                scope.entity,
-                DependencyRecord {
-                    scope,
-                    version,
-                    scene_revision: self.model.welcome.content.scene_revision,
-                    value: DependencyValue::Known(CollisionDependency::PresentationTarget(target)),
-                },
-            );
+        targets.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.id.cmp(&b.1.id)));
+        Dependencies {
+            collision: self.predictor.model().collision.clone(),
+            platforms,
+            targets: targets
+                .into_iter()
+                .take(MAX_PRESENTATION_TARGETS)
+                .map(|(_, enemy)| enemy)
+                .collect(),
         }
-        Ok(dependencies)
     }
     pub(super) fn next_action(
         &mut self,
@@ -632,35 +517,24 @@ impl Session {
         self.input_deadline = Some(deadline);
         Ok(sample)
     }
-    pub(super) fn begin_frame(&mut self) -> Result<(), String> {
-        self.frame = self.frame.checked_add(1).ok_or("frame exhausted")?;
-        self.predictor
-            .begin_frame(ReplicationFrame(self.frame))
-            .map_err(err)
+    pub(super) fn begin_frame(&mut self) {
+        self.predictor.begin_frame();
     }
-    pub(super) fn acknowledge_active(&mut self, owner_snapshot: SnapshotId, through: ServerTick) {
-        self.acknowledged_active = Some((owner_snapshot, through));
-        self.finalized = self.finalized.max(through);
-        self.simulation_clock.commit(through);
-    }
-    /// Activation is scoped to this authenticated Session and remains valid after
-    /// its initial proof ages out of bounded decode history. Recovery/new Welcome
-    /// explicitly resets it; ordinary checkpoint retention is not revocation.
     pub(super) fn update_connection(
         &self,
         connection: &mut crate::DreamConnection,
         rtt_ms: f64,
         party_size: usize,
     ) {
-        connection.connected = self.active && !self.recovering;
-        connection.client_id = self.model.welcome.client.0;
-        connection.player_id = self.model.welcome.player.get();
+        connection.connected = self.active;
+        connection.client_id = self.welcome.client.0;
+        connection.player_id = self.welcome.player.get();
         connection.party_size = party_size;
         connection.rtt_ms = rtt_ms;
         connection.status = if connection.connected {
             "Connected to the shared dream"
         } else {
-            "Synchronizing the shared dream…"
+            "Joining the shared dream…"
         }
         .into();
     }
@@ -671,653 +545,330 @@ impl Session {
             .ok_or("control sequence exhausted")?;
         encode_control(
             message,
-            self.model.welcome.stream.epoch,
+            self.welcome.stream.epoch,
             self.control_sequence,
-            self.model.welcome.frame_limit().map_err(err)?,
+            self.welcome.frame_limit().map_err(err)?,
         )
         .map_err(err)
     }
-    /// Queue only completed public-state decode proofs. The server's
-    /// acknowledgement is cumulative per scope incarnation, so only the newest
-    /// receipt of each is kept; successive incarnations of one entity remain
-    /// distinct. Owner and baseline proofs never pass through this queue.
-    pub(super) fn queue_decoded_receipt(&mut self, receipt: StateReceipt) {
-        match self.pending_decoded_receipts.get(&receipt.scope) {
-            Some(queued) if queued.snapshot >= receipt.snapshot => {}
-            _ => {
-                self.pending_decoded_receipts.insert(receipt.scope, receipt);
-            }
-        }
+    /// One input packet: the stream acknowledgement and the given records.
+    pub(super) fn input(&mut self, records: Vec<InputRecord>) -> Result<Vec<u8>, String> {
+        self.input_sequence = self.input_sequence.wrapping_add(1);
+        encode_input(
+            &InputPacket {
+                ack: self.stream.ack(),
+                records: BoundedVec::new(records).map_err(err)?,
+            },
+            self.welcome.stream.epoch,
+            self.input_sequence,
+            self.welcome.frame_limit().map_err(err)?,
+        )
+        .map_err(err)
     }
-    /// One control's worth of queued receipts, oldest scopes first. A new
-    /// Session starts with no queued proofs.
-    pub(super) fn take_decoded_receipts(&mut self) -> Option<ClientControl> {
-        let batch: Vec<_> = std::iter::from_fn(|| self.pending_decoded_receipts.pop_first())
-            .take(DECODED_RECEIPTS_PER_CONTROL)
-            .map(|(_, receipt)| receipt)
-            .collect();
-        (!batch.is_empty()).then(|| ClientControl::Decoded {
-            receipts: BoundedVec::new(batch)
-                .expect("eight receipts fit the protocol's twelve-receipt capacity"),
-        })
+    #[cfg(test)]
+    pub(super) fn stream_ack(&self) -> engine_net::replication::stream::StreamAck {
+        self.stream.ack()
     }
-    /// Call only after publication succeeds. In particular, a new attachment
-    /// has no pose sample but still retires the older generation's pose/history.
-    fn remember_published_entity(&mut self, entity: EntityId) {
-        let first = EntityId {
-            generation: 0,
-            ..entity
-        };
-        while let Some(old) = self.entities.range(first..entity).next().copied() {
-            self.entities.remove(&old);
-            self.poses.remove(old);
-        }
-        self.entities.insert(entity);
+    #[cfg(test)]
+    pub(super) fn replica(&self, entity: EntityId) -> Option<&Replica> {
+        self.replicas.get(&entity).map(|entry| &entry.replica)
     }
-    pub(super) fn expire_groups(&mut self, now: Duration) -> Result<usize, ReplicationError> {
-        let mut expired = self.groups.expire(now.as_millis() as u64)?;
-        if self.pending_reset_group.as_ref().is_some_and(|group| {
-            now.saturating_sub(group.started_at).as_millis()
-                >= u128::from(group_limits().max_age_ms)
-        }) {
-            self.pending_reset_group = None;
-            expired += 1;
-        }
-        Ok(expired)
+    /// Whether any state packet has arrived, so there is something to acknowledge.
+    pub(super) fn has_state(&self) -> bool {
+        self.stream.ack().latest != 0
     }
-    pub(super) fn receive_pending_reset_group(
-        &mut self,
-        now: Duration,
-    ) -> Result<Option<(ClientControl, Duration)>, super::ReceiveRejection> {
-        let Some(pending) = &self.pending_reset_group else {
-            return Ok(None);
-        };
-        if now.saturating_sub(pending.started_at).as_millis()
-            >= u128::from(group_limits().max_age_ms)
-        {
-            return Err(super::ReceiveRejection::replication(
-                ReplicationError::Expired,
-                || "owner group awaiting baseline reset".into(),
-            ));
-        }
-        let bytes = pending.bytes.clone();
-        let received_at = pending.received_at;
-        Ok(self
-            .receive_state(&bytes, now)?
-            .map(|receipt| (receipt, received_at)))
-    }
+    /// Decode and keep one state packet. A packet that cannot be decoded is
+    /// not acknowledged, and the server covers it in a later packet.
     pub(super) fn receive_state(
         &mut self,
         bytes: &[u8],
-        now: Duration,
-    ) -> Result<Option<ClientControl>, super::ReceiveRejection> {
-        let welcome = &self.model.welcome;
-        let expected = self.model.expectation();
-        let frame = decode_state(
-            bytes,
-            welcome.stream.epoch,
-            welcome.frame_limit().map_err(err)?,
+    ) -> Result<bool, super::ReceiveRejection> {
+        let limit = FrameLimit::new(MAX_STATE_FRAME_BYTES).map_err(err)?;
+        let packet = decode_state(bytes, self.welcome.stream.epoch, limit).map_err(err)?;
+        if !self.stream.accepts(packet.seq) {
+            return Ok(false);
+        }
+        let result = self.decode_entries(&packet);
+        let (decoded, restored) = match result {
+            Ok(entries) => entries,
+            Err(error) => {
+                self.delivery.rejected_packets = self.delivery.rejected_packets.saturating_add(1);
+                return Err(error);
+            }
+        };
+        let changes = self
+            .stream
+            .accept(packet.seq, decoded, &packet.removed)
+            .map_err(err)?;
+        self.delivery.state_packets = self.delivery.state_packets.saturating_add(1);
+        for (entity, replica) in restored {
+            if !changes.updated.contains(&entity) {
+                continue;
+            }
+            if !self.replicas.contains_key(&entity) {
+                *self.incarnations.entry(entity).or_insert(0) += 1;
+            }
+            match &replica {
+                Replica::Actor(actor) => {
+                    if let Err(error) = self.poses.receive(self.scope_for(entity), packet.tick, actor)
+                    {
+                        log::debug!("remote pose {entity:?}: {error:?}");
+                    }
+                }
+                Replica::Owner(owner) => {
+                    self.combat_references.push_back((packet.seq, packet.tick));
+                    while self.combat_references.len() > 64 {
+                        self.combat_references.pop_front();
+                    }
+                    self.simulation_clock.commit(packet.tick);
+                    if self
+                        .pending_owner
+                        .as_ref()
+                        .is_none_or(|(seq, _, _)| *seq < packet.seq)
+                    {
+                        self.pending_owner = Some((packet.seq, packet.tick, owner.clone()));
+                    }
+                }
+                Replica::Global(_) => {}
+            }
+            self.replicas.insert(
+                entity,
+                Entry {
+                    tick: packet.tick,
+                    replica,
+                },
+            );
+        }
+        for entity in changes.removed {
+            self.replicas.remove(&entity);
+            self.poses.remove(entity);
+        }
+        if packet.seq > self.status_seq {
+            self.status_seq = packet.seq;
+            self.status = packet.status;
+            self.simulation_clock.commit(packet.status.finalized);
+            self.observe_arrival_feedback(packet.status.arrival);
+        }
+        Ok(true)
+    }
+    #[allow(clippy::type_complexity)]
+    fn decode_entries(
+        &self,
+        packet: &StatePacket,
+    ) -> Result<(Vec<(EntityId, ReplicaState)>, Vec<(EntityId, Replica)>), super::ReceiveRejection>
+    {
+        let expected = self.predictor.model().expectation();
+        let mut decoded = Vec::with_capacity(packet.entries.len());
+        let mut restored = Vec::with_capacity(packet.entries.len());
+        for entry in &packet.entries {
+            let base = match self
+                .stream
+                .base(entry.entity, entry.base, packet.seq)
+                .map_err(err)?
+            {
+                Base::Superseded => continue,
+                Base::Whole => None,
+                Base::Delta(base) => Some(base),
+            };
+            let state = ReplicaState::decode(&entry.body, base).map_err(err)?;
+            let expected_kind = if entry.entity == self.welcome.owner_entity {
+                ReplicaKind::Owner
+            } else if entry.entity == self.welcome.global_entity {
+                ReplicaKind::Global
+            } else {
+                ReplicaKind::Actor
+            };
+            if state.kind() != expected_kind {
+                return Err("state kind does not match its entity".into());
+            }
+            let replica = state
+                .restore((expected_kind == ReplicaKind::Owner).then_some(expected))
+                .map_err(err)?;
+            match &replica {
+                Replica::Owner(owner)
+                    if owner.stamp().server_tick != packet.tick.0
+                        || owner.collision_identity() != self.welcome.content.scene =>
+                {
+                    return Err("owner state does not match its packet".into());
+                }
+                Replica::Global(global)
+                    if global.stamp.server_tick != packet.tick.0
+                        || global.stamp.match_epoch != self.welcome.match_epoch =>
+                {
+                    return Err("match summary does not match its packet".into());
+                }
+                _ => {}
+            }
+            decoded.push((entry.entity, state));
+            restored.push((entry.entity, replica));
+        }
+        Ok((decoded, restored))
+    }
+    /// Apply the newest owner state: restore it at its tick and replay local
+    /// input after it. A state outside the retained history becomes the new
+    /// base. Nothing here ends or resets the session.
+    pub(super) fn reconcile(&mut self) -> Result<(), String> {
+        let Some((_, tick, checkpoint)) = self.pending_owner.take() else {
+            return Ok(());
+        };
+        let state = OwnerPredictionState::from_checkpoint(
+            &checkpoint,
+            self.predictor.model().expectation(),
         )
         .map_err(err)?;
-        let receipts = match frame {
-            StateFrame::Full(state) => {
-                // Global and owner checkpoints are only accepted together through
-                // the atomic publication path, including subsequent corrections.
-                if state.scope.entity == welcome.global_entity
-                    || state.scope.entity == welcome.owner_entity
-                    || state.scope.entity == welcome.collision_entity
-                    || !matches!(
-                        decode_replica(&state.payload, Some(expected)),
-                        Ok(ReplicaPayload::Actor(_))
-                    )
-                {
-                    return Err("non-public standalone state".into());
-                }
-                let entity = state.scope.entity;
-                let incoming = (state.receipt(), state.end_tick);
-                let current = self.scopes.fence(entity.index);
-                let receipt = self.scopes.apply_full(state, |_| true).map_err(|error| {
-                    super::ReceiveRejection::replication(error, || {
-                        format!("public Full incoming={incoming:?} current={current:?}")
-                    })
-                })?;
-                if let Some(state) = self.scopes.state(entity) {
-                    if let Ok(ReplicaPayload::Actor(actor)) =
-                        decode_replica(&state.payload, Some(expected))
-                    {
-                        self.poses
-                            .receive(state.scope, state.end_tick, &actor)
-                            .map_err(|e| format!("remote presentation: {e:?}"))?;
-                    }
-                }
-                self.remember_published_entity(entity);
-                vec![receipt]
-            }
-            StateFrame::Group(group) => {
-                self.delivery.group_messages = self.delivery.group_messages.saturating_add(1);
-                let publication = group.publication;
-                let model = &self.model;
-                let current_group = self.groups.publication(publication.group);
-                let mut staged = self.baselines.stage().map_err(err)?;
-                let mut proofs = Vec::new();
-                let result = (|| {
-                    let mut decoded = group;
-                    if !baseline_wire::valid_member_count(decoded.members.len())
-                        || [
-                            model.welcome.global_entity,
-                            model.welcome.owner_entity,
-                            model.welcome.collision_entity,
-                        ]
-                        .iter()
-                        .any(|entity| !decoded.manifest.iter().any(|scope| scope.entity == *entity))
-                    {
-                        return Err(engine_net::replication::ReplicationError::InvalidPayload);
-                    }
-                    if current_group.is_some_and(|current| current.revision == publication.revision)
-                        && self
-                            .groups
-                            .manifest(publication.group)
-                            .is_some_and(|manifest| manifest != decoded.manifest)
-                    {
-                        return Err(ReplicationError::Conflict);
-                    }
-                    // Decode every bounded envelope before using age evidence.
-                    // Inspect the original caches before manifest retention can
-                    // discard a removed or reentered platform's newer context.
-                    let packets = decoded
-                        .members
-                        .iter()
-                        .map(|state| {
-                            baseline_wire::decode_member(&state.payload, state, decoded.publication)
-                                .map_err(|_| ReplicationError::InvalidPayload)
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    if let Some(error) = packets
-                        .iter()
-                        .find_map(|packet| staged.obsolete_context(packet))
-                    {
-                        let all_full = packets
-                            .iter()
-                            .all(|packet| matches!(packet.encoding, BaselineEncoding::Full));
-                        for (state, packet) in decoded.members.iter_mut().zip(packets) {
-                            if matches!(packet.encoding, BaselineEncoding::Full) {
-                                state.payload = packet.bytes;
-                                if !all_full {
-                                    decode_owner_member(model, state, decoded.end_tick)
-                                        .map_err(|_| ReplicationError::InvalidPayload)?;
-                                }
-                            } else {
-                                // A Delta implies an earlier decoded scope. An
-                                // unrelated or future optional member cannot use
-                                // another member's older revision as age proof.
-                                let incoming = packet.target.context.scope;
-                                let known = self
-                                    .scopes
-                                    .fence(incoming.entity.index)
-                                    .ok_or(ReplicationError::InvalidIdentity)?
-                                    .scope;
-                                if known.connection != incoming.connection
-                                    || known.entity.generation < incoming.entity.generation
-                                    || (known.entity.generation == incoming.entity.generation
-                                        && (known.scope < incoming.scope
-                                            || known.representation < incoming.representation
-                                            || (known.scope == incoming.scope
-                                                && known.representation
-                                                    != incoming.representation)))
-                                {
-                                    return Err(ReplicationError::Conflict);
-                                }
-                            }
-                        }
-                        if all_full {
-                            validate_owner_group(
-                                model,
-                                decoded.publication.group,
-                                decoded.end_tick,
-                                decoded.members.iter(),
-                            )
-                            .map_err(|_| ReplicationError::InvalidPayload)?;
-                        }
-                        return Err(error);
-                    }
-                    staged.retain_manifest(&decoded.manifest);
-                    let mut reset_pending = false;
-                    let mut obsolete_full = None;
-                    for (state, packet) in decoded.members.iter_mut().zip(packets) {
-                        let rejected_seed = staged.rejected_full_seed(&packet);
-                        match staged.reconstruct(state, packet) {
-                            Ok(receipt) => proofs.push(baseline_wire::proof(state, receipt)),
-                            Err(ReplicationError::BaselineResetPending) => {
-                                state.payload =
-                                    rejected_seed.ok_or(ReplicationError::InvalidIdentity)?;
-                                reset_pending = true;
-                            }
-                            Err(error @ ReplicationError::Obsolete(_))
-                                if rejected_seed.is_some() =>
-                            {
-                                state.payload = rejected_seed.unwrap();
-                                obsolete_full = Some(error);
-                            }
-                            Err(error) => return Err(error),
-                        }
-                    }
-                    validate_owner_group(
-                        model,
-                        decoded.publication.group,
-                        decoded.end_tick,
-                        decoded.members.iter(),
-                    )
-                    .map_err(|_| engine_net::replication::ReplicationError::InvalidPayload)?;
-                    if let Some(error) = obsolete_full {
-                        return Err(error);
-                    }
-                    if reset_pending {
-                        return Err(ReplicationError::BaselineResetPending);
-                    }
-                    self.groups
-                        .receive(decoded, now.as_millis() as u64, &mut self.scopes, |_| true)
-                })();
-                let progress = match result {
-                    Ok(progress) => progress,
-                    Err(ReplicationError::BaselineResetPending) => {
-                        self.delivery.baseline_reset_pending =
-                            self.delivery.baseline_reset_pending.saturating_add(1);
-                        // Only fully decoded and game-validated members reach here.
-                        // A later message can replace the bounded slot, but cannot
-                        // extend the deadline for the missing reliable reset.
-                        if self
-                            .pending_reset_group
-                            .as_ref()
-                            .is_none_or(|pending| publication > pending.publication)
-                        {
-                            let started_at = self
-                                .pending_reset_group
-                                .as_ref()
-                                .map_or(now, |pending| pending.started_at);
-                            self.pending_reset_group = Some(PendingResetGroup {
-                                publication,
-                                bytes: bytes.into(),
-                                received_at: now,
-                                started_at,
-                            });
-                        }
-                        return Ok(None);
-                    }
-                    Err(
-                        engine_net::replication::ReplicationError::Unknown
-                        | engine_net::replication::ReplicationError::Capacity,
-                    ) => {
-                        let repairs = self.baselines.repairs(now.as_millis() as u64);
-                        if repairs.is_empty() {
-                            return Ok(None);
-                        }
-                        self.baseline_repairs = self.baseline_repairs.saturating_add(1);
-                        return Ok(Some(ClientControl::BaselineRepair {
-                            requests: BoundedVec::new(repairs).map_err(err)?,
-                        }));
-                    }
-                    Err(error @ ReplicationError::Obsolete(_)) => {
-                        self.delivery.baseline_stale =
-                            self.delivery.baseline_stale.saturating_add(1);
-                        return Err(super::ReceiveRejection::replication(error, || {
-                            format!("Group incoming={publication:?} current={current_group:?}")
-                        }));
-                    }
-                    Err(error) => {
-                        return Err(super::ReceiveRejection::replication(error, || {
-                            format!(
-                                "Group incoming={publication:?} current={current_group:?} receive_ms={}",
-                                now.as_millis()
-                            )
-                        }));
-                    }
-                };
-                match progress {
-                    GroupProgress::Staged => return Ok(None),
-                    GroupProgress::Published(receipts) => {
-                        if self
-                            .pending_reset_group
-                            .as_ref()
-                            .is_some_and(|pending| publication >= pending.publication)
-                        {
-                            self.pending_reset_group = None;
-                        }
-                        self.delivery.groups_completed =
-                            self.delivery.groups_completed.saturating_add(1);
-                        self.baselines = staged;
-                        for receipt in &receipts {
-                            if let Some(state) = self.scopes.state(receipt.scope.entity) {
-                                if let Ok(ReplicaPayload::Actor(actor)) =
-                                    decode_replica(&state.payload, Some(self.model.expectation()))
-                                {
-                                    self.poses
-                                        .receive(state.scope, state.end_tick, &actor)
-                                        .map_err(|error| {
-                                            format!("group presentation: {error:?}")
-                                        })?;
-                                }
-                            }
-                            self.remember_published_entity(receipt.scope.entity);
-                        }
-                        if let Some(state) = self.scopes.state(self.model.welcome.owner_entity) {
-                            self.simulation_clock.commit(state.end_tick);
-                            self.decoded_groups.insert(state.snapshot, state.end_tick);
-                            self.combat_references
-                                .push_back((state.receipt(), state.end_tick));
-                            while self.combat_references.len() > 64 {
-                                self.combat_references.pop_front();
-                            }
-                            while self.decoded_groups.len() > 32 {
-                                self.decoded_groups.pop_first();
-                            }
-                        }
-                        return Ok(Some(ClientControl::OwnerDecoded {
-                            proofs: BoundedVec::new(proofs).map_err(err)?,
-                        }));
-                    }
-                }
-            }
-        };
-        Ok(Some(ClientControl::Decoded {
-            receipts: BoundedVec::new(receipts).map_err(err)?,
-        }))
-    }
-    pub(super) fn reconcile(&mut self) -> Result<(), String> {
-        if self.recovering {
-            return Ok(());
-        }
-        let Some(proof) = self.groups.published_group(OWNER_GROUP, &self.scopes) else {
-            return Ok(());
-        };
-        // Admission may publish an inactive owner first and a committed active
-        // owner second. No speculative commands exist before this gate opens.
-        if !self.active && self.sequence.0 == 0 {
-            self.predictor.remove_group(OWNER_GROUP);
-        }
-        if self.predictor.group_count() == 0 {
-            self.predictor
-                .initialize(&proof, self.model.binding(), &self.model)
-                .map_err(err)?;
-        } else {
-            // State and reliable finalization proofs travel on independent lanes.
-            // A decoded checkpoint is retained while its command-finalization
-            // proof catches up; arrival ordering is not a prediction failure.
-            if proof.end_tick() > self.finalized {
-                return Ok(());
-            }
-            let predicted = self
-                .predictor
-                .predicted_tick(OWNER_GROUP)
-                .ok_or("missing prediction history")?;
-            self.delivery.replay_requested = predicted.0.saturating_sub(proof.end_tick().0);
-            self.delivery.maximum_replay_requested = self
-                .delivery
-                .maximum_replay_requested
-                .max(self.delivery.replay_requested);
-            let same_identity = self
-                .predictor
-                .identity(OWNER_GROUP)
-                .is_some_and(|identity| {
-                    identity.binding == self.model.binding()
-                        && identity.group_revision == proof.publication().revision
-                        && identity.scopes == proof.manifest().iter().copied().collect()
-                });
-            let advanced_topology = self
-                .predictor
-                .identity(OWNER_GROUP)
-                .is_some_and(|identity| {
-                    identity.binding == self.model.binding()
-                        && proof.publication().revision > identity.group_revision
-                        && [
-                            self.model.welcome.global_entity,
-                            self.model.welcome.owner_entity,
-                            self.model.welcome.collision_entity,
-                        ]
-                        .into_iter()
-                        .all(|entity| {
-                            identity.scopes.iter().find(|scope| scope.entity == entity)
-                                == proof.manifest().iter().find(|scope| scope.entity == entity)
-                        })
-                });
-            if advanced_topology {
-                // An intermediate closure may be lost on the state lane. A
-                // later revision can therefore contain the same scopes again;
-                // it still requires an atomic replacement and bounded replay.
-                self.predictor = replace_topology(&self.predictor, &self.model, &proof, self.frame)
-                    .map_err(|error| {
-                        format!(
-                            "{error}; active={} sequence={}",
-                            self.active, self.sequence.0
-                        )
-                    })?;
-            } else if proof.end_tick() > predicted && same_identity {
-                // The server has simulated past everything this client has
-                // predicted: receive precedes command generation, and after a
-                // hitch or a background tab the gap is as long as the pause.
-                // Every discarded target is already finalized (checked above),
-                // so nothing local remains to replay. Rebase on the complete
-                // checkpoint atomically, without inventing inputs or discarding
-                // the hardware journal/future command sequence; command
-                // generation forecasts forward from here.
-                let mut replacement = new_predictor(self.model.welcome.stream.epoch)?;
-                replacement
-                    .begin_frame(ReplicationFrame(self.frame))
-                    .map_err(err)?;
-                replacement
-                    .initialize(&proof, self.model.binding(), &self.model)
-                    .map_err(err)?;
-                self.predictor = replacement;
-            } else {
-                let started = bevy::platform::time::Instant::now();
-                let result = self.predictor.reconcile(
-                    &proof,
-                    self.model.binding(),
-                    self.finalized,
-                    &self.model,
-                );
-                self.delivery.replay_cpu_micros =
-                    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
-                self.delivery.maximum_replay_cpu_micros = self
-                    .delivery
-                    .maximum_replay_cpu_micros
-                    .max(self.delivery.replay_cpu_micros);
-                result.map_err(err)?;
+        let dependencies = self.prediction_dependencies(tick);
+        let started = bevy::platform::time::Instant::now();
+        let correction = self
+            .predictor
+            .correct(tick, state.clone(), dependencies.clone());
+        let micros = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        self.delivery.replay_cpu_micros = micros;
+        self.delivery.maximum_replay_cpu_micros = self.delivery.maximum_replay_cpu_micros.max(micros);
+        match correction {
+            Ok(Correction::Replayed(_)) => self.delivery.replayed += 1,
+            Ok(Correction::Rebased) => self.delivery.rebased += 1,
+            Ok(Correction::Stale) => self.delivery.stale += 1,
+            Err(error) => {
+                // Local input after the corrected tick could not be replayed;
+                // continue from the server's state and forecast forward.
+                log::warn!("Owner replay failed; continuing from authority: {error:?}");
+                self.predictor.reset(tick, state, dependencies);
+                self.delivery.rebased += 1;
             }
         }
+        self.active = checkpoint.is_active();
         self.events.publish(&self.predictor)?;
-        // Binding is source-owned: require the owner checkpoint's exact game
-        // projectile ID and an admitted public projectile scope for that ID.
+        // Binding is source-owned: require the owner state's exact game
+        // projectile ID and a public projectile entity carrying that ID.
         let bindings = self
             .predictor
-            .state(OWNER_GROUP)
+            .state()
             .into_iter()
-            .flat_map(|s| s.0.starfall_flights())
+            .flat_map(|state| state.starfall_flights())
             .filter_map(|flight| {
                 let id = flight.authority_id?;
-                self.entities.iter().find_map(|entity| {
-                    let state = self.scopes.state(*entity)?;
-                    match decode_replica(&state.payload, None).ok()? {
-                        ReplicaPayload::Actor(
-                            dreamwake_sim::replication::PublicReplica::Projectile(p),
-                        ) if p.id == id && p.owner == Some(self.model.welcome.player.get()) => {
-                            Some((flight.key, *entity))
-                        }
-                        _ => None,
+                self.replicas.iter().find_map(|(entity, entry)| match &entry.replica {
+                    Replica::Actor(PublicReplica::Projectile(p))
+                        if p.id == id && p.owner == Some(self.welcome.player.get()) =>
+                    {
+                        Some((flight.key, *entity))
                     }
+                    _ => None,
                 })
             })
             .collect::<Vec<_>>();
         for (key, entity) in bindings {
             self.events.bind(key, entity)?;
         }
-        if !self.active
-            && let Some((snapshot, through)) = self.acknowledged_active
-        {
-            self.active = self
-                .decoded_groups
-                .get(&snapshot)
-                .is_some_and(|tick| through >= *tick);
-        }
         Ok(())
     }
-    /// Read the committed owner checkpoint without depending on render readiness
-    /// or on whether prediction has reconciled its newer publication yet.
+    /// The newest owner state received, whether or not prediction has used it.
     pub(crate) fn authoritative_owner_pose(
         &self,
     ) -> Result<Option<(ServerTick, [f32; 2])>, String> {
-        let Some(state) = self.scopes.state(self.model.welcome.owner_entity) else {
+        let Some(entry) = self.replicas.get(&self.welcome.owner_entity) else {
             return Ok(None);
         };
-        let ReplicaPayload::Owner(owner) =
-            decode_replica(&state.payload, Some(self.model.expectation())).map_err(err)?
-        else {
-            return Err("owner scope type".into());
+        let Replica::Owner(owner) = &entry.replica else {
+            return Err("owner entity type".into());
         };
-        if owner.stamp().server_tick != state.end_tick.0 {
-            return Err("owner checkpoint time".into());
-        }
-        Ok(Some((state.end_tick, owner.hero_view().position)))
+        Ok(Some((entry.tick, owner.hero_view().position)))
     }
     pub(crate) fn presentation(
         &self,
         predicted: bool,
     ) -> Result<Option<DreamPresentation>, String> {
-        let Some(global) = self.scopes.state(self.model.welcome.global_entity) else {
+        let Some(Entry {
+            replica: Replica::Global(global),
+            ..
+        }) = self.replicas.get(&self.welcome.global_entity)
+        else {
             return Ok(None);
         };
-        let ReplicaPayload::Global(global) =
-            decode_replica(&global.payload, Some(self.model.expectation())).map_err(err)?
-        else {
-            return Err("global scope type".into());
-        };
         let owner = if predicted {
-            self.predictor.state(OWNER_GROUP).map(|v| v.0.clone())
+            self.predictor.state().cloned()
         } else {
-            self.scopes
-                .state(self.model.welcome.owner_entity)
-                .and_then(|s| {
-                    match decode_replica(&s.payload, Some(self.model.expectation())).ok()? {
-                        ReplicaPayload::Owner(owner) => {
-                            dreamwake_sim::replication::OwnerPredictionState::from_checkpoint(
-                                &owner,
-                                self.model.expectation(),
-                            )
-                            .ok()
-                        }
-                        _ => None,
-                    }
-                })
+            match self.replicas.get(&self.welcome.owner_entity) {
+                Some(Entry {
+                    replica: Replica::Owner(owner),
+                    ..
+                }) => OwnerPredictionState::from_checkpoint(
+                    owner,
+                    self.predictor.model().expectation(),
+                )
+                .ok(),
+                _ => None,
+            }
         };
         let Some(owner) = owner else {
             return Ok(None);
         };
         let mut actors = Vec::new();
         let mut cover_markers = Vec::new();
-        for entity in &self.entities {
-            let Some(state) = self.scopes.state(*entity) else {
+        for (entity, entry) in &self.replicas {
+            let Replica::Actor(actor) = &entry.replica else {
                 continue;
             };
-            if let ReplicaPayload::Actor(mut actor) =
-                decode_replica(&state.payload, Some(self.model.expectation())).map_err(err)?
+            let mut actor = actor.clone();
+            if let PublicReplica::CoverMarker(marker) = &actor
+                && let Some(Entry {
+                    replica: Replica::Actor(PublicReplica::Cover(cover)),
+                    ..
+                }) = self.replicas.get(&marker.parent)
+                && cover.present
             {
-                if let dreamwake_sim::replication::PublicReplica::CoverMarker(marker) = &actor {
-                    let attachment = marker.attachment();
-                    if let Ok(engine_net::replication::attachments::AttachmentResolution::Parent {
-                        local,
-                        parent,
-                    }) = attachment.resolve(state.scope, &self.scopes)
-                        && let Ok(ReplicaPayload::Actor(mut parent)) = decode_replica(parent, None)
-                        && matches!(&parent, dreamwake_sim::replication::PublicReplica::Cover(cover) if cover.present)
-                    {
-                        if predicted {
-                            self.poses.apply(marker.parent, &mut parent);
-                        }
-                        if let dreamwake_sim::replication::PublicReplica::Cover(cover) = parent {
-                            cover_markers.push(
-                                dreamwake_sim::replication::CoverMarkerPresentation {
-                                    id: marker.id,
-                                    position: std::array::from_fn(|axis| {
-                                        cover.position[axis] + local[axis]
-                                    }),
-                                    open: cover.open,
-                                },
-                            );
-                        }
-                    }
+                let mut parent = PublicReplica::Cover(*cover);
+                if predicted {
+                    self.poses.apply(self.scope_for(marker.parent), &mut parent);
                 }
-                if predicted
-                    && matches!(
-                        actor,
-                        dreamwake_sim::replication::PublicReplica::Projectile(_)
-                    )
-                    && self.events.suppress_public(*entity)
-                {
-                    continue;
+                if let PublicReplica::Cover(cover) = parent {
+                    cover_markers.push(dreamwake_sim::replication::CoverMarkerPresentation {
+                        id: marker.id,
+                        position: std::array::from_fn(|axis| {
+                            cover.position[axis] + marker.local_offset[axis]
+                        }),
+                        open: cover.open,
+                    });
                 }
-                if predicted && !self.poses.apply(state.scope, &mut actor) {
-                    continue;
-                }
-                actors.push(actor);
             }
+            if predicted
+                && matches!(actor, PublicReplica::Projectile(_))
+                && self.events.suppress_public(*entity)
+            {
+                continue;
+            }
+            if predicted && !self.poses.apply(self.scope_for(*entity), &mut actor) {
+                continue;
+            }
+            actors.push(actor);
         }
-        // Unordered public scopes may arrive before an independently entitled
-        // source scope. Retain the replica, but wait to render its reference.
+        // Public entities may arrive before an independently disclosed source.
+        // Keep them, but wait to render a reference to a source not yet shown.
         let mut sources = BTreeSet::from([owner.owner()]);
         for actor in &actors {
             match actor {
-                dreamwake_sim::replication::PublicReplica::Hero(v) => {
+                PublicReplica::Hero(v) => {
                     sources.insert(v.id);
                 }
-                dreamwake_sim::replication::PublicReplica::Enemy(v) => {
+                PublicReplica::Enemy(v) => {
                     sources.insert(v.id);
                 }
                 _ => {}
             }
         }
         actors.retain(|actor| match actor {
-            dreamwake_sim::replication::PublicReplica::Projectile(v) => {
-                v.owner.is_none_or(|id| sources.contains(&id))
-            }
-            dreamwake_sim::replication::PublicReplica::Wisp(v) => {
-                v.owner.is_none_or(|id| sources.contains(&id))
-            }
-            dreamwake_sim::replication::PublicReplica::Effect(v) => {
-                v.id.owner == 0 || sources.contains(&v.id.owner)
-            }
+            PublicReplica::Projectile(v) => v.owner.is_none_or(|id| sources.contains(&id)),
+            PublicReplica::Wisp(v) => v.owner.is_none_or(|id| sources.contains(&id)),
+            PublicReplica::Effect(v) => v.id.owner == 0 || sources.contains(&v.id.owner),
             _ => true,
         });
-        let Some(tick) = self.predictor.predicted_tick(OWNER_GROUP) else {
-            return Ok(None);
-        };
-        let collision_entity = self.model.welcome.collision_entity;
-        let Some(current) = self.scopes.state(collision_entity) else {
-            return Ok(None);
-        };
-        let Some(record) = self
-            .predictor
-            .dependency_history(OWNER_GROUP, tick)
-            .and_then(|frame| frame.records.get(&collision_entity))
-        else {
-            return Ok(None);
-        };
-        // A newer publication in the same entered scope does not revoke a
-        // retained prediction dependency. Finalization may arrive later on the
-        // reliable lane. The owner hash and scene below bind the exact geometry.
-        if record.scope != current.scope {
-            return Ok(None);
-        }
-        let DependencyValue::Known(CollisionDependency::StaticCollision(collision)) = &record.value
-        else {
-            return Ok(None);
-        };
         let mut presentation =
-            DreamPresentation::from_replicas(&global, &owner, &actors).map_err(err)?;
+            DreamPresentation::from_replicas(global, &owner, &actors).map_err(err)?;
         presentation.cover_markers = cover_markers;
         if predicted {
-            presentation.elapsed = self.poses.presentation_elapsed(&global);
+            presentation.elapsed = self.poses.presentation_elapsed(global);
             // Retain already-proven retirement fences from the existing action
-            // binding lane while an older owner checkpoint is still in flight.
-            // Entity creation and advancement come only from shared simulation.
+            // binding lane while an older owner state is still in flight.
             let retired = owner
                 .starfall_flights()
                 .iter()
@@ -1333,8 +884,8 @@ impl Session {
                         && platform.scene_revision == base.scene_revision
                         && let Ok(pose) = platform.pose_at(owner.gameplay_tick())
                     {
-                        // A local rider and its declared base share the predicted
-                        // display time. Remote presentation remains at common R.
+                        // A local rider and its base share the predicted display
+                        // time. Remote presentation remains at the common time.
                         platform.pose = pose;
                         platform.gameplay_tick = owner.gameplay_tick();
                         platform.phase = ((platform.gameplay_tick - platform.origin_gameplay_tick)
@@ -1344,21 +895,14 @@ impl Session {
                 }
             }
         }
-        // Retain the admitted immutable manifest already used by prediction.
-        // Presentation never rebuilds or substitutes current renderer geometry.
         presentation
-            .attach_collision(collision, &owner)
+            .attach_collision(&self.predictor.model().collision, &owner)
             .map_err(err)?;
         Ok(Some(presentation))
     }
-    pub(super) fn recover(&mut self) {
-        self.pending_reset_group = None;
-        self.active = false;
-        self.recovering = true;
-        if self.resync_request == ResyncRequest::Idle {
-            self.resync_request = ResyncRequest::PendingEnqueue;
-        }
-        self.last_input_retry_committed = None;
+    /// Drop unsent intent after a long pause in local input, keeping the
+    /// session: the next owner state and forecast continue from authority.
+    pub(super) fn reset_input(&mut self) {
         self.issued_commands.clear();
         self.retired_issuance_through = self.retired_issuance_through.max(self.sequence);
         self.lead_policy_head = None;
@@ -1372,134 +916,25 @@ fn err(error: impl std::fmt::Display) -> String {
     error.to_string()
 }
 
-/// A new, fully authorized base closure may replace only the topology. Stable
-/// control binding and mandatory scopes were checked before entering this path.
-/// Nothing becomes visible until every retained input frame replays successfully.
-fn replace_topology(
-    old: &PredictionManager<OwnerModel>,
-    model: &OwnerModel,
-    proof: &PublishedGroup<'_, Vec<u8>>,
-    frame: u64,
-) -> Result<PredictionManager<OwnerModel>, String> {
-    let predicted = old
-        .predicted_tick(OWNER_GROUP)
-        .ok_or("missing topology history")?;
-    // Replay is bounded by retained history. A checkpoint ahead of the
-    // prediction (after a hitch) has nothing to replay and becomes the base.
-    let replay = predicted.0.saturating_sub(proof.end_tick().0);
-    // Retain both managers until commit, including worst-case checkpoint,
-    // dependency and command storage plus map/event bookkeeping for each frame.
-    let staging = (replay as usize + 1) * (80 * 1024 + COLLISION_HISTORY_BYTES + 8192);
-    if old.retained_bytes().saturating_add(staging) > 64 * 1024 * 1024 {
-        return Err("topology replay exceeds aggregate history bytes".into());
-    }
-    let mut next = new_predictor(model.welcome.stream.epoch)?;
-    next.begin_frame(ReplicationFrame(frame)).map_err(err)?;
-    next.initialize(proof, model.binding(), model)
-        .map_err(err)?;
-    let prior = old
-        .history_state(OWNER_GROUP, proof.end_tick())
-        .or_else(|| old.state(OWNER_GROUP))
-        .ok_or("missing source identity at topology boundary")?;
-    if next
-        .state(OWNER_GROUP)
-        .is_none_or(|state| state.0.combat_generation() != prior.0.combat_generation())
-    {
-        return Err("changed owner source requires fresh admission".into());
-    }
-    for tick in proof.end_tick().0.saturating_add(1)..=predicted.0 {
-        let input = old
-            .replay_input_history(OWNER_GROUP, ServerTick(tick))
-            .ok_or("missing topology replay input")?
-            .clone();
-        let dependencies = next
-            .dependency_history(OWNER_GROUP, ServerTick(tick - 1))
-            .ok_or("missing topology replay dependency")?
-            .clone();
-        match input {
-            ReplayInput::Command(command) => {
-                next.predict(OWNER_GROUP, command, dependencies, model)
-            }
-            ReplayInput::Substitute => {
-                next.predict_substitute(OWNER_GROUP, ServerTick(tick), dependencies, model)
-            }
-        }
-        .map_err(err)?;
-    }
-    Ok(next)
-}
-
-fn new_predictor(epoch: ConnectionEpoch) -> Result<PredictionManager<OwnerModel>, String> {
-    let defaults = PredictionLimits::default();
-    // One small owner group: retained history is the real bound on replay and
-    // forecast work. A tighter per-frame budget would turn round trip plus
-    // lead, or a hitch, into a fault instead of a slightly longer frame.
-    let ticks = defaults.history_ticks;
-    let steps = ticks * defaults.entities_per_group;
-    PredictionManager::new(
-        epoch,
-        PredictionLimits {
-            // Includes the inline state and map metadata in addition to the
-            // owner's bounded 64 KiB decoded allocation envelope.
-            checkpoint_bytes: 80 * 1024,
-            dependency_bytes: COLLISION_HISTORY_BYTES,
-            replay_ticks_per_frame: ticks,
-            replay_entity_steps_per_frame: steps,
-            prediction_ticks_per_frame: ticks,
-            prediction_entity_steps_per_frame: steps,
-            ..defaults
-        },
-    )
-    .map_err(err)
-}
-
-fn reference_for_view(
-    references: &std::collections::VecDeque<(StateReceipt, ServerTick)>,
-    viewed_at: ServerTick,
-) -> Option<StateReceipt> {
+/// The newest owner state the client held at a displayed tick.
+fn reference_for_view(references: &VecDeque<(u32, ServerTick)>, viewed_at: ServerTick) -> Option<u32> {
     references
         .iter()
         .rev()
         .find(|(_, tick)| *tick <= viewed_at)
-        .map(|(receipt, _)| *receipt)
+        .map(|(seq, _)| *seq)
 }
 #[cfg(test)]
 mod combat_reference_tests {
     use super::*;
     #[test]
-    fn new_owner_checkpoint_cannot_move_reference_past_frozen_render_tick() {
-        let old = StateReceipt {
-            scope: ScopeIdentity {
-                connection: ConnectionEpoch(1),
-                entity: EntityId {
-                    index: 1,
-                    generation: 1,
-                },
-                scope: ScopeEpoch(1),
-                representation: RepresentationRevision(1),
-            },
-            baseline_generation: BaselineGeneration(1),
-            snapshot: SnapshotId(1),
-            version: StateVersion(1),
-        };
-        let mut references = [(old, ServerTick(90))].into();
+    fn new_owner_state_cannot_move_reference_past_frozen_render_tick() {
+        let mut references = VecDeque::from([(4, ServerTick(90))]);
         let frozen_render_tick = ServerTick(92);
-        assert_eq!(
-            reference_for_view(&references, frozen_render_tick),
-            Some(old)
-        );
+        assert_eq!(reference_for_view(&references, frozen_render_tick), Some(4));
         for tick in 93..110 {
-            references.push_back((
-                StateReceipt {
-                    snapshot: SnapshotId(tick),
-                    ..old
-                },
-                ServerTick(tick),
-            ));
-            assert_eq!(
-                reference_for_view(&references, frozen_render_tick),
-                Some(old)
-            );
+            references.push_back((tick as u32, ServerTick(tick)));
+            assert_eq!(reference_for_view(&references, frozen_render_tick), Some(4));
         }
         assert_eq!(reference_for_view(&references, ServerTick(89)), None);
     }

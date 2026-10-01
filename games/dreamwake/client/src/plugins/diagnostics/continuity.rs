@@ -55,8 +55,6 @@ pub(crate) struct SessionLedger {
     pub continuity_resets: u64,
     pub connects: u64,
     pub disconnects: u64,
-    /// Session-level recoveries the client requested from the server.
-    pub recoveries: u64,
     pub connected_seconds: f64,
     #[serde(skip)]
     last: Option<Sample>,
@@ -67,10 +65,6 @@ pub(crate) struct SessionLedger {
 }
 
 impl SessionLedger {
-    pub(crate) fn record_recovery(&mut self) {
-        self.recoveries += 1;
-    }
-
     fn observe(
         &mut self,
         now: f64,

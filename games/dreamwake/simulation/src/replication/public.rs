@@ -206,13 +206,13 @@ impl PublicCoverView {
 }
 
 /// Public adornment of a cover. Parent linkage conveys no inventory entitlement.
-/// The server fills the exact connection scope after independently admitting both
-/// roots. Clients stage this state until that exact parent scope is published.
+/// The server names the cover's replicated entity after independently admitting
+/// both; clients place the marker only while that exact cover is present.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PublicCoverMarkerView {
     pub id: u64,
-    pub parent: engine_net::types::ScopeIdentity,
+    pub parent: engine_net::types::EntityId,
     pub revision: u64,
     pub local_offset: [f32; 3],
     pub open: bool,
@@ -221,20 +221,9 @@ impl PublicCoverMarkerView {
     pub fn valid(&self) -> bool {
         self.id > 0
             && self.revision > 0
-            && self.parent.connection.0 > 0
-            && self.parent.entity.index > 0
-            && self.parent.entity.generation > 0
-            && self.parent.scope.0 > 0
-            && self.parent.representation.0 > 0
+            && self.parent.index > 0
+            && self.parent.generation > 0
             && self.local_offset == [0.0, 1.35, 0.0]
-    }
-    pub fn attachment(&self) -> engine_net::replication::attachments::Attachment<[f32; 3]> {
-        engine_net::replication::attachments::Attachment {
-            parent: self.parent,
-            revision: self.revision,
-            local: self.local_offset,
-            independent: None,
-        }
     }
 }
 

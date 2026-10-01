@@ -1,236 +1,59 @@
-//! Scoped owner replay through the shared gameplay simulation.
+//! Owner replay through the shared gameplay simulation.
 use dreamwake_protocol::{
     DreamAction,
     live::{TickInput, Welcome},
-    replication::{ReplicaPayload, decode_replica},
 };
-use dreamwake_sim::replication::{OwnerExpectation, OwnerPredictionState};
+use dreamwake_sim::collision::CollisionWorld;
+use dreamwake_sim::replication::{
+    OwnerExpectation, OwnerPredictionRunner, OwnerPredictionState, PublicEnemyView,
+    PublicPlatformView,
+};
 use engine_net::{
-    commands::{Command, OwnerStream},
-    prediction::*,
-    replication::{FullState, Payload, PublishedGroup},
+    commands::Command,
+    prediction::rewind::{Rewind, RewindInput, RewindModel},
     types::*,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
-#[derive(Debug, Clone, PartialEq)]
-pub(super) struct OwnerState(
-    pub OwnerPredictionState,
-    pub BTreeMap<engine_core::ColliderKey, EntityId>,
-);
-impl Payload for OwnerState {
-    fn retained_bytes(&self) -> usize {
-        // Owner schema bounds all owned vectors/strings. Charge its entire allowed
-        // decoded allocation envelope rather than only the current JSON length.
-        64 * 1024
-    }
+pub(super) type InputCommand = Command<TickInput, DreamAction>;
+pub(super) type Predictor = Rewind<OwnerModel>;
+/// Ticks prediction may run ahead of the newest owner state and still replay:
+/// about four seconds at 60 Hz.
+pub(super) const HISTORY_TICKS: usize = 256;
+
+/// What a tick reads besides the owner's own state. The collision world is
+/// shared, platforms are the replicated poses the owner rides, and targets are
+/// independently disclosed enemy poses that only guide reversible companion
+/// targeting; none of them is an authoritative contact or damage source.
+#[derive(Clone, Debug)]
+pub(super) struct Dependencies {
+    pub collision: Arc<CollisionWorld>,
+    pub platforms: Vec<PublicPlatformView>,
+    pub targets: Vec<PublicEnemyView>,
 }
-#[derive(Clone, PartialEq)]
-pub(super) struct InputCommand(pub Command<TickInput, DreamAction>);
-impl Payload for InputCommand {
-    fn retained_bytes(&self) -> usize {
-        1024
-    }
-}
-#[derive(Clone, Debug, PartialEq)]
-pub(super) enum CollisionDependency {
-    StaticCollision(dreamwake_sim::collision::CollisionWorld),
-    Platform(dreamwake_sim::replication::PublicPlatformView),
-    /// An independently disclosed pose may guide reversible companion targeting.
-    /// It cannot supply an authoritative contact, damage result or enemy AI.
-    PresentationTarget(dreamwake_sim::replication::PublicEnemyView),
-}
-impl Payload for CollisionDependency {
-    fn retained_bytes(&self) -> usize {
-        match self {
-            Self::StaticCollision(world) => world.retained_bytes(),
-            Self::Platform(_) => 1024,
-            Self::PresentationTarget(_) => 0,
-        }
-    }
-    fn optional(&self) -> bool {
-        match self {
-            // Replay must read these back to reproduce collision and platform
-            // motion, so losing either really does make a frame unreplayable.
-            Self::StaticCollision(_) | Self::Platform(_) => false,
-            // Reversible companion targeting only. An enemy leaving range is
-            // ordinary movement, and replay already drops targets per frame,
-            // so a revoked pose must not invalidate frames that saw it.
-            Self::PresentationTarget(_) => true,
-        }
-    }
-}
-// 64 permitted colliders, conservative prepared geometry envelope plus the
-// dependency record/map overhead. This is independent of wire group size.
-// The simulation enforces the same bound in `step_with_targets`.
 pub(super) use dreamwake_sim::replication::MAX_PREDICTION_TARGETS as MAX_PRESENTATION_TARGETS;
-pub(super) const COLLISION_HISTORY_BYTES: usize =
-    4096 + 64 * 1024 + 2048 + MAX_PRESENTATION_TARGETS * 512;
 
-/// Validate every reconstructible member even when another member's old delta
-/// base has retired. Complete publications additionally require group validation.
-pub(super) fn decode_owner_member(
-    model: &OwnerModel,
-    state: &FullState<Vec<u8>>,
-    end_tick: ServerTick,
-) -> Result<ReplicaPayload, PredictionError> {
-    if state.end_tick != end_tick || state.scope.connection != model.welcome.stream.epoch {
-        return Err(PredictionError::InvalidState);
-    }
-    let payload = decode_replica(&state.payload, Some(model.expectation()))
-        .map_err(|_| PredictionError::InvalidState)?;
-    let entity = state.scope.entity;
-    let welcome = &model.welcome;
-    let valid = match &payload {
-        ReplicaPayload::Owner(value) => {
-            entity == welcome.owner_entity
-                && value.context().stamp.server_tick == end_tick.0
-                && value.collision_identity() == welcome.content.scene
-        }
-        ReplicaPayload::Global(value) => {
-            entity == welcome.global_entity
-                && value.stamp.server_tick == end_tick.0
-                && value.stamp.match_epoch == welcome.match_epoch
-                && value.stamp.scene_revision == u64::from(welcome.content.scene_revision.0)
-        }
-        ReplicaPayload::Collision(value) => {
-            entity == welcome.collision_entity
-                && value.scene_revision() == u64::from(welcome.content.scene_revision.0)
-                && value.identity() == welcome.content.scene
-        }
-        ReplicaPayload::Actor(dreamwake_sim::replication::PublicReplica::Platform(value)) => {
-            entity != welcome.owner_entity
-                && entity != welcome.global_entity
-                && entity != welcome.collision_entity
-                && value.scene_revision == u64::from(welcome.content.scene_revision.0)
-        }
-        _ => false,
-    };
-    if !valid {
-        return Err(PredictionError::InvalidIdentity);
-    }
-    Ok(payload)
-}
-
-pub(super) fn validate_owner_group<'a>(
-    model: &OwnerModel,
-    group: GroupId,
-    end_tick: ServerTick,
-    states: impl IntoIterator<Item = &'a FullState<Vec<u8>>>,
-) -> Result<DecodedPrediction<OwnerState, CollisionDependency>, PredictionError> {
-    if group != dreamwake_protocol::live::OWNER_GROUP {
-        return Err(PredictionError::InvalidIdentity);
-    }
-    let mut owner = None;
-    let mut global = None;
-    let mut collision = None;
-    let mut count = 0;
-    let mut platform = None;
-    for state in states {
-        count += 1;
-        match decode_owner_member(model, state, end_tick)? {
-            ReplicaPayload::Owner(value)
-                if state.scope.entity == model.welcome.owner_entity && owner.is_none() =>
-            {
-                owner = Some(value)
-            }
-            ReplicaPayload::Global(value)
-                if state.scope.entity == model.welcome.global_entity && global.is_none() =>
-            {
-                global = Some(value)
-            }
-            ReplicaPayload::Collision(value)
-                if state.scope.entity == model.welcome.collision_entity && collision.is_none() =>
-            {
-                collision = Some((state.scope, state.version, value))
-            }
-            ReplicaPayload::Actor(dreamwake_sim::replication::PublicReplica::Platform(value))
-                if platform.is_none()
-                    && state.scope.entity != model.welcome.owner_entity
-                    && state.scope.entity != model.welcome.global_entity
-                    && state.scope.entity != model.welcome.collision_entity =>
-            {
-                platform = Some((state.scope, state.version, value))
-            }
-            _ => return Err(PredictionError::InvalidIdentity),
-        }
-    }
-    if !dreamwake_protocol::live::baselines::valid_member_count(count) {
-        return Err(PredictionError::InvalidIdentity);
-    }
-    let owner = owner.ok_or(PredictionError::InvalidState)?;
-    let global = global.ok_or(PredictionError::InvalidState)?;
-    let (scope, version, manifest) = collision.ok_or(PredictionError::InvalidState)?;
-    if owner.context() != &global
-        || global.stamp.server_tick != end_tick.0
-        || manifest.scene_revision() != u64::from(model.welcome.content.scene_revision.0)
-        || owner.collision_identity() != manifest.identity()
-        || manifest.identity() != model.welcome.content.scene
-    {
-        return Err(PredictionError::InvalidState);
-    }
-    let state = OwnerPredictionState::from_checkpoint(&owner, model.expectation())
-        .map_err(|_| PredictionError::InvalidState)?;
-    let world = manifest
-        .build()
-        .map_err(|_| PredictionError::InvalidState)?;
-    let required = owner.required_bases();
-    if count != 3 + required.len() || required.len() > 1 {
-        return Err(PredictionError::InvalidIdentity);
-    }
-    let validation_bases: Vec<_> = platform
-        .as_ref()
-        .map(|(_, _, view)| view.clone())
-        .into_iter()
-        .collect();
-    state
-        .validate_collision_with_bases(&world, &validation_bases)
-        .map_err(|_| PredictionError::InvalidState)?;
-    let mut bases = BTreeMap::new();
-    let mut records = BTreeMap::from([(
-        scope.entity,
-        DependencyRecord {
-            scope,
-            version,
-            scene_revision: model.welcome.content.scene_revision,
-            value: DependencyValue::Known(CollisionDependency::StaticCollision(world)),
-        },
-    )]);
-    if let Some((scope, version, view)) = platform {
-        if required != [view.collider]
-            || view.scene_revision != global.stamp.scene_revision
-            || view.gameplay_tick != global.stamp.gameplay_tick
-        {
-            return Err(PredictionError::InvalidIdentity);
-        }
-        bases.insert(view.collider, scope.entity);
-        records.insert(
-            scope.entity,
-            DependencyRecord {
-                scope,
-                version,
-                scene_revision: model.welcome.content.scene_revision,
-                value: DependencyValue::Known(CollisionDependency::Platform(view)),
-            },
-        );
-    } else if !required.is_empty() {
-        return Err(PredictionError::InvalidState);
-    }
-    Ok(DecodedPrediction {
-        state: OwnerState(state, bases),
-        dependencies: DependencyFrame { records },
-    })
-}
 pub(super) struct OwnerModel {
     pub welcome: Welcome,
-    runner: std::sync::Mutex<dreamwake_sim::replication::OwnerPredictionRunner>,
+    pub collision: Arc<CollisionWorld>,
+    runner: std::sync::Mutex<OwnerPredictionRunner>,
 }
 impl OwnerModel {
-    pub fn new(welcome: Welcome) -> Self {
-        Self {
-            welcome,
-            runner: std::sync::Mutex::new(dreamwake_sim::replication::OwnerPredictionRunner::new()),
+    /// The scene's collision is part of the content both sides agreed on in
+    /// the Welcome, so the client builds it locally instead of receiving it.
+    pub fn new(welcome: Welcome) -> Result<Self, String> {
+        let manifest = dreamwake_sim::collision::CollisionManifest::current(u64::from(
+            welcome.content.scene_revision.0,
+        ));
+        if manifest.identity() != welcome.content.scene {
+            return Err("scene collision differs from the server's".into());
         }
+        let collision = Arc::new(manifest.build().map_err(|e| format!("{e:?}"))?);
+        Ok(Self {
+            welcome,
+            collision,
+            runner: std::sync::Mutex::new(OwnerPredictionRunner::new()),
+        })
     }
     pub fn expectation(&self) -> OwnerExpectation {
         OwnerExpectation {
@@ -241,131 +64,38 @@ impl OwnerModel {
             minimum_revision: 0,
         }
     }
-    pub fn binding(&self) -> PredictionBinding {
-        PredictionBinding {
-            owner: self.welcome.stream,
-            scene_revision: self.welcome.content.scene_revision,
-            teleport_segment: 0,
-        }
-    }
 }
-impl PredictionModel for OwnerModel {
-    type Wire = Vec<u8>;
-    type State = OwnerState;
+impl RewindModel for OwnerModel {
+    type State = OwnerPredictionState;
     type Command = InputCommand;
-    type Dependency = CollisionDependency;
-    fn decode_group(
-        &self,
-        group: &PublishedGroup<'_, Vec<u8>>,
-        binding: PredictionBinding,
-    ) -> Result<DecodedPrediction<OwnerState, CollisionDependency>, PredictionError> {
-        if binding != self.binding()
-            || !dreamwake_protocol::live::baselines::valid_member_count(group.manifest().len())
-        {
-            return Err(PredictionError::InvalidIdentity);
-        }
-        validate_owner_group(
-            self,
-            group.publication().group,
-            group.end_tick(),
-            group.states(),
-        )
-    }
-    fn valid_state(&self, state: &OwnerState) -> bool {
-        state.1.len() <= 1
-            && state
-                .1
-                .keys()
-                .copied()
-                .eq(state.0.required_bases().iter().copied())
-            && state
-                .0
-                .checkpoint()
-                .validate_for(self.expectation())
-                .is_ok()
-    }
-    fn command_identity(&self, command: &InputCommand) -> (OwnerStream, CommandSeq, TargetTick) {
-        (command.0.owner, command.0.sequence, command.0.target)
-    }
-    fn valid_command(&self, command: &InputCommand) -> bool {
-        dreamwake_protocol::live::valid_tick_input(&command.0.input)
-            && command
-                .0
-                .actions
-                .as_slice()
-                .iter()
-                .all(|e| dreamwake_protocol::live::valid_tick_action(&e.action))
-    }
-    fn required_dependencies(&self, state: &OwnerState, _: Option<&InputCommand>) -> Vec<EntityId> {
-        std::iter::once(self.welcome.collision_entity)
-            .chain(state.1.values().copied())
-            .collect()
-    }
+    type Dependencies = Dependencies;
+    type Error = String;
     fn step(
         &self,
-        state: &mut OwnerState,
+        state: &mut OwnerPredictionState,
         _: ServerTick,
-        command: &InputCommand,
-        dependencies: &DependencyFrame<CollisionDependency>,
-    ) -> Result<BTreeSet<ActionKey>, PredictionError> {
-        self.step_owner(state, Some(command), dependencies)
-    }
-    fn step_substitute(
-        &self,
-        state: &mut OwnerState,
-        _: ServerTick,
-        dependencies: &DependencyFrame<CollisionDependency>,
-    ) -> Result<BTreeSet<ActionKey>, PredictionError> {
-        self.step_owner(state, None, dependencies)
-    }
-}
-impl OwnerModel {
-    fn step_owner(
-        &self,
-        state: &mut OwnerState,
-        command: Option<&InputCommand>,
-        dependencies: &DependencyFrame<CollisionDependency>,
-    ) -> Result<BTreeSet<ActionKey>, PredictionError> {
-        let record = dependencies
-            .records
-            .get(&self.welcome.collision_entity)
-            .ok_or(PredictionError::InvalidState)?;
-        if record.scope.entity != self.welcome.collision_entity
-            || record.scope.connection != self.welcome.stream.epoch
-            || record.scene_revision != self.welcome.content.scene_revision
-        {
-            return Err(PredictionError::InvalidIdentity);
-        }
-        let DependencyValue::Known(CollisionDependency::StaticCollision(collision)) = &record.value
-        else {
-            return Err(PredictionError::InvalidState);
+        input: &RewindInput<InputCommand>,
+        dependencies: &Dependencies,
+    ) -> Result<(), String> {
+        let command = input.command();
+        let bases: Vec<_> = state
+            .required_bases()
+            .iter()
+            .map(|key| {
+                dependencies
+                    .platforms
+                    .iter()
+                    .find(|platform| platform.collider == *key)
+                    .cloned()
+                    .ok_or("missing required platform")
+            })
+            .collect::<Result<_, _>>()?;
+        let mut held = match command {
+            Some(command) => command.input.held,
+            None => state.substitute_predicted_input(),
         };
-        let mut bases = Vec::with_capacity(1);
-        for (&key, &entity) in &state.1 {
-            let record = dependencies
-                .records
-                .get(&entity)
-                .ok_or(PredictionError::InvalidState)?;
-            if record.scope.entity != entity
-                || record.scope.connection != self.welcome.stream.epoch
-                || record.scene_revision != self.welcome.content.scene_revision
-            {
-                return Err(PredictionError::InvalidIdentity);
-            }
-            let DependencyValue::Known(CollisionDependency::Platform(view)) = &record.value else {
-                return Err(PredictionError::InvalidState);
-            };
-            if view.collider != key {
-                return Err(PredictionError::InvalidIdentity);
-            }
-            bases.push(view.clone());
-        }
-        let mut input = match command {
-            Some(command) => command.0.input.held,
-            None => state.0.substitute_predicted_input(),
-        };
-        input.dash = false;
-        input.casts = [false; 4];
+        held.dash = false;
+        held.casts = [false; 4];
         use dreamwake_sim::{combat::RayActionKey, replication::OwnerCombatAction};
         let mut action = None;
         let mut beam = None;
@@ -376,113 +106,78 @@ impl OwnerModel {
                 command_stream: self.welcome.stream.stream.0,
                 ownership_epoch: self.welcome.stream.ownership.0,
                 actor: self.welcome.player.get(),
-                actor_generation: state.0.combat_generation(),
-                command_sequence: command.0.sequence.0,
+                actor_generation: state.combat_generation(),
+                command_sequence: command.sequence.0,
                 action_slot: slot,
             };
-            if let Some(edge) = command
-                .0
-                .actions
-                .as_slice()
-                .iter()
-                .min_by_key(|edge| edge.slot)
-            {
-                match edge.action {
+            if let Some(edge) = command.actions.as_slice().iter().min_by_key(|edge| edge.slot) {
+                action = match edge.action {
                     DreamAction::Cast { slot, aim } => {
-                        input.aim = aim;
-                        action = Some(OwnerCombatAction::Cast {
+                        held.aim = aim;
+                        Some(OwnerCombatAction::Cast {
                             key: key(edge.slot),
                             slot,
                             aim,
-                        });
+                        })
                     }
                     DreamAction::Dash { direction } => {
-                        input.dash = true;
-                        input.movement = direction;
-                        action = Some(OwnerCombatAction::Dash {
+                        held.dash = true;
+                        held.movement = direction;
+                        Some(OwnerCombatAction::Dash {
                             key: key(edge.slot),
                             direction,
-                        });
-                    }
-                    DreamAction::Dreamlance { aim, .. } => {
-                        action = Some(OwnerCombatAction::Ray {
-                            key: key(edge.slot),
-                            aim,
                         })
                     }
-                    DreamAction::BeamBegin { aim, .. } => {
-                        action = Some(OwnerCombatAction::BeamBegin {
-                            key: key(edge.slot),
-                            aim,
-                        })
-                    }
+                    DreamAction::Dreamlance { aim, .. } => Some(OwnerCombatAction::Ray {
+                        key: key(edge.slot),
+                        aim,
+                    }),
+                    DreamAction::BeamBegin { aim, .. } => Some(OwnerCombatAction::BeamBegin {
+                        key: key(edge.slot),
+                        aim,
+                    }),
                     DreamAction::ChargeBegin
                     | DreamAction::ChargeRelease { .. }
-                    | DreamAction::ChargeCancel { .. } => {
-                        action = Some(OwnerCombatAction::Charge {
-                            key: key(edge.slot),
-                            command: match edge.action {
-                                DreamAction::ChargeBegin => engine_core::ChargeCommand::Begin {
-                                    episode: command.0.sequence.0,
-                                },
-                                DreamAction::ChargeRelease { episode } => {
-                                    engine_core::ChargeCommand::Release { episode }
-                                }
-                                DreamAction::ChargeCancel { episode } => {
-                                    engine_core::ChargeCommand::Cancel { episode }
-                                }
-                                _ => unreachable!(),
+                    | DreamAction::ChargeCancel { .. } => Some(OwnerCombatAction::Charge {
+                        key: key(edge.slot),
+                        command: match edge.action {
+                            DreamAction::ChargeBegin => engine_core::ChargeCommand::Begin {
+                                episode: command.sequence.0,
                             },
-                            aim: input.aim,
-                        })
-                    }
-                    DreamAction::BeamStop => {
-                        action = Some(OwnerCombatAction::BeamStop {
-                            key: key(edge.slot),
-                        })
-                    }
-                    _ => {}
-                }
+                            DreamAction::ChargeRelease { episode } => {
+                                engine_core::ChargeCommand::Release { episode }
+                            }
+                            DreamAction::ChargeCancel { episode } => {
+                                engine_core::ChargeCommand::Cancel { episode }
+                            }
+                            _ => unreachable!(),
+                        },
+                        aim: held.aim,
+                    }),
+                    DreamAction::BeamStop => Some(OwnerCombatAction::BeamStop {
+                        key: key(edge.slot),
+                    }),
+                    _ => None,
+                };
             }
-            beam = command.0.input.beam.map(|sample| (key(0), sample.aim));
-            state.0.record_predicted_input(command.0.input.held);
+            beam = command.input.beam.map(|sample| (key(0), sample.aim));
+            state.record_predicted_input(command.input.held);
         }
-        let targets = dependencies
-            .records
-            .values()
-            .filter_map(|record| match &record.value {
-                DependencyValue::Known(CollisionDependency::PresentationTarget(target)) => {
-                    Some(*target)
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        if targets.len() > MAX_PRESENTATION_TARGETS {
-            return Err(PredictionError::InvalidDependency);
+        if dependencies.targets.len() > MAX_PRESENTATION_TARGETS {
+            return Err("prediction target capacity".into());
         }
         self.runner
             .lock()
-            .map_err(|_| PredictionError::InvalidState)?
+            .map_err(|_| "prediction runner poisoned")?
             .step_with_targets(
-                &mut state.0,
-                input,
-                collision,
+                state,
+                held,
+                &dependencies.collision,
                 &bases,
                 action,
                 beam,
-                &targets,
+                &dependencies.targets,
             )
-            .map_err(|_| PredictionError::InvalidState)?;
-        Ok(state
-            .0
-            .cast_cues()
-            .iter()
-            .map(|cue| ActionKey {
-                connection: ConnectionEpoch(cue.connection_epoch),
-                stream: CommandStream(cue.command_stream),
-                command: CommandSeq(cue.command_sequence),
-                slot: cue.action_slot,
-            })
-            .collect())
+            .map_err(|error| error.to_string())
     }
 }

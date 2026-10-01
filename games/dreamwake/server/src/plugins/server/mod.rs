@@ -10,17 +10,15 @@ pub struct DreamwakeServerPlugin {
     pub seed: u64,
     pub lucid: bool,
     pub replication_distance: f32,
-    pub compression: engine_net::CompressionPolicy,
 }
 
 impl bevy::prelude::Plugin for DreamwakeServerPlugin {
     fn build(&self, app: &mut bevy::prelude::App) {
-        let mut authority = DreamAuthority::with_replication_policy(
+        let mut authority = DreamAuthority::with_replication_distance(
             self.seed,
             self.lucid,
             self.shared.max_clients,
             self.replication_distance,
-            self.compression,
         );
         authority.observe_transport(self.shared.clone());
         app.init_resource::<crate::ActionTrace>();

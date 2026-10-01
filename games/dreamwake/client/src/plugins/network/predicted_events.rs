@@ -1,8 +1,8 @@
 //! One bounded journal for committed owner prediction effects and cosmetic cues.
-use super::model::OwnerModel;
-use dreamwake_protocol::live::{ActionOutcome, OWNER_GROUP, TerminalStatus};
+use super::model::Predictor;
+use dreamwake_protocol::live::{ActionOutcome, TerminalStatus};
 use dreamwake_sim::starfall::{SpawnKey, StarfallFlight};
-use engine_net::{events::*, prediction::PredictionManager, replication::Payload, types::*};
+use engine_net::{events::*, replication::Payload, types::*};
 use std::collections::{BTreeMap, BTreeSet};
 
 const PROJECTILE: EventKind = EventKind(1);
@@ -96,10 +96,7 @@ impl PredictedEvents {
     /// cannot follow the prediction, for example after a rebase that moved
     /// the predicted tick or retired its commands, it restarts for the same
     /// scope from the current prediction. At worst a cue repeats or is missed.
-    pub(super) fn publish(
-        &mut self,
-        predictor: &PredictionManager<OwnerModel>,
-    ) -> Result<(), String> {
+    pub(super) fn publish(&mut self, predictor: &Predictor) -> Result<(), String> {
         let Err(error) = self.follow(predictor) else {
             return Ok(());
         };
@@ -110,11 +107,11 @@ impl PredictedEvents {
         }
         Ok(())
     }
-    fn follow(&mut self, predictor: &PredictionManager<OwnerModel>) -> Result<(), String> {
-        let Some(now) = predictor.predicted_tick(OWNER_GROUP) else {
+    fn follow(&mut self, predictor: &Predictor) -> Result<(), String> {
+        let Some(now) = predictor.predicted_tick() else {
             return Ok(());
         };
-        let Some(current) = predictor.state(OWNER_GROUP) else {
+        let Some(current) = predictor.state() else {
             return Ok(());
         };
         let first = ServerTick(now.0.saturating_sub(255));
@@ -122,11 +119,10 @@ impl PredictedEvents {
         let mut retired_keys = BTreeSet::new();
         let mut retained_command_head = None::<CommandSeq>;
         let current_keys = current
-            .0
             .starfall_flights()
             .iter()
             .map(|f| f.key)
-            .chain(current.0.starfall_repeats().iter().map(|r| r.key))
+            .chain(current.starfall_repeats().iter().map(|r| r.key))
             .map(|key| EventKey {
                 action: action(key),
                 kind: PROJECTILE,
@@ -134,19 +130,21 @@ impl PredictedEvents {
             })
             .collect::<BTreeSet<_>>();
         for tick in first.0..=now.0 {
-            if let Some(command) = predictor.command_history(OWNER_GROUP, ServerTick(tick)) {
+            if let Some(command) = predictor
+                .history_input(ServerTick(tick))
+                .and_then(|input| input.command())
+            {
                 retained_command_head = Some(
-                    retained_command_head
-                        .map_or(command.0.sequence, |head| head.min(command.0.sequence)),
+                    retained_command_head.map_or(command.sequence, |head| head.min(command.sequence)),
                 );
             }
-            if let Some(state) = predictor.history_state(OWNER_GROUP, ServerTick(tick)) {
-                retired_keys.extend(state.0.starfall_retired().iter().map(|key| EventKey {
+            if let Some(state) = predictor.history_state(ServerTick(tick)) {
+                retired_keys.extend(state.starfall_retired().iter().map(|key| EventKey {
                     action: action(*key),
                     kind: PROJECTILE,
                     spawn_ordinal: u32::from(key.ordinal),
                 }));
-                for &action in state.0.cast_cues() {
+                for &action in state.cast_cues() {
                     let key = SpawnKey { action, ordinal: 0 };
                     for (kind, payload) in [
                         (CAST_SOUND, PresentationEvent::CastSound),
@@ -159,13 +157,11 @@ impl PredictedEvents {
             }
         }
         let objects = current
-            .0
             .starfall_flights()
             .iter()
             .map(|f| (f.key, PresentationEvent::Projectile(f.clone())))
             .chain(
                 current
-                    .0
                     .starfall_repeats()
                     .iter()
                     .map(|r| (r.key, PresentationEvent::Reserved(r.key))),
@@ -408,6 +404,8 @@ mod tests {
         };
         use dreamwake_protocol::live::{ActionOutcomeData, OutcomeReason};
         let (mut session, _) = fixture();
+        // Start the journal before the fixture's first owner state.
+        session.events = adapter();
         let first = key();
         let mut second = first;
         second.action.command_sequence = 2;
@@ -470,9 +468,9 @@ mod tests {
                     batch: outcome.sequence,
                     records: BoundedVec::new(vec![outcome.clone()]).unwrap(),
                 },
-                session.model.welcome.stream.epoch,
+                session.welcome.stream.epoch,
                 0,
-                session.model.welcome.frame_limit().unwrap(),
+                session.welcome.frame_limit().unwrap(),
             )
             .unwrap();
             receive_message(

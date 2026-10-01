@@ -160,8 +160,7 @@ fn record_trace(
         "heroes": view.heroes.iter().map(|h| h.id).collect::<Vec<_>>(),
         "scopes": scopes,
         "hero_scopes": hero_scopes.into_iter().map(|(hero_id, scope, end_tick, position)| serde_json::json!({"hero_id":hero_id, "scope":scope, "end_tick":end_tick.0, "position":position})).collect::<Vec<_>>(),
-        "active": session.is_some_and(|s| s.active && !s.recovering),
-        "recovering": session.map(|s| s.recovering),
+        "active": session.is_some_and(|s| s.active),
         "connection_epoch": session.map(|s| s.connection_epoch.0),
         "estimated_server_tick": session.and_then(|s| s.estimated_server_tick).map(|t| t.0),
         "lead_ticks": session.map(|s| s.lead_ticks),
@@ -169,15 +168,13 @@ fn record_trace(
         "pending_commands": metrics.as_ref().map(|m| m.pending_commands),
         "finalized_tick": session.map(|s| s.finalized_tick.0),
         "predicted_tick": session.and_then(|s| s.predicted_tick).map(|t| t.0),
-        "history_bytes": session.map(|s| s.prediction_bytes),
-        "scope_bytes": session.map(|s| s.scope_bytes),
-        "staging_bytes": session.map(|s| s.group_bytes),
-        "baseline_bytes": session.map(|s| s.baseline_bytes),
-        "baseline_repairs": session.map(|s| s.baseline_repairs),
+        "entities": session.map(|s| s.entities),
+        "stream_latest": session.map(|s| s.stream_latest),
+        "owner_tick": session.and_then(|s| s.owner_tick).map(|t| t.0),
+        "delivery": session.map(|s| s.delivery),
         "decode_errors": telemetry.decode_errors,
         "transport_errors": telemetry.transport_errors,
         "decode_issue": telemetry.decode_issue,
-        "recovery_issue": telemetry.recovery_issue,
         "transport_issue": telemetry.transport_issue,
         "rtt_ms": runtime.map(|r| r.renet.rtt() * 1000.0),
         "renet_receive_bytes_per_second": runtime.map(|r| r.renet.bytes_received_per_sec()),
@@ -199,7 +196,6 @@ fn record_trace(
     record["transport_connection"] = serde_json::json!(session.map(|s| s.transport_connection));
     record["stale_epoch_rejections"] = serde_json::json!(telemetry.stale_epoch_rejections);
     record["clock_resync_rejections"] = serde_json::json!(telemetry.clock_resync_rejections);
-    record["obsolete_rejections"] = serde_json::json!(telemetry.obsolete_rejections);
     record["decode_failures"] = serde_json::json!(telemetry.decode_failures);
     record["replay_ticks"] = serde_json::json!(session.map(|s| s.replay_ticks));
     record["predicted_ticks_this_frame"] =
@@ -354,8 +350,6 @@ mod trace_tests {
         telemetry.record_clock_rejection(engine_net::synchronization::SyncError::ResyncRequired(
             engine_net::synchronization::ResyncReason::LeadExceeded,
         ));
-        telemetry
-            .record_obsolete_rejection(engine_net::replication::ObsoleteReason::Scope, "snapshot");
         telemetry.reset_samples();
         let window = super::super::native_window::NativeWindowMetrics::default();
         record_trace(
@@ -374,17 +368,13 @@ mod trace_tests {
         assert_eq!(row["trace_sequence"], 1);
         assert_eq!(row["trace_segment"], 0);
         assert_eq!(row["elapsed"], 1.0);
-        assert_eq!(row["decode_errors"], 5);
+        assert_eq!(row["decode_errors"], 4);
         assert_eq!(row["stale_epoch_rejections"], 2);
         assert_eq!(row["clock_resync_rejections"], 1);
-        assert_eq!(row["obsolete_rejections"], 1);
         assert_eq!(row["decode_failures"], 1);
         assert_eq!(
             row["decode_issue"],
-            format!(
-                "obsolete {}: snapshot",
-                engine_net::replication::ObsoleteReason::Scope
-            )
+            "clock synchronization: ResyncRequired(LeadExceeded)"
         );
         assert!(row.as_object().unwrap().contains_key("replay_ticks"));
         assert!(

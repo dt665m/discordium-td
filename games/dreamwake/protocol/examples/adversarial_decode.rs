@@ -9,20 +9,16 @@ mod corpus;
 mod generated;
 #[path = "adversarial/p11.rs"]
 mod p11;
-use corpus::{Corpus, entity, state};
-use dreamwake_protocol::{
-    DreamAction, live,
-    replication::{ReplicaPayload, decode_replica, encode_replica},
-};
+use corpus::{Corpus, entity};
+use dreamwake_protocol::{DreamAction, live};
 use dreamwake_sim::{
     DreamInput,
-    replication::{OwnerExpectation, ReplicationStamp},
+    replication::{OwnerExpectation, PublicReplica, Replica, ReplicaState, ReplicationStamp},
 };
-use engine_net::replication::baselines::*;
 use engine_net::{
     codec::{self, BoundedVec, FrameHeader, FrameLimit, Lane},
-    commands::{ActionEdge, Command, OwnerStream},
-    replication::*,
+    commands::{ActionEdge, OwnerStream},
+    replication::stream::{Base, ClientStream, StreamAck},
     types::*,
 };
 use std::{
@@ -31,35 +27,27 @@ use std::{
 };
 const EPOCH: ConnectionEpoch = ConnectionEpoch(2);
 const MAX_INPUT: usize = 32_768;
-const NAMES: [&str; 19] = [
-    "commands",
+const NAMES: [&str; 14] = [
+    "input",
     "client_control",
     "server_control",
     "welcome",
-    "public_replica",
+    "public_state",
     "private_forgery",
-    "full_scope",
-    "group_manifest",
-    "whole_group_frame",
-    "baseline_delta",
+    "state_delta",
+    "state_packet",
     "compression",
     "nonfinite",
-    "live_state",
     "generated_fields",
-    "owner_dependencies",
     "combat_view_timing",
     "action_outcomes",
-    "finalized_ack",
     "outcomes_ack",
 ];
 fn limit() -> FrameLimit {
     FrameLimit::new(1100).unwrap()
 }
-fn group_limits() -> GroupLimits {
-    GroupLimits {
-        members: 3,
-        ..Default::default()
-    }
+fn state_limit() -> FrameLimit {
+    FrameLimit::new(live::MAX_STATE_FRAME_BYTES).unwrap()
 }
 struct Random(u64);
 impl Random {
@@ -168,133 +156,44 @@ fn accepted(value: bool) -> Outcome {
         reason: if value { "accepted" } else { "decode_rejected" },
     }
 }
-fn client(c: &Corpus) -> ClientScopes<Vec<u8>> {
-    let mut client = ClientScopes::new(
-        EPOCH,
-        ScopeLimits {
-            known_entities: 8,
-            ..Default::default()
-        },
-    )
-    .unwrap();
+/// A receiving stream holding the entities the corpus packet names as bases.
+fn client(c: &Corpus) -> ClientStream<EntityId, ReplicaState> {
+    let mut client = ClientStream::new(8);
     client
-        .apply_full(state(1, c.global.clone(), 1), |_| true)
+        .accept(3, vec![(entity(7), c.delta_base.clone())], &[])
         .unwrap();
     client
-        .apply_full(state(2, c.owner.clone(), 1), |_| true)
-        .unwrap();
-    client
-        .apply_full(state(3, c.collision.clone(), 1), |_| true)
-        .unwrap();
-    client
-}
-fn unchanged(client: &ClientScopes<Vec<u8>>, c: &Corpus) {
-    assert_eq!(
-        client.known_entities(),
-        3,
-        "failure changed published entity count"
-    );
-    assert_eq!(
-        client.state(entity(1)),
-        Some(&state(1, c.global.clone(), 1)),
-        "failure changed global publication"
-    );
-    assert_eq!(
-        client.state(entity(2)),
-        Some(&state(2, c.owner.clone(), 1)),
-        "failure changed private publication"
-    );
-    assert_eq!(
-        client.state(entity(3)),
-        Some(&state(3, c.collision.clone(), 1)),
-        "failure changed collision publication"
-    );
-}
-fn decode_owner_group(bytes: &[u8], c: &Corpus) -> Result<GroupChunk<Vec<u8>>, ReplicationError> {
-    // Same positive binding constraints as the live owner's three-member group.
-    let group = decode_group(bytes, group_limits(), |p| Ok(p.to_vec()))?;
-    validate_decoded_group(group, c)
-}
-fn validate_decoded_group(
-    group: GroupChunk<Vec<u8>>,
-    c: &Corpus,
-) -> Result<GroupChunk<Vec<u8>>, ReplicationError> {
-    if group.publication.group != live::OWNER_GROUP || group.members.len() != 3 {
-        return Err(ReplicationError::InvalidPayload);
-    }
-    let mut global = None;
-    let mut owner = None;
-    let mut collision = None;
-    for value in &group.members {
-        match decode_replica(&value.payload, Some(c.expected))
-            .map_err(|_| ReplicationError::InvalidPayload)?
-        {
-            ReplicaPayload::Global(g) if value.scope.entity == entity(1) => global = Some(g),
-            ReplicaPayload::Owner(o) if value.scope.entity == entity(2) => owner = Some(o),
-            ReplicaPayload::Collision(m) if value.scope.entity == entity(3) => collision = Some(m),
-            _ => return Err(ReplicationError::InvalidPayload),
-        }
-    }
-    if global
-        .as_ref()
-        .zip(owner.as_ref())
-        .is_none_or(|(g, o)| o.context() != g || g.stamp.server_tick != group.end_tick.0)
-    {
-        return Err(ReplicationError::InvalidPayload);
-    }
-    if owner
-        .as_ref()
-        .zip(collision.as_ref())
-        .is_none_or(|(owner, collision)| {
-            owner.collision_identity() != collision.identity()
-                || owner.stamp().scene_revision != collision.scene_revision()
-        })
-    {
-        return Err(ReplicationError::InvalidPayload);
-    }
-    Ok(group)
-}
-fn apply_full(decoded: Result<FullState<Vec<u8>>, ReplicationError>, c: &Corpus) -> Outcome {
-    let mut client = client(c);
-    let result = decoded.and_then(|s| client.apply_full(s, |p| decode_replica(p, None).is_ok()));
-    if result.is_err() {
-        unchanged(&client, c);
-    }
-    assert!(client.retained_bytes() <= ScopeLimits::default().retained_payload_bytes);
-    Outcome {
-        accepted: result.is_ok(),
-        published: result.is_ok(),
-        reason: if result.is_ok() {
-            "accepted"
-        } else {
-            "publication_rejected"
-        },
-    }
 }
 fn run(family: usize, bytes: &[u8], case: usize, c: &Corpus) -> Outcome {
     match family {
-        0 => accepted(live::decode_commands(bytes, EPOCH, limit()).is_ok()),
+        0 => accepted(live::decode_input(bytes, EPOCH, limit()).is_ok()),
         1 => accepted(live::decode_control::<live::ClientControl>(bytes, EPOCH, limit()).is_ok()),
         2 => accepted(live::decode_control::<live::ServerControl>(bytes, EPOCH, limit()).is_ok()),
         3 => accepted(live::decode_welcome(bytes).is_ok()),
         4 => {
-            let value = decode_replica(bytes, None);
+            let value = ReplicaState::decode(bytes, None);
+            let restored = value.as_ref().ok().map(|state| state.restore(None));
             assert!(
-                !matches!(value, Ok(ReplicaPayload::Owner(_))),
-                "public decode disclosed owner payload"
+                !matches!(restored, Some(Ok(Replica::Owner(_)))),
+                "public decode disclosed owner state"
             );
-            if let Ok(ref value) = value {
-                let roundtrip = encode_replica(value).unwrap();
-                assert_eq!(decode_replica(&roundtrip, None).unwrap(), *value);
+            if let (Ok(state), Some(Ok(_))) = (&value, &restored) {
+                let mut roundtrip = Vec::new();
+                state.encode(None, &mut roundtrip).unwrap();
+                assert_eq!(ReplicaState::decode(&roundtrip, None).unwrap(), *state);
             }
+            let result = value
+                .and_then(|state| state.restore(None))
+                .map(|_| ());
             Outcome {
-                accepted: value.is_ok(),
+                accepted: result.is_ok(),
                 published: false,
-                reason: value.as_ref().err().map_or("accepted", generated::reason),
+                reason: result.as_ref().err().map_or("accepted", generated::reason),
             }
         }
         5 => {
-            assert!(decode_replica(&c.owner, None).is_err());
+            let owner = ReplicaState::decode(&c.owner_state, None).unwrap();
+            assert!(owner.restore(None).is_err(), "owner restored without expectation");
             let mut wrong = c.expected;
             match case % 5 {
                 0 => wrong.owner += 1,
@@ -304,19 +203,11 @@ fn run(family: usize, bytes: &[u8], case: usize, c: &Corpus) -> Outcome {
                 _ => wrong.minimum_revision = u64::MAX,
             }
             assert!(
-                decode_replica(&c.owner, Some(wrong)).is_err(),
+                owner.restore(Some(wrong)).is_err(),
                 "forged owner expectation accepted"
             );
-            for tag in [0, 2, 3, 255] {
-                let mut retagged = c.owner.clone();
-                retagged[0] = tag;
-                assert!(
-                    decode_replica(&retagged, Some(c.expected)).is_err(),
-                    "private payload retagged public"
-                );
-            }
-            let result = decode_replica(bytes, Some(c.expected));
-            if let Ok(ReplicaPayload::Owner(owner)) = &result {
+            let result = ReplicaState::decode(bytes, None).and_then(|state| state.restore(Some(c.expected)));
+            if let Ok(Replica::Owner(owner)) = &result {
                 assert_eq!(owner.expectation().owner, c.expected.owner);
             }
             Outcome {
@@ -325,114 +216,60 @@ fn run(family: usize, bytes: &[u8], case: usize, c: &Corpus) -> Outcome {
                 reason: result.as_ref().err().map_or("accepted", generated::reason),
             }
         }
-        6 => apply_full(decode_full_state(bytes, EPOCH, 16384), c),
+        6 => {
+            let result = ReplicaState::decode(bytes, Some(&c.delta_base))
+                .and_then(|state| state.restore(None));
+            Outcome {
+                accepted: result.is_ok(),
+                published: false,
+                reason: result.as_ref().err().map_or("accepted", generated::reason),
+            }
+        }
         7 => {
-            let mut client = client(c);
-            let mut groups = GroupAssembler::new(EPOCH, group_limits()).unwrap();
-            let result = decode_owner_group(bytes, c).and_then(|g| {
-                groups.receive(g, 0, &mut client, |p| {
-                    decode_replica(p, Some(c.expected)).is_ok()
-                })
-            });
-            if !matches!(result, Ok(GroupProgress::Published(_))) {
-                unchanged(&client, c);
-            }
-            assert!(groups.staged_bytes() <= group_limits().staging_bytes);
-            Outcome {
-                accepted: result.is_ok(),
-                published: matches!(result, Ok(GroupProgress::Published(_))),
-                reason: if result.is_ok() {
-                    "accepted"
-                } else {
-                    "group_rejected"
-                },
-            }
-        }
-        8 => {
-            let mut client = client(c);
-            let mut groups = GroupAssembler::new(EPOCH, group_limits()).unwrap();
-            let mut published = false;
-            let decoded = live::decode_state(bytes, EPOCH, limit());
-            let result = match decoded {
-                Ok(live::StateFrame::Group(group)) => {
-                    validate_decoded_group(group, c).and_then(|group| {
-                        let progress = groups.receive(group, 0, &mut client, |_| true)?;
-                        published = matches!(progress, GroupProgress::Published(_));
-                        Ok(())
-                    })
-                }
-                _ => Err(ReplicationError::InvalidPayload),
-            };
-            if !published {
-                unchanged(&client, c);
-            }
-            assert!(groups.staged_bytes() <= group_limits().staging_bytes);
-            Outcome {
-                accepted: result.is_ok(),
-                published,
-                reason: if result.is_ok() {
-                    "accepted"
-                } else {
-                    "group_frame_rejected"
-                },
-            }
-        }
-        9 => {
-            let mut client = ClientBaselines::new(
-                c.baseline.target.context,
-                c.baseline.target.generation,
-                BaselineLimits::default(),
-            )
-            .unwrap();
-            client
-                .receive(&c.baseline, &BytePatch, |p| decode_replica(p, None).is_ok())
-                .unwrap();
-            let before = client.current().cloned();
-            let mut packet = BaselinePacket {
-                target: BaselineReceipt {
-                    snapshot: SnapshotId(2),
-                    version: StateVersion(2),
-                    ..c.baseline.target
-                },
-                encoding: BaselineEncoding::Delta {
-                    base: c.baseline.target,
-                },
-                bytes: bytes.to_vec(),
-            };
-            match case % 8 {
-                0 => packet.target.context.scope.connection = ConnectionEpoch(99),
-                1 => packet.target.context.scope.scope = ScopeEpoch(2),
-                2 => packet.target.context.scope.entity.generation = 2,
-                3 => packet.target.generation = BaselineGeneration(2),
-                _ => {}
-            }
-            let result = client.receive(&packet, &BytePatch, |p| decode_replica(p, None).is_ok());
+            let mut stream = client(c);
+            let before = (stream.ack(), stream.current(entity(7)).map(|(seq, s)| (seq, s.clone())));
+            let result = live::decode_state(bytes, EPOCH, state_limit())
+                .map_err(|_| "packet_rejected")
+                .and_then(|packet| {
+                    let mut decoded = Vec::new();
+                    for entry in &packet.entries {
+                        let base = match stream
+                            .base(entry.entity, entry.base, packet.seq)
+                            .map_err(|_| "base_rejected")?
+                        {
+                            Base::Superseded => continue,
+                            Base::Whole => None,
+                            Base::Delta(base) => Some(base),
+                        };
+                        let state = ReplicaState::decode(&entry.body, base)
+                            .map_err(|_| "entry_rejected")?;
+                        state.restore(None).map_err(|_| "entry_rejected")?;
+                        decoded.push((entry.entity, state));
+                    }
+                    stream
+                        .accept(packet.seq, decoded, &packet.removed)
+                        .map_err(|_| "stream_rejected")
+                });
             if result.is_err() {
                 assert_eq!(
-                    client.current(),
-                    before.as_ref(),
-                    "failed delta changed published baseline"
+                    (stream.ack(), stream.current(entity(7)).map(|(seq, s)| (seq, s.clone()))),
+                    before,
+                    "a rejected packet changed the stream"
                 );
-                assert_eq!(client.retained_states(), 1);
             }
-            assert!(client.retained_bytes() <= BaselineLimits::default().resident_bytes);
             Outcome {
                 accepted: result.is_ok(),
                 published: result.is_ok(),
-                reason: if result.is_ok() {
-                    "accepted"
-                } else {
-                    "publication_rejected"
-                },
+                reason: result.err().unwrap_or("accepted"),
             }
         }
-        10 => {
+        8 => {
             accepted(engine_net::decode_with_limit::<BoundedVec<u8, 16384>>(bytes, 16384).is_ok())
         }
-        11 => {
+        9 => {
             for invalid in &c.nonfinite {
                 assert!(
-                    live::decode_commands(invalid, EPOCH, limit()).is_err(),
+                    live::decode_input(invalid, EPOCH, limit()).is_err(),
                     "nonfinite/unbounded intent accepted"
                 );
             }
@@ -443,18 +280,11 @@ fn run(family: usize, bytes: &[u8], case: usize, c: &Corpus) -> Outcome {
             let mut count = vec![0];
             count.extend_from_slice(&u64::MAX.to_le_bytes());
             assert!(engine_net::decode_with_limit::<BoundedVec<u8, 16384>>(&count, 16384).is_err());
-            accepted(live::decode_commands(bytes, EPOCH, limit()).is_ok())
+            accepted(live::decode_input(bytes, EPOCH, limit()).is_ok())
         }
-        12 => {
-            let decoded = match live::decode_state(bytes, EPOCH, limit()) {
-                Ok(live::StateFrame::Full(v)) => Ok(v),
-                _ => Err(ReplicationError::InvalidPayload),
-            };
-            apply_full(decoded, c)
-        }
-        13 => {
+        10 => {
             let item = &c.schema_cases[(case / NAMES.len()) % c.schema_cases.len()];
-            let result = decode_replica(bytes, Some(c.expected));
+            let result = generated::decode(item.root, bytes, c.expected);
             assert_eq!(
                 result.is_err(),
                 item.rejected,
@@ -462,50 +292,15 @@ fn run(family: usize, bytes: &[u8], case: usize, c: &Corpus) -> Outcome {
                 item.root,
                 item.mutation
             );
-            if let Ok(ref decoded) = result {
-                assert_eq!(
-                    decode_replica(&encode_replica(decoded).unwrap(), Some(c.expected)).unwrap(),
-                    *decoded
-                );
-            }
             Outcome {
                 accepted: result.is_ok(),
                 published: false,
                 reason: result.as_ref().err().map_or("accepted", generated::reason),
             }
         }
-        14 => {
-            let item = &c.dependency_cases[(case / NAMES.len()) % c.dependency_cases.len()];
-            let mut client = client(c);
-            let mut groups = GroupAssembler::new(EPOCH, group_limits()).unwrap();
-            let result = decode_owner_group(bytes, c).and_then(|g| {
-                groups.receive(g, 0, &mut client, |p| {
-                    decode_replica(p, Some(c.expected)).is_ok()
-                })
-            });
-            assert_eq!(
-                result.is_err(),
-                item.rejected,
-                "owner group {}",
-                item.mutation
-            );
-            if result.is_err() {
-                unchanged(&client, c);
-            }
-            assert!(groups.staged_bytes() <= group_limits().staging_bytes);
-            Outcome {
-                accepted: result.is_ok(),
-                published: matches!(result, Ok(GroupProgress::Published(_))),
-                reason: if result.is_ok() {
-                    "accepted"
-                } else {
-                    item.mutation
-                },
-            }
-        }
-        15 => {
+        11 => {
             let item = &c.combat_cases[(case / NAMES.len()) % c.combat_cases.len()];
-            let result = live::decode_commands(bytes, EPOCH, limit());
+            let result = live::decode_input(bytes, EPOCH, limit());
             assert_eq!(
                 result.is_err(),
                 item.rejected,
@@ -522,7 +317,7 @@ fn run(family: usize, bytes: &[u8], case: usize, c: &Corpus) -> Outcome {
                 },
             }
         }
-        16 => {
+        12 => {
             let item = &c.outcome_cases[(case / NAMES.len()) % c.outcome_cases.len()];
             let result = live::decode_control::<live::ServerControl>(bytes, EPOCH, limit());
             assert_eq!(
@@ -541,26 +336,7 @@ fn run(family: usize, bytes: &[u8], case: usize, c: &Corpus) -> Outcome {
                 },
             }
         }
-        17 => {
-            let item = &c.finalized_ack_cases[(case / NAMES.len()) % c.finalized_ack_cases.len()];
-            let result = live::decode_control::<live::ClientControl>(bytes, EPOCH, limit());
-            assert_eq!(
-                result.is_err(),
-                item.rejected,
-                "FinalizedAck {}",
-                item.mutation
-            );
-            Outcome {
-                accepted: result.is_ok(),
-                published: false,
-                reason: if result.is_ok() {
-                    "accepted"
-                } else {
-                    item.mutation
-                },
-            }
-        }
-        18 => {
+        13 => {
             let item = &c.outcomes_ack_cases[(case / NAMES.len()) % c.outcomes_ack_cases.len()];
             let result = live::decode_control::<live::ClientControl>(bytes, EPOCH, limit());
             assert_eq!(
@@ -600,10 +376,17 @@ fn main() {
     }
     assert!(seed != 0 && (1..=1_000_000).contains(&cases));
     let c = Corpus::new();
-    // Positive controls ensure each real codec and the complete private group are exercised.
-    assert!(decode_replica(&c.owner, Some(c.expected)).is_ok());
+    // Positive controls ensure each real codec is exercised.
+    assert!(
+        ReplicaState::decode(&c.owner_state, None)
+            .unwrap()
+            .restore(Some(c.expected))
+            .is_ok()
+    );
     assert!(c.welcome.compatible(ConnectionId(9)));
-    assert_eq!(decode_owner_group(&c.group, &c).unwrap().members.len(), 3);
+    assert!(live::decode_input(&c.input, EPOCH, limit()).is_ok());
+    assert_eq!(run(7, &c.state_packet, 0, &c).published, true);
+    assert_eq!(run(6, &c.delta, 0, &c).accepted, true);
     assert_eq!(c.schema_seeds.len(), generated::ROOT_NAMES.len());
     assert_eq!(
         c.schema_seeds
@@ -612,10 +395,9 @@ fn main() {
             .collect::<std::collections::BTreeSet<_>>(),
         generated::ROOT_NAMES.into_iter().collect(),
     );
-    for (_, seed) in &c.schema_seeds {
-        assert!(decode_replica(seed, Some(c.expected)).is_ok());
+    for (root, seed) in &c.schema_seeds {
+        assert!(generated::decode(root, seed, c.expected).is_ok());
     }
-    assert_eq!(c.state.payload, c.global);
     let mut counts = [[0u64; 3]; NAMES.len()];
     let mut family_alloc = [0usize; NAMES.len()];
     let mut family_live = [0usize; NAMES.len()];
@@ -636,33 +418,21 @@ fn main() {
                 .max(1),
         );
         let original = match family {
-            0 | 11 => &c.command,
+            0 | 9 => &c.input,
             1 => &c.client_control[rng.index(c.client_control.len())],
             2 => &c.server_control[rng.index(c.server_control.len())],
             3 => &c.welcome_bytes,
-            4 => {
-                let public: Vec<_> = c
-                    .schema_seeds
-                    .iter()
-                    .filter(|(name, _)| *name != "owner")
-                    .collect();
-                &public[rng.index(public.len())].1
-            }
-            5 => &c.owner,
-            6 => &c.full,
-            7 => &c.group,
-            8 => &c.group_message,
-            9 => &c.delta,
-            10 => &c.compressed,
-            12 => &c.live_state,
-            13 => &c.schema_cases[(case / NAMES.len()) % c.schema_cases.len()].bytes,
-            14 => &c.dependency_cases[(case / NAMES.len()) % c.dependency_cases.len()].bytes,
-            15 => &c.combat_cases[(case / NAMES.len()) % c.combat_cases.len()].bytes,
-            16 => &c.outcome_cases[(case / NAMES.len()) % c.outcome_cases.len()].bytes,
-            17 => &c.finalized_ack_cases[(case / NAMES.len()) % c.finalized_ack_cases.len()].bytes,
+            4 => &c.live_states[rng.index(c.live_states.len())].1,
+            5 => &c.owner_state,
+            6 => &c.delta,
+            7 => &c.state_packet,
+            8 => &c.compressed,
+            10 => &c.schema_cases[(case / NAMES.len()) % c.schema_cases.len()].bytes,
+            11 => &c.combat_cases[(case / NAMES.len()) % c.combat_cases.len()].bytes,
+            12 => &c.outcome_cases[(case / NAMES.len()) % c.outcome_cases.len()].bytes,
             _ => &c.outcomes_ack_cases[(case / NAMES.len()) % c.outcomes_ack_cases.len()].bytes,
         };
-        let bytes = if family >= 13 {
+        let bytes = if family >= 10 {
             original.clone()
         } else {
             mutate(original, &mut rng)
@@ -681,7 +451,7 @@ fn main() {
                 counts[family][usize::from(value.accepted)] += 1;
                 counts[family][2] += u64::from(value.published);
                 *reasons[family].entry(value.reason).or_default() += 1;
-                if family == 13 {
+                if family == 10 {
                     let item = &c.schema_cases[(case / NAMES.len()) % c.schema_cases.len()];
                     schema_counts.entry((item.root, item.mutation)).or_default()
                         [usize::from(value.accepted)] += 1;

@@ -7,7 +7,6 @@ use bevy_net_debug::ConditionerDebug;
 use dreamwake_sim::{DreamPresentation, RunPhase};
 use engine_client::network_tools::graphs::{DebugMetric, DiagnosticHistory};
 use engine_client::ui::debug::DebugUiState;
-use engine_net::replication::ObsoleteReason;
 use std::time::Duration;
 
 #[derive(Resource, Default)]
@@ -16,11 +15,9 @@ pub(crate) struct Telemetry {
     pub decode_errors: u64,
     pub stale_epoch_rejections: u64,
     pub clock_resync_rejections: u64,
-    pub obsolete_rejections: u64,
     pub decode_failures: u64,
     pub transport_errors: u64,
     pub decode_issue: Option<String>,
-    pub recovery_issue: Option<String>,
     pub transport_issue: Option<String>,
     last_ack: Option<u32>,
     ack_ms: Option<f64>,
@@ -31,12 +28,11 @@ pub(crate) struct Telemetry {
 }
 pub(crate) enum IssueKind {
     Decode,
-    Recovery,
     Transport,
 }
 impl Telemetry {
     /// Lifetime counters survive reconnect and sample resets. Only the exact
-    /// codec rejection is stale; clock and obsolete classifications require typed errors.
+    /// codec rejection is stale; clock classifications require typed errors.
     pub fn record_decode_rejection(&mut self, reason: &str) {
         if self.decode_errors < u64::MAX {
             self.decode_errors += 1;
@@ -48,14 +44,6 @@ impl Telemetry {
             *counter += 1;
         }
         self.record_issue(IssueKind::Decode, reason);
-    }
-    pub fn record_obsolete_rejection(&mut self, reason: ObsoleteReason, context: &str) {
-        // Freeze all partition counters together at the lifetime counter ceiling.
-        if self.decode_errors < u64::MAX {
-            self.decode_errors += 1;
-            self.obsolete_rejections += 1;
-        }
-        self.record_issue(IssueKind::Decode, &format!("obsolete {reason}: {context}"));
     }
     pub fn record_clock_rejection(&mut self, error: engine_net::synchronization::SyncError) {
         use engine_net::synchronization::SyncError;
@@ -80,7 +68,6 @@ impl Telemetry {
             .collect();
         *match kind {
             IssueKind::Decode => &mut self.decode_issue,
-            IssueKind::Recovery => &mut self.recovery_issue,
             IssueKind::Transport => &mut self.transport_issue,
         } = Some(reason);
     }
@@ -198,9 +185,7 @@ pub(super) fn sample(
                 let metrics = r.metrics();
                 let Some(session) = metrics.session else { return "PREDICTION  Waiting for session".into(); };
                 let tick = |value: Option<engine_net::types::ServerTick>| value.map_or("--".into(), |t| t.0.to_string());
-                let status = if session.recovering {
-                    "Recovering"
-                } else if !session.active {
+                let status = if !session.active {
                     "Waiting for activation"
                 } else if now - metrics.last_received_seconds > PREDICTION_MAX_SNAPSHOT_AGE {
                     "STALLED · state >300 ms"
@@ -213,33 +198,31 @@ pub(super) fn sample(
                 } else { "Active" };
                 let slack = session.arrival_slack.map_or("--".into(), |n| n.to_string());
                 format!(concat!(
-                    "PREDICTION  {}\nState {} · Final {} · Predicted {}\n",
+                    "PREDICTION  {}\nOwner {} · Final {} · Predicted {}\n",
                     "Estimate {} · Lead {} · Last slack {}\nPending {} · Replay {} · New {}\n",
                     "ARRIVAL  {} unique · {} late · Policy {}\nFeedback {} applied / {} prior · Command {}@{}\n",
-                    "History {:.1} KiB · Game {} · Shift {}\n",
-                    "SCOPES  {} live / {} known · {} predicted groups\n",
-                    "Staging {} groups · {:.1} KiB\n",
-                    "Replicas {:.1} KiB · Epoch {}/{}\n",
+                    "Game {} · Shift {}\n",
+                    "STREAM  {} entities · packet {} · Epoch {}/{}\n",
+                    "{} packets · {} rejected\n",
+                    "CORRECTIONS  {} replayed · {} rebased · {} stale\n",
+                    "Replay max {:.2} ms\n",
                     "REMOTE  {} blended · {} frozen · {} samples\n",
-                    "{} active / {} known · {:.1} KiB · t {:.2}s\n",
-                    "DELIVERY  {} groups · {} messages · {} stale\n",
-                    "Replay max {} ticks · {:.2} ms"
-                ), status, tick(session.checkpoint_server_tick), session.finalized_tick.0, tick(session.predicted_tick),
+                    "{} active / {} known · {:.1} KiB · t {:.2}s"
+                ), status, tick(session.owner_tick), session.finalized_tick.0, tick(session.predicted_tick),
                     tick(session.estimated_server_tick), session.lead_ticks, slack, metrics.pending_commands,
                     session.replay_ticks, session.predicted_ticks_this_frame,
                     session.arrival_feedback.observed_commands, session.arrival_feedback.late_commands, session.lead_policy,
                     session.arrival_feedback_applied, session.arrival_feedback_ignored,
                     session.arrival_feedback.sample.map_or("--".into(), |sample| sample.sequence.0.to_string()),
                     session.arrival_feedback.sample.map_or("--".into(), |sample| sample.target.0.to_string()),
-                    session.prediction_bytes as f64 / 1024.0,
-                    session.gameplay_tick.map_or("--".into(), |t| t.to_string()), shift_text(&telemetry, metrics.transport_connected, now), session.live_scopes, session.known_scopes,
-                    session.prediction_groups, session.incomplete_groups,
-                    session.group_bytes as f64 / 1024.0, session.scope_bytes as f64 / 1024.0,
-                    session.match_epoch, session.connection_epoch.0, session.interpolation.interpolated,
+                    session.gameplay_tick.map_or("--".into(), |t| t.to_string()), shift_text(&telemetry, metrics.transport_connected, now),
+                    session.entities, session.stream_latest, session.match_epoch, session.connection_epoch.0,
+                    session.delivery.state_packets, session.delivery.rejected_packets,
+                    session.delivery.replayed, session.delivery.rebased, session.delivery.stale,
+                    session.delivery.maximum_replay_cpu_micros as f64 / 1000.0,
+                    session.interpolation.interpolated,
                     session.interpolation.frozen, session.interpolation.retained_samples, session.interpolation.active_entities,
-                    session.interpolation.known_entities, session.interpolation.retained_bytes as f64 / 1024.0, session.interpolation.cursor.as_secs_f64(),
-                    session.delivery.groups_completed, session.delivery.group_messages, session.delivery.baseline_stale,
-                    session.delivery.maximum_replay_requested, session.delivery.maximum_replay_cpu_micros as f64 / 1000.0)
+                    session.interpolation.known_entities, session.interpolation.retained_bytes as f64 / 1024.0, session.interpolation.cursor.as_secs_f64())
             },
         );
         for (metric, mut text) in &mut overlay_rows {
@@ -315,23 +298,18 @@ pub(super) fn sample(
                     "Last decode issue: {}",
                     telemetry.decode_issue.as_deref().unwrap_or("--")
                 ),
-                DebugMetric::RecoveryIssue => format!(
-                    "Last recovery issue: {}",
-                    telemetry.recovery_issue.as_deref().unwrap_or("--")
-                ),
                 DebugMetric::TransportIssue => format!(
                     "Last transport issue: {}",
                     telemetry.transport_issue.as_deref().unwrap_or("--")
                 ),
                 DebugMetric::TransportErrors => telemetry.transport_errors.to_string(),
-                DebugMetric::BaselineMisses => metrics
+                DebugMetric::StateRejections => metrics
                     .as_ref()
                     .and_then(|m| m.session.as_ref())
                     .map_or("--".into(), |s| {
                         format!(
-                            "{} repairs · {} KiB",
-                            s.baseline_repairs,
-                            s.baseline_bytes / 1024
+                            "{} rejected · {} stale",
+                            s.delivery.rejected_packets, s.delivery.stale
                         )
                     }),
                 DebugMetric::Interpolation => metrics
@@ -473,7 +451,6 @@ mod tests {
             telemetry.decode_errors,
             telemetry.stale_epoch_rejections
                 + telemetry.clock_resync_rejections
-                + telemetry.obsolete_rejections
                 + telemetry.decode_failures
         );
     }
@@ -515,57 +492,6 @@ mod tests {
         );
     }
     #[test]
-    fn typed_obsolete_rejections_are_bounded_lifetime_and_do_not_hide_stale_errors() {
-        let mut telemetry = Telemetry::default();
-        for reason in [
-            ObsoleteReason::Scope,
-            ObsoleteReason::Publication,
-            ObsoleteReason::RetiredBaseline,
-        ] {
-            telemetry.record_obsolete_rejection(reason, "snapshot");
-        }
-        telemetry.reset_samples();
-        assert_eq!(telemetry.obsolete_rejections, 3);
-        assert_eq!(telemetry.decode_errors, 3);
-        assert_eq!(telemetry.decode_failures, 0);
-        let reason = ObsoleteReason::Scope;
-        telemetry.record_obsolete_rejection(reason, &format!("snapshot\n{}", "x".repeat(300)));
-        let issue = telemetry.decode_issue.as_ref().unwrap();
-        assert!(issue.starts_with(&format!("obsolete {reason}: snapshot")));
-        assert_eq!(issue.chars().count(), 160);
-        assert!(!issue.chars().any(char::is_control));
-        telemetry.record_decode_rejection("Stale");
-        telemetry.record_decode_rejection("Obsolete(Scope)");
-        assert_eq!(telemetry.decode_failures, 2);
-        assert_eq!(telemetry.obsolete_rejections, 4);
-        assert_eq!(telemetry.decode_errors, 6);
-    }
-    #[test]
-    fn obsolete_partition_saturation_keeps_latest_issue_visible() {
-        let mut telemetry = Telemetry {
-            decode_errors: u64::MAX - 1,
-            decode_failures: u64::MAX - 1,
-            ..Default::default()
-        };
-        telemetry.record_obsolete_rejection(ObsoleteReason::Scope, "snapshot");
-        telemetry.record_decode_rejection("Stale");
-        telemetry.record_obsolete_rejection(ObsoleteReason::Publication, "delta");
-        telemetry.reset_samples();
-        assert_eq!(telemetry.decode_errors, u64::MAX);
-        assert_eq!(telemetry.obsolete_rejections, 1);
-        assert_eq!(
-            telemetry.decode_errors,
-            telemetry.stale_epoch_rejections
-                + telemetry.clock_resync_rejections
-                + telemetry.obsolete_rejections
-                + telemetry.decode_failures
-        );
-        assert_eq!(
-            telemetry.decode_issue,
-            Some(format!("obsolete {}: delta", ObsoleteReason::Publication))
-        );
-    }
-    #[test]
     fn lifetime_rejection_partition_freezes_together_but_latest_issue_remains_visible() {
         use engine_net::synchronization::{ResyncReason, SyncError};
         let mut telemetry = Telemetry {
@@ -575,7 +501,6 @@ mod tests {
         };
         telemetry.record_clock_rejection(SyncError::ResyncRequired(ResyncReason::LeadExceeded));
         telemetry.record_decode_rejection("WrongEpoch");
-        telemetry.record_obsolete_rejection(ObsoleteReason::Scope, "snapshot");
         telemetry.record_clock_rejection(SyncError::InvalidSample);
         telemetry.reset_samples();
         assert_eq!(telemetry.decode_errors, u64::MAX);
@@ -583,7 +508,6 @@ mod tests {
             telemetry.decode_errors,
             telemetry.stale_epoch_rejections
                 + telemetry.clock_resync_rejections
-                + telemetry.obsolete_rejections
                 + telemetry.decode_failures
         );
         assert_eq!(telemetry.clock_resync_rejections, 1);

@@ -1,8 +1,8 @@
-//! Targeted generated-field cases retain valid outer protocol/compression framing.
+//! Targeted field corruptions of the canonical (offline) schema encoding, each
+//! decoded by that root's real canonical decoder.
 use super::*;
 use dreamwake_sim::{collision::CollisionManifest, replication::*};
 use std::ops::Range;
-const DTO_BYTES: usize = 16_374;
 pub const ROOT_NAMES: [&str; 12] = [
     "global",
     "owner",
@@ -23,10 +23,8 @@ pub struct SchemaCase {
     pub bytes: Vec<u8>,
     pub rejected: bool,
 }
-pub fn seeds(
-    capture: &CommittedReplication,
-    checkpoint: OwnerCheckpoint,
-) -> Vec<(&'static str, Vec<u8>)> {
+/// One public actor of every kind, from the capture where one exists.
+pub fn actors(capture: &CommittedReplication) -> Vec<(&'static str, PublicReplica)> {
     let sources = ApprovedSources::new([1]).unwrap();
     let effect = capture
         .keys()
@@ -39,7 +37,7 @@ pub fn seeds(
             }
         })
         .expect("accepted beam owns its public graphic");
-    let actors = [
+    vec![
         (
             "platform",
             capture
@@ -68,15 +66,7 @@ pub fn seeds(
             "cover_marker",
             PublicReplica::CoverMarker(PublicCoverMarkerView {
                 id: 13,
-                parent: engine_net::types::ScopeIdentity {
-                    connection: engine_net::types::ConnectionEpoch(1),
-                    entity: engine_net::types::EntityId {
-                        index: 12,
-                        generation: 1,
-                    },
-                    scope: engine_net::types::ScopeEpoch(2),
-                    representation: engine_net::types::RepresentationRevision(1),
-                },
+                parent: entity(12),
                 revision: 2,
                 local_offset: [0.0, 1.35, 0.0],
                 open: true,
@@ -142,40 +132,36 @@ pub fn seeds(
                 age: 0.125,
             }),
         ),
-    ];
+    ]
+}
+pub fn seeds(
+    capture: &CommittedReplication,
+    checkpoint: OwnerCheckpoint,
+    actors: &[(&'static str, PublicReplica)],
+) -> Vec<(&'static str, Vec<u8>)> {
     let mut values = vec![
-        (
-            "global",
-            encode_replica(&ReplicaPayload::Global(capture.global().clone())).unwrap(),
-        ),
-        (
-            "owner",
-            encode_replica(&ReplicaPayload::Owner(checkpoint)).unwrap(),
-        ),
-        (
-            "collision",
-            encode_replica(&ReplicaPayload::Collision(CollisionManifest::current(1))).unwrap(),
-        ),
+        ("global", capture.global().encode().unwrap()),
+        ("owner", checkpoint.encode().unwrap()),
+        ("collision", CollisionManifest::current(1).encode().unwrap()),
     ];
     values.extend(
         actors
-            .into_iter()
-            .map(|(name, v)| (name, encode_replica(&ReplicaPayload::Actor(v)).unwrap())),
+            .iter()
+            .map(|(name, actor)| (*name, actor.encode().unwrap())),
     );
     values
 }
-fn unwrap(bytes: &[u8]) -> (u8, Vec<u8>) {
-    let (&tag, body) = bytes.split_first().unwrap();
-    let value: BoundedVec<u8, DTO_BYTES> =
-        engine_net::decode_with_limit(body, DTO_BYTES + 8).unwrap();
-    (tag, value.into_vec())
+fn is_actor(root: &str) -> bool {
+    !matches!(root, "global" | "owner" | "collision")
 }
-fn wrap(tag: u8, body: Vec<u8>) -> Vec<u8> {
-    let mut bytes = vec![tag];
-    bytes.extend(engine_net::encode(
-        &BoundedVec::<u8, DTO_BYTES>::new(body).unwrap(),
-    ));
-    bytes
+/// The root's real canonical decoder.
+pub fn decode(root: &str, bytes: &[u8], expected: OwnerExpectation) -> Result<(), ReplicationError> {
+    match root {
+        "global" => DreamGlobalView::decode(bytes).map(|_| ()),
+        "owner" => OwnerCheckpoint::decode(bytes, expected).map(|_| ()),
+        "collision" => CollisionManifest::decode(bytes).map(|_| ()),
+        _ => PublicReplica::decode(bytes).map(|_| ()),
+    }
 }
 fn field(bytes: &[u8], record: usize, path: &[u16]) -> Range<usize> {
     if path[0] == 0 {
@@ -205,35 +191,33 @@ fn field(bytes: &[u8], record: usize, path: &[u16]) -> Range<usize> {
 fn patch(
     cases: &mut Vec<SchemaCase>,
     root: &'static str,
-    tag: u8,
     original: &[u8],
     path: &[u16],
     value: &[u8],
     mutation: &'static str,
 ) {
     let mut bytes = original.to_vec();
-    let start = usize::from(tag == 2) + 36;
+    let start = usize::from(is_actor(root)) + 36;
     let range = field(&bytes, start, path);
     assert!(value.len() <= range.len());
     bytes[range.start..range.start + value.len()].copy_from_slice(value);
     cases.push(SchemaCase {
         root,
         mutation,
-        bytes: wrap(tag, bytes),
+        bytes,
         rejected: true,
     });
 }
 pub fn cases(seeds: &[(&'static str, Vec<u8>)]) -> Vec<SchemaCase> {
     let mut cases = Vec::new();
-    for &(root, ref payload) in seeds {
+    for &(root, ref body) in seeds {
         cases.push(SchemaCase {
             root,
             mutation: "valid",
-            bytes: payload.clone(),
+            bytes: body.clone(),
             rejected: false,
         });
-        let (tag, body) = unwrap(payload);
-        let record = usize::from(tag == 2) + 36;
+        let record = usize::from(is_actor(root)) + 36;
         for mutation in [
             "fingerprint",
             "unknown_field",
@@ -261,13 +245,12 @@ pub fn cases(seeds: &[(&'static str, Vec<u8>)]) -> Vec<SchemaCase> {
             cases.push(SchemaCase {
                 root,
                 mutation,
-                bytes: wrap(tag, bytes),
+                bytes,
                 rejected: true,
             });
         }
-        let mut add = |path: &[u16], value: &[u8], name| {
-            patch(&mut cases, root, tag, &body, path, value, name)
-        };
+        let mut add =
+            |path: &[u16], value: &[u8], name| patch(&mut cases, root, body, path, value, name);
         match root {
             "global" => {
                 add(&[1, 1], &0u32.to_le_bytes(), "identity");
@@ -322,16 +305,13 @@ pub fn cases(seeds: &[(&'static str, Vec<u8>)]) -> Vec<SchemaCase> {
             }
             "cover" => {
                 add(&[2], &u32::MAX.to_le_bytes(), "cover_pose_count");
-                add(&[4], &[0], "cover_pose_state");
+                add(&[4], &[2], "cover_bool_encoding");
             }
             "cover_marker" => {
-                // Exact parent scope and local offset bindings from the
-                // production CoverMarker schema (0x110c, version 1).
-                add(&[2], &0u64.to_le_bytes(), "parent_connection");
+                // Parent entity and local offset bindings from the production
+                // CoverMarker schema (0x110c, version 2).
                 add(&[3], &0u64.to_le_bytes(), "parent_index");
                 add(&[4], &0u32.to_le_bytes(), "parent_generation");
-                add(&[5], &0u64.to_le_bytes(), "parent_scope");
-                add(&[6], &0u32.to_le_bytes(), "parent_representation");
                 add(&[8], &u32::MAX.to_le_bytes(), "offset_count");
             }
             "hero" => add(&[2], &u32::MAX.to_le_bytes(), "pose_count"),
@@ -387,55 +367,6 @@ pub fn reason(error: &dreamwake_sim::replication::ReplicationError) -> &'static 
         _ => "decode_rejected",
     }
 }
-pub fn dependency_cases(global: &[u8], owner: &[u8], collision: &[u8]) -> Vec<SchemaCase> {
-    let full = vec![
-        state(1, global.to_vec(), 2),
-        state(2, owner.to_vec(), 2),
-        state(3, collision.to_vec(), 2),
-    ];
-    let mut cases = Vec::new();
-    for mutation in [
-        "valid",
-        "missing_collision",
-        "wrong_collision_scene",
-        "collision_wrong_representation",
-    ] {
-        let mut members = full.clone();
-        match mutation {
-            "missing_collision" => {
-                members.pop();
-            }
-            "wrong_collision_scene" => {
-                members[2].payload =
-                    encode_replica(&ReplicaPayload::Collision(CollisionManifest::current(2)))
-                        .unwrap()
-            }
-            "collision_wrong_representation" => members[2].payload = global.to_vec(),
-            _ => {}
-        }
-        let chunk = GroupChunk {
-            publication: GroupPublication {
-                connection: EPOCH,
-                group: live::OWNER_GROUP,
-                revision: GroupRevision(1),
-                snapshot: SnapshotId(2),
-            },
-            end_tick: ServerTick(10),
-            manifest: members.iter().map(|v| v.scope).collect(),
-            index: 0,
-            count: 1,
-            members,
-        };
-        let bytes = encode_group(&chunk, group_limits(), |p| Ok(p.clone())).unwrap();
-        cases.push(SchemaCase {
-            root: "owner_group",
-            mutation,
-            bytes,
-            rejected: mutation != "valid",
-        });
-    }
-    cases
-}
 
 #[cfg(test)]
 mod tests {
@@ -446,9 +377,8 @@ mod tests {
         let names: std::collections::BTreeSet<_> =
             corpus.schema_seeds.iter().map(|(name, _)| *name).collect();
         assert_eq!(names, ROOT_NAMES.into_iter().collect());
-        assert_eq!(corpus.schema_seeds.len(), ROOT_NAMES.len());
         for case in &corpus.schema_cases {
-            let result = decode_replica(&case.bytes, Some(corpus.expected));
+            let result = decode(case.root, &case.bytes, corpus.expected);
             assert_eq!(
                 result.is_err(),
                 case.rejected,
@@ -456,26 +386,6 @@ mod tests {
                 case.root,
                 case.mutation
             );
-        }
-        // The short randomized smoke visits only a subset of generated cases.
-        // This regression always checks every root's framing and semantic cases.
-        for root in ROOT_NAMES {
-            for mutation in [
-                "valid",
-                "fingerprint",
-                "unknown_field",
-                "missing_fields",
-                "field_length",
-                "duplicate_field",
-            ] {
-                assert!(
-                    corpus
-                        .schema_cases
-                        .iter()
-                        .any(|case| case.root == root && case.mutation == mutation),
-                    "missing {root} / {mutation}"
-                );
-            }
         }
     }
 }

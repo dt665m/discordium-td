@@ -5,6 +5,7 @@ use engine_net::{schema::*, types::SchemaId};
 mod collision;
 mod components;
 mod enums;
+mod live;
 mod marker;
 mod motion;
 mod owner;
@@ -18,6 +19,7 @@ use motion::*;
 use owner::Owner;
 use platform::Platform;
 use public::*;
+pub use live::{Replica, ReplicaKind, ReplicaState};
 
 const F: Range = Range::Float32 {
     minimum: -f32::MAX,
@@ -43,6 +45,13 @@ const U64: Range = Range::Unsigned {
     minimum: 0,
     maximum: u64::MAX,
 };
+/// Live replication precision: positions to a millimetre, directions to a
+/// four-thousandth, speeds to four millimetres per second and short timers to
+/// a millisecond. Power-of-two scales convert back to `f32` exactly.
+type Metres = Quantized<1024>;
+type Direction = Quantized<4096>;
+type Speed = Quantized<256>;
+type Seconds = Quantized<1024>;
 const fn p(units: Units, range: Range) -> FieldSpec {
     FieldSpec::exact(units, range, Visibility::Public, Prediction::None)
 }

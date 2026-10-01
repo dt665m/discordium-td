@@ -40,19 +40,22 @@ impl SharedNet {
             webrtc_logical: transport.webrtc().egress_stats(),
         })
     }
-    /// Bytes a connection's transport has accepted but not yet sent. Only the
-    /// WebRTC data channel queues (SCTP is congestion controlled); a native UDP
-    /// socket either sends or drops, so it reports zero. Senders should hold
-    /// back superseded state while this is high rather than add queueing delay.
-    pub fn peer_backlog_bytes(&self, connection_id: u64) -> std::io::Result<usize> {
-        let mut transport = self
+    /// How many more bytes this connection may send now under its egress
+    /// rate cap. A sender that finds the allowance spent should skip work
+    /// this tick rather than queue it, as Unreal's `IsNetReady` does: queued
+    /// state only arrives late. `None` when the connection is unknown.
+    pub fn peer_egress_allowance(
+        &self,
+        connection_id: u64,
+    ) -> std::io::Result<Option<renet_cross::EgressAllowance>> {
+        let transport = self
             .transport
             .lock()
             .map_err(|_| std::io::Error::other("transport statistics lock poisoned"))?;
         Ok(transport
-            .webrtc_mut()
-            .peer_backlog_bytes(connection_id)
-            .unwrap_or(0))
+            .udp()
+            .peer_egress_allowance(connection_id)
+            .or_else(|| transport.webrtc().peer_egress_allowance(connection_id)))
     }
     /// The identifier is the transport connection ID, not a game player ID.
     pub fn peer_egress_stats(&self, connection_id: u64) -> std::io::Result<PeerEgressStats> {

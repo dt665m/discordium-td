@@ -277,6 +277,74 @@ fn parse_frame(
     ))
 }
 
+/// Append `value` as an unsigned LEB128 integer in its shortest form.
+pub fn put_varint(out: &mut Vec<u8>, mut value: u64) {
+    loop {
+        let byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value == 0 {
+            out.push(byte);
+            return;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+/// A bounds-checked cursor over a received payload. Every read fails on
+/// truncation rather than panicking, and varints must use their shortest form.
+pub struct ByteReader<'a> {
+    bytes: &'a [u8],
+}
+impl<'a> ByteReader<'a> {
+    pub fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes }
+    }
+    pub fn remaining(&self) -> usize {
+        self.bytes.len()
+    }
+    pub fn take(&mut self, size: usize) -> Result<&'a [u8], CodecError> {
+        if size > self.bytes.len() {
+            return Err(CodecError::Truncated);
+        }
+        let (value, rest) = self.bytes.split_at(size);
+        self.bytes = rest;
+        Ok(value)
+    }
+    pub fn u8(&mut self) -> Result<u8, CodecError> {
+        Ok(self.take(1)?[0])
+    }
+    pub fn u64_le(&mut self) -> Result<u64, CodecError> {
+        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+    }
+    pub fn varint(&mut self) -> Result<u64, CodecError> {
+        let mut value = 0u64;
+        for index in 0..10 {
+            let byte = self.u8()?;
+            if index == 9 && byte > 1 {
+                return Err(CodecError::InvalidPayload("varint overflow".into()));
+            }
+            value |= u64::from(byte & 0x7f) << (7 * index);
+            if byte & 0x80 == 0 {
+                if index > 0 && byte == 0 {
+                    return Err(CodecError::InvalidPayload("overlong varint".into()));
+                }
+                return Ok(value);
+            }
+        }
+        Err(CodecError::InvalidPayload("varint overflow".into()))
+    }
+    pub fn varint_u32(&mut self) -> Result<u32, CodecError> {
+        u32::try_from(self.varint()?).map_err(|_| CodecError::InvalidPayload("varint range".into()))
+    }
+    pub fn finish(&self) -> Result<(), CodecError> {
+        if self.bytes.is_empty() {
+            Ok(())
+        } else {
+            Err(CodecError::TrailingBytes)
+        }
+    }
+}
+
 /// Game schemas validate finite numerics, identity and semantic ranges here.
 /// Receiving a decoded value is not permission to apply it to the world.
 pub trait Validate {

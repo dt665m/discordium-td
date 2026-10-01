@@ -1,9 +1,5 @@
 use super::*;
-use engine_net::{
-    replication::*,
-    scheduling::{Cadence, TransportBudget, UnitId, UnitRequest},
-};
-use peer::FrozenGroup;
+use dreamwake_sim::replication::{Replica, ReplicaState};
 
 pub(super) fn control(
     server: &mut RenetServer,
@@ -19,31 +15,7 @@ pub(super) fn control(
     }
     peer.egress.control_messages += 1;
     peer.egress.control_bytes += bytes.len() as u64;
-    if let live::ServerControl::Finalized { receipts, .. } = value {
-        peer.egress.finalized_messages += 1;
-        peer.egress.finalized_bytes += bytes.len() as u64;
-        peer.egress.finalized_receipts += receipts.as_slice().len() as u64;
-    }
     server.send_message(id, wire::CONTROL_CHANNEL, bytes);
-    Ok(())
-}
-/// Reliable transport owns retransmission after each fence is accepted once.
-pub(super) fn lifecycle(
-    server: &mut RenetServer,
-    id: u64,
-    peer: &mut Peer,
-    scopes: &mut ServerScopes<Vec<u8>>,
-) -> Result<(), String> {
-    let exits: Vec<_> = scopes.unsent_exits().take(8).collect();
-    for exit in exits {
-        control(server, id, peer, &live::ServerControl::Exit(exit))?;
-        scopes.mark_exit_sent(exit).map_err(failure)?;
-    }
-    let destroys: Vec<_> = scopes.unsent_destroys().take(8).collect();
-    for destroy in destroys {
-        control(server, id, peer, &live::ServerControl::Destroy(destroy))?;
-        scopes.mark_destroy_sent(destroy).map_err(failure)?;
-    }
     Ok(())
 }
 pub(super) fn welcome(server: &mut RenetServer, id: u64, peer: &mut Peer) -> Result<(), String> {
@@ -66,151 +38,33 @@ pub(super) fn disconnect_failed(server: &mut RenetServer, authority: &mut DreamA
         authority.disconnect(id);
     }
 }
-struct PreparedGroup {
-    publication: GroupPublication,
-    members: Vec<FullState<Vec<u8>>>,
-    baseline_packets: Vec<engine_net::replication::baselines::BaselinePacket>,
-    bytes: Vec<u8>,
-}
 
-fn prepare_group(
-    peer: &mut Peer,
-    scopes: &mut ServerScopes<Vec<u8>>,
-) -> Result<Option<PreparedGroup>, String> {
-    if peer.frozen.is_some() {
-        return Ok(None);
-    }
-    let mut members = Vec::with_capacity(live::baselines::MEMBERS);
-    for id in peer.owner_group_entities() {
-        let state = scopes.pending(id).ok_or("Missing owner group member")?;
-        members.push(state.clone());
-    }
-    members.sort_by_key(|state| state.scope);
-    let end_tick = members[0].end_tick;
-    if members.iter().any(|state| state.end_tick != end_tick) {
-        return Err("Mixed owner group ticks".into());
-    }
-    let manifest: Vec<_> = members.iter().map(|state| state.scope).collect();
-    // Revision identifies the prediction topology, not publication frequency.
-    // FullState snapshot IDs identify newer checkpoints within that topology.
-    if manifest != peer.group_manifest {
-        peer.group_revision = peer
-            .group_revision
-            .checked_next()
-            .ok_or("Group revision exhausted")?;
-        peer.group_manifest.clone_from(&manifest);
-    }
-    let publication = GroupPublication {
-        connection: peer.welcome.stream.epoch,
-        group: live::OWNER_GROUP,
-        revision: peer.group_revision,
-        snapshot: members
-            .iter()
-            .find(|state| state.scope.entity == peer.welcome.owner_entity)
-            .ok_or("Missing owner")?
-            .snapshot,
-    };
-    if peer.last_owner_publication == Some(publication) {
-        return Ok(None);
-    }
-    let Some(baseline_packets) = peer.baselines.prepare(&members, publication)? else {
-        return Ok(None);
-    };
-    let mut encoded_members = members.clone();
-    for (state, packet) in encoded_members.iter_mut().zip(&baseline_packets) {
-        state.payload = live::baselines::encode_member(packet).map_err(failure)?;
-    }
-    let chunk = GroupChunk {
-        publication,
-        end_tick,
-        manifest,
-        index: 0,
-        count: 1,
-        members: encoded_members,
-    };
-    let sequence = peer.next_frame()?;
-    let bytes = live::encode_state(
-        &live::StateFrame::Group(chunk),
-        peer.welcome.stream.epoch,
-        sequence,
-        peer.limit(),
-    )
-    .map_err(failure)?;
-    Ok(Some(PreparedGroup {
-        publication,
-        members,
-        baseline_packets,
-        bytes,
-    }))
-}
-// Limit this delivery class, not unrelated reliable controls. Clock replies and
-// scope fences must not consume finalization's four-batch progress window.
-// New committed ticks coalesce in the bounded audit while these await receipt ACK.
-// Sixteen batches of 32 receipts cover more than eight seconds of ticks per
-// round trip, so acknowledgement latency alone cannot outrun the audit.
-pub(super) const FINALIZED_CONTROL_WINDOW: usize = 16;
-/// How long an active owner may wait for its reset proof before the stream is
-/// replaced. A slow path delivers late rather than never (the group travels
-/// reliably), so this only catches a reset that genuinely cannot complete.
-const ACTIVE_RESET_PROOF_DEADLINE: Duration = Duration::from_secs(10);
-fn finalization_audit_expired(peer: &Peer, tick: ServerTick) -> bool {
-    tick > peer.finalized_sent_through
-        && peer
-            .inbox
-            .receipts()
-            .find(|receipt| receipt.tick > peer.finalized_sent_through)
-            .is_none_or(|receipt| receipt.tick.0 != peer.finalized_sent_through.0 + 1)
-}
-fn finalized(
-    server: &mut RenetServer,
-    id: u64,
-    peer: &mut Peer,
-    tick: ServerTick,
-) -> Result<(), String> {
-    if tick <= peer.finalized_sent_through {
-        return Ok(());
-    }
-    if peer.finalized_batches.len() >= FINALIZED_CONTROL_WINDOW {
-        peer.egress.finalized_deferred += 1;
-        return Ok(());
-    }
-    let receipts: Vec<_> = peer
-        .inbox
-        .receipts()
-        .filter(|receipt| receipt.tick > peer.finalized_sent_through)
-        .take(32)
-        .copied()
-        .collect();
-    if receipts
-        .first()
-        .is_none_or(|receipt| receipt.tick.0 != peer.finalized_sent_through.0 + 1)
-    {
-        return Err("Unsent finalization audit expired".into());
-    }
-    // Never claim a later watermark than this bounded batch. This also preserves
-    // every execution/substitution receipt when publication had to catch up.
-    let through = receipts.last().unwrap().tick;
-    control(
-        server,
-        id,
-        peer,
-        &live::ServerControl::Finalized {
-            through,
-            receipts: BoundedVec::new(receipts).map_err(failure)?,
-            menu_applied: peer.menu_applied,
-            arrival: peer.arrival,
-        },
-    )?;
-    peer.finalized_sent_through = through;
-    peer.finalized_batches.issue(through).map_err(failure)?;
-    peer.arrival.sample = None;
-    Ok(())
-}
-
-/// Remote actors within this distance of the player update at the full
-/// publication rate; farther ones at half of it.
+/// Remote actors within this distance of the player update every publication
+/// and farther ones every other, as Unreal's replication graph spends less on
+/// what matters less. The client's remote-pose buffer covers either interval.
 const NEAR_ACTOR_METRES: f64 = 16.0;
+/// Per-packet transport framing beyond the state frame: Renet's packet header
+/// and netcode's prefix, sequence and MAC.
+const TRANSPORT_OVERHEAD_BYTES: u64 = 40;
 
+/// One entity's candidate state for this publication, in send order.
+struct Candidate {
+    order: (u8, u64),
+    entity: EntityId,
+    state: ReplicaState,
+    owner: bool,
+}
+
+/// Build and send this publication's state packets for one connection.
+///
+/// An entity is sent only when its state differs from the newest state the
+/// client acknowledged, unless that exact state is already on its way and not
+/// yet reported lost. A lost packet therefore costs nothing until the client
+/// reports it, and then the next packet carries every changed field with its
+/// current value. Packets are filled owner first, then the match summary, then
+/// actors nearest first, and stop where the connection's egress allowance
+/// ends: what does not fit waits for the next publication rather than queueing
+/// behind the transport (Unreal's `IsNetReady`).
 #[allow(clippy::too_many_arguments)]
 fn peer_state(
     server: &mut RenetServer,
@@ -218,64 +72,18 @@ fn peer_state(
     peer: &mut Peer,
     replication: &mut DreamReplication,
     outcomes: &mut outcomes::Outcomes,
-    now: Duration,
     tick: ServerTick,
-    backlog: usize,
+    allowance: Option<renet_cross::EgressAllowance>,
 ) -> Result<(), String> {
     welcome(server, id, peer)?;
-    if !peer.active && now >= peer.initial_deadline {
-        return Err("Initial scene synchronization expired".into());
-    }
-    finalized(server, id, peer, tick)?;
     // Controls have first use of each Renet packetization pass.
     action_outcomes(server, id, peer, outcomes)?;
     if !peer.ready {
         return Ok(());
     }
-    // Only bootstrap/reset keeps an exact pending proof. Ordinary publications
-    // never wait for application receipts before admitting newer state.
-    if peer.active && peer.baselines.reset_pending.is_none() {
-        peer.frozen = None;
-    }
-    // Joining peers use the bounded initial retry, and active owners wait for
-    // their proof under the reset retry. A committed owner's replacement
-    // bootstrap has neither, so it gets the same long deadline here.
-    if !peer.active
-        && peer.activation_committed
-        && peer
-            .frozen
-            .as_ref()
-            .is_some_and(|group| now.saturating_sub(group.started) >= ACTIVE_RESET_PROOF_DEADLINE)
-    {
-        return Err("Replacement owner synchronization expired".into());
-    }
-    let members = replication
-        .owner_group_entities(peer.welcome.player.get())
-        .map_err(failure)?;
-    let bases: Vec<_> = members
-        .into_iter()
-        .filter(|entity| {
-            *entity != peer.welcome.global_entity
-                && *entity != peer.welcome.owner_entity
-                && *entity != peer.welcome.collision_entity
-        })
-        .collect();
-    if bases != peer.owner_bases {
-        // Already queued old topology remains transport-owned. Its identities
-        // cannot satisfy the new closure's atomic publication or decode proof.
-        peer.frozen = None;
-        peer.baselines.close();
-        peer.owner_bases = bases;
-    }
-    let frozen_ids = if peer.frozen.is_some() {
-        peer.owner_group_entities().into_iter().collect()
-    } else {
-        BTreeSet::new()
-    };
-    replication
-        .gather_peer_with_frozen(
+    let gather = replication
+        .gather_peer(
             id,
-            &frozen_ids,
             peer.inbox.finalized_through(),
             &peer
                 .inbox
@@ -283,218 +91,161 @@ fn peer_state(
                 .map(|input| input.held.held_only()),
         )
         .map_err(failure)?;
-    let eligible = replication
-        .eligible(id)
-        .ok_or("Missing prepared eligibility")?
-        .clone();
-    if replication.global_entity() != Some(peer.welcome.global_entity)
-        || replication.owner_entity(peer.welcome.player.get()) != Some(peer.welcome.owner_entity)
-        || replication.collision_entity() != Some(peer.welcome.collision_entity)
-    {
-        return Err("Changed owner identity requires session reset".into());
+    for entity in gather.removed {
+        peer.stream.remove(entity);
     }
-    let world = replication.world_revision();
-    let policy = replication.policy_revision();
-    let scopes = replication
-        .scopes_mut(id)
-        .ok_or("Uncommitted scope barrier")?;
-    let group = prepare_group(peer, scopes)?;
-    if !peer.baselines.reset_queued
-        && let Some(resets) = peer.baselines.reset_pending.clone()
-    {
-        control(
-            server,
-            id,
-            peer,
-            &live::ServerControl::BaselineReset {
-                resets: BoundedVec::new(resets).map_err(failure)?,
-            },
-        )?;
-        peer.baselines.reset_queued = true;
-    }
-    lifecycle(server, id, peer, scopes)?;
-    let mut packets = BTreeMap::new();
-    // This is admission credit, not a promise to emit the whole group this
-    // flush. Renet schedules its own slices/retries under transport pacing.
-    let budget = TransportBudget {
-        available_wire_bytes: peer.scheduler.available_wire_bytes(now),
-        maximum_atomic_wire_bytes: 36 * 1024,
-    };
-    // Keep remote cadence independent of owner queue backpressure.
-    let mut requests = Vec::new();
-    // A pending owner cannot display remote actors before it proves its own
-    // checkpoint, and activation depends only on the owner group's decode
-    // receipts. Publishing the public stream first competes with that group for
-    // a transport whose real ceiling is lower than this scheduler's budget: a
-    // browser data channel refuses writes once its buffer fills, and Renet has
-    // already accounted those packets as sent. Withhold remote state until the
-    // owner activates so bootstrap keeps the pipe to itself.
-    //
-    // A saturated path gets the same treatment, as Unreal's replication does:
-    // remote actors wait while the transport is still sending earlier data,
-    // and resume with their newest state. Queueing them instead would only
-    // make every message, the owner's included, arrive later.
-    let saturated = backlog > peer.path.limit_bytes();
-    if saturated {
-        peer.egress.remote_held_publications += 1;
-    }
-    let remotes_eligible = peer.active && !saturated;
-    for entry in eligible.entries().filter(|_| remotes_eligible) {
-        let entity = entry.entity();
-        if peer.owner_group_entities().contains(&entity) {
+    peer.publications += 1;
+    let mut candidates = Vec::with_capacity(gather.entities.len());
+    for entry in gather.entities {
+        let owner = matches!(entry.replica, Replica::Owner(_));
+        let global = matches!(entry.replica, Replica::Global(_));
+        // A joining client receives its own hero and the match summary
+        // first; the rest of the world follows once it participates.
+        if !peer.active && !owner && !global {
             continue;
         }
-        let Some(state) = scopes.pending(entity) else {
-            continue;
-        };
-        let state = state.clone();
-        let sequence = peer.next_frame()?;
-        // Every remote DTO is individually bounded and must fit the negotiated
-        // single-message allowance. Never delegate an oversized payload to Renet.
-        let bytes = live::encode_state(
-            &live::StateFrame::Full(state),
-            peer.welcome.stream.epoch,
-            sequence,
-            peer.limit(),
-        )
-        .map_err(failure)?;
-        // Relevance sets cadence, as in Unreal's replication graph: actors
-        // near the player update at the publication rate, the rest at half.
-        // The client's remote-pose buffer covers either interval.
         let near = entry
-            .nearest_observer()
+            .distance
             .is_none_or(|metres| metres <= NEAR_ACTOR_METRES);
-        requests.push(UnitRequest::entity(
-            entity,
-            admission_cost(bytes.len()),
-            if near {
-                Cadence {
-                    period_ticks: 3,
-                    maximum_age_ticks: 12,
-                    priority: 100,
-                    critical: false,
-                }
-            } else {
-                Cadence {
-                    period_ticks: 6,
-                    maximum_age_ticks: 24,
-                    priority: 60,
-                    critical: false,
-                }
-            },
-        ));
-        packets.insert(entity, bytes);
+        if !owner
+            && !global
+            && !near
+            && (peer.publications + entry.entity.index) % 2 != 0
+        {
+            continue;
+        }
+        let state = ReplicaState::capture(&entry.replica).map_err(failure)?;
+        if peer
+            .stream
+            .base(entry.entity)
+            .is_some_and(|(_, base)| *base == state)
+        {
+            continue;
+        }
+        if peer
+            .stream
+            .in_flight(entry.entity)
+            .is_some_and(|(seq, sent)| *sent == state && !peer.stream.lost(seq))
+        {
+            continue;
+        }
+        let order = if owner {
+            (0, 0)
+        } else if global {
+            (1, 0)
+        } else {
+            (2, (entry.distance.unwrap_or(0.0) * 100.0) as u64)
+        };
+        candidates.push(Candidate {
+            order,
+            entity: entry.entity,
+            state,
+            owner,
+        });
     }
-    if let Some(group) = &group {
-        let owner_age = tick.0.saturating_sub(group.members[0].end_tick.0);
-        peer.egress.group_age_ticks = owner_age;
-        peer.egress.maximum_group_age_ticks = peer.egress.maximum_group_age_ticks.max(owner_age);
-        requests.push(
-            UnitRequest::prediction_group(
-                &eligible,
-                live::OWNER_GROUP,
-                admission_cost(group.bytes.len()),
-                Cadence {
-                    period_ticks: 2,
-                    maximum_age_ticks: 6,
-                    priority: 255,
-                    critical: !peer.active
-                        || peer.baselines.reset_pending.is_some()
-                        || owner_age >= 6,
-                },
-            )
-            .map_err(failure)?,
-        );
-    }
-    let plan = peer
-        .scheduler
-        .schedule(&eligible, &requests, now, budget)
-        .map_err(failure)?;
-    let mut group = group;
-    peer.scheduler
-        .transmit(plan, world, policy, |unit| {
-            match unit.id() {
-                UnitId::Entity(entity) => {
-                    let Some(bytes) = packets.remove(&entity) else { return false; };
-                    if !server.can_send_message(id, wire::STATE_CHANNEL, bytes.len()) {
-                        return false;
-                    }
-                    scopes
-                    .transmit_pending(entity, |_| {
-                            peer.egress.state_messages += 1;
-                            peer.egress.state_bytes += bytes.len() as u64;
-                            server.send_message(id, wire::STATE_CHANNEL, bytes);
-                        true
-                    })
-                    .unwrap_or(false)
-                },
-                UnitId::PredictionGroup(_) => {
-                    let Some(group) = group.take() else { return false; };
-                    if !server.can_send_message(id, wire::OWNER_GROUP_CHANNEL, group.bytes.len()) {
-                        peer.egress.group_queue_deferred += 1;
-                        return false;
-                    }
-                    // No source payload or send proof advances before the
-                    // complete authorized unit is accepted by Renet.
-                    if group.members.iter().any(|state| {
-                        scopes
-                            .pending(state.scope.entity)
-                            .is_none_or(|pending| pending.receipt() != state.receipt())
-                            && scopes.decoded_current(state.scope.entity) != Some(state.receipt())
-                    }) {
-                        return false;
-                    }
-                    peer.egress.state_messages += 1;
-                    let group_len = group.bytes.len() as u64;
-                    peer.egress.state_bytes += group_len;
-                    server.send_message(id, wire::OWNER_GROUP_CHANNEL, group.bytes);
-                    peer.last_owner_publication = Some(group.publication);
-                    peer.egress.group_messages += 1;
-                    peer.egress.group_bytes += group_len;
-                    for state in &group.members {
-                        if state.scope.entity == peer.welcome.owner_entity {
-                            peer.combat.sent(state.receipt(), state.end_tick, tick);
-                        }
-                    }
-                    for state in &group.members {
-                        if scopes.mark_sent(state.receipt()).is_err() {
-                            return false;
-                        }
-                    }
-                    if peer
-                        .baselines
-                        .mark_sent(&group.members, &group.baseline_packets)
-                        .is_err()
-                    {
-                        return false;
-                    }
-                    if !peer.active || peer.baselines.reset_pending.is_some() {
-                        peer.frozen = Some(FrozenGroup {
-                            receipts: group.members.iter().map(FullState::receipt).collect(),
-                            bases: group.baseline_packets.iter().filter_map(|packet| {
-                                match packet.encoding {
-                                    engine_net::replication::baselines::BaselineEncoding::Delta { base } => Some(base),
-                                    _ => None,
-                                }
-                            }).collect(),
-                            decoded: BTreeSet::new(),
-                            started: now,
-                            active_state: peer.activation_committed,
-                        });
-                    }
-                    true
-                }
+    candidates.sort_by_key(|candidate| (candidate.order, candidate.entity));
+    let mut budget = allowance.map(|allowance| {
+        (
+            allowance.available_data_bytes,
+            TRANSPORT_OVERHEAD_BYTES + allowance.ip_udp_overhead,
+        )
+    });
+    let status = live::OwnerStatus {
+        finalized: peer.inbox.finalized_through(),
+        menu_applied: peer.menu_applied,
+        arrival: peer.arrival,
+    };
+    let target = live::APPLICATION_FRAME_BYTES;
+    let limit = engine_net::codec::FrameLimit::new(live::MAX_STATE_FRAME_BYTES).map_err(failure)?;
+    let mut pending = candidates.into_iter().peekable();
+    let mut first = true;
+    loop {
+        let removals: Vec<_> = if first {
+            peer.stream
+                .pending_removals()
+                .take(live::MAX_STATE_REMOVALS)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if pending.peek().is_none() && removals.is_empty() && !first {
+            break;
+        }
+        let seq = peer.stream.begin().map_err(failure)?;
+        let mut packet = live::StatePacket {
+            seq,
+            tick,
+            status,
+            entries: Vec::new(),
+            removed: Vec::new(),
+        };
+        for entity in removals {
+            peer.stream.include_removal(entity).map_err(failure)?;
+            packet.removed.push(entity);
+        }
+        let mut size = packet.encoded_len().map_err(failure)?;
+        let mut carries_owner = false;
+        while let Some(candidate) = pending.peek() {
+            let base = peer
+                .stream
+                .base(candidate.entity)
+                .filter(|(_, base)| candidate.state.deltas_from(base));
+            let mut body = Vec::new();
+            candidate
+                .state
+                .encode(base.map(|(_, base)| base), &mut body)
+                .map_err(failure)?;
+            // Entity identity, base distance and length prefix.
+            let entry_size = body.len() + 16;
+            if !packet.entries.is_empty()
+                && (size + entry_size > target || packet.entries.len() == live::MAX_STATE_ENTRIES)
+            {
+                break;
             }
-        })
-        .map_err(failure)?;
+            let candidate = pending.next().expect("peeked");
+            carries_owner |= candidate.owner;
+            packet.entries.push(live::StateEntry {
+                entity: candidate.entity,
+                base: base.map(|(seq, _)| seq),
+                body,
+            });
+            peer.stream
+                .include(candidate.entity, candidate.state)
+                .map_err(failure)?;
+            size += entry_size;
+        }
+        let bytes = live::encode_state(&packet, peer.welcome.stream.epoch, limit).map_err(failure)?;
+        let cost = budget.map(|(_, overhead)| bytes.len() as u64 + overhead);
+        if budget.zip(cost).is_some_and(|((left, _), cost)| cost > left)
+            || !server.can_send_message(id, wire::STATE_CHANNEL, bytes.len())
+        {
+            // Not ready for more this tick: drop the packet's bookkeeping and
+            // let these entities go out in a later publication.
+            peer.stream.cancel();
+            peer.egress.allowance_limited += 1;
+            break;
+        }
+        if let (Some((left, _)), Some(cost)) = (budget.as_mut(), cost) {
+            *left -= cost;
+        }
+        peer.stream.finish().map_err(failure)?;
+        if carries_owner {
+            peer.combat.sent(seq, tick, tick);
+        }
+        peer.egress.state_packets += 1;
+        peer.egress.state_bytes += bytes.len() as u64;
+        peer.egress.state_entries += packet.entries.len() as u64;
+        server.send_message(id, wire::STATE_CHANNEL, bytes);
+        // A feedback sample is reported once; the counters repeat.
+        peer.arrival.sample = None;
+        first = false;
+    }
+    if peer.ready && !peer.active && !peer.activate_pending && peer.holds_owner() {
+        peer.activate_pending = true;
+    }
     Ok(())
 }
 
-/// Conservative initial-send cost for admission. This does not reserve ACKs or
-/// predict retries; final encrypted bytes are measured/enforced by the adapter.
-fn admission_cost(bytes: usize) -> usize {
-    bytes + bytes.div_ceil(1200) * 100
-}
 fn outcome_batch(
     server: &mut RenetServer,
     id: u64,
@@ -590,64 +341,6 @@ pub(super) fn states(server: &mut RenetServer, authority: &mut DreamAuthority) {
             }
         }
     }
-    let deferred: Vec<_> = authority
-        .peers
-        .iter()
-        .filter_map(|(&id, peer)| peer.resync_deferred.then_some(id))
-        .collect();
-    for id in deferred {
-        if let Err(reason) = authority.resync(id) {
-            log::warn!("Dreamwake deferred resync peer {id}: {reason}");
-            authority.failed.insert(id);
-        }
-    }
-    // A stalled initial client may miss an entire immutable bootstrap unit or
-    // its unsent command audit before it can send Ready/application receipts.
-    // Retire that stream and offer a fresh one, within the original admission
-    // deadline and shared resync cap. Already participating owners never use this.
-    let initial_retries: Vec<_> = authority
-        .peers
-        .iter()
-        .filter_map(|(&id, peer)| {
-            (!peer.active
-                && !peer.activation_committed
-                && authority.now < peer.initial_deadline
-                && (finalization_audit_expired(peer, authority.tick)
-                    || peer.frozen.as_ref().is_some_and(|group| {
-                        authority.now.saturating_sub(group.started) >= Duration::from_secs(2)
-                    })))
-            .then_some(id)
-        })
-        .collect();
-    for id in initial_retries {
-        if let Err(reason) = authority.resync(id) {
-            log::warn!("Dreamwake initial synchronization peer {id}: {reason}");
-            authority.failed.insert(id);
-        }
-    }
-    // A participating client can suspend beyond an immutable baseline reset's
-    // proof deadline. Retire that stream through the existing bounded recovery
-    // handshake, preserving its actor and transport queues. This does not relax
-    // finalization-audit continuity or restart a replacement bootstrap.
-    let reset_retries: Vec<_> = authority
-        .peers
-        .iter()
-        .filter_map(|(&id, peer)| {
-            (peer.active
-                && peer.activation_committed
-                && peer.baselines.reset_pending.is_some()
-                && peer.frozen.as_ref().is_some_and(|group| {
-                    authority.now.saturating_sub(group.started) >= ACTIVE_RESET_PROOF_DEADLINE
-                }))
-            .then_some(id)
-        })
-        .collect();
-    for id in reset_retries {
-        if let Err(reason) = authority.resync(id) {
-            log::warn!("Dreamwake baseline reset synchronization peer {id}: {reason}");
-            authority.failed.insert(id);
-        }
-    }
     disconnect_failed(server, authority);
     let Some(revision) = authority.revision.checked_add(1) else {
         authority.failed.extend(authority.peers.keys());
@@ -685,34 +378,23 @@ pub(super) fn states(server: &mut RenetServer, authority: &mut DreamAuthority) {
             authority.failed.extend(authority.peers.keys());
         } else {
             for (&id, peer) in &mut authority.peers {
-                let transport = authority.transport_diagnostics.as_ref();
-                let backlog = transport
-                    .and_then(|transport| transport.peer_backlog_bytes(id).ok())
-                    .unwrap_or(0);
-                // Only a queueing transport (WebRTC) needs its path measured.
-                if let Some(written) = transport
-                    .and_then(|transport| transport.peer_egress_stats(id).ok())
-                    .and_then(|stats| stats.webrtc_logical)
-                    .map(|stats| stats.encrypted_logical_bytes)
-                {
-                    peer.path
-                        .observe(authority.now, written, backlog, server.rtt(id));
-                }
+                let allowance = authority
+                    .transport_diagnostics
+                    .as_ref()
+                    .and_then(|transport| transport.peer_egress_allowance(id).ok().flatten());
                 if let Err(reason) = peer_state(
                     server,
                     id,
                     peer,
                     &mut authority.replication,
                     &mut authority.outcomes,
-                    authority.now,
                     authority.tick,
-                    backlog,
+                    allowance,
                 ) {
                     log::warn!("Dreamwake replication peer {id}: {reason}");
                     authority.failed.insert(id);
                 }
                 report_egress(
-                    server,
                     id,
                     peer,
                     authority.now,
@@ -725,7 +407,6 @@ pub(super) fn states(server: &mut RenetServer, authority: &mut DreamAuthority) {
 }
 
 fn report_egress(
-    server: &RenetServer,
     id: u64,
     peer: &mut Peer,
     now: Duration,
@@ -735,54 +416,28 @@ fn report_egress(
         return;
     }
     peer.next_egress_report = now + Duration::from_secs(1);
-    let control_bytes = wire::CONTROL_MEMORY_BYTES
-        .saturating_sub(server.channel_available_memory(id, wire::CONTROL_CHANNEL));
-    let group_bytes = wire::OWNER_GROUP_SEND_BYTES
-        .saturating_sub(server.channel_available_memory(id, wire::OWNER_GROUP_CHANNEL));
-    let remote_bytes = wire::REMOTE_STATE_MEMORY_BYTES
-        .saturating_sub(server.channel_available_memory(id, wire::STATE_CHANNEL));
     let stats = transport.and_then(|transport| transport.peer_egress_stats(id).ok());
-    let backlog = transport
-        .and_then(|transport| transport.peer_backlog_bytes(id).ok())
-        .unwrap_or(0);
     let native = stats.and_then(|stats| stats.native_udp_ip);
     let web = stats.and_then(|stats| stats.webrtc_logical);
     let pacing_drops =
         native.map_or(0, |stats| stats.pacing_drops) + web.map_or(0, |stats| stats.pacing_drops);
     // A refused data channel write is discarded after Renet has accounted the
-    // packet as sent, so it never appears as a pacing or capacity drop. Report
-    // it at warn level: sustained backend loss stalls reliable bootstrap.
+    // packet as sent, so it never appears as a pacing drop.
     let backend_drops =
         native.map_or(0, |stats| stats.backend_drops) + web.map_or(0, |stats| stats.backend_drops);
     let line = format!(
-        "Dreamwake egress peer={id} at_ms={} finalized_through={} control_messages_total={} control_bytes_total={} finalized_messages_total={} finalized_bytes_total={} finalized_receipts_total={} finalized_deferred_total={} state_messages_total={} state_bytes_total={} remote_held_publications_total={} transport_backlog_bytes={backlog} control_queue_payload_bytes={} state_queue_payload_bytes={} group_queue_payload_bytes={} native_udp_ip={native:?} webrtc_logical={web:?}",
+        "Dreamwake egress peer={id} at_ms={} finalized_through={} control_messages_total={} control_bytes_total={} state_packets_total={} state_bytes_total={} state_entries_total={} allowance_limited_total={} stream_unacknowledged={} native_udp_ip={native:?} webrtc_logical={web:?}",
         now.as_millis(),
-        peer.finalized_sent_through.0,
+        peer.inbox.finalized_through().0,
         peer.egress.control_messages,
         peer.egress.control_bytes,
-        peer.egress.finalized_messages,
-        peer.egress.finalized_bytes,
-        peer.egress.finalized_receipts,
-        peer.egress.finalized_deferred,
-        peer.egress.state_messages,
+        peer.egress.state_packets,
         peer.egress.state_bytes,
-        peer.egress.remote_held_publications,
-        control_bytes,
-        group_bytes + remote_bytes,
-        group_bytes,
+        peer.egress.state_entries,
+        peer.egress.allowance_limited,
+        peer.stream.unacknowledged(),
     );
-    let line = format!(
-        "{line} group_messages={} group_bytes={} group_queue_deferred={} group_age_ticks={} maximum_group_age_ticks={}",
-        peer.egress.group_messages,
-        peer.egress.group_bytes,
-        peer.egress.group_queue_deferred,
-        peer.egress.group_age_ticks,
-        peer.egress.maximum_group_age_ticks,
-    );
-    if pacing_drops > peer.last_pacing_drops
-        || backend_drops > peer.last_backend_drops
-        || control_bytes >= wire::CONTROL_MEMORY_BYTES / 2
-    {
+    if pacing_drops > peer.last_pacing_drops || backend_drops > peer.last_backend_drops {
         log::warn!("{line}");
     } else {
         log::info!("{line}");

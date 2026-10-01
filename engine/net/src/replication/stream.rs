@@ -144,6 +144,20 @@ impl<K: Copy + Ord, S: Clone + PartialEq> ServerStream<K, S> {
             .as_ref()
             .map(|(seq, state)| (*seq, state))
     }
+    /// The newest state sent for `key` that is not yet acknowledged, with the
+    /// packet carrying it.
+    pub fn in_flight(&self, key: K) -> Option<(u32, &S)> {
+        self.entities
+            .get(&key)?
+            .in_flight
+            .back()
+            .map(|(seq, state)| (*seq, state))
+    }
+    /// Whether the receiver reported packets after `seq` without `seq`, so
+    /// `seq` is lost. A packet not yet covered by any acknowledgement is not.
+    pub fn lost(&self, seq: u32) -> bool {
+        self.acked.latest > seq && !self.acked.covers(seq)
+    }
     /// Record that the current packet carries `state` for `key`.
     pub fn include(&mut self, key: K, state: S) -> Result<(), StreamError> {
         let seq = self.pending.ok_or(StreamError::PacketState)?;

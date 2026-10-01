@@ -116,10 +116,11 @@ fn publication_clock_keeps_servicing_paused_or_intro_state() {
     );
 }
 
-use dreamwake_protocol::replication::{ReplicaPayload, decode_replica};
-use dreamwake_sim::replication::{OwnerExpectation, OwnerPredictionState};
+use dreamwake_sim::replication::{
+    OwnerExpectation, OwnerPredictionState, PublicReplica, Replica, ReplicaState,
+};
 use dreamwake_sim::{DreamPresentation, EnemyKind, RewardKind, UpgradeKind};
-use engine_net::replication::*;
+use engine_net::replication::stream::{Base, ClientStream};
 use engine_server::{ServerDriver, SharedNet};
 use renet_cross::{
     BootstrapConfig, BootstrapService, MixedTransportBuilder, MonotonicClientIdAllocator,
@@ -132,50 +133,58 @@ type TestBootstrap = BootstrapService<
     SecureSessionAuthPolicy<crate::admission::GuestAdmission>,
 >;
 
+/// A minimal client speaking the live protocol over real UDP: it decodes the
+/// state stream, acknowledges it in every input packet and resends its
+/// unconsumed commands, without prediction.
 struct TestClient {
-    baselines: BTreeMap<
-        EntityId,
-        (
-            engine_net::replication::baselines::BaselineContext,
-            engine_net::replication::baselines::ClientBaselines<Vec<u8>>,
-        ),
-    >,
-    owner_proofs: Vec<live::baselines::DecodedBaseline>,
-    collision_cache: Option<(Vec<u8>, [u8; 32])>,
     id: u64,
     renet: RenetClient,
     transport: UdpNetcodeClientTransport,
     welcome: Option<live::Welcome>,
-    pending_reset_group: Option<Vec<u8>>,
-    groups: Option<GroupAssembler<Vec<u8>>>,
-    scopes: Option<ClientScopes<Vec<u8>>>,
-    known: BTreeSet<EntityId>,
-    active: bool,
+    stream: ClientStream<EntityId, ReplicaState>,
+    replicas: BTreeMap<EntityId, (ServerTick, Replica)>,
+    status: live::OwnerStatus,
+    status_seq: u32,
     sequence: u32,
     commands: u64,
     menu_sequence: u64,
     held: DreamInput,
     edge: Option<DreamAction>,
-    history: VecDeque<engine_net::commands::Command<live::TickInput, DreamAction>>,
+    unconsumed: VecDeque<live::InputRecord>,
     view: Option<DreamPresentation>,
-    finalized: ServerTick,
-    finalized_sequences: BTreeSet<CommandSeq>,
-    active_proof: Option<SnapshotId>,
-    decoded_groups: BTreeSet<SnapshotId>,
     notices: Vec<String>,
     outcomes: BTreeMap<ActionKey, live::ActionOutcome>,
     max_packet: usize,
+    state_bytes: usize,
     drop_states: bool,
-    send_proofs: bool,
+    send_acks: bool,
     receive_application: bool,
 }
 impl TestClient {
-    fn resume_proofs(&mut self) {
-        self.send_proofs = true;
-        if !self.owner_proofs.is_empty() {
-            self.control(live::ClientControl::OwnerDecoded {
-                proofs: BoundedVec::new(self.owner_proofs.clone()).unwrap(),
-            });
+    fn new(id: u64, renet: RenetClient, transport: UdpNetcodeClientTransport) -> Self {
+        Self {
+            id,
+            renet,
+            transport,
+            welcome: None,
+            stream: ClientStream::new(4096),
+            replicas: BTreeMap::new(),
+            status: live::OwnerStatus::default(),
+            status_seq: 0,
+            sequence: 0,
+            commands: 0,
+            menu_sequence: 0,
+            held: DreamInput::default(),
+            edge: None,
+            unconsumed: VecDeque::new(),
+            view: None,
+            notices: Vec::new(),
+            outcomes: BTreeMap::new(),
+            max_packet: 0,
+            state_bytes: 0,
+            drop_states: false,
+            send_acks: true,
+            receive_application: true,
         }
     }
     fn control(&mut self, value: live::ClientControl) {
@@ -202,14 +211,23 @@ impl TestClient {
             minimum_revision: 0,
         }
     }
-    fn receive(&mut self, now: Duration) {
+    /// The owner's hero participates in the run.
+    fn active(&self) -> bool {
+        self.owner().is_some_and(|owner| owner.is_active())
+    }
+    fn owner(&self) -> Option<&dreamwake_sim::replication::OwnerCheckpoint> {
+        let owner = self.welcome.as_ref()?.owner_entity;
+        match self.replicas.get(&owner)? {
+            (_, Replica::Owner(owner)) => Some(owner),
+            _ => None,
+        }
+    }
+    fn receive(&mut self, _now: Duration) {
         if !self.receive_application {
             return;
         }
         let mut changed = false;
-        let mut finalized_ack = None;
         let mut outcomes_ack = None;
-        let mut reset_received = false;
         while let Some(bytes) = self.renet.receive_message(wire::CONTROL_CHANNEL) {
             if live::is_welcome(&bytes) {
                 let welcome = live::decode_welcome(&bytes).unwrap();
@@ -221,32 +239,19 @@ impl TestClient {
                 {
                     continue;
                 }
-                self.pending_reset_group = None;
-                self.groups =
-                    Some(GroupAssembler::new(welcome.stream.epoch, live::group_limits()).unwrap());
-                self.scopes = Some(
-                    ClientScopes::new(
-                        welcome.stream.epoch,
-                        dreamwake_protocol::live::baselines::scope_limits(),
-                    )
-                    .unwrap(),
-                );
                 let content = welcome.content;
                 self.welcome = Some(welcome);
-                self.active = false;
+                self.stream = ClientStream::new(4096);
+                self.replicas.clear();
+                self.status = live::OwnerStatus::default();
+                self.status_seq = 0;
                 self.sequence = 0;
                 self.commands = 0;
                 self.menu_sequence = 0;
                 self.held = DreamInput::default();
                 self.edge = None;
-                self.history.clear();
-                self.known.clear();
-                self.baselines.clear();
-                self.owner_proofs.clear();
-                self.collision_cache = None;
+                self.unconsumed.clear();
                 self.view = None;
-                self.decoded_groups.clear();
-                self.active_proof = None;
                 self.control(live::ClientControl::Ready { content });
                 continue;
             }
@@ -257,61 +262,6 @@ impl TestClient {
                 live::decode_control(&bytes, welcome.stream.epoch, welcome.frame_limit().unwrap())
                     .unwrap();
             match control {
-                live::ServerControl::BaselineRetired { fences } => {
-                    for fence in fences.as_slice() {
-                        if let Some((context, cache)) =
-                            self.baselines.get_mut(&fence.context.scope.entity)
-                        {
-                            if *context == fence.context {
-                                let _ = cache.acknowledge_retirement(*fence);
-                            }
-                        }
-                    }
-                }
-                live::ServerControl::BaselineReset { resets } => {
-                    reset_received = true;
-                    for reset in resets.as_slice() {
-                        if let Some((context, cache)) =
-                            self.baselines.get_mut(&reset.context.scope.entity)
-                        {
-                            if *context == reset.context {
-                                cache.apply_reset(*reset).unwrap();
-                            }
-                        }
-                    }
-                }
-                live::ServerControl::Finalized {
-                    through, receipts, ..
-                } => {
-                    self.finalized = through;
-                    finalized_ack = Some(through);
-                    for receipt in receipts.as_slice() {
-                        if let Some(sequence) = receipt.sequence {
-                            self.finalized_sequences.insert(sequence);
-                        }
-                    }
-                }
-                live::ServerControl::Active { owner_snapshot, .. } => {
-                    assert!(self.decoded_groups.contains(&owner_snapshot));
-                    self.active = true;
-                    self.active_proof = Some(owner_snapshot);
-                }
-                live::ServerControl::Exit(exit) => {
-                    changed = true;
-                    self.known.remove(&exit.scope.entity);
-                    self.scopes.as_mut().unwrap().apply_exit(exit).unwrap();
-                    self.control(live::ClientControl::Exited(exit));
-                }
-                live::ServerControl::Destroy(destroy) => {
-                    changed = true;
-                    self.known.remove(&destroy.entity);
-                    self.scopes
-                        .as_mut()
-                        .unwrap()
-                        .apply_destroy(destroy)
-                        .unwrap();
-                    self.control(live::ClientControl::Destroyed(destroy));
-                }
                 live::ServerControl::Notice { utf8 } => self
                     .notices
                     .push(String::from_utf8(utf8.into_vec()).unwrap()),
@@ -327,152 +277,65 @@ impl TestClient {
                 | live::ServerControl::OutcomeUnavailable { .. } => {}
             }
         }
-        if let Some(through) = finalized_ack {
-            self.control(live::ClientControl::FinalizedAck { through });
-        }
         if let Some(through) = outcomes_ack {
             self.control(live::ClientControl::OutcomesAck { through });
         }
-        let mut pending = if reset_received {
-            self.pending_reset_group.take()
-        } else {
-            None
-        };
-        while !self.drop_states {
-            let Some(bytes) = pending
-                .take()
-                .map(Into::into)
-                .or_else(|| self.renet.receive_message(wire::STATE_CHANNEL))
-                .or_else(|| self.renet.receive_message(wire::OWNER_GROUP_CHANNEL))
-            else {
-                break;
-            };
+        while let Some(bytes) = self.renet.receive_message(wire::STATE_CHANNEL) {
+            if self.drop_states {
+                continue;
+            }
             self.max_packet = self.max_packet.max(bytes.len());
+            self.state_bytes += bytes.len();
             let Some(welcome) = self.welcome.clone() else {
                 continue;
             };
-            let expected = self.expected();
-            let mut receipts = Vec::new();
-            let state = match live::decode_state(
-                &bytes,
-                welcome.stream.epoch,
-                welcome.frame_limit().unwrap(),
-            ) {
-                Ok(state) => state,
+            let limit = engine_net::codec::FrameLimit::new(live::MAX_STATE_FRAME_BYTES).unwrap();
+            let packet = match live::decode_state(&bytes, welcome.stream.epoch, limit) {
+                Ok(packet) => packet,
                 Err(engine_net::codec::CodecError::WrongEpoch) => continue,
                 Err(error) => panic!("state decode: {error:?}"),
             };
-            match state {
-                live::StateFrame::Full(state) => {
-                    assert!(matches!(
-                        decode_replica(&state.payload, None).unwrap(),
-                        ReplicaPayload::Actor(_)
-                    ));
-                    let entity = state.scope.entity;
-                    match self
-                        .scopes
-                        .as_mut()
-                        .unwrap()
-                        .apply_full(state, |payload| decode_replica(payload, None).is_ok())
-                    {
-                        Ok(receipt) => {
-                            self.known.insert(entity);
-                            receipts.push(receipt);
-                            changed = true;
-                        }
-                        Err(ReplicationError::Obsolete(_)) => continue,
-                        Err(error) => panic!("public Full: {error:?}"),
-                    }
-                }
-                live::StateFrame::Group(mut group) => {
-                    let publication = group.publication;
-                    let mut staged_baselines = self.baselines.clone();
-                    let mut baseline_proofs = Vec::new();
-                    let mut retirements = Vec::new();
-                    let progress = (|| {
-                        for state in &mut group.members {
-                            use engine_net::replication::baselines::*;
-                            let packet =
-                                live::baselines::decode_member(&state.payload, state, publication)
-                                    .map_err(|_| ReplicationError::InvalidPayload)?;
-                            let context = packet.target.context;
-                            if staged_baselines
-                                .get(&state.scope.entity)
-                                .is_none_or(|(old, _)| *old != context)
-                            {
-                                staged_baselines.insert(
-                                    state.scope.entity,
-                                    (
-                                        context,
-                                        ClientBaselines::new(
-                                            context,
-                                            packet.target.generation,
-                                            live::baselines::limits(),
-                                        )?,
-                                    ),
-                                );
-                            }
-                            let (_, cache) = staged_baselines.get_mut(&state.scope.entity).unwrap();
-                            let previous = cache.current().map(|state| state.receipt.snapshot);
-                            let receipt = cache.receive(&packet, &BytePatch, |bytes| {
-                                decode_replica(bytes, Some(expected)).is_ok()
-                            })?;
-                            state.payload = cache.state(receipt)?.payload.clone();
-                            baseline_proofs.push(live::baselines::proof(state, receipt));
-                            if let Some(previous) =
-                                previous.filter(|previous| *previous < receipt.snapshot)
-                            {
-                                if let Ok(request) = cache.propose_retirement(previous) {
-                                    retirements.push(request);
-                                }
-                            }
-                        }
-                        self.groups.as_mut().unwrap().receive(
-                            group,
-                            nanos(now) / 1_000_000,
-                            self.scopes.as_mut().unwrap(),
-                            |payload| decode_replica(payload, Some(expected)).is_ok(),
-                        )
-                    })();
-                    let progress = match progress {
-                        Ok(value) => value,
-                        Err(ReplicationError::Obsolete(_)) => continue,
-                        Err(ReplicationError::BaselineResetPending) => {
-                            self.pending_reset_group = Some(bytes.to_vec());
-                            continue;
-                        }
-                        Err(error) => panic!(
-                            "group decode: {error:?}; incoming={publication:?}; current={:?}",
-                            self.groups.as_ref().unwrap().publication(publication.group)
-                        ),
-                    };
-                    match progress {
-                        GroupProgress::Published(values) => {
-                            changed = true;
-                            assert!(live::baselines::valid_member_count(values.len()));
-                            self.baselines = staged_baselines;
-                            self.owner_proofs = baseline_proofs.clone();
-                            if self.send_proofs {
-                                self.control(live::ClientControl::OwnerDecoded {
-                                    proofs: BoundedVec::new(baseline_proofs).unwrap(),
-                                });
-                                if !retirements.is_empty() {
-                                    self.control(live::ClientControl::BaselineRetire {
-                                        requests: BoundedVec::new(retirements).unwrap(),
-                                    });
-                                }
-                            }
-                            self.decoded_groups.insert(publication.snapshot);
-                        }
-                        GroupProgress::Staged => panic!("canonical whole group remains staged"),
-                    }
+            if !self.stream.accepts(packet.seq) {
+                continue;
+            }
+            let expected = self.expected();
+            let mut decoded = Vec::new();
+            let mut restored = Vec::new();
+            for entry in &packet.entries {
+                let base = match self.stream.base(entry.entity, entry.base, packet.seq).unwrap() {
+                    Base::Superseded => continue,
+                    Base::Whole => None,
+                    Base::Delta(base) => Some(base),
+                };
+                let state = ReplicaState::decode(&entry.body, base).unwrap();
+                let owner = (entry.entity == welcome.owner_entity).then_some(expected);
+                let replica = state.restore(owner).unwrap();
+                assert_eq!(
+                    matches!(replica, Replica::Owner(_)),
+                    entry.entity == welcome.owner_entity
+                );
+                decoded.push((entry.entity, state));
+                restored.push((entry.entity, replica));
+            }
+            let changes = self
+                .stream
+                .accept(packet.seq, decoded, &packet.removed)
+                .unwrap();
+            for (entity, replica) in restored {
+                if changes.updated.contains(&entity) {
+                    self.replicas.insert(entity, (packet.tick, replica));
                 }
             }
-            if self.send_proofs && !receipts.is_empty() {
-                self.control(live::ClientControl::Decoded {
-                    receipts: BoundedVec::new(receipts).unwrap(),
-                });
+            for entity in changes.removed {
+                self.replicas.remove(&entity);
             }
+            if packet.seq > self.status_seq {
+                self.status_seq = packet.seq;
+                self.status = packet.status;
+                self.unconsumed
+                    .retain(|record| record.target.0 > packet.status.finalized.0);
+            }
+            changed = true;
         }
         if changed {
             self.refresh();
@@ -482,81 +345,72 @@ impl TestClient {
         let Some(welcome) = &self.welcome else {
             return;
         };
-        let expected = self.expected();
-        let scopes = self.scopes.as_ref().unwrap();
-        let (Some(global), Some(owner), Some(collision)) = (
-            scopes.state(welcome.global_entity),
-            scopes.state(welcome.owner_entity),
-            scopes.state(welcome.collision_entity),
-        ) else {
+        let Some((_, Replica::Global(global))) = self.replicas.get(&welcome.global_entity) else {
             return;
         };
-        assert_eq!(global.end_tick, owner.end_tick);
-        assert_eq!(owner.end_tick, collision.end_tick);
-        if self
-            .collision_cache
-            .as_ref()
-            .is_none_or(|(bytes, _)| *bytes != collision.payload)
-        {
-            let ReplicaPayload::Collision(manifest) =
-                decode_replica(&collision.payload, None).unwrap()
-            else {
-                panic!("missing collision dependency")
-            };
-            self.collision_cache = Some((collision.payload.clone(), manifest.identity()));
-        }
-        let collision_identity = self.collision_cache.as_ref().unwrap().1;
-        assert_eq!(collision_identity, welcome.content.scene);
-        let ReplicaPayload::Global(global) = decode_replica(&global.payload, None).unwrap() else {
-            panic!()
+        let Some(owner) = self.owner() else {
+            return;
         };
-        let ReplicaPayload::Owner(owner) = decode_replica(&owner.payload, Some(expected)).unwrap()
-        else {
-            panic!()
-        };
-        assert_eq!(owner.collision_identity(), collision_identity);
-        let owner = OwnerPredictionState::from_checkpoint(&owner, expected).unwrap();
+        assert_eq!(owner.collision_identity(), welcome.content.scene);
+        let owner = OwnerPredictionState::from_checkpoint(owner, self.expected()).unwrap();
         let actors: Vec<_> = self
-            .known
-            .iter()
-            .filter_map(|id| scopes.state(*id))
-            .filter_map(
-                |state| match decode_replica(&state.payload, None).unwrap() {
-                    ReplicaPayload::Actor(value) => Some(value),
-                    _ => None,
-                },
-            )
+            .replicas
+            .values()
+            .filter_map(|(_, replica)| match replica {
+                Replica::Actor(actor) => Some(actor.clone()),
+                _ => None,
+            })
             .collect();
-        self.view = Some(DreamPresentation::from_replicas(&global, &owner, &actors).unwrap());
+        self.view = Some(DreamPresentation::from_replicas(global, &owner, &actors).unwrap());
     }
+    /// One input packet per tick: the newest command and the oldest ones the
+    /// server has not consumed, with the stream acknowledgement.
     fn send_input(&mut self, target: TargetTick) {
-        if !self.active {
+        let Some(welcome) = &self.welcome else {
             return;
+        };
+        if self.active() {
+            self.commands += 1;
+            let actions = self
+                .edge
+                .take()
+                .map(|action| engine_net::commands::ActionEdge { slot: 0, action })
+                .into_iter()
+                .collect();
+            self.unconsumed.push_back(live::InputRecord {
+                sequence: CommandSeq(self.commands),
+                target,
+                input: self.held.into(),
+                actions: BoundedVec::new(actions).unwrap(),
+            });
+            while self.unconsumed.len() > 64 {
+                self.unconsumed.pop_front();
+            }
         }
-        let welcome = self.welcome.as_ref().unwrap();
-        self.commands += 1;
-        let actions = self
-            .edge
-            .take()
-            .map(|action| engine_net::commands::ActionEdge { slot: 0, action })
-            .into_iter()
-            .collect();
-        self.history.push_back(engine_net::commands::Command {
-            owner: welcome.stream,
-            sequence: CommandSeq(self.commands),
-            target,
-            input: self.held.into(),
-            actions: BoundedVec::new(actions).unwrap(),
-        });
-        while self.history.len() > 3 {
-            self.history.pop_front();
-        }
-        let bundle = live::CommandBundle {
-            records: BoundedVec::new(self.history.iter().cloned().collect()).unwrap(),
+        let records: Vec<_> = self
+            .unconsumed
+            .iter()
+            .rev()
+            .take(3)
+            .chain(self.unconsumed.iter().take(3))
+            .cloned()
+            .fold(Vec::new(), |mut records, record| {
+                if !records.contains(&record) {
+                    records.push(record);
+                }
+                records
+            });
+        let packet = live::InputPacket {
+            ack: if self.send_acks {
+                self.stream.ack()
+            } else {
+                Default::default()
+            },
+            records: BoundedVec::new(records).unwrap(),
         };
         self.sequence += 1;
-        let bytes = live::encode_commands(
-            &bundle,
+        let bytes = live::encode_input(
+            &packet,
             welcome.stream.epoch,
             self.sequence,
             welcome.frame_limit().unwrap(),
@@ -647,37 +501,7 @@ impl Harness {
             },
         )
         .unwrap();
-        self.clients.push(TestClient {
-            baselines: BTreeMap::new(),
-            owner_proofs: Vec::new(),
-            collision_cache: None,
-            id,
-            renet,
-            transport,
-            welcome: None,
-            pending_reset_group: None,
-            groups: None,
-            scopes: None,
-            known: BTreeSet::new(),
-            active: false,
-            sequence: 0,
-            commands: 0,
-            menu_sequence: 0,
-            held: DreamInput::default(),
-            edge: None,
-            history: VecDeque::new(),
-            view: None,
-            finalized: ServerTick(0),
-            finalized_sequences: BTreeSet::new(),
-            active_proof: None,
-            decoded_groups: BTreeSet::new(),
-            notices: Vec::new(),
-            outcomes: Default::default(),
-            max_packet: 0,
-            drop_states: false,
-            send_proofs: true,
-            receive_application: true,
-        });
+        self.clients.push(TestClient::new(id, renet, transport));
         index
     }
     fn pump(&mut self, steps: usize) {
@@ -712,13 +536,6 @@ impl Harness {
             });
         }
     }
-    fn input(&mut self, index: usize, movement: [f32; 2]) {
-        self.clients[index].held = DreamInput {
-            movement,
-            aim: movement,
-            ..Default::default()
-        };
-    }
     fn latest(&self, index: usize) -> DreamPresentation {
         self.clients[index]
             .view
@@ -732,19 +549,18 @@ fn stalled_udp_input_backlog_is_bounded_and_drains_without_disconnect() {
     let mut h = Harness::new();
     h.join();
     h.pump(36);
-    assert!(h.clients[0].active);
+    assert!(h.clients[0].active());
     let client = &mut h.clients[0];
-    let welcome = client.welcome.as_ref().unwrap();
-    let bundle = live::CommandBundle {
-        records: BoundedVec::new(client.history.iter().cloned().collect()).unwrap(),
+    let welcome = client.welcome.clone().unwrap();
+    let packet = live::InputPacket {
+        ack: client.stream.ack(),
+        records: BoundedVec::new(client.unconsumed.iter().take(3).cloned().collect()).unwrap(),
     };
-    assert_eq!(bundle.records.as_slice().len(), 3);
-    // Thirty legal redundant bundles arrive after a stalled receive loop: 90
-    // records exceed a single tick's admission budget of 64.
+    // Thirty legal redundant packets arrive after a stalled receive loop.
     for _ in 0..30 {
         client.sequence += 1;
-        let bytes = live::encode_commands(
-            &bundle,
+        let bytes = live::encode_input(
+            &packet,
             welcome.stream.epoch,
             client.sequence,
             welcome.frame_limit().unwrap(),
@@ -794,339 +610,281 @@ fn legal_control_burst_drains_across_ticks_without_disconnect() {
 }
 
 #[test]
-fn production_udp_uses_two_stage_activation_and_distinct_command_finalization() {
+fn activation_follows_the_client_acknowledging_its_own_hero() {
     let mut h = Harness::new();
     h.join();
     h.join();
+    h.clients[0].send_acks = false;
     h.pump(36);
-    assert!(
-        h.clients.iter().all(|client| client.active),
-        "peers={} clients={:?}",
-        h.driver.authority.peers.len(),
-        h.clients
-            .iter()
-            .map(|c| (
-                c.id,
-                c.welcome.is_some(),
-                c.decoded_groups.len(),
-                c.renet.disconnect_reason()
-            ))
-            .collect::<Vec<_>>()
-    );
-    assert!(h.driver.authority.peers.values().all(|peer| peer.active));
-    assert!(
-        h.clients
-            .iter()
-            .all(|client| client.decoded_groups.len() >= 2)
-    );
-    assert_eq!(h.latest(0).hero.id, 41);
-    assert_eq!(h.latest(1).hero.id, 42);
-    h.action(0, 1, DreamAction::Start { lucid: false });
-    h.pump(12);
-    let first = h.latest(0).hero.position;
-    let second = h.latest(1).hero.position;
-    h.input(0, [1.0, 0.0]);
-    h.input(1, [-1.0, 0.0]);
-    h.pump(12);
-    assert!(h.latest(0).hero.position[0] > first[0]);
-    assert!(h.latest(1).hero.position[0] < second[0]);
-    assert!(
-        h.clients
-            .iter()
-            .all(|client| !client.finalized_sequences.is_empty())
-    );
-    assert!(
-        h.clients
-            .iter()
-            .all(|client| client.max_packet <= live::OWNER_GROUP_MESSAGE_BYTES)
-    );
-}
-#[test]
-fn initial_expiry_retires_stream_and_recovers_within_original_deadline() {
-    let mut h = Harness::new();
-    h.join();
-    h.clients[0].send_proofs = false;
-    h.pump(45);
-    let original = h.driver.authority.peers[&41].welcome.stream;
-    let deadline = h.driver.authority.peers[&41].initial_deadline;
-    h.pump(90);
-    let peer = &h.driver.authority.peers[&41];
-    assert_eq!(peer.resyncs, 1);
-    assert_ne!(peer.welcome.stream.epoch, original.epoch);
-    assert_eq!(peer.initial_deadline, deadline);
-    assert!(!peer.active && !peer.activation_committed);
-    assert!(!h.driver.authority.sim.player_is_active(41));
-    h.clients[0].resume_proofs();
-    h.pump(36);
-    assert!(h.driver.authority.peers[&41].active);
-    assert!(h.driver.authority.sim.player_is_active(41));
-    assert!(h.now < deadline);
-}
-
-#[test]
-fn six_second_application_startup_stall_joins_without_a_new_stream() {
-    let mut h = Harness::new();
-    h.join();
-    // Keep transport receipt ACKs flowing while rendering blocks the application
-    // from consuming Welcome, sending Ready, and acknowledging Finalized. The
-    // finalization audit outlasts the stall, so the original stream survives.
-    h.clients[0].receive_application = false;
-    h.pump(12);
-    let original = h.driver.authority.peers[&41].welcome.stream;
-    let deadline = h.driver.authority.peers[&41].initial_deadline;
-    h.pump(348);
-    let peer = &h.driver.authority.peers[&41];
-    assert!(!peer.ready && !peer.active && !peer.activation_committed);
-    assert_eq!(peer.initial_deadline, deadline);
-    let _ = original;
-    h.clients[0].receive_application = true;
-    h.pump(60);
-    assert!(h.driver.authority.peers[&41].active);
-    assert!(h.driver.authority.sim.player_is_active(41));
-    assert!(h.now < deadline);
-}
-
-#[test]
-fn initial_audit_recovery_cannot_extend_admission_deadline() {
-    let mut h = Harness::new();
-    h.join();
-    h.clients[0].receive_application = false;
-    h.pump(12);
-    let deadline = h.driver.authority.peers[&41].initial_deadline;
-    // Whatever recovery runs meanwhile keeps this deadline; a client that
-    // never consumes its Welcome leaves when it passes.
-    while h.now < deadline {
-        if let Some(peer) = h.driver.authority.peers.get(&41) {
-            assert_eq!(peer.initial_deadline, deadline);
-        }
-        h.pump(30);
-    }
-    h.pump(30);
-    assert!(!h.driver.authority.peers.contains_key(&41));
-    assert!(!h.driver.authority.sim.player_is_active(41));
-}
-
-#[test]
-fn committed_owner_audit_expiry_does_not_use_initial_recovery() {
-    let mut h = Harness::new();
-    h.join();
-    h.pump(36);
-    let peer = h.driver.authority.peers.get_mut(&41).unwrap();
-    assert!(peer.active && peer.activation_committed);
-    let original = peer.welcome.stream;
-    // Isolate the control-audit stall from independent state-transfer deadlines.
-    peer.ready = false;
-    peer.frozen = None;
-    h.clients[0].active = false;
-    h.clients[0].receive_application = false;
-    // Past the whole audit: the receipt window (16 × 32 ticks) fills, then the
-    // bounded history (1024 ticks) evicts the oldest unsent receipt.
-    h.pump(1100);
-    let peer = &h.driver.authority.peers[&41];
-    assert_eq!(peer.welcome.stream, original);
-    assert_eq!(peer.resyncs, 0);
-    let through = peer.finalized_sent_through;
-    h.driver
-        .authority
-        .receive_control(
-            41,
-            live::ClientControl::FinalizedAck { through },
-            &mut h.driver.server,
-        )
-        .unwrap();
-    super::publish::states(&mut h.driver.server, &mut h.driver.authority);
-    assert!(!h.driver.authority.peers.contains_key(&41));
-}
-
-#[test]
-fn initial_recovery_keeps_absolute_deadline() {
-    let mut h = Harness::new();
-    h.join();
-    h.clients[0].send_proofs = false;
-    h.pump(45);
-    let peer = h.driver.authority.peers.get_mut(&41).unwrap();
-    peer.initial_deadline = h.now + Duration::from_secs(2);
-    let deadline = peer.initial_deadline;
-    h.pump(90);
-    assert_eq!(h.driver.authority.peers[&41].resyncs, 1);
-    assert_eq!(h.driver.authority.peers[&41].initial_deadline, deadline);
-    h.pump(40);
-    assert!(h.driver.authority.peers.is_empty());
-}
-
-#[test]
-fn recovery_is_rate_limited_by_a_sliding_window_and_never_refused() {
-    let mut h = Harness::new();
-    h.join();
-    h.pump(36);
-    let now = h.driver.authority.now;
-    let player = h.driver.authority.peers[&41].welcome.player;
-    for expected in 1..=3 {
-        h.driver.authority.resync(41).unwrap();
-        assert_eq!(h.driver.authority.peers[&41].resyncs, expected);
-        assert_eq!(
-            h.driver.authority.peers[&41].resync_attempts.len(),
-            expected as usize
-        );
-    }
-    let retained_stream = h.driver.authority.peers[&41].welcome.stream;
-    // A fourth request inside the window is postponed, not refused.
-    h.driver.authority.resync(41).unwrap();
-    assert!(h.driver.authority.peers[&41].resync_deferred);
-    assert_eq!(
-        h.driver.authority.peers[&41].welcome.stream,
-        retained_stream
-    );
-    assert!(h.driver.authority.sim.player_is_active(player.get()));
-    h.driver.authority.now = now + Duration::from_secs(30);
-    h.driver.authority.resync(41).unwrap();
-    let peer = &h.driver.authority.peers[&41];
-    assert_eq!(peer.resyncs, 4);
-    assert_eq!(peer.resync_attempts.len(), 1);
-    assert!(!peer.resync_deferred);
-    assert_ne!(peer.welcome.stream, retained_stream);
-    assert!(h.driver.authority.sim.player_is_active(player.get()));
-}
-
-#[test]
-fn withheld_decode_proof_never_activates_or_accepts_commands() {
-    let mut h = Harness::new();
-    h.join();
-    h.clients[0].send_proofs = false;
-    h.pump(45);
-    assert!(!h.clients[0].active);
+    // Without acknowledgements the joining client receives its hero and the
+    // match summary again and again, and nothing else, and never activates.
+    let first = &h.clients[0];
+    assert!(first.owner().is_some());
+    assert!(!first.active());
     assert!(!h.driver.authority.peers[&41].active);
-    assert!(!h.driver.authority.sim.player_is_active(41));
     assert!(
-        h.driver.authority.peers[&41]
-            .inbox
-            .highest_received_sequence()
-            .is_none()
+        first
+            .replicas
+            .values()
+            .all(|(_, replica)| !matches!(replica, Replica::Actor(_))),
+        "remote actors wait for activation"
     );
-    let original = h.driver.authority.peers[&41]
-        .frozen
-        .as_ref()
-        .unwrap()
-        .receipts[0];
-    h.pump(30);
-    assert_eq!(
-        h.driver.authority.peers[&41]
-            .frozen
-            .as_ref()
-            .unwrap()
-            .receipts[0],
-        original
+    assert!(h.clients[1].active());
+    assert!(
+        h.clients[1]
+            .replicas
+            .values()
+            .any(|(_, replica)| matches!(replica, Replica::Actor(_))),
+        "an active client sees the world"
     );
-    h.pump(360);
-    assert_eq!(h.driver.authority.peers[&41].resyncs, 3);
-    assert!(!h.driver.authority.peers[&41].active);
-    // Further recovery waits for the rate limit instead of ending the
-    // session; a client that never proves anything leaves at its deadline.
-    let deadline = h.driver.authority.peers[&41].initial_deadline;
-    while h.now < deadline {
-        h.pump(30);
-    }
-    h.pump(30);
-    assert!(h.driver.authority.peers.is_empty());
-    assert!(!h.driver.authority.sim.player_is_active(41));
-}
-#[test]
-fn transient_application_stall_recovers_without_unbounded_transfer_restart() {
-    let mut h = Harness::new();
-    h.join();
-    h.join();
-    h.pump(36);
-    h.action(0, 1, DreamAction::Start { lucid: false });
-    h.pump(12);
-    let before = h.latest(1).stamp.server_tick;
-    h.clients[1].drop_states = true;
-    h.pump(45);
-    assert_eq!(h.latest(1).stamp.server_tick, before);
-    assert!(h.clients[1].finalized.0 > before);
-    assert!(h.driver.authority.peers.contains_key(&42));
-    h.clients[1].drop_states = false;
+    h.clients[0].send_acks = true;
     h.pump(24);
-    assert!(h.latest(1).stamp.server_tick > before);
-    assert_eq!(h.latest(1).phase, h.latest(0).phase);
-    h.clients[1].renet.disconnect();
-    h.pump(12);
-    assert!(!h.driver.authority.peers.contains_key(&42));
-    let rejoined = h.join();
-    h.pump(36);
-    assert!(h.clients[rejoined].active);
-    assert_eq!(h.latest(rejoined).hero.id, 43);
-}
-
-#[test]
-fn three_second_application_stall_resumes_on_the_same_stream() {
-    let mut h = Harness::new();
-    h.join();
-    h.pump(36);
-    let original = h.clients[0].welcome.clone().unwrap();
-    let original_hero = h.driver.authority.sim.snapshot_for(41).hero;
     assert!(h.driver.authority.peers[&41].active);
-
-    // Renet still exchanges packets and transport ACKs, but the application
-    // cannot consume state or return decode/finalization receipts for 3 seconds.
-    // Proofs arrive late rather than never, so the stream is kept.
-    h.clients[0].receive_application = false;
-    h.pump(180);
-    let peer = &h.driver.authority.peers[&41];
-    assert_eq!(peer.resyncs, 0);
-    assert_eq!(peer.welcome.stream, original.stream);
-    assert!(peer.activation_committed);
-    assert!(h.driver.authority.sim.player_is_active(41));
-    let retained = h.driver.authority.sim.snapshot_for(41).hero;
-    assert_eq!(retained.hp, original_hero.hp);
+    assert!(h.clients[0].active());
     assert!(h.clients[0].renet.disconnect_reason().is_none());
-
-    h.clients[0].receive_application = true;
-    h.pump(60);
-    let peer = &h.driver.authority.peers[&41];
-    assert!(peer.active);
-    assert_eq!(peer.resyncs, 0);
-    assert_eq!(peer.welcome.stream, original.stream);
-    assert!(h.clients[0].active);
-    assert!(h.latest(0).stamp.server_tick > original.tick.0);
 }
 
 #[test]
-fn stall_past_the_reset_deadline_replaces_the_stream_and_play_resumes() {
+fn lost_state_packets_recover_without_application_retransmission() {
     let mut h = Harness::new();
     h.join();
     h.pump(36);
-    let original = h.driver.authority.peers[&41].welcome.stream;
-    h.clients[0].receive_application = false;
-    h.pump(660);
-    let peer = &h.driver.authority.peers[&41];
-    assert_eq!(peer.resyncs, 1);
-    assert_ne!(peer.welcome.stream, original);
-    assert!(peer.activation_committed && !peer.active);
-    assert!(h.driver.authority.sim.player_is_active(41));
-    h.clients[0].receive_application = true;
+    h.action(0, 1, DreamAction::Start { lucid: false });
     h.pump(60);
+    let before = h.latest(0).stamp.server_tick;
+    // A second of total downstream loss: every packet is gone, nothing is
+    // acknowledged, and the server keeps publishing current state.
+    h.clients[0].drop_states = true;
+    h.pump(60);
+    assert_eq!(h.latest(0).stamp.server_tick, before);
     assert!(h.driver.authority.peers[&41].active);
-    assert!(h.clients[0].active);
+    h.clients[0].drop_states = false;
+    h.pump(6);
+    let after = h.latest(0);
+    assert!(after.stamp.server_tick >= h.driver.authority.tick.0 - 6);
+    // Everything the server holds for this client is what the client holds.
+    let client = &h.clients[0];
+    let server = &h.driver.authority.peers[&41].stream;
+    let held: BTreeSet<_> = client.replicas.keys().copied().collect();
+    let sent: BTreeSet<_> = server.keys().collect();
+    assert_eq!(held, sent);
+    assert!(h.clients[0].renet.disconnect_reason().is_none());
 }
 
 #[test]
-fn active_reset_expiry_does_not_restart_an_unproven_replacement_bootstrap() {
+fn unchanged_actors_cost_nothing_once_acknowledged() {
     let mut h = Harness::new();
     h.join();
     h.pump(36);
-    h.clients[0].receive_application = false;
-    h.pump(660);
-    assert_eq!(h.driver.authority.peers[&41].resyncs, 1);
-    h.clients[0].receive_application = true;
-    h.clients[0].send_proofs = false;
-    h.pump(18);
+    assert!(h.clients[0].active());
+    // The intro has no moving enemies: after the first whole states, each
+    // publication carries the owner and match summary changes only.
+    let start = h.clients[0].state_bytes;
+    h.pump(120);
+    let per_second = (h.clients[0].state_bytes - start) / 2;
     let peer = &h.driver.authority.peers[&41];
-    assert!(peer.ready && peer.activation_committed && !peer.active);
-    assert!(peer.frozen.is_some());
-    h.pump(660);
-    assert!(!h.driver.authority.peers.contains_key(&41));
-    assert!(h.clients[0].renet.is_disconnected());
+    eprintln!(
+        "idle intro state bytes/s={per_second} packets={} entries={}",
+        peer.egress.state_packets, peer.egress.state_entries
+    );
+    assert!(per_second < 4_000, "{per_second} bytes per second while idle");
 }
+
+#[test]
+fn moving_world_stays_within_tens_of_kilobytes_per_second() {
+    let mut h = Harness::new();
+    h.join();
+    h.join();
+    h.pump(36);
+    h.action(0, 1, DreamAction::Start { lucid: false });
+    let mut pilots = [Pilot::default(), Pilot::default()];
+    for _ in 0..120 {
+        for index in 0..2 {
+            if let Some(view) = h.clients[index].view.clone() {
+                pilots[index].drive(&mut h, index, &view);
+            }
+        }
+        h.pump(1);
+    }
+    let start: Vec<_> = h.clients.iter().map(|client| client.state_bytes).collect();
+    for _ in 0..300 {
+        for index in 0..2 {
+            if let Some(view) = h.clients[index].view.clone() {
+                pilots[index].drive(&mut h, index, &view);
+            }
+        }
+        h.pump(1);
+    }
+    for (client, start) in h.clients.iter().zip(start) {
+        let per_second = (client.state_bytes - start) / 5;
+        eprintln!("combat state bytes/s={per_second}");
+        assert!(per_second < 30_000, "{per_second} bytes per second in combat");
+    }
+}
+
+#[test]
+fn party_menu_rules_and_tick_action_identity_survive_live_protocol() {
+    let mut h = Harness::new();
+    h.join();
+    h.join();
+    h.pump(36);
+    h.action(1, 1, DreamAction::Start { lucid: false });
+    h.pump(12);
+    h.action(1, 2, DreamAction::Restart);
+    h.action(1, 3, DreamAction::Pause { paused: true });
+    h.action(1, 4, DreamAction::Swap { a: 0, b: 1 });
+    h.pump(12);
+    assert_eq!(h.driver.authority.epoch, 1);
+    assert!(!h.driver.authority.sim.is_paused());
+    assert!(
+        h.clients[1]
+            .notices
+            .iter()
+            .any(|value| value.contains("Finish the shared run"))
+    );
+    assert!(
+        h.clients[1]
+            .notices
+            .iter()
+            .any(|value| value.contains("shared dream"))
+    );
+    let sequence = h.clients[0].commands + 1;
+    h.action(
+        0,
+        77,
+        DreamAction::Cast {
+            slot: 2,
+            aim: [0.0, -1.0],
+        },
+    );
+    h.pump(3);
+    assert!(
+        h.driver
+            .authority
+            .sim
+            .snapshot_for(41)
+            .presentations
+            .iter()
+            .any(|effect| effect.id.owner == 41 && u64::from(effect.id.action_seq) == sequence)
+    );
+    h.pump(6);
+    assert!(
+        h.clients[0]
+            .unconsumed
+            .iter()
+            .all(|record| record.sequence.0 > sequence),
+        "consumed commands are no longer resent"
+    );
+}
+
+#[test]
+fn action_sequence_exhaustion_cannot_enter_authority_inbox() {
+    let mut h = Harness::new();
+    h.join();
+    h.pump(36);
+    let exhausted = engine_net::commands::Command {
+        owner: h.clients[0].welcome.as_ref().unwrap().stream,
+        sequence: CommandSeq(u64::from(u32::MAX) + 1),
+        target: TargetTick(h.driver.authority.tick.0 + 2),
+        input: DreamInput::default().into(),
+        actions: BoundedVec::default(),
+    };
+    let before = h.driver.authority.peers[&41].inbox.pending_len();
+    assert!(
+        h.driver
+            .authority
+            .receive_commands(41, vec![exhausted])
+            .is_err()
+    );
+    assert_eq!(h.driver.authority.peers[&41].inbox.pending_len(), before);
+}
+
+#[test]
+fn paced_owner_and_moving_enemies_keep_actual_remote_cadence() {
+    let mut h = Harness::new();
+    let shared = h.driver.authority.transport_diagnostics.clone().unwrap();
+    shared
+        .transport
+        .lock()
+        .unwrap()
+        .udp_mut()
+        .set_egress_limit(Some(
+            renet_cross::EgressConfig::new(
+                renet_cross::EgressBasis::NativeUdpIp,
+                crate::DEFAULT_EGRESS_BYTES_PER_SECOND,
+                crate::DEFAULT_EGRESS_BURST_BYTES,
+                2400,
+            )
+            .unwrap(),
+        ))
+        .unwrap();
+    h.join();
+    let setup = std::time::Instant::now();
+    for frame in 1..=120 {
+        let due = setup + Duration::from_secs_f64(f64::from(frame) / 60.0);
+        if let Some(wait) = due.checked_duration_since(std::time::Instant::now()) {
+            std::thread::sleep(wait);
+        }
+        h.pump(1);
+        if frame == 60 {
+            h.action(0, 1, DreamAction::Start { lucid: false });
+        }
+    }
+    let before = shared.peer_egress_stats(41).unwrap().native_udp_ip.unwrap();
+    let started = std::time::Instant::now();
+    let mut latest = BTreeMap::new();
+    let mut moving_gaps = Vec::new();
+    let mut owner_age = 0;
+    for frame in 0..480 {
+        // The native limiter uses wall time, so pace the pump to it.
+        let due = started + Duration::from_secs_f64(f64::from(frame + 1) / 60.0);
+        if let Some(wait) = due.checked_duration_since(std::time::Instant::now()) {
+            std::thread::sleep(wait);
+        }
+        h.pump(1);
+        assert!(h.clients[0].active());
+        if frame < 60 {
+            continue;
+        }
+        let client = &h.clients[0];
+        let owner = client.welcome.as_ref().unwrap().owner_entity;
+        owner_age = owner_age.max(h.driver.authority.tick.0 - client.replicas[&owner].0.0);
+        for (entity, (tick, replica)) in &client.replicas {
+            let Replica::Actor(PublicReplica::Enemy(enemy)) = replica else {
+                continue;
+            };
+            if let Some((previous, position)) = latest.insert(*entity, (*tick, enemy.position))
+                && previous != *tick
+                && position != enemy.position
+            {
+                moving_gaps.push(tick.0 - previous.0);
+            }
+        }
+    }
+    let after = shared.peer_egress_stats(41).unwrap().native_udp_ip.unwrap();
+    let elapsed = started.elapsed().as_secs_f64();
+    assert!(moving_gaps.len() >= 12, "exercise moving enemies");
+    moving_gaps.sort_unstable();
+    eprintln!(
+        "moving enemy gap p50={} p95={} max={} owner_age={owner_age} native_bytes={}",
+        moving_gaps[moving_gaps.len() / 2],
+        moving_gaps[(moving_gaps.len() - 1) * 95 / 100],
+        moving_gaps.last().unwrap(),
+        after.native_udp_ip_bytes - before.native_udp_ip_bytes
+    );
+    assert!(
+        moving_gaps[(moving_gaps.len() - 1) * 95 / 100] <= 6,
+        "moving actors update inside the 100 ms presentation buffer"
+    );
+    assert!(owner_age <= 6, "owner state stays fresh: {owner_age}");
+    assert_eq!(after.pacing_drops - before.pacing_drops, 0);
+    assert!(
+        (after.native_udp_ip_bytes - before.native_udp_ip_bytes) as f64
+            <= crate::DEFAULT_EGRESS_BYTES_PER_SECOND as f64 * elapsed
+                + crate::DEFAULT_EGRESS_BURST_BYTES as f64
+    );
+}
+
 #[derive(Default)]
 struct Pilot {
     action_sequence: u32,
@@ -1348,7 +1106,7 @@ fn complete_cooperative_run_over_live_udp_reaches_every_realm_and_boss_victory()
     assert!(
         h.clients
             .iter()
-            .all(|client| client.max_packet <= live::OWNER_GROUP_MESSAGE_BYTES)
+            .all(|client| client.max_packet <= live::MAX_STATE_FRAME_BYTES)
     );
     h.pump(12);
     assert_eq!(h.latest(0).phase, RunPhase::Victory);
@@ -1359,84 +1117,6 @@ fn complete_cooperative_run_over_live_udp_reaches_every_realm_and_boss_victory()
     );
 }
 
-#[test]
-fn party_menu_rules_and_tick_action_identity_survive_live_protocol() {
-    let mut h = Harness::new();
-    h.join();
-    h.join();
-    h.pump(36);
-    h.action(1, 1, DreamAction::Start { lucid: false });
-    h.pump(12);
-    h.action(1, 2, DreamAction::Restart);
-    h.action(1, 3, DreamAction::Pause { paused: true });
-    h.action(1, 4, DreamAction::Swap { a: 0, b: 1 });
-    h.pump(12);
-    assert_eq!(h.driver.authority.epoch, 1);
-    assert!(!h.driver.authority.sim.is_paused());
-    assert!(
-        h.clients[1]
-            .notices
-            .iter()
-            .any(|value| value.contains("Finish the shared run"))
-    );
-    assert!(
-        h.clients[1]
-            .notices
-            .iter()
-            .any(|value| value.contains("shared dream"))
-    );
-    let sequence = h.clients[0].commands + 1;
-    h.action(
-        0,
-        77,
-        DreamAction::Cast {
-            slot: 2,
-            aim: [0.0, -1.0],
-        },
-    );
-    h.pump(3);
-    assert!(
-        h.driver
-            .authority
-            .sim
-            .snapshot_for(41)
-            .presentations
-            .iter()
-            .any(|effect| effect.id.owner == 41 && u64::from(effect.id.action_seq) == sequence)
-    );
-    h.pump(6);
-    assert!(
-        h.clients[0]
-            .finalized_sequences
-            .contains(&CommandSeq(sequence))
-    );
-}
-#[test]
-fn invalid_owner_stream_and_action_sequence_exhaustion_cannot_enter_authority_inbox() {
-    let mut h = Harness::new();
-    h.join();
-    h.join();
-    h.pump(36);
-    let make = |owner, sequence| live::CommandBundle {
-        records: BoundedVec::new(vec![engine_net::commands::Command {
-            owner,
-            sequence: CommandSeq(sequence),
-            target: TargetTick(h.driver.authority.tick.0 + 2),
-            input: DreamInput::default().into(),
-            actions: BoundedVec::default(),
-        }])
-        .unwrap(),
-    };
-    let wrong = make(h.clients[1].welcome.as_ref().unwrap().stream, 100);
-    let exhausted = make(
-        h.clients[0].welcome.as_ref().unwrap().stream,
-        u64::from(u32::MAX) + 1,
-    );
-    let before = h.driver.authority.peers[&41].inbox.pending_len();
-    assert!(h.driver.authority.receive_bundle(41, wrong).is_err());
-    assert!(h.driver.authority.receive_bundle(41, exhausted).is_err());
-    assert_eq!(h.driver.authority.peers[&41].inbox.pending_len(), before);
-}
 #[test]
 fn snapshots_follow_completed_ticks_despite_late_wakeups() {
     let mut clock = TickClock::new(dreamwake_sim::TICK_HZ, wire::TICKS_PER_SNAPSHOT);
@@ -1468,147 +1148,6 @@ fn snapshots_follow_completed_ticks_despite_late_wakeups() {
 }
 
 #[test]
-fn owner_baselines_bound_missing_proofs_and_resume_after_one_reset() {
-    let mut h = Harness::new();
-    h.join();
-    h.pump(36);
-    assert!(h.clients[0].active);
-    h.clients[0].send_proofs = false;
-    h.pump(9);
-    let owner = h.clients[0].welcome.as_ref().unwrap().owner_entity;
-    let old = h.clients[0]
-        .scopes
-        .as_ref()
-        .unwrap()
-        .state(owner)
-        .unwrap()
-        .receipt();
-    let initial = h.latest(0).stamp.server_tick;
-    // A delayed proof for a retained sent version is allowed as historical
-    // evidence, but cannot acknowledge the newer desired full state.
-    h.pump(6);
-    h.clients[0].control(live::ClientControl::Decoded {
-        receipts: BoundedVec::new(vec![old]).unwrap(),
-    });
-    h.pump(3);
-    let scopes = h.driver.authority.replication.scopes_mut(41).unwrap();
-    assert_ne!(scopes.pending(owner).unwrap().receipt(), old);
-    assert!(scopes.decoded_current(owner).is_none());
-    let retired = h.clients[0]
-        .scopes
-        .as_ref()
-        .unwrap()
-        .state(owner)
-        .unwrap()
-        .receipt();
-    assert_ne!(retired, old);
-    let old_proofs = h.clients[0].owner_proofs.clone();
-    let topology = h.driver.authority.peers[&41].group_revision;
-    // Missing feedback fills bounded retention and negotiates exactly one reset.
-    // Wait for that transition, then withhold its proof inside the two-second
-    // deadline; no application repeat is needed for already delivered bytes.
-    for _ in 0..30 {
-        if h.driver.authority.peers[&41]
-            .baselines
-            .reset_pending
-            .is_some()
-        {
-            break;
-        }
-        h.pump(3);
-    }
-    h.pump(6);
-    assert!(h.driver.authority.peers[&41].active);
-    assert!(h.latest(0).stamp.server_tick > initial);
-    assert!(h.latest(0).stamp.server_tick < initial + 120);
-    let reset = h.driver.authority.peers[&41]
-        .baselines
-        .reset_pending
-        .clone()
-        .unwrap();
-    assert_eq!(reset.len(), OWNER_GROUP_MEMBERS);
-    let repair_tick = h.latest(0).stamp.server_tick;
-    h.pump(30);
-    assert_eq!(h.latest(0).stamp.server_tick, repair_tick);
-    assert_eq!(
-        h.driver.authority.peers[&41]
-            .baselines
-            .reset_pending
-            .as_ref()
-            .unwrap(),
-        &reset
-    );
-    assert!(h.driver.authority.tick.0 - h.clients[0].finalized.0 <= 3);
-    h.clients[0].control(live::ClientControl::OwnerDecoded {
-        proofs: BoundedVec::new(old_proofs).unwrap(),
-    });
-    h.pump(3);
-    assert_eq!(
-        h.driver.authority.peers[&41]
-            .baselines
-            .reset_pending
-            .as_ref()
-            .unwrap(),
-        &reset
-    );
-    let scopes = h.driver.authority.replication.scopes_mut(41).unwrap();
-    assert!(scopes.decoded_current(owner).is_none());
-    assert_eq!(h.driver.authority.peers[&41].group_revision, topology);
-    h.clients[0].resume_proofs();
-    h.pump(12);
-    assert!(h.clients[0].active);
-    assert!(h.latest(0).stamp.server_tick > repair_tick);
-}
-
-#[test]
-fn withheld_owner_messages_recover_from_retained_full_reset_without_generation_churn() {
-    let mut h = Harness::new();
-    h.join();
-    h.pump(36);
-    let before = h.latest(0).stamp.server_tick;
-    h.clients[0].drop_states = true;
-    for _ in 0..30 {
-        if h.driver.authority.peers[&41]
-            .baselines
-            .reset_pending
-            .is_some()
-        {
-            break;
-        }
-        h.pump(3);
-    }
-    h.pump(30);
-    assert_eq!(h.latest(0).stamp.server_tick, before);
-    assert!(h.driver.authority.peers[&41].active);
-    let peer = &h.driver.authority.peers[&41];
-    let snapshot = peer
-        .frozen
-        .as_ref()
-        .unwrap()
-        .receipts
-        .iter()
-        .find(|receipt| receipt.scope.entity == peer.welcome.owner_entity)
-        .unwrap()
-        .snapshot;
-    assert!(
-        h.driver.authority.peers[&41]
-            .baselines
-            .reset_pending
-            .is_some()
-    );
-    h.clients[0].drop_states = false;
-    h.pump(12);
-    assert!(h.latest(0).stamp.server_tick > before);
-    assert!(h.clients[0].decoded_groups.contains(&snapshot));
-    let w = h.clients[0].welcome.as_ref().unwrap();
-    let scopes = h.clients[0].scopes.as_ref().unwrap();
-    assert_eq!(
-        scopes.state(w.owner_entity).unwrap().end_tick,
-        scopes.state(w.global_entity).unwrap().end_tick
-    );
-}
-
-#[test]
 fn arrival_feedback_counts_first_effective_observations_without_duplicate_inflation() {
     let mut authority = DreamAuthority::new(71, false, 8);
     assert!(authority.admit(41));
@@ -1629,14 +1168,7 @@ fn arrival_feedback_counts_first_effective_observations_without_duplicate_inflat
         slack,
     };
     let receive = |authority: &mut DreamAuthority, records| {
-        authority
-            .receive_bundle(
-                41,
-                live::CommandBundle {
-                    records: BoundedVec::new(records).unwrap(),
-                },
-            )
-            .unwrap();
+        authority.receive_commands(41, records).unwrap();
     };
     for tick in 1..=300 {
         let peer = authority.peers.get_mut(&41).unwrap();
@@ -1795,19 +1327,26 @@ fn stable_player_has_one_controller_and_reclaim_changes_both_epochs() {
     assert!(second.stream.ownership > first.stream.ownership);
     assert_eq!(second.player, first.player);
     assert_eq!(authority.sim.snapshot_for(player.get()).hero.hp, before.hp);
-    authority.peers.get_mut(&43).unwrap().active = true;
-    let old = engine_net::commands::Command {
-        owner: first.stream,
-        sequence: CommandSeq(1),
-        target: TargetTick(authority.tick.0 + 2),
-        input: DreamInput::default().into(),
-        actions: BoundedVec::new(vec![]).unwrap(),
-    };
-    let bundle = live::CommandBundle {
-        records: BoundedVec::new(vec![old]).unwrap(),
-    };
-    assert!(
-        authority.receive_bundle(43, bundle).is_err(),
+    // Input framed for the old connection epoch never decodes on the new one.
+    let old = live::encode_input(
+        &live::InputPacket {
+            ack: Default::default(),
+            records: BoundedVec::new(vec![live::InputRecord {
+                sequence: CommandSeq(1),
+                target: TargetTick(authority.tick.0 + 2),
+                input: DreamInput::default().into(),
+                actions: BoundedVec::default(),
+            }])
+            .unwrap(),
+        },
+        first.stream.epoch,
+        1,
+        authority.peers[&43].limit(),
+    )
+    .unwrap();
+    assert_eq!(
+        live::decode_input(&old, second.stream.epoch, authority.peers[&43].limit()),
+        Err(engine_net::codec::CodecError::WrongEpoch),
         "old owner stream cannot control reclaimed player"
     );
 }
@@ -1818,12 +1357,12 @@ fn authenticated_udp_rejoin_preserves_player_and_rejects_a_second_controller() {
     let original = h.join_player(700);
     h.join_player(800);
     h.pump(36);
-    assert!(h.clients[original].active);
+    assert!(h.clients[original].active());
     assert_eq!(h.latest(original).hero.id, 700);
     let first = h.clients[original].welcome.clone().unwrap();
     let second = h.join_player(700);
     h.pump(20);
-    assert!(!h.clients[second].active);
+    assert!(!h.clients[second].active());
     assert!(h.clients[second].renet.is_disconnected());
     assert!(h.driver.authority.peers[&41].active);
     h.action(original, 1, DreamAction::Start { lucid: false });
@@ -1834,7 +1373,7 @@ fn authenticated_udp_rejoin_preserves_player_and_rejects_a_second_controller() {
     let retained = h.driver.authority.sim.snapshot_for(700).hero;
     let reconnect = h.join_player(700);
     h.pump(36);
-    assert!(h.clients[reconnect].active);
+    assert!(h.clients[reconnect].active());
     let welcome = h.clients[reconnect].welcome.as_ref().unwrap();
     assert_ne!(welcome.client, first.client);
     assert!(welcome.stream.epoch > first.stream.epoch);
@@ -1851,25 +1390,24 @@ fn authenticated_udp_rejoin_preserves_player_and_rejects_a_second_controller() {
 fn stalled_bootstrap_peer_is_displaced_by_a_fresh_stream_for_the_same_player() {
     let mut h = Harness::new();
     let stalled = h.join_player(700);
-    // Withholding the owner group proof reproduces a client whose bootstrap
-    // never completes, so it holds no participation, health or readiness.
-    h.clients[stalled].send_proofs = false;
+    // Withholding acknowledgements reproduces a client whose join never
+    // completes, so it holds no participation, health or readiness.
+    h.clients[stalled].send_acks = false;
     h.pump(30);
     let first = h.clients[stalled].welcome.clone().unwrap();
     let first_connection = first.client.0;
-    assert!(!h.clients[stalled].active);
+    assert!(!h.clients[stalled].active());
     assert!(!h.driver.authority.peers[&first_connection].active);
-    assert!(!h.driver.authority.peers[&first_connection].activation_committed);
 
-    // The replacement is admitted instead of refused, so a stalled bootstrap
-    // cannot strand its own profile or spend its three resynchronizations.
+    // The replacement is admitted instead of refused, so a stalled join
+    // cannot strand its own profile.
     let fresh = h.join_player(700);
     h.pump(45);
     assert!(
         !h.driver.authority.peers.contains_key(&first_connection),
         "the never-activated peer is displaced"
     );
-    assert!(h.clients[fresh].active, "the fresh stream activates");
+    assert!(h.clients[fresh].active(), "the fresh stream activates");
     let welcome = h.clients[fresh].welcome.as_ref().unwrap();
     assert_eq!(welcome.player, first.player);
     assert!(welcome.stream.epoch > first.stream.epoch);
@@ -1916,86 +1454,6 @@ fn game_connection_limit_cannot_exceed_retained_hero_capacity() {
 }
 
 #[test]
-fn finalized_receipts_are_sent_once_on_the_reliable_lane() {
-    let mut h = Harness::new();
-    h.join();
-    h.pump(36);
-    assert!(h.clients[0].active);
-    let peer = &h.driver.authority.peers[&41];
-    let before = (
-        peer.egress.finalized_receipts,
-        peer.egress.finalized_bytes,
-        peer.egress.finalized_messages,
-    );
-    h.pump(120);
-    let peer = &h.driver.authority.peers[&41];
-    assert_eq!(peer.egress.finalized_receipts - before.0, 120);
-    assert_eq!(peer.egress.finalized_messages - before.2, 40);
-    assert_eq!(peer.finalized_sent_through, h.driver.authority.tick);
-    assert!(h.driver.authority.tick.0 - h.clients[0].finalized.0 <= 3);
-    let repeated: Vec<_> = peer
-        .inbox
-        .receipts()
-        .skip(peer.inbox.receipts().len() - 32)
-        .copied()
-        .collect();
-    // The historical frame, before control frames were deflated.
-    let old = engine_net::codec::HEADER_BYTES
-        + engine_net::codec::encode_payload(
-            &live::ServerControl::Finalized {
-                through: h.driver.authority.tick,
-                receipts: BoundedVec::new(repeated).unwrap(),
-                menu_applied: peer.menu_applied,
-                arrival: live::ArrivalFeedback::default(),
-            },
-            peer.limit().payload_bytes(),
-        )
-        .unwrap()
-        .len();
-    let new_bytes = peer.egress.finalized_bytes - before.1;
-    assert!(new_bytes * 4 < old as u64 * 40);
-    eprintln!(
-        "Finalized measured: old_32_receipt_frame_bytes={old} old_20hz_bytes_per_second={} new_120tick_bytes={new_bytes} new_20hz_bytes_per_second={} receipt_count=120 publication_count=40",
-        old * 20,
-        new_bytes / 2
-    );
-}
-
-#[test]
-fn finalized_queue_coalesces_unsent_ticks_and_recovers_after_ack_stall() {
-    let mut h = Harness::new();
-    h.join();
-    h.pump(36);
-    assert!(h.clients[0].active);
-    // Keep simulation/publication running while this client neither reads nor ACKs.
-    for _ in 0..90 {
-        h.frame += 1;
-        h.now = TickRate::new(dreamwake_sim::TICK_HZ)
-            .unwrap()
-            .deadline(ServerTick(h.frame))
-            .unwrap();
-        h.driver.poll(h.now).unwrap();
-    }
-    let queue = wire::CONTROL_MEMORY_BYTES
-        - h.driver
-            .server
-            .channel_available_memory(41, wire::CONTROL_CHANNEL);
-    // At most one window of coalesced Finalized messages plus one reliable
-    // baseline-reset fence: bounded, however long the stall.
-    assert!(queue < 2500, "coalesced Finalized queue bytes: {queue}");
-    assert!(h.driver.authority.peers[&41].egress.finalized_deferred > 0);
-    // Receive-only recovery isolates server finalization from client command-clock behavior.
-    h.clients[0].active = false;
-    h.pump(60);
-    assert!(h.driver.authority.peers.contains_key(&41));
-    assert!(h.driver.authority.tick.0 - h.clients[0].finalized.0 <= 3);
-    assert_eq!(
-        h.driver.authority.peers[&41].finalized_sent_through,
-        h.driver.authority.tick
-    );
-}
-
-#[test]
 fn production_channel_priority_keeps_control_before_saturating_state() {
     let mut server = renet::RenetServer::new(super::connection_config());
     server.add_connection(41);
@@ -2027,301 +1485,13 @@ fn production_channel_priority_keeps_control_before_saturating_state() {
 }
 
 #[test]
-fn collision_decode_proof_is_required_before_owner_activation() {
-    let mut h = Harness::new();
-    h.join();
-    h.clients[0].send_proofs = false;
-    h.pump(18);
-    let peer = &h.driver.authority.peers[&41];
-    let group = peer.frozen.as_ref().unwrap();
-    assert_eq!(group.receipts.len(), OWNER_GROUP_MEMBERS);
-    let collision = peer.welcome.collision_entity;
-    let without_collision: Vec<_> = group
-        .receipts
-        .iter()
-        .filter(|state| state.scope.entity != collision)
-        .copied()
-        .collect();
-    assert_eq!(without_collision.len(), 2);
-    let collision_receipt = *group
-        .receipts
-        .iter()
-        .find(|state| state.scope.entity == collision)
-        .unwrap();
-    h.clients[0].control(live::ClientControl::Decoded {
-        receipts: BoundedVec::new(without_collision).unwrap(),
-    });
-    h.pump(9);
-    assert!(!h.driver.authority.peers[&41].activate_pending);
-    assert!(!h.driver.authority.peers[&41].active);
-    assert!(!h.driver.authority.sim.player_is_active(41));
-    assert_eq!(collision_receipt.scope.entity, collision);
-    let proofs = h.clients[0].owner_proofs.clone();
-    h.clients[0].control(live::ClientControl::OwnerDecoded {
-        proofs: BoundedVec::new(proofs).unwrap(),
-    });
-    h.clients[0].send_proofs = true;
-    h.pump(18);
-    assert!(h.clients[0].active);
-    assert!(h.driver.authority.sim.player_is_active(41));
-    let counters = &h.driver.authority.peers[&41].egress;
-    let before = (counters.state_bytes, counters.control_bytes);
-    let transport = h.driver.authority.transport_diagnostics.clone().unwrap();
-    let native_before = transport
-        .peer_egress_stats(41)
-        .unwrap()
-        .native_udp_ip
-        .unwrap();
-    h.pump(120);
-    let counters = &h.driver.authority.peers[&41].egress;
-    let native_after = transport
-        .peer_egress_stats(41)
-        .unwrap()
-        .native_udp_ip
-        .unwrap();
-    eprintln!(
-        "N043 sustained 120 ticks: state_bytes_per_second={} control_bytes_per_second={} native_udp_ip_bytes_per_second={} pacing_drops={}",
-        (counters.state_bytes - before.0) / 2,
-        (counters.control_bytes - before.1) / 2,
-        (native_after.native_udp_ip_bytes - native_before.native_udp_ip_bytes) / 2,
-        native_after.pacing_drops - native_before.pacing_drops,
-    );
-    assert!(h.clients[0].active);
-    assert!(h.driver.authority.tick.0 - h.clients[0].finalized.0 <= 3);
-}
-
-#[test]
-fn wrong_collision_ready_identity_revokes_the_session() {
-    let mut h = Harness::new();
-    h.join();
-    h.pump(36);
-    assert!(h.clients[0].active);
-    let mut content = h.clients[0].welcome.as_ref().unwrap().content;
-    content.scene[0] ^= 1;
-    h.clients[0].control(live::ClientControl::Ready { content });
-    h.pump(6);
-    assert!(!h.driver.authority.peers.contains_key(&41));
-}
-
-#[test]
-fn paced_owner_message_remains_queued_until_renet_delivers_it_completely() {
-    let mut h = Harness::new();
-    let shared = h.driver.authority.transport_diagnostics.clone().unwrap();
-    shared
-        .transport
-        .lock()
-        .unwrap()
-        .udp_mut()
-        .set_egress_limit(Some(
-            renet_cross::EgressConfig::new(
-                renet_cross::EgressBasis::NativeUdpIp,
-                60_000,
-                2048,
-                512,
-            )
-            .unwrap(),
-        ))
-        .unwrap();
-    h.join();
-    let mut staged = false;
-    let mut identity = None;
-    for _ in 0..100 {
-        std::thread::sleep(Duration::from_millis(25));
-        h.pump(1);
-        if let Some(peer) = h.driver.authority.peers.get(&41)
-            && let Some(group) = &peer.frozen
-            && !peer.active
-            && !h.clients[0]
-                .decoded_groups
-                .contains(&group.receipts[0].snapshot)
-        {
-            staged = true;
-            let receipt = group.receipts[0];
-            if let Some((active_state, previous)) = identity {
-                if active_state == group.active_state {
-                    assert_eq!(receipt, previous);
-                }
-            }
-            identity = Some((group.active_state, receipt));
-            assert!(group.decoded.is_empty());
-            assert!(
-                h.driver
-                    .server
-                    .channel_available_memory(41, wire::OWNER_GROUP_CHANNEL)
-                    < wire::OWNER_GROUP_SEND_BYTES
-            );
-            assert!(!h.clients[0].active);
-        }
-        if h.clients[0].active {
-            break;
-        }
-    }
-    assert!(staged, "full owner group must exceed this data burst");
-    assert!(
-        h.clients[0].active,
-        "continuous input ACKs must not starve staged bootstrap"
-    );
-    assert_eq!(h.driver.authority.peers[&41].resyncs, 0);
-    let stats = shared.peer_egress_stats(41).unwrap().native_udp_ip.unwrap();
-    assert_eq!(stats.cap_drops, 0);
-}
-
-#[test]
-fn paced_owner_and_moving_enemies_keep_actual_remote_cadence() {
-    let mut h = Harness::new();
-    let shared = h.driver.authority.transport_diagnostics.clone().unwrap();
-    shared
-        .transport
-        .lock()
-        .unwrap()
-        .udp_mut()
-        .set_egress_limit(Some(
-            renet_cross::EgressConfig::new(
-                renet_cross::EgressBasis::NativeUdpIp,
-                crate::DEFAULT_EGRESS_BYTES_PER_SECOND,
-                crate::DEFAULT_EGRESS_BURST_BYTES,
-                2400,
-            )
-            .unwrap(),
-        ))
-        .unwrap();
-    h.join();
-    let setup = std::time::Instant::now();
-    for frame in 1..=120 {
-        let due = setup + Duration::from_secs_f64(f64::from(frame) / 60.0);
-        if let Some(wait) = due.checked_duration_since(std::time::Instant::now()) {
-            std::thread::sleep(wait);
-        }
-        h.pump(1);
-        if frame == 60 {
-            h.action(0, 1, DreamAction::Start { lucid: false });
-        }
-    }
-    let before = shared.peer_egress_stats(41).unwrap().native_udp_ip.unwrap();
-    let started = std::time::Instant::now();
-    let mut latest = BTreeMap::new();
-    let mut gaps = Vec::new();
-    let mut moving_updates = 0;
-    let mut moving_gaps = Vec::new();
-    let mut near_gaps = Vec::new();
-    let mut owner_age = 0;
-    for frame in 0..480 {
-        // The actual native limiter uses wall time; simulated pumping alone
-        // would not test its wire allowance or split-prefix pressure.
-        let due = started + Duration::from_secs_f64(f64::from(frame + 1) / 60.0);
-        if let Some(wait) = due.checked_duration_since(std::time::Instant::now()) {
-            std::thread::sleep(wait);
-        }
-        h.pump(1);
-        assert!(h.clients[0].active);
-        if frame < 60 {
-            continue;
-        }
-        let owner_position = h
-            .driver
-            .authority
-            .sim
-            .snapshot()
-            .heroes
-            .iter()
-            .find(|hero| hero.id == 41)
-            .unwrap()
-            .position;
-        let client = &h.clients[0];
-        let scopes = client.scopes.as_ref().unwrap();
-        let owner = scopes
-            .state(client.welcome.as_ref().unwrap().owner_entity)
-            .unwrap();
-        owner_age = owner_age.max(h.driver.authority.tick.0 - owner.end_tick.0);
-        for entity in &client.known {
-            let Some(state) = scopes.state(*entity) else {
-                continue;
-            };
-            let decoded = decode_replica(&state.payload, None).unwrap();
-            let ReplicaPayload::Actor(dreamwake_sim::replication::PublicReplica::Enemy(enemy)) =
-                decoded
-            else {
-                continue;
-            };
-            if let Some((previous, position)) =
-                latest.insert(state.scope, (state.end_tick, enemy.position))
-            {
-                if previous != state.end_tick {
-                    gaps.push(state.end_tick.0 - previous.0);
-                    let gap = state.end_tick.0 - previous.0;
-                    if position != enemy.position {
-                        moving_gaps.push(gap);
-                    }
-                    let dx = enemy.position[0] - owner_position[0];
-                    let dz = enemy.position[1] - owner_position[1];
-                    if dx * dx + dz * dz <= 32.0 * 32.0 {
-                        near_gaps.push(gap);
-                    }
-                    moving_updates += usize::from(position != enemy.position);
-                }
-            }
-        }
-    }
-    let after = shared.peer_egress_stats(41).unwrap().native_udp_ip.unwrap();
-    let elapsed = started.elapsed().as_secs_f64();
-    eprintln!(
-        "paced enemies updates={} moving={} maximum_gap={:?} owner_age={} native_bytes={} elapsed={elapsed}",
-        gaps.len(),
-        moving_updates,
-        gaps.iter().max(),
-        owner_age,
-        after.native_udp_ip_bytes - before.native_udp_ip_bytes
-    );
-    assert!(
-        moving_updates >= 12,
-        "exercise sustained moving-enemy publications"
-    );
-    gaps.sort_unstable();
-    eprintln!(
-        "enemy gap distribution p50={} p95={} max={}",
-        gaps[gaps.len() / 2],
-        gaps[(gaps.len() - 1) * 95 / 100],
-        gaps.last().unwrap()
-    );
-    for (name, values) in [("moving", &mut moving_gaps), ("near", &mut near_gaps)] {
-        assert!(!values.is_empty(), "exercise {name} actor publications");
-        values.sort_unstable();
-        assert!(
-            values[(values.len() - 1) * 95 / 100] <= 6,
-            "{name} actors must normally update inside the 100 ms presentation buffer"
-        );
-        eprintln!(
-            "{name} enemy gap p50={} p95={} max={}",
-            values[values.len() / 2],
-            values[(values.len() - 1) * 95 / 100],
-            values.last().unwrap()
-        );
-    }
-    assert!(
-        gaps.iter().all(|gap| *gap <= 12),
-        "remote updates exceeded 12 ticks: {gaps:?}"
-    );
-    assert!(
-        owner_age <= 12,
-        "owner completion must also remain fresh: {owner_age}"
-    );
-    assert_eq!(after.cap_drops - before.cap_drops, 0);
-    assert_eq!(after.pacing_drops - before.pacing_drops, 0);
-    assert!(
-        (after.native_udp_ip_bytes - before.native_udp_ip_bytes) as f64
-            <= crate::DEFAULT_EGRESS_BYTES_PER_SECOND as f64 * elapsed
-                + crate::DEFAULT_EGRESS_BURST_BYTES as f64
-    );
-}
-
-#[test]
 fn reliable_action_outcome_arrives_alongside_continuing_finalization() {
     let mut h = Harness::new();
     h.join();
     h.pump(36);
     h.action(0, 1, DreamAction::Start { lucid: false });
     h.pump(12);
-    let before = h.clients[0].finalized;
+    let before = h.clients[0].status.finalized;
     h.action(
         0,
         2,
@@ -2330,7 +1500,7 @@ fn reliable_action_outcome_arrives_alongside_continuing_finalization() {
         },
     );
     h.pump(24);
-    assert!(h.clients[0].finalized > before);
+    assert!(h.clients[0].status.finalized > before);
     assert!(
         h.clients[0]
             .outcomes
@@ -2345,37 +1515,3 @@ fn reliable_action_outcome_arrives_alongside_continuing_finalization() {
     assert_eq!(h.clients[0].outcomes.get(&outcome.key), Some(&outcome));
 }
 
-#[test]
-fn lifecycle_fences_enqueue_once_during_ack_stall_and_allow_fresh_welcome() {
-    let mut h = Harness::new();
-    h.join();
-    h.pump(36);
-    assert!(h.clients[0].active);
-    let original = h.driver.authority.peers[&41].welcome.stream;
-    let welcome = h.driver.authority.peers[&41].welcome.clone();
-    let authority = &mut h.driver.authority;
-    let scopes = authority.replication.scopes_mut(41).unwrap();
-    let exit = scopes.exit(welcome.global_entity).unwrap();
-    let destroy = scopes.destroy(welcome.owner_entity).unwrap();
-    let peer = authority.peers.get_mut(&41).unwrap();
-    let before = peer.egress.control_messages;
-    // Thirty 20 Hz publication attempts with all client reads/ACKs withheld.
-    for _ in 0..30 {
-        publish::lifecycle(&mut h.driver.server, 41, peer, scopes).unwrap();
-    }
-    assert_eq!(peer.egress.control_messages - before, 2);
-    assert_eq!(scopes.pending_exits().collect::<Vec<_>>(), vec![exit]);
-    assert_eq!(scopes.pending_destroys().collect::<Vec<_>>(), vec![destroy]);
-    let queue = wire::CONTROL_MEMORY_BYTES
-        - h.driver
-            .server
-            .channel_available_memory(41, wire::CONTROL_CHANNEL);
-    assert!(queue < 2048, "lifecycle queue bytes: {queue}");
-    h.driver.authority.resync(41).unwrap();
-    h.clients[0].active = false;
-    h.pump(60);
-    let peer = &h.driver.authority.peers[&41];
-    assert_ne!(peer.welcome.stream.epoch, original.epoch);
-    assert!(peer.active);
-    assert!(h.clients[0].active);
-}

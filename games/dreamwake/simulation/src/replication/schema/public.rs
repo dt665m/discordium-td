@@ -69,13 +69,13 @@ impl Root for Global {
         Ok(value)
     }
 }
-copy_schema!(Hero,game::PublicHeroView,0x1104,2,{
+engine_net::schema! {pub(super) struct Hero(SchemaId(0x1104),3,Representation::PublicPresentation) {
     1=>id:u64=1=>p(Units::Unitless,U64),
-    2=>position:[f32;2]=[0.0;2]=>linear(Units::Metres,F),
-    3=>elevation:f32=0.0=>p(Units::Metres,F),
+    2=>position:[Metres;2]=[Metres::ZERO;2]=>linear(Units::Metres,F),
+    3=>elevation:Metres=Metres::ZERO=>p(Units::Metres,F),
     4=>crouched:bool=false=>p(Units::Unitless,Range::None),
-    5=>facing:[f32;2]=[0.0,-1.0]=>p(Units::Unitless,F),
-    6=>velocity:[f32;2]=[0.0;2]=>p(Units::Custom("metres/second"),F),
+    5=>facing:[Direction;2]=[Direction::ZERO;2]=>p(Units::Unitless,F),
+    6=>velocity:[Speed;2]=[Speed::ZERO;2]=>p(Units::Custom("metres/second"),F),
     7=>hp:f32=1.0=>p(Units::Unitless,NONNEG),
     8=>max_hp:f32=1.0=>p(Units::Unitless,NONNEG),
     9=>shield:f32=0.0=>p(Units::Unitless,NONNEG),
@@ -83,36 +83,70 @@ copy_schema!(Hero,game::PublicHeroView,0x1104,2,{
     11=>invulnerable:bool=false=>p(Units::Unitless,Range::None),
     12=>dashing:bool=false=>p(Units::Unitless,Range::None),
     13=>combo:u32=0=>p(Units::Unitless,U32),
-    14=>hit_flash:f32=0.0=>p(Units::Seconds,F),
-    15=>attack_flash:f32=0.0=>p(Units::Seconds,F),
+    14=>hit_flash:Seconds=Seconds::ZERO=>p(Units::Seconds,F),
+    15=>attack_flash:Seconds=Seconds::ZERO=>p(Units::Seconds,F),
     16=>color:[u8;3]=crate::player_color_for_slot(0)=>p(Units::Unitless,U8),
-});
+}}
 impl Root for Hero {
     type Model = game::PublicHeroView;
     fn capture(v: &Self::Model) -> Result<Self, SchemaError> {
         game::PublicReplica::Hero(*v).validate().map_err(invalid)?;
-        Ok(v.into())
+        Ok(Self {
+            id: v.id,
+            position: Quantized::array(v.position)?,
+            elevation: Quantized::new(v.elevation)?,
+            crouched: v.crouched,
+            facing: Quantized::array(v.facing)?,
+            velocity: Quantized::array(v.velocity)?,
+            hp: v.hp,
+            max_hp: v.max_hp,
+            shield: v.shield,
+            level: v.level,
+            invulnerable: v.invulnerable,
+            dashing: v.dashing,
+            combo: v.combo,
+            hit_flash: Quantized::new(v.hit_flash)?,
+            attack_flash: Quantized::new(v.attack_flash)?,
+            color: v.color,
+        })
     }
     fn restore(&self) -> Result<Self::Model, SchemaError> {
-        let v: Self::Model = self.clone().into();
+        let v = Self::Model {
+            id: self.id,
+            position: Quantized::values(self.position),
+            elevation: self.elevation.get(),
+            crouched: self.crouched,
+            facing: Quantized::values(self.facing),
+            velocity: Quantized::values(self.velocity),
+            hp: self.hp,
+            max_hp: self.max_hp,
+            shield: self.shield,
+            level: self.level,
+            invulnerable: self.invulnerable,
+            dashing: self.dashing,
+            combo: self.combo,
+            hit_flash: self.hit_flash.get(),
+            attack_flash: self.attack_flash.get(),
+            color: self.color,
+        };
         game::PublicReplica::Hero(v).validate().map_err(invalid)?;
         Ok(v)
     }
 }
-engine_net::schema! {pub(super) struct Enemy(SchemaId(0x1105),2,Representation::PublicPresentation) {
+engine_net::schema! {pub(super) struct Enemy(SchemaId(0x1105),3,Representation::PublicPresentation) {
     1=>id:u64=1=>p(Units::Unitless,U64),
-    2=>position:[f32;2]=[0.0;2]=>linear(Units::Metres,F),
-    3=>facing:[f32;2]=[0.0,-1.0]=>p(Units::Unitless,F),
+    2=>position:[Metres;2]=[Metres::ZERO;2]=>linear(Units::Metres,F),
+    3=>facing:[Direction;2]=[Direction::ZERO;2]=>p(Units::Unitless,F),
     4=>hp:f32=1.0=>p(Units::Unitless,NONNEG),
     5=>max_hp:f32=1.0=>p(Units::Unitless,NONNEG),
     6=>kind:EnemyKind=EnemyKind::Melee=>p(Units::Unitless,Range::None),
-    7=>windup:f32=0.0=>p(Units::Seconds,F),
-    8=>target:[f32;2]=[0.0;2]=>p(Units::Metres,F),
+    7=>windup:Seconds=Seconds::ZERO=>p(Units::Seconds,F),
+    8=>target:[Metres;2]=[Metres::ZERO;2]=>p(Units::Metres,F),
     9=>warn_radius:f32=0.0=>p(Units::Metres,NONNEG),
     10=>phase:u8=0=>p(Units::Unitless,U8),
     11=>slowed:bool=false=>p(Units::Unitless,Range::None),
-    12=>hit_flash:f32=0.0=>p(Units::Seconds,F),
-    13=>velocity:[f32;2]=[0.0;2]=>p(Units::Custom("metres/second"),F),
+    12=>hit_flash:Seconds=Seconds::ZERO=>p(Units::Seconds,F),
+    13=>velocity:[Speed;2]=[Speed::ZERO;2]=>p(Units::Custom("metres/second"),F),
 }}
 impl Root for Enemy {
     type Model = game::PublicEnemyView;
@@ -120,50 +154,50 @@ impl Root for Enemy {
         game::PublicReplica::Enemy(*v).validate().map_err(invalid)?;
         Ok(Self {
             id: v.id,
-            position: v.position,
-            facing: v.facing,
-            velocity: v.velocity,
+            position: Quantized::array(v.position)?,
+            facing: Quantized::array(v.facing)?,
+            velocity: Quantized::array(v.velocity)?,
             hp: v.hp,
             max_hp: v.max_hp,
             kind: v.kind.into(),
-            windup: v.windup,
-            target: v.target,
+            windup: Quantized::new(v.windup)?,
+            target: Quantized::array(v.target)?,
             warn_radius: v.warn_radius,
             phase: v.phase,
             slowed: v.slowed,
-            hit_flash: v.hit_flash,
+            hit_flash: Quantized::new(v.hit_flash)?,
         })
     }
     fn restore(&self) -> Result<Self::Model, SchemaError> {
         let v = Self::Model {
             id: self.id,
-            position: self.position,
-            facing: self.facing,
-            velocity: self.velocity,
+            position: Quantized::values(self.position),
+            facing: Quantized::values(self.facing),
+            velocity: Quantized::values(self.velocity),
             hp: self.hp,
             max_hp: self.max_hp,
             kind: self.kind.clone().into(),
-            windup: self.windup,
-            target: self.target,
+            windup: self.windup.get(),
+            target: Quantized::values(self.target),
             warn_radius: self.warn_radius,
             phase: self.phase,
             slowed: self.slowed,
-            hit_flash: self.hit_flash,
+            hit_flash: self.hit_flash.get(),
         };
         game::PublicReplica::Enemy(v).validate().map_err(invalid)?;
         Ok(v)
     }
 }
-engine_net::schema! {pub(super) struct Projectile(SchemaId(0x1106),2,Representation::PublicPresentation) {
+engine_net::schema! {pub(super) struct Projectile(SchemaId(0x1106),3,Representation::PublicPresentation) {
     1=>id:u64=1=>p(Units::Unitless,U64),
     2=>owner:Option<u64>=None=>p(Units::Unitless,U64),
-    3=>position:[f32;2]=[0.0;2]=>linear(Units::Metres,F),
-    4=>direction:[f32;2]=[0.0,-1.0]=>p(Units::Unitless,F),
+    3=>position:[Metres;2]=[Metres::ZERO;2]=>linear(Units::Metres,F),
+    4=>direction:[Direction;2]=[Direction::ZERO;2]=>p(Units::Unitless,F),
     5=>radius:f32=0.1=>p(Units::Metres,NONNEG),
     6=>friendly:bool=true=>p(Units::Unitless,Range::None),
     7=>essence:Option<Essence>=None=>p(Units::Unitless,Range::None),
     8=>speed:f32=0.0=>p(Units::Custom("metres/second"),NONNEG),
-    9=>remaining:f32=0.0=>p(Units::Seconds,NONNEG),
+    9=>remaining:Seconds=Seconds::ZERO=>p(Units::Seconds,NONNEG),
     10=>max_distance:Option<f32>=None=>p(Units::Metres,NONNEG),
 }}
 impl Root for Projectile {
@@ -175,10 +209,10 @@ impl Root for Projectile {
         Ok(Self {
             id: v.id,
             owner: v.owner,
-            position: v.position,
-            direction: v.direction,
+            position: Quantized::array(v.position)?,
+            direction: Quantized::array(v.direction)?,
             speed: v.speed,
-            remaining: v.remaining,
+            remaining: Quantized::new(v.remaining)?,
             max_distance: v.max_distance,
             radius: v.radius,
             friendly: v.friendly,
@@ -189,10 +223,10 @@ impl Root for Projectile {
         let v = Self::Model {
             id: self.id,
             owner: self.owner,
-            position: self.position,
-            direction: self.direction,
+            position: Quantized::values(self.position),
+            direction: Quantized::values(self.direction),
             speed: self.speed,
-            remaining: self.remaining,
+            remaining: self.remaining.get(),
             max_distance: self.max_distance,
             radius: self.radius,
             friendly: self.friendly,
@@ -204,13 +238,13 @@ impl Root for Projectile {
         Ok(v)
     }
 }
-engine_net::schema! {pub(super) struct Wisp(SchemaId(0x1107),2,Representation::PublicPresentation) {
+engine_net::schema! {pub(super) struct Wisp(SchemaId(0x1107),3,Representation::PublicPresentation) {
     1=>id:u64=1=>p(Units::Unitless,U64),
     2=>owner:Option<u64>=None=>p(Units::Unitless,U64),
-    3=>position:[f32;2]=[0.0;2]=>linear(Units::Metres,F),
-    4=>remaining:f32=0.0=>p(Units::Seconds,NONNEG),
+    3=>position:[Metres;2]=[Metres::ZERO;2]=>linear(Units::Metres,F),
+    4=>remaining:Seconds=Seconds::ZERO=>p(Units::Seconds,NONNEG),
     5=>essence:Option<Essence>=None=>p(Units::Unitless,Range::None),
-    6=>velocity:[f32;2]=[0.0;2]=>p(Units::Custom("metres/second"),F),
+    6=>velocity:[Speed;2]=[Speed::ZERO;2]=>p(Units::Custom("metres/second"),F),
 }}
 impl Root for Wisp {
     type Model = game::PublicWispView;
@@ -219,9 +253,9 @@ impl Root for Wisp {
         Ok(Self {
             id: v.id,
             owner: v.owner,
-            position: v.position,
-            velocity: v.velocity,
-            remaining: v.remaining,
+            position: Quantized::array(v.position)?,
+            velocity: Quantized::array(v.velocity)?,
+            remaining: Quantized::new(v.remaining)?,
             essence: v.essence.map(Into::into),
         })
     }
@@ -229,33 +263,47 @@ impl Root for Wisp {
         let v = Self::Model {
             id: self.id,
             owner: self.owner,
-            position: self.position,
-            velocity: self.velocity,
-            remaining: self.remaining,
+            position: Quantized::values(self.position),
+            velocity: Quantized::values(self.velocity),
+            remaining: self.remaining.get(),
             essence: self.essence.map(Into::into),
         };
         game::PublicReplica::Wisp(v).validate().map_err(invalid)?;
         Ok(v)
     }
 }
-copy_schema!(Damage,game::PublicDamageView,0x1109,{
+engine_net::schema! {pub(super) struct Damage(SchemaId(0x1109),2,Representation::PublicPresentation) {
     1=>id:u64=1=>p(Units::Unitless,U64),
-    2=>position:[f32;2]=[0.0;2]=>linear(Units::Metres,F),
+    2=>position:[Metres;2]=[Metres::ZERO;2]=>linear(Units::Metres,F),
     3=>amount:f32=0.0=>p(Units::Unitless,NONNEG),
     4=>critical:bool=false=>p(Units::Unitless,Range::None),
     5=>friendly:bool=false=>p(Units::Unitless,Range::None),
-    6=>age:f32=0.0=>p(Units::Seconds,NONNEG),
-});
+    6=>age:Seconds=Seconds::ZERO=>p(Units::Seconds,NONNEG),
+}}
 impl Root for Damage {
     type Model = game::PublicDamageView;
     fn capture(v: &Self::Model) -> Result<Self, SchemaError> {
         game::PublicReplica::Damage(*v)
             .validate()
             .map_err(invalid)?;
-        Ok(v.into())
+        Ok(Self {
+            id: v.id,
+            position: Quantized::array(v.position)?,
+            amount: v.amount,
+            critical: v.critical,
+            friendly: v.friendly,
+            age: Quantized::new(v.age)?,
+        })
     }
     fn restore(&self) -> Result<Self::Model, SchemaError> {
-        let v: Self::Model = self.clone().into();
+        let v = Self::Model {
+            id: self.id,
+            position: Quantized::values(self.position),
+            amount: self.amount,
+            critical: self.critical,
+            friendly: self.friendly,
+            age: self.age.get(),
+        };
         game::PublicReplica::Damage(v).validate().map_err(invalid)?;
         Ok(v)
     }
@@ -295,10 +343,10 @@ impl From<GraphicId> for engine_core::GraphicsId {
         }
     }
 }
-engine_net::schema! {pub(super) struct Effect(SchemaId(0x1108),1,Representation::PublicPresentation) {
+engine_net::schema! {pub(super) struct Effect(SchemaId(0x1108),2,Representation::PublicPresentation) {
     1=>id:GraphicId=GraphicId::defaults()=>p(Units::Unitless,Range::None),
     2=>kind:GraphicKind=GraphicKind::RadialPulse(())=>p(Units::Unitless,Range::None),
-    3=>position:[f32;2]=[0.0;2]=>linear(Units::Metres,F),
+    3=>position:[Metres;2]=[Metres::ZERO;2]=>linear(Units::Metres,F),
     4=>radius:f32=0.0=>p(Units::Metres,NONNEG),
     5=>age_ticks:u32=0=>p(Units::Ticks,U32),
     6=>duration_ticks:u32=1=>p(Units::Ticks,U32),
@@ -312,7 +360,7 @@ impl Root for Effect {
         Ok(Self {
             id: (&v.id).into(),
             kind: v.kind.into(),
-            position: v.position,
+            position: Quantized::array(v.position)?,
             radius: v.radius,
             age_ticks: v.age_ticks,
             duration_ticks: v.duration_ticks,
@@ -322,7 +370,7 @@ impl Root for Effect {
         let v = Self::Model {
             id: self.id.clone().into(),
             kind: self.kind.clone().into(),
-            position: self.position,
+            position: Quantized::values(self.position),
             radius: self.radius,
             age_ticks: self.age_ticks,
             duration_ticks: self.duration_ticks,

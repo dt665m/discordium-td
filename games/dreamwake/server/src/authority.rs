@@ -1,17 +1,13 @@
 //! Authenticated Dreamwake admission, fixed-tick commands and scoped publication.
 #[cfg(test)]
 mod arrival_tests;
-mod baselines;
 mod combat;
-#[cfg(test)]
-mod finalization_tests;
 #[cfg(test)]
 mod health_tests;
 #[cfg(test)]
 mod outcome_tests;
 mod outcomes;
 mod ownership;
-mod path;
 mod peer;
 mod publish;
 #[cfg(test)]
@@ -36,8 +32,6 @@ use std::{
 const MAX_PENDING_ACTIONS: usize = 32;
 const MAX_MESSAGES_PER_TICK: usize = 64;
 const APPLICATION_FRAME_BYTES: u16 = live::APPLICATION_FRAME_BYTES as u16;
-#[cfg(test)]
-const OWNER_GROUP_MEMBERS: usize = live::baselines::MIN_MEMBERS;
 const SCENE: SceneRevision = SceneRevision(1);
 fn failure(error: impl std::fmt::Debug) -> String {
     format!("{error:?}")
@@ -61,7 +55,6 @@ pub(crate) struct DreamAuthority {
     seed: u64,
     lucid: bool,
     replication_distance: f32,
-    compression: engine_net::CompressionPolicy,
     notices: VecDeque<(u64, &'static str)>,
     failed: BTreeSet<u64>,
     pending_admissions: BTreeSet<u64>,
@@ -73,7 +66,7 @@ pub(crate) struct DreamAuthority {
     overloaded: bool,
 }
 pub(crate) fn connection_config() -> renet::ConnectionConfig {
-    wire::server_connection_config()
+    wire::connection_config()
 }
 
 impl DreamAuthority {
@@ -85,27 +78,11 @@ impl DreamAuthority {
     pub(crate) fn new(seed: u64, lucid: bool, max_clients: usize) -> Self {
         Self::with_replication_distance(seed, lucid, max_clients, 80.0)
     }
-    #[cfg(test)]
     pub(crate) fn with_replication_distance(
         seed: u64,
         lucid: bool,
         max_clients: usize,
         replication_distance: f32,
-    ) -> Self {
-        Self::with_replication_policy(
-            seed,
-            lucid,
-            max_clients,
-            replication_distance,
-            engine_net::CompressionPolicy::default(),
-        )
-    }
-    pub(crate) fn with_replication_policy(
-        seed: u64,
-        lucid: bool,
-        max_clients: usize,
-        replication_distance: f32,
-        compression: engine_net::CompressionPolicy,
     ) -> Self {
         assert!(replication_distance.is_finite() && (4.0..=80.0).contains(&replication_distance));
         let mut sim = DreamSimulation::new(seed, lucid);
@@ -120,7 +97,7 @@ impl DreamAuthority {
                 }
             },
             peers: BTreeMap::new(),
-            replication: Self::graph(1, replication_distance, compression),
+            replication: Self::graph(1, replication_distance),
             epoch: 1,
             next_connection: ConnectionEpoch(1),
             tick: ServerTick(0),
@@ -130,7 +107,6 @@ impl DreamAuthority {
             seed,
             lucid,
             replication_distance,
-            compression,
             notices: VecDeque::new(),
             failed: BTreeSet::new(),
             pending_admissions: BTreeSet::new(),
@@ -142,12 +118,8 @@ impl DreamAuthority {
             overloaded: false,
         }
     }
-    fn graph(
-        epoch: u32,
-        distance: f32,
-        compression: engine_net::CompressionPolicy,
-    ) -> DreamReplication {
-        DreamReplication::with_compression(
+    fn graph(epoch: u32, distance: f32) -> DreamReplication {
+        DreamReplication::new(
             epoch,
             f64::from(distance),
             engine_net::interest::Limits {
@@ -157,7 +129,6 @@ impl DreamAuthority {
                 prefetch: 0.0,
                 ..Default::default()
             },
-            compression,
         )
         .expect("fixed Dreamwake graph limits")
     }
@@ -168,7 +139,7 @@ impl DreamAuthority {
             Some(epoch) => epoch.checked_next().ok_or("Ownership epoch exhausted")?,
             None => OwnershipEpoch(1),
         };
-        let (global_entity, owner_entity, collision_entity) = self
+        let (global_entity, owner_entity) = self
             .replication
             .reserve_owner(player.get())
             .map_err(failure)?;
@@ -191,7 +162,6 @@ impl DreamAuthority {
                 content: live::ContentIdentity::current(SCENE),
                 global_entity,
                 owner_entity,
-                collision_entity,
                 application_frame_bytes: APPLICATION_FRAME_BYTES,
             },
             self.now,
@@ -251,47 +221,6 @@ impl DreamAuthority {
             self.sim.set_paused(false);
         }
     }
-    fn resync(&mut self, id: u64) -> Result<(), String> {
-        self.cancel_handoffs_for(id);
-        let peer = self.peers.get(&id).ok_or("Unknown peer")?;
-        let mut attempts = peer.resync_attempts.clone();
-        attempts.retain(|attempt| self.now.saturating_sub(*attempt) < Duration::from_secs(30));
-        if attempts.len() >= 3 {
-            // Recovery is rate limited, never refused. Ending the session
-            // would not make the next attempt succeed, so postpone it until
-            // the window allows and keep the player in the match meanwhile.
-            self.peers
-                .get_mut(&id)
-                .ok_or("Unknown peer")?
-                .resync_deferred = true;
-            return Ok(());
-        }
-        attempts.push_back(self.now);
-        let count = peer.resyncs.saturating_add(1);
-        if let Some(peer) = self.peers.get(&id) {
-            self.outcomes.close(
-                peer.welcome.player.get(),
-                peer.welcome.stream.epoch,
-                self.tick,
-            );
-        }
-        self.replication
-            .disconnect(id, self.tick)
-            .map_err(failure)?;
-        let player = self.peers[&id].welcome.player;
-        let initial_deadline =
-            (!self.peers[&id].activation_committed).then_some(self.peers[&id].initial_deadline);
-        let mut peer = self.make_peer(id, player)?;
-        if let Some(deadline) = initial_deadline {
-            peer.initial_deadline = deadline;
-        }
-        peer.interrupt_charge_pending = true;
-        peer.resyncs = count;
-        peer.resync_attempts = attempts;
-        peer.activation_committed = self.sim.player_is_active(player.get());
-        self.peers.insert(id, peer);
-        Ok(())
-    }
     fn receive_control(
         &mut self,
         id: u64,
@@ -299,14 +228,6 @@ impl DreamAuthority {
         server: &mut RenetServer,
     ) -> Result<(), String> {
         match control {
-            live::ClientControl::FinalizedAck { through } => {
-                self.peers
-                    .get_mut(&id)
-                    .ok_or("Unknown peer")?
-                    .finalized_batches
-                    .acknowledge(through)
-                    .map_err(failure)?;
-            }
             live::ClientControl::OutcomesAck { through } => {
                 self.peers
                     .get_mut(&id)
@@ -344,120 +265,6 @@ impl DreamAuthority {
                     )
                     .map_err(failure)?;
             }
-            live::ClientControl::Decoded { receipts } => {
-                let peer = self.peers.get(&id).ok_or("Unknown peer")?;
-                if let Some(scopes) = self.replication.scopes_mut(id) {
-                    for receipt in receipts.as_slice() {
-                        if !peer.owner_group_entities().contains(&receipt.scope.entity) {
-                            let _ = scopes.acknowledge(*receipt);
-                        }
-                    }
-                }
-            }
-            live::ClientControl::OwnerDecoded { proofs } => {
-                let peer = self.peers.get_mut(&id).ok_or("Unknown peer")?;
-                if !peer.ready {
-                    return Ok(());
-                }
-                let Some(scopes) = self.replication.scopes_mut(id) else {
-                    return Ok(());
-                };
-                if !peer.baselines.validate_proofs(proofs.as_slice())?
-                    || proofs
-                        .as_slice()
-                        .iter()
-                        .any(|proof| scopes.validate_acknowledgment(proof.state).is_err())
-                {
-                    return Ok(());
-                }
-                peer.baselines.acknowledge(proofs.as_slice())?;
-                for proof in proofs.as_slice() {
-                    let receipt = &proof.state;
-                    if scopes.acknowledge(*receipt).is_ok() {
-                        if receipt.scope.entity == peer.welcome.owner_entity {
-                            peer.combat.decoded(*receipt);
-                        }
-                        if let Some(group) = &mut peer.frozen {
-                            if group.receipts.contains(receipt) {
-                                group.decoded.insert(receipt.scope.entity);
-                            }
-                        }
-                    }
-                }
-                if peer
-                    .frozen
-                    .as_ref()
-                    .is_some_and(|group| group.decoded.len() == group.receipts.len())
-                {
-                    let group = peer.frozen.take().expect("complete frozen group");
-                    if !peer.active {
-                        if !group.active_state {
-                            peer.activate_pending = true;
-                            return Ok(());
-                        }
-                        peer.active = true;
-                        let owner_snapshot = group
-                            .receipts
-                            .iter()
-                            .find(|state| state.scope.entity == peer.welcome.owner_entity)
-                            .ok_or("Missing owner proof")?
-                            .snapshot;
-                        publish::control(
-                            server,
-                            id,
-                            peer,
-                            &live::ServerControl::Active {
-                                owner_snapshot,
-                                through: self.tick,
-                            },
-                        )?;
-                    }
-                }
-            }
-            live::ClientControl::BaselineRetire { requests } => {
-                let peer = self.peers.get_mut(&id).ok_or("Unknown peer")?;
-                if let Some(fences) = peer.baselines.retire(requests.as_slice())? {
-                    // A duplicate fence, or a fence unrelated to the retained
-                    // transfer's bases, must not restart that transfer's deadline.
-                    if peer.frozen.as_ref().is_some_and(|group| {
-                        group.bases.iter().any(|base| {
-                            fences.iter().any(|fence| {
-                                fence.context == base.context
-                                    && fence.generation == base.generation
-                                    && base.snapshot <= fence.through
-                            })
-                        })
-                    }) {
-                        peer.frozen = None;
-                    }
-                    publish::control(
-                        server,
-                        id,
-                        peer,
-                        &live::ServerControl::BaselineRetired {
-                            fences: BoundedVec::new(fences).map_err(failure)?,
-                        },
-                    )?;
-                }
-            }
-            live::ClientControl::BaselineRepair { requests } => {
-                let peer = self.peers.get_mut(&id).ok_or("Unknown peer")?;
-                let reset_was_pending = peer.baselines.reset_pending.is_some();
-                peer.baselines.repair(requests.as_slice())?;
-                if !reset_was_pending && peer.baselines.reset_pending.is_some() {
-                    peer.frozen = None;
-                }
-            }
-            live::ClientControl::Exited(exit) => {
-                if let Some(scopes) = self.replication.scopes_mut(id) {
-                    let _ = scopes.acknowledge_exit(exit);
-                }
-            }
-            live::ClientControl::Destroyed(destroy) => {
-                if let Some(scopes) = self.replication.scopes_mut(id) {
-                    let _ = scopes.acknowledge_destroy(destroy);
-                }
-            }
             live::ClientControl::Menu { sequence, action } => {
                 let peer = self.peers.get_mut(&id).ok_or("Unknown peer")?;
                 if peer.active {
@@ -478,25 +285,14 @@ impl DreamAuthority {
                     },
                 )?;
             }
-            live::ClientControl::Resync { reason, detail } => {
-                // The only signal for why an otherwise healthy session keeps
-                // rebuilding itself. Three of these inside the sliding window
-                // end the connection, so discarding it left that outcome with
-                // no attributable cause.
-                log::warn!(
-                    "Dreamwake resync peer {id}: {reason:?} \"{}\" (recent attempts {})",
-                    detail.as_str(),
-                    self.peers
-                        .get(&id)
-                        .map_or(0, |peer| peer.resync_attempts.len()),
-                );
-                self.resync(id)?;
-            }
         }
         Ok(())
     }
-    fn receive_bundle(&mut self, id: u64, bundle: live::CommandBundle) -> Result<(), String> {
+    fn receive_input(&mut self, id: u64, packet: live::InputPacket) -> Result<(), String> {
         let peer = self.peers.get_mut(&id).ok_or("Unknown peer")?;
+        // Acknowledgements count before activation: they are how it happens.
+        peer.stream.acknowledge(packet.ack).map_err(failure)?;
+        peer.combat.acknowledge(packet.ack);
         if !peer.active {
             return Ok(());
         }
@@ -506,7 +302,8 @@ impl DreamAuthority {
             return Err("Input received during prepared simulation tick".into());
         }
         let rules = Rules(peer.welcome.stream);
-        for command in bundle.records.as_slice() {
+        for record in packet.records.as_slice() {
+            let command = &record.command(peer.welcome.stream);
             // GraphicsId keeps the exact existing u32 command identity. A new
             // stream is required before exhaustion, never a truncating cast.
             if command.sequence.0 > u64::from(u32::MAX) {
@@ -636,6 +433,30 @@ impl DreamAuthority {
         }
         Ok(())
     }
+    /// Deliver commands as one input packet carrying no new acknowledgement.
+    #[cfg(test)]
+    fn receive_commands(
+        &mut self,
+        id: u64,
+        commands: Vec<engine_net::commands::Command<live::TickInput, DreamAction>>,
+    ) -> Result<(), String> {
+        let ack = self
+            .peers
+            .get(&id)
+            .ok_or("Unknown peer")?
+            .stream
+            .acknowledged();
+        self.receive_input(
+            id,
+            live::InputPacket {
+                ack,
+                records: BoundedVec::new(
+                    commands.iter().map(live::InputRecord::from_command).collect(),
+                )
+                .map_err(failure)?,
+            },
+        )
+    }
     fn notice(&mut self, id: u64, text: &'static str) {
         if self.notices.len() < self.max_clients * 8 {
             self.notices.push_back((id, text));
@@ -678,7 +499,7 @@ impl DreamAuthority {
         }
         self.ownership.retain(|id, _| connected.contains(id));
         self.sim.restart_party(self.seed, lucid);
-        self.replication = Self::graph(epoch, self.replication_distance, self.compression);
+        self.replication = Self::graph(epoch, self.replication_distance);
         self.revision = 0;
         let ids: Vec<_> = self.peers.keys().copied().collect();
         for id in ids {
@@ -807,17 +628,13 @@ impl DreamAuthority {
             self.sim.set_paused(false);
         }
         for peer in self.peers.values_mut() {
-            if peer.interrupt_charge_pending {
-                self.sim.interrupt_player_charge(peer.welcome.player.get());
-                peer.interrupt_charge_pending = false;
-            }
             if peer.activate_pending {
                 if peer.welcome.stream.ownership.0 == 1 {
                     self.sim.set_player_active(peer.welcome.player.get(), true);
                 } else {
                     self.sim.resume_player(peer.welcome.player.get());
                 }
-                peer.activation_committed = true;
+                peer.active = true;
                 peer.activate_pending = false;
             }
         }
@@ -949,6 +766,7 @@ impl DreamAuthority {
                                         )
                                         .and_then(|arrival| {
                                             peer.combat.validate(
+                                                peer.welcome.stream.epoch,
                                                 view,
                                                 arrival,
                                                 context.tick,
@@ -999,6 +817,7 @@ impl DreamAuthority {
                         {
                             if !overloaded && peer.active && explicit.len() < 64 {
                                 if let Ok((query, gameplay, fraction, _)) = peer.combat.validate(
+                                    peer.welcome.stream.epoch,
                                     sample.view,
                                     arrival,
                                     context.tick,
@@ -1147,12 +966,11 @@ impl engine_server::Authority for DreamAuthority {
             .values()
             .any(|peer| peer.welcome.player == player && peer.welcome.client.0 != id)
         {
-            // A peer that never committed activation holds no participation,
-            // health, progression or readiness by contract, so preserving it
-            // protects nothing. Refusing the newcomer instead strands the
-            // profile until the stalled bootstrap expires, and every retry
-            // spends one of its three resynchronizations. Displace the pending
-            // peer so a fresh stream can bootstrap immediately.
+            // A peer that never activated holds no participation, health,
+            // progression or readiness by contract, so preserving it protects
+            // nothing. Refusing the newcomer instead strands the profile until
+            // the stalled connection times out. Displace the pending peer so a
+            // fresh stream can join immediately.
             let stalled: Vec<u64> = self
                 .peers
                 .values()
@@ -1160,7 +978,6 @@ impl engine_server::Authority for DreamAuthority {
                     peer.welcome.player == player
                         && peer.welcome.client.0 != id
                         && !peer.active
-                        && !peer.activation_committed
                 })
                 .map(|peer| peer.welcome.client.0)
                 .collect();
@@ -1205,15 +1022,14 @@ impl engine_server::Authority for DreamAuthority {
         for id in ids {
             for channel in [wire::CONTROL_CHANNEL, wire::INPUT_CHANNEL] {
                 for _ in 0..MAX_MESSAGES_PER_TICK {
-                    // A legal compact publication can return many reliable
-                    // decode proofs in one network wakeup. Preserve their
-                    // bounded queue until the next committed tick's work budget.
+                    // Bound work per tick; anything beyond waits in Renet for
+                    // the next committed tick.
                     if self.peers[&id].messages >= MAX_MESSAGES_PER_TICK {
                         break;
                     }
-                    // Reserve work for a full bounded bundle before dequeueing.
-                    // Network wakeups may accumulate legal redundant inputs while
-                    // simulation is stalled; drain them over committed ticks.
+                    // Reserve work for a full input packet before dequeueing.
+                    // Network wakeups may accumulate redundant input while
+                    // simulation is stalled; drain it over committed ticks.
                     if channel == wire::INPUT_CHANNEL
                         && self.peers[&id].input_messages
                             >= engine_net::commands::CommandLimits::default().submissions_per_tick
@@ -1245,8 +1061,8 @@ impl engine_server::Authority for DreamAuthority {
                             Err(error) => Err(failure(error)),
                         }
                     } else {
-                        match live::decode_commands(&bytes, epoch, limit) {
-                            Ok(message) => self.receive_bundle(id, message),
+                        match live::decode_input(&bytes, epoch, limit) {
+                            Ok(message) => self.receive_input(id, message),
                             Err(engine_net::codec::CodecError::WrongEpoch) => Ok(()),
                             Err(error) => Err(failure(error)),
                         }

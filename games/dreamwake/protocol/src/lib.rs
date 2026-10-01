@@ -7,8 +7,7 @@ pub use engine_net::{
 use serde::{Deserialize, Serialize};
 pub mod live;
 pub mod player;
-pub mod replication;
-pub const PROTOCOL_ID: u64 = 0x4452_4541_4d00_001b;
+pub const PROTOCOL_ID: u64 = 0x4452_4541_4d00_001c;
 pub const SESSION_SERVICE: &str = "dreamwake";
 pub const SESSION_MATCH: &str = "default";
 pub const DEFAULT_MAX_PLAYERS: usize = 8;
@@ -18,49 +17,30 @@ pub const SNAPSHOT_HZ: u32 = 20;
 pub const TICKS_PER_SNAPSHOT: u32 = dreamwake_sim::TICK_HZ / SNAPSHOT_HZ;
 const _: () = assert!(dreamwake_sim::TICK_HZ.is_multiple_of(SNAPSHOT_HZ));
 
-pub const OWNER_GROUP_CHANNEL: u8 = 1;
-pub const OWNER_GROUP_SEND_BYTES: usize = live::OWNER_GROUP_MESSAGE_BYTES;
-pub const OWNER_GROUP_RECEIVE_BYTES: usize = 128 * 1024;
+/// Reliable controls may queue this much per direction before the sender must
+/// stop adding to them.
 pub const CONTROL_MEMORY_BYTES: usize = 128 * 1024;
-pub const REMOTE_STATE_MEMORY_BYTES: usize = 64 * 1024;
 
-/// Channel order gives controls first use of each stock Renet packetization pass.
-/// Sender payload retention and receiver slice allocation have separate bounds.
+/// Renet carries reliable controls on its ordered channel and every input and
+/// state packet on its unreliable one, with its stock retransmission timers.
+/// Each state or input message normally fits one Renet packet, so Renet does
+/// not slice it and a lost datagram loses one message. Channel order gives
+/// controls first use of each packetization pass.
 pub fn connection_config() -> renet::ConnectionConfig {
     let mut config = engine_net::connection_config();
-    for channel in config.server_channels_config.iter_mut() {
-        channel.max_memory_usage_bytes = match channel.channel_id {
-            OWNER_GROUP_CHANNEL => OWNER_GROUP_RECEIVE_BYTES,
-            CONTROL_CHANNEL => CONTROL_MEMORY_BYTES,
-            _ => REMOTE_STATE_MEMORY_BYTES,
-        };
-    }
-    for channel in config.client_channels_config.iter_mut() {
-        channel.max_memory_usage_bytes = CONTROL_MEMORY_BYTES;
-    }
-    config
-        .server_channels_config
-        .sort_by_key(|channel| match channel.channel_id {
+    for channels in [
+        &mut config.server_channels_config,
+        &mut config.client_channels_config,
+    ] {
+        for channel in channels.iter_mut() {
+            channel.max_memory_usage_bytes = CONTROL_MEMORY_BYTES;
+        }
+        channels.sort_by_key(|channel| match channel.channel_id {
             CONTROL_CHANNEL => 0,
             STATE_CHANNEL => 1,
             _ => 2,
         });
-    config
-}
-
-pub fn server_connection_config() -> renet::ConnectionConfig {
-    let mut config = connection_config();
-    // A 20 Hz publication can queue several remote actors together. Stock Renet
-    // discards unreliable messages beyond this per-flush allowance, so it must
-    // admit the publication burst, not merely one sixtieth of the byte rate.
-    // The separate final-egress pacer charges physical framing and retries.
-    config.available_bytes_per_tick = 7000;
-    config
-        .server_channels_config
-        .iter_mut()
-        .find(|channel| channel.channel_id == OWNER_GROUP_CHANNEL)
-        .expect("default Renet reliable-unordered channel")
-        .max_memory_usage_bytes = OWNER_GROUP_SEND_BYTES;
+    }
     config
 }
 

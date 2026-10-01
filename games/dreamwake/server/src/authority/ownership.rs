@@ -186,12 +186,7 @@ mod tests {
         };
         let key = queued.action_key(0);
         authority
-            .receive_bundle(
-                41,
-                live::CommandBundle {
-                    records: BoundedVec::new(vec![queued]).unwrap(),
-                },
-            )
+            .receive_commands(41, vec![queued])
             .unwrap();
         assert!(authority.outcomes.lookup(41, key).is_none());
         authority.step(Duration::from_millis(34));
@@ -205,8 +200,7 @@ mod tests {
         assert!(next.welcome.stream.ownership > first.stream.ownership);
         assert_eq!(next.welcome.tick, ServerTick(2));
         assert_eq!(next.inbox.finalized_through(), ServerTick(3));
-        assert!(!next.active && !next.ready && !next.activation_committed);
-        assert!(next.welcome_pending && next.frozen.is_none());
+        assert!(!next.active && !next.ready && next.welcome_pending);
         assert!(!authority.sim.player_is_active(41));
         assert_eq!(authority.sim.snapshot_for(41).hero.hp, hp);
         assert!(authority.handoffs.is_empty());
@@ -290,58 +284,5 @@ mod tests {
         assert!(authority.peers.contains_key(&41));
         assert!(!authority.peers.contains_key(&42));
         assert!(authority.handoffs[&41].replacement.is_some());
-    }
-    #[test]
-    fn stream_recovery_interrupts_charge_without_changing_participation_or_resources() {
-        let mut authority = active();
-        authority.begin_run();
-        let first = authority.peers[&41].welcome.clone();
-        let command = engine_net::commands::Command {
-            owner: first.stream,
-            sequence: CommandSeq(1),
-            target: TargetTick(2),
-            input: DreamInput {
-                aim: [1.0, 0.0],
-                ..Default::default()
-            }
-            .into(),
-            actions: BoundedVec::new(vec![engine_net::commands::ActionEdge {
-                slot: 0,
-                action: DreamAction::ChargeBegin,
-            }])
-            .unwrap(),
-        };
-        let key = command.action_key(0);
-        authority
-            .receive_bundle(
-                41,
-                live::CommandBundle {
-                    records: BoundedVec::new(vec![command]).unwrap(),
-                },
-            )
-            .unwrap();
-        authority.step(Duration::from_millis(34));
-        authority.step(Duration::from_millis(51));
-        let before = authority.sim.snapshot_for(41).hero;
-        assert!(before.charge_ticks > 0);
-        let terminal = authority.outcomes.lookup(41, key).unwrap();
-        assert_eq!(terminal.data.status, live::TerminalStatus::Accepted);
-        authority.resync(41).unwrap();
-        // Stream recovery queues gameplay interruption for the next committed
-        // step; the receive handler never rewrites already committed state.
-        assert_eq!(
-            authority.sim.snapshot_for(41).hero.charge_ticks,
-            before.charge_ticks
-        );
-        authority.step(Duration::from_millis(68));
-        let after = authority.sim.snapshot_for(41).hero;
-        assert_eq!(after.charge_ticks, 0);
-        assert!(!after.charge_executing);
-        assert_eq!(after.stamina, before.stamina);
-        assert_eq!(after.charge_cooldown_ticks, before.charge_cooldown_ticks);
-        assert_eq!(after.hp, before.hp);
-        assert!(authority.sim.player_is_active(41));
-        assert!(authority.peers[&41].welcome.stream.epoch > first.stream.epoch);
-        assert_eq!(authority.outcomes.lookup(41, key).unwrap(), terminal);
     }
 }

@@ -1,6 +1,18 @@
-//! Authenticated readiness, immutable commands, scoped state and distinct proofs.
-//! No live message can contain DreamSnapshot or arbitrary simulation components.
-pub mod baselines;
+//! Dreamwake's live messages.
+//!
+//! Three kinds of traffic share the connection:
+//!
+//! * reliable controls in both directions (readiness, menu choices, terminal
+//!   action outcomes, clock probes, notices);
+//! * unreliable client input packets, each carrying the newest commands and
+//!   the oldest ones the server has not yet consumed, plus the client's
+//!   acknowledgement of state packets;
+//! * unreliable server state packets: the owner's status and changed entity
+//!   states, each encoded against the newest state the client acknowledged.
+//!
+//! Nothing here waits for application receipts: the state stream recovers
+//! from loss by itself, and the owner's state in every packet supersedes the
+//! previous one.
 pub mod combat;
 pub use combat::{
     ActionOutcome, ActionOutcomeData, BeamAimSample, CombatViewStamp, OutcomeReason,
@@ -10,23 +22,28 @@ pub use combat::{
 mod tests;
 use crate::{DreamAction, PROTOCOL_ID};
 use dreamwake_sim::{CheckpointIdentity, DreamInput};
-use engine_net::replication::baselines::{BaselineRepair, BaselineReset, BaselineRetirement};
 use engine_net::{
-    codec::{self, BoundedVec, CodecError, FrameHeader, FrameLimit, Lane, Validate},
-    commands::{Command, FinalizedReceipt, OwnerStream},
-    replication::*,
-    schema::BoundedString,
+    codec::{self, BoundedVec, ByteReader, CodecError, FrameHeader, FrameLimit, Lane, Validate},
+    commands::{ActionEdge, Command, OwnerStream},
+    replication::stream::{STREAM_WINDOW, StreamAck},
     types::*,
 };
 use serde::{Deserialize, Serialize};
 
-pub const OWNER_GROUP: GroupId = GroupId(1);
-/// Whole-message allowance on the reliable-unordered owner channel.
-pub const OWNER_GROUP_MESSAGE_BYTES: usize = 64 * 1024;
-/// Public actors and controls remain small messages under stock Renet's slice size.
+/// Largest application frame, including the frame header. It keeps every
+/// message inside one Renet packet, so one lost datagram loses one message.
 pub const APPLICATION_FRAME_BYTES: usize = 1100;
-const WELCOME_MAGIC: &[u8; 4] = b"DW16";
+const WELCOME_MAGIC: &[u8; 4] = b"DW17";
 pub const WELCOME_BYTES: usize = 1024;
+/// Commands per input packet: the newest, the two before it, and the oldest
+/// ones the server has not consumed yet.
+pub const MAX_INPUT_RECORDS: usize = 6;
+/// A state packet is normally kept within [`APPLICATION_FRAME_BYTES`]; one
+/// entity's whole state that alone exceeds it, such as a joining owner's
+/// first checkpoint, travels in a larger packet that Renet slices.
+pub const MAX_STATE_FRAME_BYTES: usize = 32 * 1024;
+pub const MAX_STATE_ENTRIES: usize = 255;
+pub const MAX_STATE_REMOVALS: usize = 255;
 
 /// A first effective command arrival, tied to the immutable command that caused
 /// it. Server-observed values never include client-supplied lead policy metadata.
@@ -113,9 +130,10 @@ pub struct Welcome {
     pub tick: ServerTick,
     pub server_time_nanos: u64,
     pub content: ContentIdentity,
+    /// The stream entity carrying the match summary.
     pub global_entity: EntityId,
+    /// The stream entity carrying this connection's own hero.
     pub owner_entity: EntityId,
-    pub collision_entity: EntityId,
     pub application_frame_bytes: u16,
 }
 impl Validate for Welcome {
@@ -131,9 +149,6 @@ impl Validate for Welcome {
             || self.match_epoch == 0
             || self.global_entity.generation == 0
             || self.owner_entity.generation == 0
-            || self.collision_entity.generation == 0
-            || self.collision_entity == self.global_entity
-            || self.collision_entity == self.owner_entity
             || self.owner_entity == self.global_entity
             || self.content.scene_revision.0 == 0
         {
@@ -175,22 +190,8 @@ pub fn decode_welcome(bytes: &[u8]) -> Result<Welcome, CodecError> {
     codec::decode_payload(&bytes[4..], WELCOME_BYTES - 4)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ResyncReason {
-    MissingHistory,
-    MissingDependency,
-    ReplayBudget,
-    MissingScope,
-    ExpiredGroup,
-    InvalidCheckpoint,
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ClientControl {
-    /// Delivery feedback for a validated Finalized batch, never execution proof.
-    FinalizedAck {
-        through: ServerTick,
-    },
     OutcomesAck {
         through: u64,
     },
@@ -201,36 +202,14 @@ pub enum ClientControl {
     Ready {
         content: ContentIdentity,
     },
-    Decoded {
-        receipts: BoundedVec<StateReceipt, 12>,
-    },
-    OwnerDecoded {
-        proofs: BoundedVec<baselines::DecodedBaseline, { baselines::MEMBERS }>,
-    },
-    BaselineRetire {
-        requests: BoundedVec<BaselineRetirement, { baselines::MEMBERS }>,
-    },
-    BaselineRepair {
-        requests: BoundedVec<BaselineRepair, { baselines::MEMBERS }>,
-    },
-    Exited(ScopeExit),
-    Destroyed(Destroy),
     /// Menu transactions have reliable ordered delivery. Tick-critical actions
-    /// are only legal in target-tick command bundles below.
+    /// are only legal in target-tick command records.
     Menu {
         sequence: CommandSeq,
         action: DreamAction,
     },
     ClockProbe {
         client_send_nanos: u64,
-    },
-    Resync {
-        reason: ResyncReason,
-        /// The fault as the client observed it. The typed reason groups these
-        /// for policy; this says which one actually happened, because a
-        /// deployed browser's own log is unreadable from the server and three
-        /// of these inside the sliding window end the connection.
-        detail: BoundedString<96>,
     },
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -242,24 +221,6 @@ pub enum ServerControl {
     OutcomeUnavailable {
         keys: BoundedVec<ActionKey, 8>,
     },
-    BaselineRetired {
-        fences: BoundedVec<BaselineRetirement, { baselines::MEMBERS }>,
-    },
-    BaselineReset {
-        resets: BoundedVec<BaselineReset, { baselines::MEMBERS }>,
-    },
-    Finalized {
-        through: ServerTick,
-        receipts: BoundedVec<FinalizedReceipt, 32>,
-        menu_applied: Option<CommandSeq>,
-        arrival: ArrivalFeedback,
-    },
-    Active {
-        owner_snapshot: SnapshotId,
-        through: ServerTick,
-    },
-    Exit(ScopeExit),
-    Destroy(Destroy),
     ClockReply {
         client_send_nanos: u64,
         server_receive_nanos: u64,
@@ -270,25 +231,9 @@ pub enum ServerControl {
         utf8: BoundedVec<u8, 512>,
     },
 }
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct CommandBundle {
-    pub records: BoundedVec<Command<TickInput, DreamAction>, 8>,
-}
 
 fn invalid(message: &str) -> CodecError {
     CodecError::InvalidPayload(message.into())
-}
-fn valid_scope(scope: ScopeIdentity) -> bool {
-    scope.connection.0 != 0
-        && scope.entity.generation != 0
-        && scope.scope.0 != 0
-        && scope.representation.0 != 0
-}
-fn valid_receipt(receipt: &StateReceipt) -> bool {
-    valid_scope(receipt.scope)
-        && receipt.snapshot.0 != 0
-        && receipt.baseline_generation.0 != 0
-        && receipt.version.0 != 0
 }
 pub fn valid_direction(direction: [f32; 2]) -> bool {
     direction.iter().all(|v| v.is_finite())
@@ -338,73 +283,16 @@ fn valid_menu(action: &DreamAction) -> bool {
         _ => true,
     }
 }
-impl Validate for CommandBundle {
-    fn validate(&self) -> Result<(), CodecError> {
-        if self.records.is_empty() {
-            return Err(invalid("empty command bundle"));
-        }
-        for command in self.records.as_slice() {
-            let owner = command.owner;
-            if owner.connection.0 == 0
-                || owner.epoch.0 == 0
-                || owner.owner.generation == 0
-                || owner.stream.0 == 0
-                || owner.ownership.0 == 0
-                || command.sequence.0 == 0
-                || command.target.0 == 0
-                || !valid_tick_input(&command.input)
-            {
-                return Err(invalid("invalid command"));
-            }
-            let mut slots = 0_u8;
-            for edge in command.actions.as_slice() {
-                if edge.slot >= 8
-                    || slots & (1 << edge.slot) != 0
-                    || !valid_tick_action(&edge.action)
-                {
-                    return Err(invalid("invalid action edge"));
-                }
-                slots |= 1 << edge.slot;
-            }
-        }
-        Ok(())
-    }
-}
 impl Validate for ClientControl {
     fn validate(&self) -> Result<(), CodecError> {
         let valid = match self {
-            Self::FinalizedAck { through } => through.0 != 0,
             Self::OutcomesAck { through } => *through != 0,
             Self::OutcomeLookup { keys } => {
                 !keys.is_empty() && keys.as_slice().iter().all(combat::valid_action_key)
             }
             Self::Ready { content } => content.scene_revision.0 != 0,
-            Self::Decoded { receipts } => {
-                !receipts.is_empty() && receipts.as_slice().iter().all(valid_receipt)
-            }
-            Self::OwnerDecoded { proofs } => {
-                baselines::valid_member_count(proofs.len())
-                    && proofs.as_slice().iter().all(baselines::valid_proof)
-            }
-            Self::BaselineRetire { requests } => {
-                !requests.is_empty()
-                    && requests.as_slice().iter().all(|r| {
-                        baselines::valid_context(r.context)
-                            && r.generation.0 != 0
-                            && r.through.0 != 0
-                    })
-            }
-            Self::BaselineRepair { requests } => {
-                !requests.is_empty()
-                    && requests
-                        .as_slice()
-                        .iter()
-                        .all(|r| baselines::valid_context(r.context) && r.generation.0 != 0)
-            }
-            Self::Exited(exit) => valid_scope(exit.scope),
-            Self::Destroyed(destroy) => destroy.connection.0 != 0 && destroy.entity.generation != 0,
             Self::Menu { sequence, action } => sequence.0 != 0 && valid_menu(action),
-            _ => true,
+            Self::ClockProbe { .. } => true,
         };
         if valid {
             Ok(())
@@ -427,45 +315,6 @@ impl Validate for ServerControl {
             Self::OutcomeUnavailable { keys } => {
                 !keys.is_empty() && keys.as_slice().iter().all(combat::valid_action_key)
             }
-            Self::BaselineRetired { fences } => {
-                !fences.is_empty()
-                    && fences.as_slice().iter().all(|r| {
-                        baselines::valid_context(r.context)
-                            && r.generation.0 != 0
-                            && r.through.0 != 0
-                    })
-            }
-            Self::BaselineReset { resets } => {
-                !resets.is_empty()
-                    && resets
-                        .as_slice()
-                        .iter()
-                        .all(|r| baselines::valid_context(r.context) && r.generation.0 != 0)
-            }
-            Self::Finalized {
-                through,
-                receipts,
-                arrival,
-                ..
-            } => {
-                arrival.validate()
-                    && !receipts.is_empty()
-                    && receipts
-                        .as_slice()
-                        .last()
-                        .is_some_and(|receipt| receipt.tick == *through)
-                    && receipts
-                        .as_slice()
-                        .iter()
-                        .all(|r| r.tick <= *through && r.sequence.is_none_or(|s| s.0 != 0))
-                    && receipts
-                        .as_slice()
-                        .windows(2)
-                        .all(|pair| pair[0].tick.checked_next() == Some(pair[1].tick))
-            }
-            Self::Active { owner_snapshot, .. } => owner_snapshot.0 != 0,
-            Self::Exit(exit) => valid_scope(exit.scope),
-            Self::Destroy(destroy) => destroy.connection.0 != 0 && destroy.entity.generation != 0,
             Self::ClockReply {
                 server_receive_nanos,
                 server_send_nanos,
@@ -508,20 +357,76 @@ pub fn decode_control<T: serde::de::DeserializeOwned + Validate>(
     }
     codec::decode_payload(&payload, limit.payload_bytes())
 }
-pub fn encode_commands(
-    value: &CommandBundle,
+
+/// One immutable command. Its owner stream is the connection's own, so the
+/// wire carries only what changes from command to command.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InputRecord {
+    pub sequence: CommandSeq,
+    pub target: TargetTick,
+    pub input: TickInput,
+    pub actions: BoundedVec<ActionEdge<DreamAction>, 8>,
+}
+impl InputRecord {
+    pub fn from_command(command: &Command<TickInput, DreamAction>) -> Self {
+        Self {
+            sequence: command.sequence,
+            target: command.target,
+            input: command.input,
+            actions: command.actions.clone(),
+        }
+    }
+    pub fn command(&self, owner: OwnerStream) -> Command<TickInput, DreamAction> {
+        Command {
+            owner,
+            sequence: self.sequence,
+            target: self.target,
+            input: self.input,
+            actions: self.actions.clone(),
+        }
+    }
+    fn valid(&self) -> bool {
+        let mut slots = 0_u8;
+        self.sequence.0 != 0
+            && self.target.0 != 0
+            && valid_tick_input(&self.input)
+            && self.actions.as_slice().iter().all(|edge| {
+                if edge.slot >= 8 || slots & (1 << edge.slot) != 0 {
+                    return false;
+                }
+                slots |= 1 << edge.slot;
+                valid_tick_action(&edge.action)
+            })
+    }
+}
+
+/// Client to server, unreliable, sent every simulation tick the client runs.
+/// A packet with no records still delivers the state acknowledgement.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InputPacket {
+    pub ack: StreamAck,
+    pub records: BoundedVec<InputRecord, MAX_INPUT_RECORDS>,
+}
+impl Validate for InputPacket {
+    fn validate(&self) -> Result<(), CodecError> {
+        let records = self.records.as_slice();
+        if !records.iter().all(InputRecord::valid)
+            || records
+                .iter()
+                .enumerate()
+                .any(|(i, a)| records[..i].iter().any(|b| b.sequence == a.sequence))
+        {
+            return Err(invalid("invalid input packet"));
+        }
+        Ok(())
+    }
+}
+pub fn encode_input(
+    value: &InputPacket,
     epoch: ConnectionEpoch,
     sequence: u32,
     limit: FrameLimit,
 ) -> Result<Vec<u8>, CodecError> {
-    if value
-        .records
-        .as_slice()
-        .iter()
-        .any(|r| r.owner.epoch != epoch)
-    {
-        return Err(CodecError::WrongEpoch);
-    }
     let payload = codec::encode_payload(value, limit.payload_bytes())?;
     codec::encode_frame_deflated(
         FrameHeader {
@@ -533,121 +438,205 @@ pub fn encode_commands(
         limit,
     )
 }
-pub fn decode_commands(
+pub fn decode_input(
     bytes: &[u8],
     epoch: ConnectionEpoch,
     limit: FrameLimit,
-) -> Result<CommandBundle, CodecError> {
+) -> Result<InputPacket, CodecError> {
     let (header, payload) = codec::decode_frame_inflated(bytes, epoch, limit)?;
     if header.lane != Lane::Input {
         return Err(CodecError::InvalidLane);
     }
-    let bundle: CommandBundle = codec::decode_payload(&payload, limit.payload_bytes())?;
-    if bundle
-        .records
-        .as_slice()
-        .iter()
-        .any(|r| r.owner.epoch != epoch)
-    {
-        return Err(CodecError::WrongEpoch);
-    }
-    Ok(bundle)
+    codec::decode_payload(&payload, limit.payload_bytes())
 }
 
-/// Complete game prediction publications include the exact declared dependency
-/// closure; per-member payload bounds remain independent of group capacity.
-pub fn group_limits() -> GroupLimits {
-    GroupLimits {
-        members: baselines::MEMBERS,
-        group_bytes: baselines::GROUP_BYTES,
-        staging_bytes: baselines::GROUP_STAGING_BYTES,
-        incomplete: baselines::GROUP_INCOMPLETE,
-        ..Default::default()
-    }
+/// The owner's command progress, repeated in every state packet so the
+/// newest one received is always current.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OwnerStatus {
+    /// Every command targeting this tick or earlier has been consumed or
+    /// replaced; the client stops sending them.
+    pub finalized: ServerTick,
+    pub menu_applied: Option<CommandSeq>,
+    pub arrival: ArrivalFeedback,
 }
 
-pub enum StateFrame {
-    Full(FullState<Vec<u8>>),
-    Group(GroupChunk<Vec<u8>>),
+/// One entity's state, whole or as changes against the state the stream
+/// named as its base.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateEntry {
+    pub entity: EntityId,
+    pub base: Option<u32>,
+    pub body: Vec<u8>,
+}
+
+/// Server to client, unreliable. Every entry is the entity's state at `tick`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatePacket {
+    /// The stream sequence, carried in the frame header.
+    pub seq: u32,
+    pub tick: ServerTick,
+    pub status: OwnerStatus,
+    pub entries: Vec<StateEntry>,
+    pub removed: Vec<EntityId>,
+}
+
+fn put_entity(out: &mut Vec<u8>, entity: EntityId) {
+    codec::put_varint(out, entity.index);
+    codec::put_varint(out, u64::from(entity.generation));
+}
+fn read_entity(input: &mut ByteReader<'_>) -> Result<EntityId, CodecError> {
+    let entity = EntityId {
+        index: input.varint()?,
+        generation: input.varint_u32()?,
+    };
+    if entity.index == 0 || entity.generation == 0 {
+        return Err(invalid("invalid entity"));
+    }
+    Ok(entity)
+}
+
+impl StatePacket {
+    fn body(&self) -> Result<Vec<u8>, CodecError> {
+        if self.seq == 0
+            || self.entries.len() > MAX_STATE_ENTRIES
+            || self.removed.len() > MAX_STATE_REMOVALS
+            || !self.status.arrival.validate()
+        {
+            return Err(invalid("invalid state packet"));
+        }
+        let mut out = Vec::with_capacity(64);
+        codec::put_varint(&mut out, self.tick.0);
+        codec::put_varint(&mut out, self.status.finalized.0);
+        codec::put_varint(&mut out, self.status.menu_applied.map_or(0, |seq| seq.0));
+        let arrival = &self.status.arrival;
+        codec::put_varint(&mut out, arrival.observed_commands);
+        codec::put_varint(&mut out, arrival.late_commands);
+        match arrival.sample {
+            None => out.push(0),
+            Some(sample) => {
+                out.push(1);
+                codec::put_varint(&mut out, sample.sequence.0);
+                codec::put_varint(&mut out, sample.target.0);
+                codec::put_varint(&mut out, sample.arrival_tick.0);
+                out.push(sample.slack);
+            }
+        }
+        codec::put_varint(&mut out, self.entries.len() as u64);
+        for entry in &self.entries {
+            put_entity(&mut out, entry.entity);
+            // The base is named by its distance back, at most the stream window.
+            let distance = match entry.base {
+                None => 0,
+                Some(base) if base < self.seq && self.seq - base <= STREAM_WINDOW => {
+                    self.seq - base
+                }
+                Some(_) => return Err(invalid("state base outside the window")),
+            };
+            codec::put_varint(&mut out, u64::from(distance));
+            codec::put_varint(&mut out, entry.body.len() as u64);
+            out.extend_from_slice(&entry.body);
+        }
+        codec::put_varint(&mut out, self.removed.len() as u64);
+        for entity in &self.removed {
+            put_entity(&mut out, *entity);
+        }
+        Ok(out)
+    }
+    fn parse(seq: u32, bytes: &[u8]) -> Result<Self, CodecError> {
+        if seq == 0 {
+            return Err(invalid("invalid state sequence"));
+        }
+        let mut input = ByteReader::new(bytes);
+        let tick = ServerTick(input.varint()?);
+        let finalized = ServerTick(input.varint()?);
+        let menu = input.varint()?;
+        let observed_commands = input.varint()?;
+        let late_commands = input.varint()?;
+        let sample = match input.u8()? {
+            0 => None,
+            1 => Some(ArrivalSample {
+                sequence: CommandSeq(input.varint()?),
+                target: TargetTick(input.varint()?),
+                arrival_tick: ServerTick(input.varint()?),
+                slack: input.u8()?,
+            }),
+            _ => return Err(invalid("invalid arrival sample")),
+        };
+        let arrival = ArrivalFeedback {
+            sample,
+            observed_commands,
+            late_commands,
+        };
+        if !arrival.validate() {
+            return Err(invalid("invalid arrival feedback"));
+        }
+        let count = usize::try_from(input.varint()?).map_err(|_| invalid("entry count"))?;
+        if count > MAX_STATE_ENTRIES {
+            return Err(invalid("too many state entries"));
+        }
+        let mut entries = Vec::with_capacity(count);
+        for _ in 0..count {
+            let entity = read_entity(&mut input)?;
+            let distance = input.varint_u32()?;
+            let base = match distance {
+                0 => None,
+                distance if distance <= STREAM_WINDOW && distance < seq => Some(seq - distance),
+                _ => return Err(invalid("state base outside the window")),
+            };
+            let size = usize::try_from(input.varint()?).map_err(|_| invalid("entry size"))?;
+            let body = input.take(size)?.to_vec();
+            entries.push(StateEntry { entity, base, body });
+        }
+        let count = usize::try_from(input.varint()?).map_err(|_| invalid("removal count"))?;
+        if count > MAX_STATE_REMOVALS {
+            return Err(invalid("too many removals"));
+        }
+        let mut removed = Vec::with_capacity(count);
+        for _ in 0..count {
+            removed.push(read_entity(&mut input)?);
+        }
+        input.finish()?;
+        Ok(Self {
+            seq,
+            tick,
+            status: OwnerStatus {
+                finalized,
+                menu_applied: (menu != 0).then_some(CommandSeq(menu)),
+                arrival,
+            },
+            entries,
+            removed,
+        })
+    }
+    /// Frame bytes this packet would occupy before compression.
+    pub fn encoded_len(&self) -> Result<usize, CodecError> {
+        Ok(codec::HEADER_BYTES + self.body()?.len())
+    }
 }
 pub fn encode_state(
-    value: &StateFrame,
+    value: &StatePacket,
     epoch: ConnectionEpoch,
-    sequence: u32,
     limit: FrameLimit,
 ) -> Result<Vec<u8>, CodecError> {
-    encode_state_with(value, epoch, sequence, limit, true)
-}
-/// The frame as sent before deflation, for tests that edit payload bytes.
-#[cfg(test)]
-pub(crate) fn encode_state_uncompressed(
-    value: &StateFrame,
-    epoch: ConnectionEpoch,
-    sequence: u32,
-    limit: FrameLimit,
-) -> Result<Vec<u8>, CodecError> {
-    encode_state_with(value, epoch, sequence, limit, false)
-}
-fn encode_state_with(
-    value: &StateFrame,
-    epoch: ConnectionEpoch,
-    sequence: u32,
-    limit: FrameLimit,
-    deflate: bool,
-) -> Result<Vec<u8>, CodecError> {
-    let (tag, bytes, limit) = match value {
-        StateFrame::Full(state) if state.scope.connection == epoch => (
-            0,
-            encode_compact_full_state(state, limit.payload_bytes().saturating_sub(1)),
-            limit,
-        ),
-        StateFrame::Group(group) if group.publication.connection == epoch => (
-            1,
-            encode_group(group, group_limits(), |payload| Ok(payload.clone())),
-            FrameLimit::new(OWNER_GROUP_MESSAGE_BYTES)?,
-        ),
-        _ => return Err(CodecError::WrongEpoch),
-    };
-    let bytes = bytes.map_err(|_| invalid("invalid scope state"))?;
-    let mut payload = Vec::with_capacity(bytes.len() + 1);
-    payload.push(tag);
-    payload.extend_from_slice(&bytes);
-    let header = FrameHeader {
-        lane: Lane::State,
-        connection: epoch,
-        sequence,
-    };
-    if deflate {
-        codec::encode_frame_deflated(header, &payload, limit)
-    } else {
-        codec::encode_frame(header, &payload, limit)
-    }
+    codec::encode_frame_deflated(
+        FrameHeader {
+            lane: Lane::State,
+            connection: epoch,
+            sequence: value.seq,
+        },
+        &value.body()?,
+        limit,
+    )
 }
 pub fn decode_state(
     bytes: &[u8],
     epoch: ConnectionEpoch,
     limit: FrameLimit,
-) -> Result<StateFrame, CodecError> {
-    let frame_bytes = bytes.len();
-    let (header, bytes) =
-        codec::decode_frame_inflated(bytes, epoch, FrameLimit::new(OWNER_GROUP_MESSAGE_BYTES)?)?;
+) -> Result<StatePacket, CodecError> {
+    let (header, payload) = codec::decode_frame_inflated(bytes, epoch, limit)?;
     if header.lane != Lane::State {
         return Err(CodecError::InvalidLane);
     }
-    let (tag, body) = bytes.split_first().ok_or(CodecError::Truncated)?;
-    match tag {
-        0 if frame_bytes <= limit.payload_bytes() + codec::HEADER_BYTES => {
-            decode_compact_full_state(body, epoch, limit.payload_bytes().saturating_sub(1))
-                .map(StateFrame::Full)
-        }
-        1 => decode_group(body, group_limits(), |payload| Ok(payload.to_vec())).and_then(|group| {
-            if group.publication.connection == epoch {
-                Ok(StateFrame::Group(group))
-            } else {
-                Err(ReplicationError::Stale)
-            }
-        }),
-        _ => Err(ReplicationError::InvalidPayload),
-    }
-    .map_err(|_| invalid("invalid scoped frame"))
+    StatePacket::parse(header.sequence, &payload)
 }

@@ -369,7 +369,7 @@ impl CommittedReplication {
     pub fn project_cover_marker(
         &self,
         id: u64,
-        parent: engine_net::types::ScopeIdentity,
+        parent: engine_net::types::EntityId,
     ) -> Option<PublicCoverMarkerView> {
         let cover = &self.state.covers[*self.index.get(&ReplicationKey::CoverMarker(id))?];
         if !cover.present {
@@ -543,8 +543,8 @@ impl CommittedReplication {
             }
             ReplicationKey::Damage(id) => self.project_damage(id).map(PublicReplica::Damage),
             ReplicationKey::Cover(id) => self.project_cover(id).map(PublicReplica::Cover),
-            // Parent scopes are connection-local and supplied only by the trusted
-            // adapter after both representations are independently eligible.
+            // The parent entity is supplied only by the trusted adapter after
+            // both are independently eligible.
             ReplicationKey::CoverMarker(_) => None,
         }
     }

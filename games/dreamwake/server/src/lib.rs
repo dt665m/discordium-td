@@ -26,22 +26,6 @@ pub fn build_app_with_replication_distance(
     lucid: bool,
     replication_distance: f32,
 ) -> bevy::prelude::App {
-    build_app_with_replication_policy(
-        shared,
-        seed,
-        lucid,
-        replication_distance,
-        engine_net::CompressionPolicy::default(),
-    )
-}
-
-fn build_app_with_replication_policy(
-    shared: engine_server::SharedNet,
-    seed: u64,
-    lucid: bool,
-    replication_distance: f32,
-    compression: engine_net::CompressionPolicy,
-) -> bevy::prelude::App {
     use bevy::{app::ScheduleRunnerPlugin, prelude::*};
     let mut app = App::new();
     app.add_plugins(MinimalPlugins.set(ScheduleRunnerPlugin::run_loop(
@@ -52,7 +36,6 @@ fn build_app_with_replication_policy(
         seed,
         lucid,
         replication_distance,
-        compression,
     });
     app
 }
@@ -74,23 +57,6 @@ pub fn authorize_controller_handoff(
     )
 }
 
-#[derive(Debug, Clone, Copy, clap::ValueEnum)]
-pub enum CompressionMode {
-    Auto,
-    Off,
-}
-impl CompressionMode {
-    fn policy(self, minimum_bytes: usize) -> engine_net::CompressionPolicy {
-        engine_net::CompressionPolicy {
-            mode: match self {
-                Self::Auto => engine_net::CompressionMode::Auto,
-                Self::Off => engine_net::CompressionMode::Off,
-            },
-            minimum_bytes,
-        }
-    }
-}
-
 #[derive(Debug, Clone, clap::Parser)]
 #[command(name = "game_server")]
 pub struct ServerArgs {
@@ -109,17 +75,6 @@ pub struct ServerArgs {
     /// Opt-in local shot/action diagnostics. Creates a new private file, at most 8 MiB.
     #[arg(long)]
     pub action_trace: Option<std::path::PathBuf>,
-    /// Compress replica bodies only when the complete encoded result is smaller.
-    #[arg(
-        long,
-        env = "DREAMWAKE_COMPRESSION",
-        value_enum,
-        default_value = "auto"
-    )]
-    pub compression: CompressionMode,
-    /// Minimum serialized replica-body bytes eligible for automatic compression.
-    #[arg(long, env = "DREAMWAKE_COMPRESSION_MIN_BYTES", default_value_t = 0)]
-    pub compression_min_bytes: usize,
     #[command(flatten)]
     pub network: engine_server::ServerConfig,
 }
@@ -190,34 +145,6 @@ mod tests {
     }
 
     #[test]
-    fn server_compression_cli_defaults_and_overrides() {
-        let defaults = ServerArgs::try_parse_from(["server"]).unwrap();
-        assert_eq!(
-            defaults.compression.policy(defaults.compression_min_bytes),
-            engine_net::CompressionPolicy::default()
-        );
-        let configured = ServerArgs::try_parse_from([
-            "server",
-            "--compression",
-            "off",
-            "--compression-min-bytes",
-            "128",
-        ])
-        .unwrap();
-        assert_eq!(
-            configured
-                .compression
-                .policy(configured.compression_min_bytes),
-            engine_net::CompressionPolicy {
-                mode: engine_net::CompressionMode::Off,
-                minimum_bytes: 128
-            }
-        );
-        assert!(ServerArgs::try_parse_from(["server", "--compression", "invalid"]).is_err());
-        assert!(ServerArgs::try_parse_from(["server", "--compression-min-bytes", "-1"]).is_err());
-    }
-
-    #[test]
     fn default_game_and_host_cli_keep_configurable_admission() {
         let args = ServerArgs::try_parse_from(["server"]).unwrap();
         assert_eq!(args.seed, 8192);
@@ -264,13 +191,8 @@ pub fn run(mut args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
         dreamwake_protocol::PROTOCOL_ID,
         admission::GuestAdmission::open(args.identity_store)?,
     )?;
-    let mut app = build_app_with_replication_policy(
-        shared,
-        args.seed,
-        args.lucid,
-        args.replication_distance,
-        args.compression.policy(args.compression_min_bytes),
-    );
+    let mut app =
+        build_app_with_replication_distance(shared, args.seed, args.lucid, args.replication_distance);
     if let Some(file) = trace_file {
         plugins::server::trace::install(&mut app, file)?;
     }

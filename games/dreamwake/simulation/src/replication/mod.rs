@@ -9,7 +9,10 @@
 mod audience;
 mod capture;
 pub(crate) mod schema;
-pub use schema::{owner_group_schema_maxima, schema_identities, schema_identity};
+pub use schema::{
+    Replica, ReplicaKind, ReplicaState, owner_group_schema_maxima, schema_identities,
+    schema_identity,
+};
 #[cfg(test)]
 mod collision_tests;
 #[cfg(test)]

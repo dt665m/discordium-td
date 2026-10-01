@@ -1,4 +1,3 @@
-mod baselines;
 use crate::plugins::diagnostics::capture as diagnostics;
 use bevy_net_debug::ConditionerDebug;
 // Renet client, bounded local prediction, and authoritative snapshot reconciliation.
@@ -16,7 +15,7 @@ use engine_net::{
     codec::BoundedVec,
     commands::{ActionEdge, Command},
     input::HardwareSample,
-    replication::ReplicationError,
+    prediction::rewind::RewindInput,
     synchronization::{SyncError, TimeExchange},
     types::*,
 };
@@ -25,9 +24,9 @@ mod outcomes;
 pub(crate) mod predicted_events;
 mod presentation;
 mod session;
-use model::InputCommand;
 pub(crate) use presentation::RemotePoseMetrics;
 use renet::RenetClient;
+use model::InputCommand;
 use session::Session;
 pub(crate) use session::SessionMetrics;
 use std::{collections::VecDeque, time::Duration};
@@ -150,8 +149,6 @@ pub(crate) struct PendingFrame {
     command: Command<TickInput, DreamAction>,
     /// First transmission, for acknowledgement latency.
     sent_at: f64,
-    /// Latest transmission, including redundancy and retries.
-    last_sent: f64,
 }
 pub(crate) struct Runtime {
     pub(crate) renet: RenetClient,
@@ -496,38 +493,6 @@ fn send_control(runtime: &mut Runtime, message: ClientControl) -> Result<(), Str
     runtime.renet.send_message(CONTROL_CHANNEL, bytes);
     Ok(())
 }
-fn send_state_receipt(runtime: &mut Runtime, message: ClientControl) -> Result<(), String> {
-    let ClientControl::Decoded { receipts } = message else {
-        return send_control(runtime, message);
-    };
-    let session = runtime.prediction.as_mut().ok_or("no session")?;
-    for receipt in receipts.into_vec() {
-        session.queue_decoded_receipt(receipt);
-    }
-    Ok(())
-}
-/// Public-state acknowledgements are cumulative, so they go out five times a
-/// second rather than one per received state. At twenty publications a
-/// second for every nearby actor, per-message receipts made the client's
-/// upload larger than its download.
-const DECODED_RECEIPT_INTERVAL: Duration = Duration::from_millis(200);
-fn flush_decoded_receipts(runtime: &mut Runtime, now: Duration) -> Result<(), String> {
-    let Some(session) = runtime.prediction.as_mut() else {
-        return Ok(());
-    };
-    if now < session.next_receipt_flush {
-        return Ok(());
-    }
-    session.next_receipt_flush = now + DECODED_RECEIPT_INTERVAL;
-    while let Some(batch) = runtime
-        .prediction
-        .as_mut()
-        .and_then(Session::take_decoded_receipts)
-    {
-        send_control(runtime, batch)?;
-    }
-    Ok(())
-}
 /// The time network work actually runs, on the frame clock's timeline.
 ///
 /// The frame clock can trail the wall clock by a whole frame: with pipelined
@@ -540,66 +505,6 @@ pub(crate) fn network_now(time: &Time<Real>) -> Duration {
         + time
             .last_update()
             .map_or(Duration::ZERO, |last| last.elapsed())
-}
-fn request_resync(
-    world: &mut World,
-    runtime: &mut Runtime,
-    now: Duration,
-    reason: &str,
-    kind: ResyncReason,
-) {
-    world
-        .resource_mut::<diagnostics::Telemetry>()
-        .record_issue(diagnostics::IssueKind::Recovery, reason);
-    // Diagnostics are optional for the network layer: embedders and tests may
-    // run it without them, and recovery must not panic for want of a counter.
-    if let Some(mut ledger) =
-        world.get_resource_mut::<crate::plugins::diagnostics::continuity::SessionLedger>()
-    {
-        ledger.record_recovery();
-    }
-    log::warn!("Scoped session requires resynchronization: {reason}");
-    if let Some(session) = &mut runtime.prediction {
-        session.resync_reason = kind;
-        // Truncate on a char boundary: the field is byte-bounded and the text
-        // is diagnostic, so losing the tail is better than losing the message.
-        let mut detail = reason.to_owned();
-        while detail.len() > 96 {
-            detail.pop();
-        }
-        session.resync_detail = detail;
-        session.recover();
-    }
-    service_pending_resync(runtime, now);
-}
-
-fn service_pending_resync(runtime: &mut Runtime, now: Duration) {
-    let Some(session) = &mut runtime.prediction else {
-        return;
-    };
-    if session.resync_request != session::ResyncRequest::PendingEnqueue
-        || session
-            .last_resync
-            .is_some_and(|last| now.saturating_sub(last) < Duration::from_secs(1))
-    {
-        return;
-    }
-    // Encoding/backpressure failure retains PendingEnqueue and its deadline.
-    let Ok(bytes) = session.control(&ClientControl::Resync {
-        reason: session.resync_reason,
-        detail: engine_net::schema::BoundedString::new(&session.resync_detail).unwrap_or_default(),
-    }) else {
-        return;
-    };
-    if runtime.renet.is_disconnected()
-        || !runtime.renet.can_send_message(CONTROL_CHANNEL, bytes.len())
-    {
-        return;
-    }
-    runtime.renet.send_message(CONTROL_CHANNEL, bytes);
-    // Once queued, Renet owns retries; another fault must not queue duplicates.
-    session.last_resync = Some(now);
-    session.resync_request = session::ResyncRequest::AwaitingWelcome;
 }
 fn poll_network(world: &mut World) {
     let result = world
@@ -669,11 +574,11 @@ fn poll_network(world: &mut World) {
         world.resource_mut::<DreamConnection>().status = format!("Connection interrupted: {error}");
     }
     if let Some(session) = &mut runtime.prediction {
-        let _ = session.begin_frame();
+        session.begin_frame();
     }
-    // Reliable readiness/control precedes the unordered state lane in this batch.
-    for channel in [CONTROL_CHANNEL, OWNER_GROUP_CHANNEL, STATE_CHANNEL] {
-        for _ in 0..128 {
+    // Reliable controls precede the state lane in this batch.
+    for channel in [CONTROL_CHANNEL, STATE_CHANNEL] {
+        for _ in 0..256 {
             let Some(bytes) = runtime.renet.receive_message(channel) else {
                 break;
             };
@@ -682,25 +587,6 @@ fn poll_network(world: &mut World) {
                 let mut telemetry = world.resource_mut::<diagnostics::Telemetry>();
                 record_receive_rejection(&mut telemetry, &error);
                 log::warn!("Ignored scoped message: {error}");
-            }
-        }
-    }
-    // Recovery stops prediction/reconciliation, not request delivery. Give a
-    // pending resync the first available control space after processing receives.
-    service_pending_resync(&mut runtime, now);
-    // Public-state ACKs coalesce on their own interval. Owner/baseline proofs
-    // above remain immediate and are never held in this queue.
-    if let Err(error) = flush_decoded_receipts(&mut runtime, now) {
-        log::warn!("Could not encode decoded-state acknowledgements: {error}");
-    }
-    let finalized_ack = runtime
-        .prediction
-        .as_mut()
-        .and_then(|session| session.finalized_ack_pending.take());
-    if let Some(through) = finalized_ack {
-        if send_control(&mut runtime, ClientControl::FinalizedAck { through }).is_err() {
-            if let Some(session) = &mut runtime.prediction {
-                session.finalized_ack_pending = Some(through);
             }
         }
     }
@@ -740,7 +626,7 @@ fn poll_network(world: &mut World) {
             let replay = runtime
                 .prediction
                 .as_ref()
-                .map_or(0, |s| s.predictor.work().replay_ticks);
+                .map_or(0, |s| s.predictor.work().replayed_ticks);
             world
                 .resource_mut::<diagnostics::Telemetry>()
                 .record_reconciliation(replay, shift, now.as_secs_f64());
@@ -753,13 +639,14 @@ fn poll_network(world: &mut World) {
             }
             world.resource_mut::<DreamView>().0 = displayed;
         }
-        Err(error) => request_resync(
-            world,
-            &mut runtime,
-            now,
-            &error,
-            ResyncReason::InvalidCheckpoint,
-        ),
+        Err(error) => {
+            // A state that cannot be applied is skipped; the next owner state
+            // supersedes it. Nothing here resets the session.
+            log::warn!("Owner state skipped: {error}");
+            world
+                .resource_mut::<diagnostics::Telemetry>()
+                .record_decode_rejection(&error);
+        }
         _ => {}
     }
     let mut probe = false;
@@ -767,16 +654,6 @@ fn poll_network(world: &mut World) {
         if now.saturating_sub(session.last_probe) >= Duration::from_millis(250) {
             session.last_probe = now;
             probe = true;
-        }
-        let expired = session.expire_groups(now).unwrap_or(1);
-        if expired > 0 {
-            request_resync(
-                world,
-                &mut runtime,
-                now,
-                "group assembly expired",
-                ResyncReason::ExpiredGroup,
-            );
         }
     }
     if probe {
@@ -789,9 +666,9 @@ fn poll_network(world: &mut World) {
     }
     if let Some(session) = &runtime.prediction {
         if let Some(lookup) = runtime.outcomes.lookup(
-            session.model.welcome.player.get(),
-            session.model.welcome.stream.epoch,
-            session.finalized,
+            session.welcome.player.get(),
+            session.welcome.stream.epoch,
+            session.status.finalized,
             now,
         ) {
             send_control(&mut runtime, lookup).ok();
@@ -884,30 +761,11 @@ fn finish_disconnection(
 enum ReceiveRejection {
     Scoped(String),
     Clock(SyncError),
-    Replication {
-        error: ReplicationError,
-        context: String,
-    },
-}
-impl ReceiveRejection {
-    fn replication(error: ReplicationError, context: impl FnOnce() -> String) -> Self {
-        Self::Replication {
-            error,
-            context: context().chars().take(768).collect(),
-        }
-    }
 }
 fn record_receive_rejection(telemetry: &mut diagnostics::Telemetry, error: &ReceiveRejection) {
     match error {
         ReceiveRejection::Scoped(reason) => telemetry.record_decode_rejection(reason),
         ReceiveRejection::Clock(error) => telemetry.record_clock_rejection(*error),
-        ReceiveRejection::Replication {
-            error: ReplicationError::Obsolete(reason),
-            context,
-        } => telemetry.record_obsolete_rejection(*reason, context),
-        ReceiveRejection::Replication { .. } => {
-            telemetry.record_decode_rejection(&error.to_string());
-        }
     }
 }
 impl From<String> for ReceiveRejection {
@@ -930,7 +788,6 @@ impl std::fmt::Display for ReceiveRejection {
         match self {
             Self::Scoped(reason) => f.write_str(reason),
             Self::Clock(error) => error.fmt(f),
-            Self::Replication { error, context } => write!(f, "{error}: {context}"),
         }
     }
 }
@@ -953,15 +810,15 @@ fn receive_message(
             return Err("incompatible welcome".into());
         }
         if runtime.prediction.as_ref().is_some_and(|s| {
-            welcome.server_instance == s.model.welcome.server_instance
-                && welcome.stream.epoch <= s.model.welcome.stream.epoch
+            welcome.server_instance == s.welcome.server_instance
+                && welcome.stream.epoch <= s.welcome.stream.epoch
         }) {
             return Ok(());
         }
         let content = welcome.content;
         runtime.outcomes.bind_instance(welcome.server_instance);
         let mut session = Session::new(welcome)?;
-        session.begin_frame()?;
+        session.begin_frame();
         runtime.prediction = Some(session);
         runtime.pending.clear();
         runtime.action_seq = CommandSeq(0);
@@ -979,26 +836,49 @@ fn receive_message(
         return Ok(());
     }
     let session = runtime.prediction.as_mut().ok_or("state before welcome")?;
-    if channel == STATE_CHANNEL || channel == OWNER_GROUP_CHANNEL {
-        if let Some(receipt) = session.receive_state(bytes, now)? {
-            accept_state_receipt(runtime, receipt, now, world)?;
+    if channel == STATE_CHANNEL {
+        if session.receive_state(bytes)? {
+            let owner = session.welcome.player.get();
+            let epoch = session.welcome.stream.epoch;
+            let finalized = session.status.finalized;
+            let menu_applied = session.status.menu_applied;
+            if let Some((tick, _)) = session.authoritative_owner_pose()? {
+                runtime.outcomes.observe(owner, epoch, tick, now, false);
+            }
+            for frame in runtime
+                .pending
+                .iter()
+                .filter(|frame| frame.command.target.0 <= finalized.0)
+            {
+                // Telemetry's legacy u32 sample key is display-only.
+                world.resource_mut::<diagnostics::Telemetry>().acknowledge(
+                    frame.command.sequence.0 as u32,
+                    frame.sent_at,
+                    now.as_secs_f64(),
+                );
+            }
+            runtime.pending.retain(|frame| frame.command.target.0 > finalized.0);
+            if runtime
+                .in_flight_action
+                .is_some_and(|sequence| menu_applied.is_some_and(|applied| sequence <= applied))
+            {
+                runtime.in_flight_action = None;
+            }
+            runtime.last_received = runtime.last_received.max(now.as_secs_f64());
+            world.resource_mut::<diagnostics::Telemetry>().snapshots += 1;
         }
         return Ok(());
     }
     let control: ServerControl = decode_control(
         bytes,
-        session.model.welcome.stream.epoch,
-        session
-            .model
-            .welcome
-            .frame_limit()
-            .map_err(|e| e.to_string())?,
+        session.welcome.stream.epoch,
+        session.welcome.frame_limit().map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
     match control {
         ServerControl::ActionOutcomes { batch, records } => {
             runtime.outcomes.receive_batch(
-                session.model.welcome.player.get(),
+                session.welcome.player.get(),
                 records.as_slice(),
                 now,
             )?;
@@ -1015,172 +895,7 @@ fn receive_message(
             // Lookup-window expiry is not a new gameplay rejection.
             runtime
                 .outcomes
-                .unavailable(session.model.welcome.player.get(), keys.as_slice());
-        }
-        ServerControl::BaselineRetired { fences } => {
-            session
-                .baselines
-                .acknowledge_retirements_with_scopes(fences.as_slice(), &session.scopes)
-                .map_err(|rejection| {
-                    ReceiveRejection::replication(rejection.error, || {
-                        let Some(fence) = rejection.fence else {
-                            return format!("BaselineRetired batch={}", fences.len());
-                        };
-                        let scope = fence.context.scope;
-                        let current = session.baselines.identity(scope.entity).map(|(context, generation)| {
-                            (context.scope.scope.0, context.scope.representation.0, context.group, generation.0)
-                        });
-                        let known = session.scopes.fence(scope.entity.index).map(|known| {
-                            (known.scope.connection.0, known.scope.entity.generation, known.scope.scope.0,
-                             known.scope.representation.0, known.closed)
-                        });
-                        format!("BaselineRetired entity={}/{} group={:?} generation={} through={} connection={} scope={}/{} schema={} current={current:?} known={known:?} batch={}",
-                            scope.entity.index, scope.entity.generation, fence.context.group,
-                            fence.generation.0, fence.through.0, scope.connection.0, scope.scope.0,
-                            scope.representation.0, fence.context.schema.0, fences.len())
-                    })
-                })?;
-        }
-        ServerControl::BaselineReset { resets } => {
-            let welcome = &session.model.welcome;
-            let expected = [
-                welcome.global_entity,
-                welcome.owner_entity,
-                welcome.collision_entity,
-            ]
-            .into_iter()
-            .collect::<std::collections::BTreeSet<_>>();
-            let entities = resets
-                .as_slice()
-                .iter()
-                .map(|r| r.context.scope.entity)
-                .collect::<std::collections::BTreeSet<_>>();
-            // A future topology may name one platform before its first full DTO.
-            // A reset only creates bounded byte caches: complete typed group
-            // validation still grants every prediction dependency atomically.
-            if !dreamwake_protocol::live::baselines::valid_member_count(resets.len())
-                || entities.len() != resets.len()
-                || !expected.is_subset(&entities)
-                || resets
-                    .as_slice()
-                    .windows(2)
-                    .any(|pair| pair[0].context.group != pair[1].context.group)
-                || resets
-                    .as_slice()
-                    .iter()
-                    .any(|r| r.context.scope.connection != welcome.stream.epoch)
-            {
-                return Err("invalid owner baseline reset".into());
-            }
-            let identities = resets
-                .as_slice()
-                .iter()
-                .map(|r| {
-                    (
-                        r.context,
-                        r.generation,
-                        session.baselines.identity(r.context.scope.entity),
-                    )
-                })
-                .collect::<Vec<_>>();
-            session
-                .baselines
-                .apply_resets_with_scopes(resets.as_slice(), &session.scopes)
-                .map_err(|error| {
-                    ReceiveRejection::replication(error, || {
-                        format!("BaselineReset incoming/context/generation/current={identities:?}")
-                    })
-                })?;
-            if let Some((receipt, received_at)) = session.receive_pending_reset_group(now)? {
-                accept_state_receipt(runtime, receipt, received_at, world)?;
-            }
-        }
-        ServerControl::Active {
-            owner_snapshot,
-            through,
-        } => {
-            session.acknowledge_active(owner_snapshot, through);
-        }
-        ServerControl::Finalized {
-            through,
-            receipts,
-            menu_applied,
-            arrival,
-        } => {
-            if through > session.finalized
-                && receipts
-                    .as_slice()
-                    .first()
-                    .is_none_or(|receipt| receipt.tick.0 > session.finalized.0.saturating_add(1))
-            {
-                return Err("Finalization receipt gap".into());
-            }
-            // Reliable duplicate or older publications may repeat delivery
-            // bookkeeping, but their feedback must not tune command lead twice.
-            if through > session.finalized {
-                session.finalized = through;
-                session.simulation_clock.commit(through);
-                session.observe_arrival_feedback(arrival)?;
-            }
-            for receipt in receipts.as_slice() {
-                if let Some(sequence) = receipt.sequence {
-                    if let Some(frame) = runtime.pending.iter().find(|p| {
-                        p.command.sequence == sequence && p.command.target.0 == receipt.tick.0
-                    }) {
-                        // Telemetry's legacy u32 sample key is display-only.
-                        world.resource_mut::<diagnostics::Telemetry>().acknowledge(
-                            sequence.0 as u32,
-                            frame.sent_at,
-                            now.as_secs_f64(),
-                        );
-                    }
-                }
-            }
-            runtime.pending.retain(|p| p.command.target.0 > through.0);
-            if runtime
-                .in_flight_action
-                .is_some_and(|s| menu_applied.is_some_and(|ack| s <= ack))
-            {
-                runtime.in_flight_action = None;
-            }
-            session.finalized_ack_pending = Some(
-                session
-                    .finalized_ack_pending
-                    .map_or(through, |previous| previous.max(through)),
-            );
-        }
-        ServerControl::Exit(exit) => {
-            let current = session.scopes.fence(exit.scope.entity.index);
-            session.scopes.apply_exit(exit).map_err(|error| {
-                ReceiveRejection::replication(error, || {
-                    format!("Exit incoming={:?} current={current:?}", exit.scope)
-                })
-            })?;
-            // An idempotent delayed exit may leave a newer incarnation intact.
-            // Presentation and dependencies must follow the actual scope fence.
-            if session.scopes.state(exit.scope.entity).is_none() {
-                session.predictor.revoke_scope(exit.scope);
-                session.baselines.revoke(exit.scope.entity);
-                session.entities.remove(&exit.scope.entity);
-                session.poses.remove(exit.scope.entity);
-            }
-            send_control(runtime, ClientControl::Exited(exit))?;
-        }
-        ServerControl::Destroy(destroy) => {
-            let current = session.scopes.fence(destroy.entity.index);
-            let revoked_scope = session.scopes.state(destroy.entity).map(|s| s.scope);
-            session.scopes.apply_destroy(destroy).map_err(|error| {
-                ReceiveRejection::replication(error, || {
-                    format!("Destroy incoming={destroy:?} current={current:?}")
-                })
-            })?;
-            session.baselines.revoke(destroy.entity);
-            if let Some(scope) = revoked_scope {
-                session.predictor.revoke_scope(scope);
-            }
-            session.entities.remove(&destroy.entity);
-            session.poses.remove(destroy.entity);
-            send_control(runtime, ClientControl::Destroyed(destroy))?;
+                .unavailable(session.welcome.player.get(), keys.as_slice());
         }
         ServerControl::ClockReply {
             client_send_nanos,
@@ -1188,8 +903,6 @@ fn receive_message(
             server_send_nanos,
             tick,
         } => {
-            // Keep the typed rejection through the receive boundary. It still
-            // exits immediately, without acknowledgements or freshness updates.
             session.observe_clock_reply(
                 TimeExchange {
                     client_send: Duration::from_nanos(client_send_nanos),
@@ -1204,42 +917,6 @@ fn receive_message(
             world.resource_mut::<DreamConnection>().status =
                 String::from_utf8_lossy(utf8.as_slice()).into_owned()
         }
-    }
-    Ok(())
-}
-fn accept_state_receipt(
-    runtime: &mut Runtime,
-    receipt: ClientControl,
-    received_at: Duration,
-    world: &mut World,
-) -> Result<(), ReceiveRejection> {
-    let session = runtime.prediction.as_ref().unwrap();
-    if let Some(checkpoint) = session.scopes.state(session.model.welcome.owner_entity) {
-        runtime.outcomes.observe(
-            session.model.welcome.player.get(),
-            session.model.welcome.stream.epoch,
-            checkpoint.end_tick,
-            received_at,
-            false,
-        );
-    }
-    runtime.last_received = runtime.last_received.max(received_at.as_secs_f64());
-    world.resource_mut::<diagnostics::Telemetry>().snapshots += 1;
-    send_state_receipt(runtime, receipt)?;
-    let requests = runtime
-        .prediction
-        .as_mut()
-        .unwrap()
-        .baselines
-        .retirements()
-        .map_err(|e| e.to_string())?;
-    if !requests.is_empty() {
-        send_control(
-            runtime,
-            ClientControl::BaselineRetire {
-                requests: BoundedVec::new(requests).map_err(|e| e.to_string())?,
-            },
-        )?;
     }
     Ok(())
 }
@@ -1298,35 +975,25 @@ fn journal_hardware(world: &mut World) {
     let beam = world
         .get_resource::<crate::plugins::input::CapturedBeam>()
         .and_then(|beam| beam.0);
+    if edge_overflow {
+        // More edges than one frame can carry: the extra presses are dropped,
+        // as a game would drop input it cannot keep up with.
+        log::warn!("Hardware action edge capacity; extra edges dropped this frame");
+    }
     if let Some(mut runtime) = world.remove_non_send::<Runtime>() {
-        if edge_overflow {
-            request_resync(
-                world,
-                &mut runtime,
-                now,
-                "Hardware action edge capacity",
-                ResyncReason::ReplayBudget,
-            );
-            world.insert_non_send(runtime);
-            return;
-        }
-        if let Some(session) = &mut runtime.prediction {
-            if session.active && !session.recovering {
-                if let Err(error) = session.journal.capture(HardwareSample {
-                    at: now,
-                    held: Some(TickInput { held: input, beam }),
-                    edges,
-                    mouse_delta: [0.0; 2],
-                }) {
-                    request_resync(
-                        world,
-                        &mut runtime,
-                        now,
-                        &error.to_string(),
-                        ResyncReason::ReplayBudget,
-                    );
-                }
-            }
+        if let Some(session) = &mut runtime.prediction
+            && session.active
+            && let Err(error) = session.journal.capture(HardwareSample {
+                at: now,
+                held: Some(TickInput { held: input, beam }),
+                edges,
+                mouse_delta: [0.0; 2],
+            })
+        {
+            // The journal is full after a long pause in command generation.
+            // Start input over; the server already filled the gap.
+            log::warn!("Input journal restarted: {error}");
+            session.reset_input();
         }
         world.insert_non_send(runtime);
     }
@@ -1340,15 +1007,21 @@ fn predict_and_send(world: &mut World) {
         return;
     };
     let now = network_now(world.resource::<Time<Real>>());
-    let result = generate_commands(&mut runtime, now);
-    if let Err(error) = result {
-        request_resync(
-            world,
-            &mut runtime,
-            now,
-            &error,
-            ResyncReason::MissingHistory,
-        );
+    match generate_commands(&mut runtime, now) {
+        Ok(commands) => {
+            if let Err(error) = send_input(&mut runtime, &commands) {
+                log::warn!("Could not send input: {error}");
+            }
+        }
+        Err(error) => {
+            // Prediction could not advance. Drop local intent and continue
+            // from the next owner state; the session stays connected.
+            log::warn!("Prediction paused: {error}");
+            if let Some(session) = &mut runtime.prediction {
+                session.reset_input();
+                session.predictor.clear();
+            }
+        }
     }
     if now.as_secs_f64() - runtime.last_received <= PREDICTION_MAX_SNAPSHOT_AGE {
         if let Some(displayed) = runtime
@@ -1357,31 +1030,31 @@ fn predict_and_send(world: &mut World) {
             .and_then(|s| s.presentation(true).ok().flatten())
         {
             if let Some(session) = &runtime.prediction {
-                if let Some(tick) = session.predictor.predicted_tick(OWNER_GROUP) {
+                if let Some(tick) = session.predictor.predicted_tick() {
                     runtime.outcomes.observe(
-                        session.model.welcome.player.get(),
-                        session.model.welcome.stream.epoch,
+                        session.welcome.player.get(),
+                        session.welcome.stream.epoch,
                         tick,
                         now,
                         true,
                     );
                     if let Some((key, id)) = session
                         .predictor
-                        .state(OWNER_GROUP)
-                        .and_then(|owner| owner.0.beam_graphics_action())
+                        .state()
+                        .and_then(|owner| owner.beam_graphics_action())
                     {
-                        let stream = session.model.welcome.stream;
+                        let stream = session.welcome.stream;
                         if key.connection_epoch == stream.epoch.0
                             && key.command_stream == stream.stream.0
                             && key.ownership_epoch == stream.ownership.0
-                            && key.match_epoch == session.model.welcome.match_epoch
+                            && key.match_epoch == session.welcome.match_epoch
                             && displayed
                                 .presentations
                                 .iter()
                                 .any(|graphic| graphic.id == id)
                         {
                             runtime.outcomes.graphics_seen(
-                                session.model.welcome.player.get(),
+                                session.welcome.player.get(),
                                 ActionKey {
                                     connection: stream.epoch,
                                     stream: stream.stream,
@@ -1401,43 +1074,71 @@ fn predict_and_send(world: &mut World) {
     }
     world.insert_non_send(runtime);
 }
-/// The newest command plus three predecessors: at 60 Hz that survives 50 ms
-/// of consecutive loss, and the retry path covers longer gaps. More repeats
-/// multiply the client's upload by the record count for little extra benefit,
-/// and a saturated uplink delays every command instead.
-const COMMAND_RECORDS_PER_PACKET: usize = 4;
+/// Commands the newest input packet repeats right behind the newest one, so a
+/// short burst of loss costs nothing.
+const RECENT_RECORDS: usize = 3;
+/// Commands the server has not consumed yet, oldest first, repeated in every
+/// packet until it confirms them, as Unreal resends its oldest unacknowledged
+/// important move.
+const OLDEST_RECORDS: usize = 3;
+
+/// One input packet per simulation tick: the acknowledgement of state received
+/// so far, the newest commands and the oldest the server has not consumed. A
+/// tick without commands, such as while joining, still sends the
+/// acknowledgement the server uses to send deltas and to activate the hero.
+fn send_input(runtime: &mut Runtime, commands: &[InputCommand]) -> Result<(), String> {
+    let Some(session) = &mut runtime.prediction else {
+        return Ok(());
+    };
+    if commands.is_empty() && !session.has_state() {
+        return Ok(());
+    }
+    if !runtime.renet.is_connected() {
+        return Ok(());
+    }
+    let mut records: Vec<InputRecord> = Vec::new();
+    let recent = runtime
+        .pending
+        .iter()
+        .rev()
+        .take(RECENT_RECORDS)
+        .map(|frame| &frame.command);
+    let oldest = runtime
+        .pending
+        .iter()
+        .take(OLDEST_RECORDS)
+        .map(|frame| &frame.command);
+    for command in commands.iter().rev().chain(recent).chain(oldest) {
+        if records.len() == MAX_INPUT_RECORDS {
+            break;
+        }
+        if !records.iter().any(|record| record.sequence == command.sequence) {
+            records.push(InputRecord::from_command(command));
+        }
+    }
+    let bytes = session.input(records)?;
+    runtime.renet.send_message(INPUT_CHANNEL, bytes);
+    Ok(())
+}
 
 /// How many ticks toward `target` fit this frame's prediction budget. A gap
 /// longer than the budget (the client stopped running for a while) is covered
 /// over several frames rather than treated as a fault.
-fn prediction_ticks_this_frame(
-    session: &Session,
-    pending: usize,
-    current: ServerTick,
-    target: TargetTick,
-) -> Result<u64, String> {
-    let remaining = session
-        .predictor
-        .remaining_prediction_ticks(OWNER_GROUP)
-        .ok_or("missing owner prediction")?;
-    let reachable = target.0.saturating_sub(current.0).min(remaining as u64);
-    // Unacknowledged commands are bounded by what the server can still admit;
-    // reaching that means acknowledgements stopped, which no pause explains.
-    if pending.saturating_add(reachable as usize) > 256 {
-        return Err("unacknowledged command capacity".into());
-    }
-    Ok(reachable)
+fn prediction_ticks_this_frame(session: &Session, current: ServerTick, target: TargetTick) -> u64 {
+    let remaining = session.predictor.remaining_ticks();
+    target.0.saturating_sub(current.0).min(remaining as u64)
 }
-fn generate_commands(runtime: &mut Runtime, now: Duration) -> Result<(), String> {
+/// Generate this tick's commands and advance prediction through them.
+fn generate_commands(runtime: &mut Runtime, now: Duration) -> Result<Vec<InputCommand>, String> {
     let Some(session) = &mut runtime.prediction else {
-        return Ok(());
+        return Ok(Vec::new());
     };
     if !session.active
-        || session.recovering
         || !runtime.renet.is_connected()
         || session.clock.sample_count() == 0
+        || !session.predictor.is_initialized()
     {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let server_now = session
         .clock
@@ -1455,43 +1156,42 @@ fn generate_commands(runtime: &mut Runtime, now: Duration) -> Result<(), String>
         .map_err(|e| e.to_string())?;
     session.estimated_simulation_tick = Some(estimated);
     let Some(target) = session.assign_command_target(estimated)? else {
-        return retry_pending_commands(runtime, &[], now);
+        return Ok(Vec::new());
     };
     let current = session
         .predictor
-        .predicted_tick(OWNER_GROUP)
+        .predicted_tick()
         .ok_or("missing owner prediction")?;
     if target.0 <= current.0 {
-        return retry_pending_commands(runtime, &[], now);
+        return Ok(Vec::new());
     }
-    let reachable = prediction_ticks_this_frame(session, runtime.pending.len(), current, target)?;
+    let reachable = prediction_ticks_this_frame(session, current, target);
     // Bootstrap or a frontier behind estimated simulation time is a forecast
     // gap. Replay server-style substitutes through the fresh head's predecessor;
     // only that head authors intent. An already-ahead frontier keeps every normal
     // contiguous hardware sample. Forecast never drains an edge or allocates a
-    // command/action identity, and consumes the ordinary prediction work budget.
+    // command/action identity.
     let forecast_gap = session.forecast_gap(estimated);
     if reachable < target.0 - current.0 {
         // Catch up by forecasting only; the head is authored once in reach.
         for tick in current.0 + 1..=current.0 + reachable {
-            let dependencies = session.prediction_dependencies(ServerTick(tick))?;
+            let dependencies = session.prediction_dependencies(ServerTick(tick));
             session
                 .predictor
-                .predict_substitute(OWNER_GROUP, ServerTick(tick), dependencies, &session.model)
-                .map_err(|e| e.to_string())?;
-            session.events.publish(&session.predictor)?;
+                .predict(ServerTick(tick), RewindInput::Substitute, dependencies)
+                .map_err(|e| format!("{e:?}"))?;
         }
-        return retry_pending_commands(runtime, &[], now);
+        session.events.publish(&session.predictor)?;
+        return Ok(Vec::new());
     }
-    let mut covered = Vec::new();
+    let mut commands = Vec::new();
     for tick in current.0 + 1..=target.0 {
         if forecast_gap && tick < target.0 {
-            let dependencies = session.prediction_dependencies(ServerTick(tick))?;
+            let dependencies = session.prediction_dependencies(ServerTick(tick));
             session
                 .predictor
-                .predict_substitute(OWNER_GROUP, ServerTick(tick), dependencies, &session.model)
-                .map_err(|e| e.to_string())?;
-            session.events.publish(&session.predictor)?;
+                .predict(ServerTick(tick), RewindInput::Substitute, dependencies)
+                .map_err(|e| format!("{e:?}"))?;
             continue;
         }
         let sample = session.command_sample(TargetTick(tick), target, now)?;
@@ -1507,7 +1207,7 @@ fn generate_commands(runtime: &mut Runtime, now: Duration) -> Result<(), String>
                 .map_err(|e| e.to_string())?;
         }
         let command = Command {
-            owner: session.model.welcome.stream,
+            owner: session.welcome.stream,
             sequence: session.sequence,
             target: TargetTick(tick),
             input: sample.held,
@@ -1515,55 +1215,21 @@ fn generate_commands(runtime: &mut Runtime, now: Duration) -> Result<(), String>
         };
         runtime
             .outcomes
-            .track(session.model.welcome.player.get(), &command, now)?;
-        // New commands use the latest admitted atomic checkpoint. Reusing the
-        // speculative frontier would keep its original moving-base sample alive
-        // indefinitely; replay still retains each existing frame's dependencies.
-        let dependencies = session.prediction_dependencies(ServerTick(tick))?;
+            .track(session.welcome.player.get(), &command, now)?;
+        let dependencies = session.prediction_dependencies(ServerTick(tick));
         session
             .predictor
             .predict(
-                OWNER_GROUP,
-                InputCommand(command.clone()),
+                ServerTick(tick),
+                RewindInput::Command(command.clone()),
                 dependencies,
-                &session.model,
             )
-            .map_err(|e| e.to_string())?;
-        session.events.publish(&session.predictor)?;
+            .map_err(|e| format!("{e:?}"))?;
         session.record_command_issuance(command.sequence, command.target, target);
         runtime.pending.push_back(PendingFrame {
             command: command.clone(),
             sent_at: now.as_secs_f64(),
-            last_sent: now.as_secs_f64(),
         });
-        let older = runtime
-            .pending
-            .iter()
-            .rev()
-            .skip(1)
-            .map(|p| p.command.clone())
-            .collect::<Vec<_>>();
-        let limit = session
-            .model
-            .welcome
-            .frame_limit()
-            .map_err(|e| e.to_string())?;
-        let records = engine_net::commands::pack_redundant(
-            &command,
-            &older,
-            COMMAND_RECORDS_PER_PACKET,
-            limit.payload_bytes(),
-        )
-        .map_err(|e| e.to_string())?;
-        covered.extend(records.as_slice().iter().map(|record| record.sequence));
-        let bytes = encode_commands(
-            &CommandBundle { records },
-            session.model.welcome.stream.epoch,
-            command.sequence.0 as u32,
-            limit,
-        )
-        .map_err(|e| e.to_string())?;
-        runtime.renet.send_message(INPUT_CHANNEL, bytes);
         runtime.outcomes.enqueued(
             command
                 .actions
@@ -1572,117 +1238,10 @@ fn generate_commands(runtime: &mut Runtime, now: Duration) -> Result<(), String>
                 .map(|edge| command.action_key(edge.slot)),
             now,
         );
+        commands.push(command);
     }
-    retry_pending_commands(runtime, &covered, now)
-}
-
-/// Progress can make an immutable Future command eligible after it has left
-/// normal newest-eight redundancy. Retry that bounded admission window even
-/// when command generation is paused or already sent newer records this frame.
-/// A pending command is resent at most this often. Retrying on every advance
-/// of authority grew with the number of unacknowledged commands at frame rate,
-/// so a slow uplink filled with retries of its own backlog.
-const COMMAND_RETRY_INTERVAL: Duration = engine_net::RELIABLE_RESEND_TIME;
-fn retry_pending_commands(
-    runtime: &mut Runtime,
-    covered: &[CommandSeq],
-    now: Duration,
-) -> Result<(), String> {
-    let now_seconds = now.as_secs_f64();
-    // Records carried as redundancy in this frame's packet were just sent.
-    for frame in runtime
-        .pending
-        .iter_mut()
-        .filter(|frame| covered.contains(&frame.command.sequence))
-    {
-        frame.last_sent = now_seconds;
-    }
-    let Some(session) = &mut runtime.prediction else {
-        return Ok(());
-    };
-    if !session.active || session.recovering || !runtime.renet.is_connected() {
-        return Ok(());
-    }
-    let committed = session.simulation_clock.committed();
-    if session
-        .last_input_retry_committed
-        .is_some_and(|previous| committed <= previous)
-    {
-        return Ok(());
-    }
-    let future_ticks = engine_net::commands::CommandLimits::default().future_ticks;
-    let through = committed
-        .0
-        .checked_add(u64::from(future_ticks))
-        .ok_or("input retry clock range")?;
-    let stream = session.model.welcome.stream;
-    let mut eligible: Vec<_> = runtime
-        .pending
-        .iter()
-        .filter(|frame| {
-            frame.command.owner == stream
-                && frame.command.target.0 > committed.0
-                && frame.command.target.0 <= through
-                && !covered.contains(&frame.command.sequence)
-                && now_seconds - frame.last_sent >= COMMAND_RETRY_INTERVAL.as_secs_f64()
-        })
-        .take(usize::from(future_ticks))
-        .map(|frame| frame.command.clone())
-        .collect();
-    let limit = session
-        .model
-        .welcome
-        .frame_limit()
-        .map_err(|e| e.to_string())?;
-    let mut packets = Vec::new();
-    while !eligible.is_empty() {
-        // Oldest eligible records get an opportunity first. Each individual
-        // frame remains newest-first and retains the established exact byte cap.
-        let prefix = &eligible[..eligible.len().min(COMMAND_RECORDS_PER_PACKET)];
-        let newest = prefix.last().unwrap();
-        let older = prefix[..prefix.len() - 1]
-            .iter()
-            .rev()
-            .cloned()
-            .collect::<Vec<_>>();
-        let records = engine_net::commands::pack_redundant(
-            newest,
-            &older,
-            COMMAND_RECORDS_PER_PACKET,
-            limit.payload_bytes(),
-        )
-        .map_err(|e| e.to_string())?;
-        let included = records
-            .as_slice()
-            .iter()
-            .map(|record| record.sequence)
-            .collect::<Vec<_>>();
-        packets.push(
-            encode_commands(
-                &CommandBundle { records },
-                stream.epoch,
-                newest.sequence.0 as u32,
-                limit,
-            )
-            .map_err(|e| e.to_string())?,
-        );
-        eligible.retain(|command| !included.contains(&command.sequence));
-        for frame in runtime
-            .pending
-            .iter_mut()
-            .filter(|frame| included.contains(&frame.command.sequence))
-        {
-            frame.last_sent = now_seconds;
-        }
-    }
-    // Same-tick replies do not replenish the retry budget. Retransmission never
-    // consumes hardware input, allocates sequences, retargets commands or creates
-    // another action/outcome record.
-    session.last_input_retry_committed = Some(committed);
-    for bytes in packets {
-        runtime.renet.send_message(INPUT_CHANNEL, bytes);
-    }
-    Ok(())
+    session.events.publish(&session.predictor)?;
+    Ok(commands)
 }
 pub(crate) fn has_local_hero(snapshot: &DreamPresentation, id: u64) -> bool {
     snapshot.hero.id == id && snapshot.heroes.iter().any(|hero| hero.id == id)
@@ -1842,28 +1401,4 @@ fn close_connection(mut exits: MessageReader<AppExit>, runtime: Option<NonSendMu
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
-mod arrival_policy_tests;
-#[cfg(all(test, not(target_arch = "wasm32")))]
-mod bootstrap_topology_tests;
-#[cfg(all(test, not(target_arch = "wasm32")))]
-mod feedback_causality_tests;
-#[cfg(all(test, not(target_arch = "wasm32")))]
-mod generation_tests;
-#[cfg(test)]
-mod obsolete_tests;
-#[cfg(all(test, not(target_arch = "wasm32")))]
-mod pending_retry_tests;
-#[cfg(test)]
-mod prediction_target_tests;
-#[cfg(all(test, not(target_arch = "wasm32")))]
-mod recovery_tests;
-#[cfg(all(test, not(target_arch = "wasm32")))]
-mod reset_pending_tests;
-#[cfg(all(test, not(target_arch = "wasm32")))]
-mod retirement_control_tests;
-#[cfg(all(test, not(target_arch = "wasm32")))]
-mod substitute_input_tests;
-#[cfg(all(test, not(target_arch = "wasm32")))]
-mod target_horizon_tests;
-#[cfg(test)]
 mod tests;

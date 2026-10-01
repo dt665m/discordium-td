@@ -1,7 +1,6 @@
 //! Per-hardware-edge timing evidence. This never supplies a muzzle or damage rule.
 use engine_net::{
     codec::{CodecError, Validate},
-    replication::StateReceipt,
     types::ServerTick,
 };
 use serde::{Deserialize, Serialize};
@@ -15,8 +14,9 @@ pub struct CombatViewStamp {
     /// Effective rendered remote pose time, including a starvation freeze (R).
     pub viewed_at: ServerTick,
     pub viewed_fraction: u16,
-    /// Exact complete owner checkpoint decoded before the edge was captured.
-    pub reference: StateReceipt,
+    /// The state packet that carried the newest owner state the client had
+    /// applied when the edge was captured.
+    pub reference: u32,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct BeamAimSample {
@@ -37,7 +37,7 @@ impl Validate for CombatViewStamp {
     fn validate(&self) -> Result<(), CodecError> {
         if self.sampled_at.0 == 0
             || (self.viewed_at, self.viewed_fraction) > (self.sampled_at, self.sampled_fraction)
-            || !super::valid_receipt(&self.reference)
+            || self.reference == 0
         {
             return Err(CodecError::InvalidPayload(
                 "invalid combat view stamp".into(),
@@ -149,7 +149,6 @@ impl Validate for ActionOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use engine_net::types::*;
     #[test]
     fn combat_stamp_checks_fractional_order_including_maximum_phase() {
         let mut view = CombatViewStamp {
@@ -157,20 +156,7 @@ mod tests {
             sampled_fraction: 2,
             viewed_at: ServerTick(10),
             viewed_fraction: 2,
-            reference: StateReceipt {
-                scope: ScopeIdentity {
-                    connection: ConnectionEpoch(1),
-                    entity: EntityId {
-                        index: 1,
-                        generation: 1,
-                    },
-                    scope: ScopeEpoch(1),
-                    representation: RepresentationRevision(1),
-                },
-                baseline_generation: BaselineGeneration(1),
-                snapshot: SnapshotId(1),
-                version: StateVersion(1),
-            },
+            reference: 1,
         };
         assert!(view.validate().is_ok());
         view.viewed_fraction = 3;
@@ -178,5 +164,7 @@ mod tests {
         view.viewed_at = ServerTick(9);
         view.viewed_fraction = u16::MAX;
         assert!(view.validate().is_ok());
+        view.reference = 0;
+        assert!(view.validate().is_err());
     }
 }

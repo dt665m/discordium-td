@@ -21,12 +21,7 @@ fn command(
 }
 fn submit(authority: &mut DreamAuthority, command: Command<live::TickInput, DreamAction>) {
     authority
-        .receive_bundle(
-            41,
-            live::CommandBundle {
-                records: BoundedVec::new(vec![command]).unwrap(),
-            },
-        )
+        .receive_commands(41, vec![command])
         .unwrap();
 }
 #[test]
@@ -100,8 +95,6 @@ fn capacity_refusal_has_terminal_record_in_reserved_overload_pool() {
 
 #[test]
 fn combat_arrival_uses_committed_time_under_authority_debt() {
-    use engine_net::replication::StateReceipt;
-
     let mut authority = DreamAuthority::new(17, false, 8);
     assert!(authority.admit(41));
     authority.peers.get_mut(&41).unwrap().active = true;
@@ -113,19 +106,14 @@ fn combat_arrival_uses_committed_time_under_authority_debt() {
         authority.step(Duration::from_millis(tick * 17));
     }
     let peer = authority.peers.get_mut(&41).unwrap();
-    let receipt = StateReceipt {
-        scope: ScopeIdentity {
-            connection: peer.welcome.stream.epoch,
-            entity: peer.welcome.owner_entity,
-            scope: ScopeEpoch(1),
-            representation: RepresentationRevision(1),
-        },
-        baseline_generation: BaselineGeneration(1),
-        snapshot: SnapshotId(18),
-        version: StateVersion(18),
-    };
-    peer.combat.sent(receipt, ServerTick(18), ServerTick(18));
-    peer.combat.decoded(receipt);
+    // The client confirmed the state packet carrying its tick-18 owner.
+    let reference = 7;
+    peer.combat.sent(reference, ServerTick(18), ServerTick(18));
+    peer.combat
+        .acknowledge(engine_net::replication::stream::StreamAck {
+            latest: reference,
+            received: 0,
+        });
     // A receive pass can observe much later wall time before the fixed driver
     // repays its debt. That must not put arrival after command execution.
     authority.now = Duration::from_secs(10);
@@ -134,7 +122,7 @@ fn combat_arrival_uses_committed_time_under_authority_debt() {
         sampled_fraction: 0,
         viewed_at: ServerTick(18),
         viewed_fraction: 0,
-        reference: receipt,
+        reference,
     };
     let mut shot = command(&authority, 1, 21);
     shot.actions = BoundedVec::new(vec![ActionEdge {

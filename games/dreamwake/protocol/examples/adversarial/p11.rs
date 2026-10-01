@@ -9,7 +9,7 @@ impl<T> codec::Validate for Fixture<T> {
         Ok(())
     }
 }
-fn framed<T: serde::Serialize>(value: &T, lane: Lane) -> Vec<u8> {
+pub fn framed<T: serde::Serialize>(value: &T, lane: Lane) -> Vec<u8> {
     let payload = codec::encode_payload(&Fixture(value), limit().payload_bytes()).unwrap();
     codec::encode_frame(
         FrameHeader {
@@ -22,10 +22,7 @@ fn framed<T: serde::Serialize>(value: &T, lane: Lane) -> Vec<u8> {
     )
     .unwrap()
 }
-pub fn cases(
-    command: &Command<live::TickInput, DreamAction>,
-    reference: StateReceipt,
-) -> (Vec<SchemaCase>, Vec<SchemaCase>) {
+pub fn cases(command: &live::InputRecord) -> (Vec<SchemaCase>, Vec<SchemaCase>) {
     let mut commands = Vec::new();
     let mut controls = Vec::new();
     let view = live::CombatViewStamp {
@@ -33,15 +30,13 @@ pub fn cases(
         viewed_fraction: 0,
         sampled_at: ServerTick(10),
         viewed_at: ServerTick(9),
-        reference,
+        reference: 4,
     };
     for mutation in [
         "valid",
         "future_view",
         "zero_sample",
-        "zero_reference_epoch",
-        "zero_reference_generation",
-        "zero_baseline_generation",
+        "zero_reference",
         "nonfinite_aim",
         "invalid_slot",
         "valid_beam_begin",
@@ -56,11 +51,7 @@ pub fn cases(
         match mutation {
             "future_view" | "future_beam_hold" => view.viewed_at = ServerTick(11),
             "zero_sample" => view.sampled_at = ServerTick(0),
-            "zero_reference_epoch" => view.reference.scope.connection = ConnectionEpoch(0),
-            "zero_reference_generation" => view.reference.scope.entity.generation = 0,
-            "zero_baseline_generation" => {
-                view.reference.baseline_generation = BaselineGeneration(0)
-            }
+            "zero_reference" => view.reference = 0,
             "nonfinite_aim" | "nonfinite_beam_hold" => aim[0] = f32::NAN,
             "invalid_slot" => slot = 8,
             _ => {}
@@ -88,7 +79,8 @@ pub fn cases(
             .unwrap();
         }
         let bytes = framed(
-            &live::CommandBundle {
+            &live::InputPacket {
+                ack: StreamAck::default(),
                 records: BoundedVec::new(vec![record]).unwrap(),
             },
             Lane::Input,
@@ -244,28 +236,6 @@ pub fn unavailable() -> live::ServerControl {
         unreachable!()
     };
     live::ServerControl::OutcomeUnavailable { keys }
-}
-
-/// Decoder validity only; a valid positive tick still requires an exact sent proof at authority.
-pub fn finalized_ack_cases() -> Vec<SchemaCase> {
-    [
-        (10, false, "valid"),
-        (u64::MAX, false, "full_width_tick"),
-        (0, true, "zero_tick"),
-    ]
-    .into_iter()
-    .map(|(tick, rejected, mutation)| SchemaCase {
-        root: "finalized_ack",
-        mutation,
-        rejected,
-        bytes: framed(
-            &live::ClientControl::FinalizedAck {
-                through: ServerTick(tick),
-            },
-            Lane::Control,
-        ),
-    })
-    .collect()
 }
 
 /// A delivery batch acknowledgment never proves an action was accepted.

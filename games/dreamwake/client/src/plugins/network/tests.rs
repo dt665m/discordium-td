@@ -199,6 +199,7 @@ pub(super) fn receipt_runtime(session: Session) -> Runtime {
         last_snapshot: None,
         in_flight_action: None,
         outcomes: Default::default(),
+        resumed_at: None,
     }
 }
 
@@ -570,8 +571,17 @@ fn disconnect_timeout_boundary_distinguishes_waiting_for_welcome_from_updates() 
         if before_welcome {
             runtime.prediction = None;
         }
-        assert!(disconnect_report(&runtime, Duration::from_secs(112), None).is_none());
-        let report = disconnect_report(&runtime, Duration::from_millis(112_001), None).unwrap();
+        // Joining waits briefly for a welcome; a joined session rides out
+        // silence as long as the server keeps its connection.
+        let limit = if before_welcome {
+            Duration::from_secs(12)
+        } else {
+            CONNECTION_TIMEOUT
+        };
+        let at_limit = Duration::from_secs(100) + limit;
+        assert!(disconnect_report(&runtime, at_limit, None).is_none());
+        let past = at_limit + Duration::from_millis(1);
+        let report = disconnect_report(&runtime, past, None).unwrap();
         assert_eq!(
             report.status,
             if before_welcome {
@@ -580,11 +590,10 @@ fn disconnect_timeout_boundary_distinguishes_waiting_for_welcome_from_updates() 
                 "Timed out waiting for server updates. Join again to reconnect."
             }
         );
-        assert!(
-            report
-                .diagnostic
-                .contains("application receive timeout after 12.001s")
-        );
+        assert!(report.diagnostic.contains(&format!(
+            "application receive timeout after {:.3}s",
+            (past - Duration::from_secs(100)).as_secs_f64()
+        )));
     }
 }
 
@@ -608,7 +617,12 @@ fn disconnection_cleanup_unlocks_identity_and_retains_outcomes_without_double_co
             .outcomes
             .track(1, &command, Duration::from_secs(100))
             .unwrap();
-        let report = disconnect_report(&runtime, Duration::from_secs(113), None).unwrap();
+        let report = disconnect_report(
+            &runtime,
+            Duration::from_secs(100) + CONNECTION_TIMEOUT + Duration::from_secs(1),
+            None,
+        )
+        .unwrap();
         let expected_status = report.status;
         let mut world = World::new();
         let mut profile = crate::identity::TravelerProfile::default();
@@ -671,4 +685,114 @@ fn link_impairment_parses_rate_burst_and_spike_fields() {
     ] {
         assert!(parse_link_impairment(bad, 9).is_err(), "{bad}");
     }
+}
+
+#[test]
+fn late_arrival_preserves_lateness_for_lead() {
+    let (mut session, _) = fixture();
+    assert_eq!(session.lead.lead(), 3);
+    session.sequence = CommandSeq(1);
+    session.record_command_issuance(CommandSeq(1), TargetTick(20), TargetTick(20));
+    session.observe_arrival_feedback(ArrivalFeedback {
+        observed_commands: 1,
+        late_commands: 1,
+        sample: Some(ArrivalSample {
+            sequence: CommandSeq(1),
+            target: TargetTick(20),
+            arrival_tick: ServerTick(27),
+            slack: 0,
+        }),
+    });
+    assert_eq!(
+        session.lead.lead(),
+        11,
+        "seven ticks of lateness should raise three ticks of lead by eight, as the controller requires"
+    );
+}
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn combat_capture_uses_current_network_time_after_polling() {
+    let (mut session, _) = fixture();
+    let started = bevy::platform::time::Instant::now() - Duration::from_secs(1);
+    let mut time = Time::<Real>::new(started);
+    time.update_with_instant(started);
+    time.update_with_instant(started + Duration::from_millis(980));
+    let polled_at = network_now(&time);
+    session
+        .observe_clock_reply(
+            TimeExchange {
+                client_send: polled_at - Duration::from_millis(2),
+                server_receive: Duration::from_secs(1),
+                server_send: Duration::from_secs(1),
+                client_receive: polled_at,
+            },
+            ServerTick(60),
+        )
+        .unwrap();
+    session.advance_presentation_clock(polled_at);
+    assert!(session.poses.combat_view_time().is_some());
+    assert!(
+        session.capture_combat_view(time.elapsed()).is_none(),
+        "the frame timestamp predates the monotonic estimate used during polling"
+    );
+    let mut runtime = receipt_runtime(session);
+    assert!(runtime.capture_combat_view(&time).is_some());
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn server_debt_must_not_drop_still_usable_input() {
+    let (mut session, _) = fixture();
+    let now = Duration::from_millis(1100);
+    session
+        .observe_clock_reply(
+            engine_net::synchronization::TimeExchange {
+                client_send: Duration::from_secs(1),
+                server_receive: Duration::from_secs(2),
+                server_send: Duration::from_secs(2),
+                client_receive: now,
+            },
+            ServerTick(100),
+        )
+        .unwrap();
+    let server_time = session.clock.estimate_server_time(now).unwrap();
+    let wall = session.clock.estimate_server_tick(now).unwrap();
+    let simulation = session
+        .simulation_clock
+        .estimate(server_time, session.lead.lead())
+        .unwrap();
+    let target = session.assign_command_target(simulation).unwrap().unwrap();
+    session.estimated_server_tick = Some(wall);
+    session.estimated_simulation_tick = Some(simulation);
+    session.status.finalized = ServerTick(100);
+    assert!(
+        target.0 > 100 && target.0 <= 100 + engine_net::types::MAX_COMMAND_HORIZON_TICKS as u64
+    );
+    let input = command(&session, 1, target.0);
+    let mut runtime = receipt_runtime(session);
+    runtime.pending.push_back(PendingFrame {
+        command: input.clone(),
+        sent_at: 0.0,
+    });
+    send_input(&mut runtime, &[input]).unwrap();
+    let mut server = renet::RenetServer::new(connection_config());
+    server.add_connection(1);
+    for packet in runtime.renet.get_packets_to_send() {
+        server.process_packet_from(&packet, 1).unwrap();
+    }
+    let bytes = server.receive_message(1, INPUT_CHANNEL).unwrap();
+    let packet = decode_input(
+        &bytes,
+        runtime.prediction.as_ref().unwrap().welcome.stream.epoch,
+        input_limit(),
+    )
+    .unwrap();
+    assert_eq!(
+        packet.records.as_slice().len(),
+        1,
+        "wall tick {:?}, committed estimate {:?}, usable target {:?}: the command must travel",
+        wall,
+        simulation,
+        target
+    );
 }

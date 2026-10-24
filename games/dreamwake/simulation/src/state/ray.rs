@@ -120,7 +120,8 @@ impl BeamEpisode {
             && self.sample.query_gameplay_tick <= self.sample.accepted_gameplay_tick
             && (self.sample.query_fraction == 0
                 || self.sample.query_gameplay_tick < self.sample.accepted_gameplay_tick)
-            && self.sample.accepted_gameplay_tick - self.sample.query_gameplay_tick <= 9
+            && self.sample.accepted_gameplay_tick - self.sample.query_gameplay_tick
+                <= crate::combat::MAXIMUM_COMBAT_REWIND_TICKS
             && self
                 .sample
                 .aim

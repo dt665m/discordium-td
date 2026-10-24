@@ -22,6 +22,101 @@ fn command(
 fn submit(authority: &mut DreamAuthority, command: Command<live::TickInput, DreamAction>) {
     authority.receive_commands(41, vec![command]).unwrap();
 }
+
+#[test]
+fn multi_edge_command_is_rejected_before_receipt_or_outcome_reservation() {
+    let mut authority = DreamAuthority::new(17, false, 8);
+    assert!(authority.admit(41));
+    authority.peers.get_mut(&41).unwrap().active = true;
+    let mut command = command(&authority, 1, 1);
+    command.actions = BoundedVec::new(vec![
+        ActionEdge {
+            slot: 0,
+            action: DreamAction::ChargeBegin,
+        },
+        ActionEdge {
+            slot: 1,
+            action: DreamAction::ChargeRelease { episode: 1 },
+        },
+    ])
+    .unwrap();
+    let owner = authority.peers[&41].welcome.player.get();
+    let connection = authority.peers[&41].welcome.stream.epoch;
+    assert!(authority.receive_commands(41, vec![command]).is_err());
+    assert_eq!(authority.peers[&41].received.through(), CommandSeq(0));
+    assert!(authority.peers[&41].late_actions.is_empty());
+    assert!(
+        authority
+            .outcomes
+            .normal
+            .pending(owner, connection)
+            .is_empty()
+    );
+    assert!(
+        authority
+            .outcomes
+            .overload
+            .pending(owner, connection)
+            .is_empty()
+    );
+}
+
+#[test]
+fn late_charge_edges_execute_in_command_order_once() {
+    for (separate_packets, release_tick) in [(false, 9), (true, 9), (false, 11), (true, 11)] {
+        let mut authority = DreamAuthority::new(17, false, 8);
+        assert!(authority.admit(41));
+        authority.peers.get_mut(&41).unwrap().active = true;
+        for tick in 1..=10 {
+            authority.step(Duration::from_millis(tick * 17));
+        }
+        let owner = authority.peers[&41].welcome.player.get();
+        authority.sim.set_player_active(owner, true);
+        authority.begin_run();
+        let mut begin = command(&authority, 1, 8);
+        begin.actions = BoundedVec::new(vec![ActionEdge {
+            slot: 0,
+            action: DreamAction::ChargeBegin,
+        }])
+        .unwrap();
+        let mut release = command(&authority, 2, release_tick);
+        release.actions = BoundedVec::new(vec![ActionEdge {
+            slot: 0,
+            action: DreamAction::ChargeRelease { episode: 1 },
+        }])
+        .unwrap();
+        let begin_key = begin.action_key(0);
+        let release_key = release.action_key(0);
+        if separate_packets {
+            submit(&mut authority, release.clone());
+            submit(&mut authority, begin.clone());
+        } else {
+            authority
+                .receive_commands(41, vec![release.clone(), begin.clone()])
+                .unwrap();
+        }
+        authority.step(Duration::from_millis(187));
+        let started = authority.outcomes.lookup(owner, begin_key).unwrap();
+        assert_eq!(started.data.status, live::TerminalStatus::Accepted);
+        assert!(
+            authority.outcomes.lookup(owner, release_key).is_none(),
+            "one action per tick"
+        );
+        authority.step(Duration::from_millis(204));
+        let released = authority.outcomes.lookup(owner, release_key).unwrap();
+        assert_eq!(released.data.status, live::TerminalStatus::Accepted);
+        authority
+            .receive_commands(41, vec![release, begin])
+            .unwrap();
+        assert!(authority.peers[&41].late_actions.is_empty());
+        authority.step(Duration::from_millis(221));
+        assert_eq!(authority.outcomes.lookup(owner, begin_key), Some(started));
+        assert_eq!(
+            authority.outcomes.lookup(owner, release_key),
+            Some(released)
+        );
+    }
+}
 #[test]
 fn terminal_duplicate_late_and_reconnect_lookup_do_not_reexecute() {
     let mut authority = DreamAuthority::new(17, false, 8);

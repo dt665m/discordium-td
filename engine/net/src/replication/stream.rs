@@ -82,8 +82,9 @@ pub struct ServerStream<K, S> {
     pending_removals: Vec<K>,
     sent: VecDeque<SentPacket<K>>,
     entities: BTreeMap<K, SentEntity<S>>,
-    /// Entities the receiver may hold that have since left this connection.
-    removals: BTreeSet<K>,
+    /// Entities that left this connection and the earliest packet that can
+    /// acknowledge that departure. An ACK from an earlier visit cannot retire it.
+    removals: BTreeMap<K, u32>,
     acked: StreamAck,
     max_entities: usize,
 }
@@ -96,7 +97,7 @@ impl<K: Copy + Ord, S: Clone + PartialEq> ServerStream<K, S> {
             pending_removals: Vec::new(),
             sent: VecDeque::new(),
             entities: BTreeMap::new(),
-            removals: BTreeSet::new(),
+            removals: BTreeMap::new(),
             acked: StreamAck::default(),
             max_entities,
         }
@@ -182,14 +183,14 @@ impl<K: Copy + Ord, S: Clone + PartialEq> ServerStream<K, S> {
     /// except keys the current packet carries again.
     pub fn pending_removals(&self) -> impl Iterator<Item = K> + '_ {
         self.removals
-            .iter()
+            .keys()
             .copied()
             .filter(|key| !self.pending_included.contains(key))
     }
     /// Record that the current packet carries the removal of `key`.
     pub fn include_removal(&mut self, key: K) -> Result<(), StreamError> {
         if self.pending.is_none()
-            || !self.removals.contains(&key)
+            || !self.removals.contains_key(&key)
             || self.pending_included.contains(&key)
             || self.pending_removals.contains(&key)
         {
@@ -232,7 +233,7 @@ impl<K: Copy + Ord, S: Clone + PartialEq> ServerStream<K, S> {
     /// `key` has left this connection. The receiver is told until it confirms.
     pub fn remove(&mut self, key: K) {
         if self.entities.remove(&key).is_some() {
-            self.removals.insert(key);
+            self.removals.insert(key, self.pending.unwrap_or(self.next));
         }
     }
     /// Whether `key` is currently part of the stream.
@@ -257,8 +258,12 @@ impl<K: Copy + Ord, S: Clone + PartialEq> ServerStream<K, S> {
                 continue;
             }
             for key in packet.removals.drain(..) {
-                // A key that came back after this removal is no longer pending.
-                if !self.entities.contains_key(&key) {
+                if !self.entities.contains_key(&key)
+                    && self
+                        .removals
+                        .get(&key)
+                        .is_some_and(|since| *since <= packet.seq)
+                {
                     self.removals.remove(&key);
                 }
             }
@@ -382,15 +387,36 @@ impl<K: Copy + Ord, S: Clone> ClientStream<K, S> {
         }
         let new = entries
             .iter()
-            .filter(|(key, _)| !self.entities.contains_key(key))
+            .filter(|(key, _)| {
+                !self.entities.contains_key(key)
+                    && self.removed_at.get(key).is_none_or(|at| *at < seq)
+            })
             .count();
-        if self.entities.len() + new > self.max_entities {
+        // Only removals that are not superseded free capacity. Validate the
+        // final population before changing any state or acknowledging the packet.
+        let removed = removals
+            .iter()
+            .filter(|key| self.current(**key).is_some_and(|(at, _)| at <= seq))
+            .count();
+        if self.entities.len() - removed + new > self.max_entities {
             return Err(StreamError::Capacity);
         }
         let mut changes = StreamChanges {
             updated: Vec::new(),
             removed: Vec::new(),
         };
+        for key in removals {
+            if self.current(*key).is_some_and(|(at, _)| at > seq) {
+                continue;
+            }
+            if self.entities.remove(key).is_some() {
+                changes.removed.push(*key);
+            }
+            self.removed_at
+                .entry(*key)
+                .and_modify(|at| *at = (*at).max(seq))
+                .or_insert(seq);
+        }
         for (key, state) in entries {
             if self.removed_at.get(&key).is_some_and(|at| *at > seq) {
                 continue;
@@ -407,19 +433,6 @@ impl<K: Copy + Ord, S: Clone> ClientStream<K, S> {
             if newest {
                 changes.updated.push(key);
             }
-        }
-        for key in removals {
-            let current = self
-                .entities
-                .get(key)
-                .and_then(|entity| entity.history.last_key_value().map(|(at, _)| *at));
-            if current.is_some_and(|at| at > seq) {
-                continue;
-            }
-            if self.entities.remove(key).is_some() {
-                changes.removed.push(*key);
-            }
-            self.removed_at.insert(*key, seq);
         }
         self.record(seq);
         Ok(changes)

@@ -214,11 +214,17 @@ pub(crate) struct Runtime {
     pub(crate) last_snapshot: Option<DreamPresentation>,
     in_flight_action: Option<CommandSeq>,
     pub(crate) outcomes: outcomes::ClientOutcomes,
+    /// When the app last resumed after not running at all.
+    resumed_at: Option<Duration>,
 }
 impl Runtime {
     /// Called at the hardware edge, before journaling or command catch-up.
-    pub(crate) fn capture_combat_view(&mut self, at: Duration) -> Option<CombatViewStamp> {
-        self.prediction.as_mut()?.capture_combat_view(at)
+    pub(crate) fn capture_combat_view(&mut self, time: &Time<Real>) -> Option<CombatViewStamp> {
+        // Polling already advances the monotonic estimator to network_now.
+        // Reusing the older frame timestamp here would reject every ranged edge.
+        self.prediction
+            .as_mut()?
+            .capture_combat_view(network_now(time))
     }
 }
 #[derive(Debug, Clone)]
@@ -598,6 +604,7 @@ fn poll_network(world: &mut World) {
                     last_snapshot: None,
                     in_flight_action: None,
                     outcomes,
+                    resumed_at: None,
                 });
                 world.resource_mut::<DreamConnection>().status = "Joining the shared dream…".into();
             }
@@ -614,10 +621,16 @@ fn poll_network(world: &mut World) {
         return;
     };
     let now = network_now(world.resource::<Time<Real>>());
-    let duration = world
-        .resource::<Time<Real>>()
-        .delta()
-        .min(Duration::from_millis(100));
+    let gap = world.resource::<Time<Real>>().delta();
+    if gap >= SUSPENSION {
+        runtime.resumed_at = Some(now);
+        if runtime.prediction.is_some() && gap >= RESUME_REJOIN {
+            world.insert_non_send(runtime);
+            rejoin(world, gap);
+            return;
+        }
+    }
+    let duration = gap.min(Duration::from_millis(100));
     runtime.renet.update(duration);
     let transport_error = runtime
         .transport
@@ -735,10 +748,35 @@ fn poll_network(world: &mut World) {
         }
     }
     if let Some(report) = disconnect_report(&runtime, now, transport_error.as_deref()) {
+        let resumed = runtime.prediction.is_some()
+            && runtime
+                .resumed_at
+                .is_some_and(|at| now.saturating_sub(at) <= CONNECTION_TIMEOUT);
         finish_disconnection(world, runtime, report, transport_error.is_some());
+        if resumed {
+            rejoin(world, Duration::ZERO);
+        }
         return;
     }
     world.insert_non_send(runtime);
+}
+/// A frame gap this long means the app did not run at all (a hidden browser
+/// tab, a sleeping laptop), not that a frame hitched. Browsers stop animation
+/// frames for hidden pages, and Bevy's web loop runs only on them.
+const SUSPENSION: Duration = Duration::from_secs(1);
+/// Absent this long, the server has given up on this connection or is about
+/// to; rejoining at once beats waiting out a receive timeout. The server lets
+/// the same Traveler displace its own silent connection.
+const RESUME_REJOIN: Duration = CONNECTION_TIMEOUT.saturating_sub(Duration::from_secs(5));
+/// Joining waits this long for the server's welcome.
+const WELCOME_TIMEOUT_SECONDS: f64 = 12.0;
+
+/// Rejoin with the same Traveler after the app was away. The server kept the
+/// run's hero for this profile, so the player continues where they left off.
+fn rejoin(world: &mut World, away: Duration) {
+    log::info!("Dreamwake rejoining after {:.1}s away", away.as_secs_f64());
+    connect(world, 3);
+    world.resource_mut::<DreamConnection>().status = "Rejoining the shared dream…".into();
 }
 struct DisconnectReport {
     status: &'static str,
@@ -777,16 +815,20 @@ fn disconnect_report(
             },
             diagnostic,
         })
-    } else if receive_gap > 12.0 {
+    } else if receive_gap
+        > if before_welcome {
+            WELCOME_TIMEOUT_SECONDS
+        } else {
+            CONNECTION_TIMEOUT.as_secs_f64()
+        }
+    {
         Some(DisconnectReport {
             status: if before_welcome {
                 "Timed out waiting for the server welcome. Try joining again."
             } else {
                 "Timed out waiting for server updates. Join again to reconnect."
             },
-            diagnostic: format!(
-                "{phase}: application receive timeout after {receive_gap:.3}s (limit 12.000s)"
-            ),
+            diagnostic: format!("{phase}: application receive timeout after {receive_gap:.3}s"),
         })
     } else {
         None
@@ -1169,11 +1211,11 @@ fn send_input(runtime: &mut Runtime, commands: &[InputCommand]) -> Result<(), St
     }
     session.input_sent_last_tick = true;
     let received = session.status.received;
-    // A command whose target the server has already passed can no longer be
-    // used, whatever the acknowledgements say. Bounding by target keeps the
-    // packet at about the lead even while status packets are being lost.
+    // Targets and expiry share committed simulation time. Wall time can run
+    // ahead while authority repays simulation debt. Bounding by target keeps
+    // packets small even while status packets are being lost.
     let usable = session
-        .estimated_server_tick
+        .estimated_simulation_tick
         .map_or(0, |tick| tick.0.saturating_sub(USABLE_TARGET_MARGIN_TICKS));
     let records: Vec<InputRecord> = runtime
         .pending

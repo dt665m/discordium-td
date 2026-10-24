@@ -159,6 +159,8 @@ struct TestClient {
     drop_states: bool,
     send_acks: bool,
     receive_application: bool,
+    /// Runs nothing at all, like a hidden browser tab.
+    suspended: bool,
 }
 impl TestClient {
     fn new(id: u64, renet: RenetClient, transport: UdpNetcodeClientTransport) -> Self {
@@ -185,6 +187,7 @@ impl TestClient {
             drop_states: false,
             send_acks: true,
             receive_application: true,
+            suspended: false,
         }
     }
     fn control(&mut self, value: live::ClientControl) {
@@ -517,7 +520,7 @@ impl Harness {
                 .unwrap();
             let delta = now.saturating_sub(self.now);
             self.now = now;
-            for client in &mut self.clients {
+            for client in self.clients.iter_mut().filter(|client| !client.suspended) {
                 client.send_input(TargetTick(self.driver.authority.tick.0 + 2));
                 client.renet.update(delta);
                 if client.transport.update(delta, &mut client.renet).is_ok() {
@@ -694,6 +697,48 @@ fn unchanged_actors_cost_nothing_once_acknowledged() {
     assert!(
         per_second < 4_000,
         "{per_second} bytes per second while idle"
+    );
+}
+
+#[test]
+fn unchanged_combat_actors_keep_fresh_authoritative_samples() {
+    let mut h = Harness::new();
+    h.join();
+    h.pump(36);
+    h.action(0, 1, DreamAction::Start { lucid: false });
+    h.pump(18);
+    let before: BTreeMap<_, _> = h.clients[0]
+        .replicas
+        .iter()
+        .filter(|(_, (_, replica))| {
+            matches!(
+                replica,
+                Replica::Actor(PublicReplica::Enemy(_) | PublicReplica::Cover(_))
+            )
+        })
+        .map(|(id, value)| (*id, value.clone()))
+        .collect();
+    assert!(!before.is_empty());
+    for _ in 0..30 {
+        h.pump(1);
+        for id in before.keys() {
+            let (tick, _) = &h.clients[0].replicas[id];
+            assert!(
+                tick.0 + 9 >= h.driver.authority.tick.0,
+                "combat entity {id:?} stopped receiving timestamped samples"
+            );
+        }
+    }
+    let unchanged = before
+        .iter()
+        .filter(|(id, (_, value))| {
+            let (tick, current) = &h.clients[0].replicas[id];
+            *tick > before[id].0 && value == current
+        })
+        .count();
+    assert!(
+        unchanged > 0,
+        "unchanged values also receive fresh timestamps"
     );
 }
 
@@ -1422,6 +1467,34 @@ fn stalled_bootstrap_peer_is_displaced_by_a_fresh_stream_for_the_same_player() {
     assert_eq!(welcome.player, first.player);
     assert!(welcome.stream.epoch > first.stream.epoch);
     assert!(welcome.stream.ownership > first.stream.ownership);
+}
+
+#[test]
+fn silent_controller_is_displaced_by_its_own_rejoin_and_keeps_the_hero() {
+    let mut h = Harness::new();
+    let hidden = h.join_player(700);
+    h.pump(36);
+    assert!(h.clients[hidden].active());
+    let first = h.clients[hidden].welcome.clone().unwrap();
+    let first_connection = first.client.0;
+    let retained = h.latest(hidden).hero;
+
+    // A hidden tab sends nothing but has not yet timed out. Its own rejoin,
+    // carrying the Traveler's secret, replaces it instead of being refused.
+    h.clients[hidden].suspended = true;
+    h.pump(60 * 4);
+    assert!(h.driver.authority.peers[&first_connection].active);
+    let rejoin = h.join_player(700);
+    h.pump(45);
+    assert!(
+        !h.driver.authority.peers.contains_key(&first_connection),
+        "the silent controller is displaced"
+    );
+    assert!(h.clients[rejoin].active());
+    let welcome = h.clients[rejoin].welcome.as_ref().unwrap();
+    assert_eq!(welcome.player, first.player);
+    assert!(welcome.stream.ownership > first.stream.ownership);
+    assert_eq!(h.latest(rejoin).hero.id, retained.id);
 }
 
 #[test]

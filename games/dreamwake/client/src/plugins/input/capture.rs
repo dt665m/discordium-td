@@ -368,7 +368,7 @@ pub(crate) fn capture_input(
     let stamp = if dreamlance || beam_held {
         runtime
             .as_mut()
-            .and_then(|runtime| runtime.capture_combat_view(time.elapsed()))
+            .and_then(|runtime| runtime.capture_combat_view(&time))
     } else {
         None
     };

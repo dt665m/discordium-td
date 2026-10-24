@@ -112,6 +112,10 @@ pub struct ServerConfig {
     /// HTTPS and loopback bootstrap do not need this option.
     #[arg(long, env = "ENGINE_ALLOW_INSECURE_BOOTSTRAP_HTTP")]
     pub allow_insecure_bootstrap_http: bool,
+    /// Silence after which an authenticated connection ends. Games supply it;
+    /// `None` keeps renet-cross's default.
+    #[arg(skip)]
+    pub connection_timeout: Option<Duration>,
 }
 fn default_http_bind(tls_enabled: bool) -> SocketAddr {
     if tls_enabled {
@@ -194,11 +198,15 @@ pub fn start_with_admission<V: SessionAdmission + 'static>(
     verifier: V,
 ) -> Result<SharedNet, Box<dyn std::error::Error>> {
     let private_key = renet_cross::generate_random_bytes();
+    let mut policy = SecureSessionAuthPolicy::new(verifier, private_key);
+    if let Some(timeout) = config.connection_timeout {
+        policy = policy.with_connection_timeout(timeout);
+    }
     start_configured(
         config,
         protocol_id,
         ServerAuthentication::Secure { private_key },
-        SecureSessionAuthPolicy::new(verifier, private_key),
+        policy,
         true,
     )
 }
@@ -225,6 +233,7 @@ fn start_configured<P: SessionAuthPolicy + Send + Sync + 'static>(
         public_http_base,
         cors_allowed_origins,
         allow_insecure_bootstrap_http,
+        connection_timeout: _,
     } = config;
     let http_tls = match (http_tls_cert, http_tls_key) {
         (Some(cert_path), Some(key_path)) => Some(HttpTlsConfig {

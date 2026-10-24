@@ -14,6 +14,9 @@ pub const DEFAULT_MAX_PLAYERS: usize = 8;
 pub const MAX_PLAYERS: usize = 1024;
 pub const MAX_INPUT_BYTES: usize = 2048;
 pub const SNAPSHOT_HZ: u32 = 20;
+/// Silence after which either end gives up on a connection. A player can leave
+/// the tab or ride out an outage this long and resume the same session.
+pub const CONNECTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 pub const TICKS_PER_SNAPSHOT: u32 = dreamwake_sim::TICK_HZ / SNAPSHOT_HZ;
 const _: () = assert!(dreamwake_sim::TICK_HZ.is_multiple_of(SNAPSHOT_HZ));
 

@@ -1,5 +1,31 @@
 use super::*;
 
+#[test]
+fn signed_arrival_slack_preserves_lateness_and_saturates_without_overflow() {
+    let cap = i32::from(engine_net::types::MAX_COMMAND_LEAD_TICKS);
+    for (target, arrival, expected) in [
+        (20, 27, -7),
+        (20, 20, 0),
+        (27, 20, 7),
+        (1, u64::MAX, -cap),
+        (u64::MAX, 1, cap),
+    ] {
+        let sample = ArrivalSample {
+            sequence: CommandSeq(1),
+            target: TargetTick(target),
+            arrival_tick: ServerTick(arrival),
+            slack: expected.max(0) as u8,
+        };
+        let feedback = ArrivalFeedback {
+            sample: Some(sample),
+            observed_commands: 1,
+            late_commands: u64::from(expected <= 0),
+        };
+        assert!(feedback.validate());
+        assert_eq!(sample.signed_slack(), expected);
+    }
+}
+
 fn entity(index: u64) -> EntityId {
     EntityId {
         index,

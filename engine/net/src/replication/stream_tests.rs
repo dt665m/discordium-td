@@ -305,3 +305,84 @@ fn in_flight_states_are_lost_only_when_a_later_packet_is_acknowledged() {
         "acknowledged states become the base"
     );
 }
+
+#[test]
+fn removal_and_addition_in_one_packet_must_fit_capacity() {
+    let mut client = ClientStream::<u8, u32>::new(1);
+    client.accept(1, vec![(1, 10)], &[]).unwrap();
+    assert!(
+        client.accept(2, vec![(2, 20)], &[1]).is_ok(),
+        "a packet leaving exactly one live entity fits capacity one"
+    );
+}
+
+#[test]
+fn superseded_removals_do_not_free_capacity_or_partially_commit() {
+    let mut client = ClientStream::<u8, u32>::new(1);
+    client.accept(3, vec![(1, 30)], &[]).unwrap();
+    let ack = client.ack();
+    assert_eq!(
+        client.accept(2, vec![(2, 20)], &[1]),
+        Err(StreamError::Capacity)
+    );
+    assert_eq!(client.ack(), ack);
+    assert_eq!(client.current(1), Some((3, &30)));
+    assert!(client.current(2).is_none());
+}
+
+#[test]
+fn superseded_entries_do_not_consume_capacity() {
+    let mut client = ClientStream::<u8, u32>::new(1);
+    client.accept(3, vec![(2, 20)], &[1]).unwrap();
+    let changes = client.accept(2, vec![(1, 10)], &[]).unwrap();
+    assert!(changes.updated.is_empty());
+    assert!(client.current(1).is_none());
+    assert_eq!(client.current(2), Some((3, &20)));
+    assert!(client.ack().covers(2));
+}
+
+#[test]
+fn old_removal_ack_must_not_cancel_a_new_removal() {
+    let mut server = ServerStream::<u8, u32>::new(8);
+    let mut client = ClientStream::<u8, u32>::new(8);
+    let first = server.begin().unwrap();
+    server.include(1, 10).unwrap();
+    server.finish().unwrap();
+    client.accept(first, vec![(1, 10)], &[]).unwrap();
+    server.acknowledge(client.ack()).unwrap();
+
+    server.remove(1);
+    let gone = server.begin().unwrap();
+    server.include_removal(1).unwrap();
+    server.finish().unwrap();
+    client.accept(gone, vec![], &[1]).unwrap();
+    let delayed_ack = client.ack();
+
+    let back = server.begin().unwrap();
+    server.include(1, 30).unwrap();
+    server.finish().unwrap();
+    client.accept(back, vec![(1, 30)], &[]).unwrap();
+
+    server.remove(1);
+    assert_eq!(server.pending_removals().collect::<Vec<_>>(), vec![1]);
+    server.acknowledge(delayed_ack).unwrap();
+    assert_eq!(
+        server.pending_removals().collect::<Vec<_>>(),
+        vec![1],
+        "the ACK only proves the first departure; client still holds the reentry"
+    );
+}
+
+#[test]
+fn reordered_removal_must_not_move_tombstone_backwards() {
+    let mut client = ClientStream::<u8, u32>::new(8);
+    client.accept(1, vec![(1, 10)], &[]).unwrap();
+    // Server sent: remove at 2, reenter at 3, remove again at 4.
+    client.accept(4, vec![], &[1]).unwrap();
+    client.accept(2, vec![], &[1]).unwrap();
+    client.accept(3, vec![(1, 30)], &[]).unwrap();
+    assert!(
+        client.current(1).is_none(),
+        "packet 3 must not resurrect the entity removed by packet 4"
+    );
+}

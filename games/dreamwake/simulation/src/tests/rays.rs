@@ -30,6 +30,74 @@ fn online(sequence: u64, query: u32) -> CombatAction {
     })
 }
 #[test]
+fn fractional_rays_and_beams_share_the_authority_rewind_budget_and_replay() {
+    for beam in [false, true] {
+        for age in [
+            11,
+            MAXIMUM_COMBAT_REWIND_TICKS,
+            MAXIMUM_COMBAT_REWIND_TICKS + 1,
+        ] {
+            let mut sim = arena();
+            let execution = MAXIMUM_COMBAT_REWIND_TICKS + 2;
+            for _ in 1..execution {
+                sim.step(DreamInput::default());
+            }
+            let CombatAction::Ray(mut ray) = online(1, execution - age) else {
+                unreachable!()
+            };
+            // Server uptime and gameplay time have distinct origins.
+            ray.execution_server_tick = 200_000 + u64::from(execution);
+            ray.query_server_tick = ray.execution_server_tick - u64::from(age);
+            ray.command_fraction = Some(32768);
+            ray.query_fraction = 32768;
+            let action = if beam {
+                CombatAction::BeamBegin(ray)
+            } else {
+                CombatAction::Ray(ray)
+            };
+            let mut replay = DreamSimulation::from_snapshot(&sim.snapshot());
+            let result = sim
+                .step_multiplayer_with_actions(&[], &[action.clone()])
+                .unwrap();
+            let replayed = replay
+                .step_multiplayer_with_actions(&[], &[action])
+                .unwrap();
+            assert_eq!(result, replayed);
+            assert_eq!(sim.snapshot(), replay.snapshot());
+            let checkpoint = DreamCheckpoint::new(sim.snapshot(), 1).unwrap();
+            let decoded = DreamCheckpoint::decode(&checkpoint.encode().unwrap(), 1).unwrap();
+            let restored = DreamSimulation::try_from_checkpoint(&decoded, 1).unwrap();
+            assert_eq!(sim.snapshot(), restored.snapshot());
+            sim.capture_replication(crate::replication::ReplicationStamp {
+                match_epoch: 1,
+                server_tick: ray.execution_server_tick,
+                gameplay_tick: execution,
+                scene_revision: 1,
+                revision: 1,
+            })
+            .unwrap()
+            .owner_checkpoint(1, 1)
+            .unwrap()
+            .encode()
+            .unwrap();
+            if age <= MAXIMUM_COMBAT_REWIND_TICKS {
+                assert_eq!(
+                    result[0].reason,
+                    ActionReason::Accepted,
+                    "beam={beam}, age={age}"
+                );
+                assert_eq!(result[0].combat.as_ref().unwrap().reason, CombatReason::Hit);
+                assert_eq!(sim.snapshot().hero.dreamlance_ammo, 5);
+            } else {
+                assert_eq!(result[0].reason, ActionReason::MissingHistory);
+                assert_eq!(sim.snapshot().hero.dreamlance_ammo, 6);
+                assert_eq!(sim.snapshot().hero.dreamlance_cooldown, 0.0);
+            }
+        }
+    }
+}
+
+#[test]
 fn dreamlance_current_pose_is_authoritative_and_cooldown_duplicate_safe() {
     let mut sim = arena();
     let action = CombatAction::RayCurrent {
@@ -303,8 +371,11 @@ fn beam_sample(sequence: u64, query: u32) -> ValidatedRay {
 #[test]
 fn held_beam_uses_latest_accepted_sample_and_has_no_recurring_edge_receipts() {
     let mut sim = arena();
-    sim.step(DreamInput::default());
-    let begin = beam_sample(1, 1);
+    for _ in 0..MAXIMUM_COMBAT_REWIND_TICKS {
+        sim.step(DreamInput::default());
+    }
+    let mut begin = beam_sample(1, 1);
+    begin.execution_server_tick = u64::from(MAXIMUM_COMBAT_REWIND_TICKS) + 1;
     let result = sim
         .step_multiplayer_with_actions(
             &[],
@@ -320,11 +391,24 @@ fn held_beam_uses_latest_accepted_sample_and_has_no_recurring_edge_receipts() {
         engine_core::GraphicsKind::Beam { .. }
     ));
     for sequence in 2..=7 {
-        let sample = beam_sample(sequence, sim.snapshot().tick);
+        let execution = sim.snapshot().tick + 1;
+        let mut sample = beam_sample(sequence, execution - MAXIMUM_COMBAT_REWIND_TICKS);
+        sample.execution_server_tick = u64::from(execution);
         let result = sim
             .step_multiplayer_with_actions(&[], &[CombatAction::BeamAim(sample)])
             .unwrap();
         assert!(result.is_empty());
+        assert_eq!(
+            sim.snapshot().state.heroes[0]
+                .ray
+                .beam
+                .as_ref()
+                .unwrap()
+                .sample
+                .key,
+            sample.key
+        );
+        DreamCheckpoint::new(sim.snapshot(), 1).unwrap();
     }
     assert_eq!(sim.snapshot().enemies[0].hp, 192.0);
     assert_eq!(sim.snapshot().presentations[0].id, graphic.id);
@@ -335,7 +419,7 @@ fn held_beam_uses_latest_accepted_sample_and_has_no_recurring_edge_receipts() {
             &[],
             &[CombatAction::BeamStop {
                 key: stop,
-                execution_server_tick: 9,
+                execution_server_tick: u64::from(sim.snapshot().tick) + 1,
             }],
         )
         .unwrap();

@@ -43,6 +43,28 @@ fn held_command(
     }
 }
 
+#[test]
+fn arrival_feedback_keeps_the_most_late_sample() {
+    let (mut authority, _) = active_authority();
+    for tick in 2..=10 {
+        authority.step(Duration::from_millis(tick * 17));
+    }
+    let older = held_command(&authority, 1, 3, [0.0, 0.0]);
+    let newer = held_command(&authority, 2, 9, [0.0, 0.0]);
+    authority
+        .receive_commands(41, vec![older.clone(), newer.clone()])
+        .unwrap();
+    let feedback = authority.peers[&41].arrival;
+    assert!(feedback.validate());
+    assert_eq!(feedback.sample.unwrap().sequence, CommandSeq(1));
+    assert_eq!(feedback.sample.unwrap().signed_slack(), -7);
+    authority.receive_commands(41, vec![newer, older]).unwrap();
+    assert_eq!(
+        authority.peers[&41].arrival, feedback,
+        "duplicates do not tune lead again"
+    );
+}
+
 /// Every owner checkpoint in the state packets the server has sent, oldest
 /// first. Nothing is acknowledged, so every owner entry is a whole state.
 fn decoded_queued_owners(

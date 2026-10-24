@@ -45,6 +45,7 @@ pub const MAX_INPUT_RECORDS: usize = engine_net::types::MAX_COMMAND_LEAD_TICKS a
 pub const MAX_STATE_FRAME_BYTES: usize = 32 * 1024;
 pub const MAX_STATE_ENTRIES: usize = 255;
 pub const MAX_STATE_REMOVALS: usize = 255;
+pub use dreamwake_sim::combat::REMOTE_INTERPOLATION_DELAY_MILLIS;
 
 /// A first effective command arrival, tied to the immutable command that caused
 /// it. Server-observed values never include client-supplied lead policy metadata.
@@ -57,6 +58,14 @@ pub struct ArrivalSample {
     /// `MAX_COMMAND_LEAD_TICKS` ticks left. More headroom than the lead
     /// controller can use is reported at that cap.
     pub slack: u8,
+}
+impl ArrivalSample {
+    /// The exact tick pair preserves lateness even though the wire's unsigned
+    /// headroom field reports zero for every missed deadline.
+    pub fn signed_slack(self) -> i32 {
+        let bound = i128::from(engine_net::types::MAX_COMMAND_LEAD_TICKS);
+        (i128::from(self.target.0) - i128::from(self.arrival_tick.0)).clamp(-bound, bound) as i32
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

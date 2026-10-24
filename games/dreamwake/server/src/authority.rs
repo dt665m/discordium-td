@@ -31,6 +31,9 @@ use std::{
 };
 const MAX_PENDING_ACTIONS: usize = 32;
 const MAX_MESSAGES_PER_TICK: usize = 64;
+/// A connected client sends input every other tick and a clock probe every
+/// quarter second; one silent this long has gone away rather than hitched.
+const SILENT_PEER_DISPLACEMENT: Duration = Duration::from_secs(3);
 const APPLICATION_FRAME_BYTES: u16 = live::APPLICATION_FRAME_BYTES as u16;
 const SCENE: SceneRevision = SceneRevision(1);
 fn failure(error: impl std::fmt::Debug) -> String {
@@ -304,6 +307,12 @@ impl DreamAuthority {
         let rules = Rules(peer.welcome.stream);
         for record in packet.records.as_slice() {
             let command = &record.command(peer.welcome.stream);
+            // The reusable command schema has multiple slots, but Dreamwake
+            // consumes one action per player per tick, just as its client emits.
+            // Reject before reserving outcomes or acknowledging command receipt.
+            if command.actions.as_slice().len() > 1 {
+                return Err("Only one action per command is allowed".into());
+            }
             // GraphicsId keeps the exact existing u32 command identity. A new
             // stream is required before exhaustion, never a truncating cast.
             if command.sequence.0 > u64::from(u32::MAX) {
@@ -361,30 +370,30 @@ impl DreamAuthority {
                     peer.overload_commands.insert(command.sequence);
                 }
                 Admission::Accepted { .. } => {}
-                // A late action still runs, on the first tick without one of
-                // its own, as Unreal's character movement executes a move when
+                // A late action still runs, in command order with other carried
+                // edges, as Unreal's character movement executes a move when
                 // it arrives. Lateness then shifts the action by a few ticks
                 // instead of discarding it. Rays judged against a view time
                 // keep their own rewind limit and still expire.
                 Admission::Late
                     if previous_admission.is_none()
                         && !command.actions.as_slice().is_empty()
-                        && command.actions.as_slice().iter().all(|edge| {
-                            matches!(
-                                edge.action,
-                                DreamAction::Dash { .. }
-                                    | DreamAction::Cast { .. }
-                                    | DreamAction::ChargeBegin
-                                    | DreamAction::ChargeRelease { .. }
-                                    | DreamAction::ChargeCancel { .. }
-                            )
-                        })
+                        && command
+                            .actions
+                            .as_slice()
+                            .iter()
+                            .all(|edge| peer::can_defer_action(&edge.action))
                         && peer.late_actions.len() + command.actions.as_slice().len()
                             <= peer::MAX_LATE_ACTIONS =>
                 {
                     for edge in command.actions.as_slice() {
+                        // Redundant input is newest-first and packets can be
+                        // reordered. Execute the retained edges in command order.
+                        let at = peer.late_actions.partition_point(|(sequence, queued, _)| {
+                            (*sequence, queued.slot) < (command.sequence, edge.slot)
+                        });
                         peer.late_actions
-                            .push_back((command.sequence, edge.clone(), overload));
+                            .insert(at, (command.sequence, edge.clone(), overload));
                     }
                 }
                 Admission::Late | Admission::TargetOccupied => {
@@ -461,8 +470,9 @@ impl DreamAuthority {
                             .ok_or("late observation counter exhausted")?;
                     }
                     if peer.arrival.sample.is_none_or(|old| {
-                        sample.slack < old.slack
-                            || (sample.slack == old.slack && sample.sequence > old.sequence)
+                        sample.signed_slack() < old.signed_slack()
+                            || (sample.signed_slack() == old.signed_slack()
+                                && sample.sequence > old.sequence)
                     }) {
                         peer.arrival.sample = Some(sample);
                     }
@@ -733,8 +743,26 @@ impl DreamAuthority {
                                 .collect()
                         })
                         .unwrap_or_default();
-                    // One action per player per tick: a late one waits for a
-                    // tick without its own.
+                    // One action per player per tick. An on-time carried edge
+                    // must not overtake an older late edge (e.g. charge release
+                    // before begin). Swapping keeps the deferred queue bounded.
+                    // View-stamped actions still execute at their admitted tick.
+                    if edges.len() == 1
+                        && peer::can_defer_action(&edges[0].1.action)
+                        && peer
+                            .late_actions
+                            .front()
+                            .is_some_and(|(sequence, edge, _)| {
+                                (*sequence, edge.slot) < (edges[0].0, edges[0].1.slot)
+                            })
+                    {
+                        let waiting = peer.late_actions.pop_front().unwrap();
+                        let current = std::mem::replace(&mut edges[0], waiting);
+                        let at = peer.late_actions.partition_point(|(sequence, edge, _)| {
+                            (*sequence, edge.slot) < (current.0, current.1.slot)
+                        });
+                        peer.late_actions.insert(at, current);
+                    }
                     if edges.is_empty() {
                         edges.extend(peer.late_actions.pop_front());
                     }
@@ -1029,21 +1057,27 @@ impl engine_server::Authority for DreamAuthority {
         {
             // A peer that never activated holds no participation, health,
             // progression or readiness by contract, so preserving it protects
-            // nothing. Refusing the newcomer instead strands the profile until
-            // the stalled connection times out. Displace the pending peer so a
-            // fresh stream can join immediately.
+            // nothing. A silent peer is a client that has gone away (a hidden
+            // browser tab, a closed laptop, a crash); its run state survives
+            // disconnection. Refusing the newcomer instead strands the profile
+            // until the old connection times out. Displace either so a fresh
+            // stream can join immediately; a live controller is kept.
+            let now = self.now;
             let stalled: Vec<u64> = self
                 .peers
                 .values()
                 .filter(|peer| {
-                    peer.welcome.player == player && peer.welcome.client.0 != id && !peer.active
+                    peer.welcome.player == player
+                        && peer.welcome.client.0 != id
+                        && (!peer.active
+                            || now.saturating_sub(peer.last_heard) >= SILENT_PEER_DISPLACEMENT)
                 })
                 .map(|peer| peer.welcome.client.0)
                 .collect();
             if !stalled.is_empty() {
                 for previous in stalled {
                     log::warn!(
-                        "Dreamwake admission: displacing never-activated peer {previous} for player {}",
+                        "Dreamwake admission: displacing inactive or silent peer {previous} for player {}",
                         player.get()
                     );
                     server.disconnect(previous);
@@ -1107,6 +1141,7 @@ impl engine_server::Authority for DreamAuthority {
                         break;
                     };
                     let peer = self.peers.get_mut(&id).unwrap();
+                    peer.last_heard = self.now;
                     peer.messages += 1;
                     if channel == wire::INPUT_CHANNEL {
                         peer.input_messages += 1;

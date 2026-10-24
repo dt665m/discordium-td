@@ -89,6 +89,9 @@ impl ServerArgs {
             .egress
             .burst_bytes
             .get_or_insert(DEFAULT_EGRESS_BURST_BYTES);
+        self.network
+            .connection_timeout
+            .get_or_insert(dreamwake_protocol::CONNECTION_TIMEOUT);
     }
 }
 

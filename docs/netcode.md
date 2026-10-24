@@ -144,7 +144,9 @@ backend drop is a send the transport refused outright.
 - Every other fixed tick, and at once when a new command carries an action, the
   client sends one unreliable input packet: its stream acknowledgement and every
   command the server has not yet reported receiving whose target is still ahead
-  of the estimated server tick, newest first, up to the 24-tick lead cap. Each
+  of the estimated committed simulation tick (with two ticks of slack), newest
+  first, up to the 24-tick lead cap. Wall time cannot expire a simulation command
+  while the server is repaying tick debt. Each
   state packet's owner status carries the received watermark. A command thus
   travels until it arrives or can no longer be used, so a lost packet costs
   nothing, and the packet stays small even while status packets are lost. There
@@ -153,16 +155,22 @@ backend drop is a send the transport refused outright.
   records carry them as small integer changes from the record before, and one
   that repeats its predecessor costs a few bytes.
 - A late command's movement is replaced by the grace above. Its dash, cast or
-  charge edges still run, on the first tick without an action of its own, as
+  charge edges still run, in command order with other carried edges, as
   Unreal's character movement executes a move when it arrives, so lateness
   shifts an action by a few ticks rather than discarding it. At most four wait at
-  once. Rays judged against a view time keep their own rewind limit and expire.
+  once, ordered by command sequence and action slot regardless of packet order.
+  A newer on-time carried edge waits behind an older queued edge; view-stamped
+  actions retain their admitted tick. Only one carried edge runs per tick.
+  The server rejects commands containing more than one action before admission.
+  Rays judged against a view time keep their own rewind limit and expire.
 - Finalized input follows committed simulation ticks and rides in every state
   packet's owner status, with the applied menu sequence and arrival feedback.
   It is separate from transport receipt, state acknowledgement and action
   outcomes. A high received sequence cannot acknowledge a command that never
-  executed. Arrival feedback uses the minimum slack among newly accepted or newly
-  late commands since publication. The client changes lead only from commands
+  executed. Arrival feedback uses the minimum signed slack among newly accepted
+  or newly late commands since publication. The target and arrival ticks retain
+  the missed deadline's magnitude even though the unsigned wire headroom is zero.
+  The client changes lead only from commands
   that could have benefited from its current lead policy; earlier samples remain
   lateness evidence.
 - Menu actions use a separate bounded reliable sequence and at most one menu
@@ -176,7 +184,9 @@ displayed at the hardware edge. Command target C and first accepted server arriv
 These stamps and combat history use committed simulation ticks; server scheduling
 debt does not convert arrival into a later wall-clock tick.
 The server intersects the retained reference, clock and arrival bounds with a
-150 ms rewind policy; it does not subtract RTT again. E and R carry a `u16`
+300 ms rewind budget: the permitted 200 ms execution lead plus the shared 100 ms
+remote display delay. Rewind is measured from execution, so both intervals must
+fit; it does not subtract RTT again. E and R carry a `u16`
 fraction in units of 1/65,536 tick, rounded downward once at capture. The remote
 combat cohort must agree on its exact displayed time, including starvation
 freezes; sharing only an integer tick is insufficient.
@@ -234,12 +244,23 @@ inactive until the client acknowledges a state packet carrying its owner state;
 activation then commits on a simulation tick. Pending players cannot move,
 receive rewards, take damage or block party readiness, and receive only their
 owner state and the match summary until activation commits. A fresh
-authenticated stream displaces a peer that never committed activation for the
-same profile.
+authenticated stream displaces a peer for the same profile that never committed
+activation or that the server has not heard from for three seconds.
 
 Nothing in the session asks the server to start over. A lost packet is covered
 by the next one, a stalled client resumes from the newest state, and the
-connection ends only on authentication or protocol failure.
+connection ends only on authentication or protocol failure, or after
+`CONNECTION_TIMEOUT` (60 seconds) of silence. Netcode carries that timeout in
+the connect token, so both ends apply it; before the Welcome the client waits
+12 seconds.
+
+Browsers deliver no animation frames to a hidden tab, or on macOS to a covered
+window, and Bevy's web loop runs only on them, so the client stops entirely
+while away. The client treats a frame gap of a second or more as a suspension.
+Back within the timeout, it resumes the same session from the newest state.
+Away for 55 seconds or more, or disconnected after a suspension, it rejoins
+with the same Traveler at once and continues the run's retained hero; the
+server lets that rejoin displace the silent connection.
 
 ### Stable Traveler IDs
 
@@ -253,7 +274,8 @@ preserve values beyond JavaScript's exact integer range.
 First registration binds an ID to a random 256-bit reconnect secret. The client
 saves that secret locally and never displays or replicates it. The server stores
 only its BLAKE3 digest. Knowing an ID does not authorize control. A second live
-connection for the same valid profile is rejected without evicting the first.
+connection for the same valid profile is rejected without evicting the first,
+unless the first has fallen silent (see [Admission and readiness](#admission-and-readiness)).
 Reconnection requires the saved secret and receives fresh connection and ownership
 epochs; old commands cannot control the rejoined traveler.
 
@@ -296,14 +318,19 @@ progression and latent owner state appear only in that owner's checkpoint.
 World RNG, allocation state, future encounters and complete server state are
 absent from live payloads.
 
-At each 20 Hz publication the server sends an entity only when its state differs
+At each 20 Hz publication the server normally sends an entity when its state differs
 from the newest state the client acknowledged, and not when that exact state is
-already in flight and not yet known lost. Packets carry the owner first, then
+already in flight and not yet known lost. Enemies and present cover also receive
+timestamped samples when unchanged so combat interpolation stays coherent;
+acknowledged unchanged samples encode as empty field deltas. Packets carry the owner first, then
 the match summary, then actors nearest first; actors farther than 16 m go out on
 every other publication, the relevance-based cadence of Unreal's replication
 graph. Each entry is either whole or the changed fields against the newest
 acknowledged state, which the entry names by packet sequence. Removals repeat
-until a packet carrying them is acknowledged.
+until a packet carrying the current departure is acknowledged. An ACK for an
+earlier visit cannot retire a later removal, and reordered removals cannot lower
+the client's removal timestamp. Packet capacity is checked against the resulting
+live population, accounting for valid removals before additions.
 
 The client acknowledges with the newest packet sequence and a 64-packet received
 bitmask in every input packet. A packet older than that window, or one whose
@@ -356,6 +383,10 @@ seconds) beyond the latest proven committed tick. Replies that repeat a stalled
 tick cannot refill that budget. Once exhausted, assignment waits without
 consuming input edges or command sequences; the wall-clock estimate and server
 debt remain visible.
+
+Network polling, command creation and ranged-action capture use the same current
+monotonic time helper. Bevy's frame timestamp can trail that clock; reusing it
+after polling would make a valid combat view fail the clock's monotonicity check.
 
 A client that stops running for a while (a garbage collection pause, shader
 compilation, a background tab) recovers in place, never through a server

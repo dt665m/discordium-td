@@ -40,6 +40,17 @@ pub(super) struct EgressCounters {
 /// Late actions a connection may have waiting at once; more expire.
 pub(super) const MAX_LATE_ACTIONS: usize = 4;
 
+pub(super) fn can_defer_action(action: &DreamAction) -> bool {
+    matches!(
+        action,
+        DreamAction::Dash { .. }
+            | DreamAction::Cast { .. }
+            | DreamAction::ChargeBegin
+            | DreamAction::ChargeRelease { .. }
+            | DreamAction::ChargeCancel { .. }
+    )
+}
+
 /// Which commands have reached the server: every sequence through a
 /// watermark, plus a bounded set of later ones that arrived first.
 #[derive(Debug, Default)]
@@ -100,8 +111,8 @@ pub(super) struct Peer {
     pub menu_received: CommandSeq,
     pub menu_applied: Option<CommandSeq>,
     pub received: Received,
-    /// Late actions waiting for a tick without one of its own, with whether
-    /// their outcome was reserved on the overload ledger.
+    /// Deferred actions in command/slot order, with whether their outcome was
+    /// reserved on the overload ledger. Newer deferrable edges cannot overtake them.
     pub late_actions: VecDeque<(
         CommandSeq,
         engine_net::commands::ActionEdge<DreamAction>,
@@ -111,6 +122,8 @@ pub(super) struct Peer {
     pub messages: usize,
     pub input_messages: usize,
     pub arrival: live::ArrivalFeedback,
+    /// When a message from this connection was last dequeued.
+    pub last_heard: Duration,
 }
 impl Peer {
     pub fn new(welcome: live::Welcome, now: Duration) -> Result<Self, String> {
@@ -150,6 +163,7 @@ impl Peer {
             messages: 0,
             input_messages: 0,
             arrival: live::ArrivalFeedback::default(),
+            last_heard: now,
         })
     }
     pub fn next_frame(&mut self) -> Result<u32, String> {

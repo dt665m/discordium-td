@@ -249,10 +249,9 @@ pub(crate) fn ray_actions(
             continue;
         }
         let aim = normalize(ray.aim);
-        // Network timing already clamps C/R on the match clock. This independent
-        // game-clock cap also prevents an adapter from inventing arbitrarily old poses.
-        let maximum_rewind = (0.150 / DT).ceil() as u32;
-        if query > run.tick || run.tick - query > maximum_rewind {
+        // Apply the same game-owned cap as network timing, now on the gameplay
+        // clock. An adapter cannot invent arbitrarily old poses.
+        if query > run.tick || run.tick - query > MAXIMUM_COMBAT_REWIND_TICKS {
             transactions
                 .verdicts
                 .push(reject(CombatReason::MissingHistory));
@@ -487,7 +486,7 @@ fn valid_beam_sample(sample: ValidatedRay, tick: u32) -> bool {
     sample.query_server_tick <= sample.execution_server_tick
         && sample.query_gameplay_tick <= tick
         && (sample.query_fraction == 0 || sample.query_gameplay_tick < tick)
-        && tick - sample.query_gameplay_tick <= 9
+        && tick - sample.query_gameplay_tick <= MAXIMUM_COMBAT_REWIND_TICKS
         && sample.aim.iter().all(|v| v.is_finite() && v.abs() <= 1.0)
         && length(normalize(sample.aim)) > 0.0
 }

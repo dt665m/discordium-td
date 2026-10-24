@@ -1,5 +1,5 @@
 use super::*;
-use dreamwake_sim::replication::{Replica, ReplicaState};
+use dreamwake_sim::replication::{PublicReplica, Replica, ReplicaState};
 
 pub(super) fn control(
     server: &mut RenetServer,
@@ -57,9 +57,10 @@ struct Candidate {
 
 /// Build and send this publication's state packets for one connection.
 ///
-/// An entity is sent only when its state differs from the newest state the
+/// A presentation entity is sent when its state differs from the newest state the
 /// client acknowledged, unless that exact state is already on its way and not
-/// yet reported lost. A lost packet therefore costs nothing until the client
+/// yet reported lost. Combat actors also carry periodic samples when unchanged.
+/// A lost packet therefore costs nothing until the client
 /// reports it, and then the next packet carries every changed field with its
 /// current value. Packets are filled owner first, then the match summary, then
 /// actors nearest first, and stop where the connection's egress allowance
@@ -111,17 +112,23 @@ fn peer_state(
             continue;
         }
         let state = ReplicaState::capture(&entry.replica).map_err(failure)?;
-        if peer
-            .stream
-            .base(entry.entity)
-            .is_some_and(|(_, base)| *base == state)
+        // Combat needs fresh timestamped observations even when geometry is
+        // unchanged; otherwise an idle cover freezes the cohort's view time.
+        let combat_sample = matches!(&entry.replica, Replica::Actor(PublicReplica::Enemy(_)))
+            || matches!(&entry.replica, Replica::Actor(PublicReplica::Cover(cover)) if cover.present);
+        if !combat_sample
+            && peer
+                .stream
+                .base(entry.entity)
+                .is_some_and(|(_, base)| *base == state)
         {
             continue;
         }
-        if peer
-            .stream
-            .in_flight(entry.entity)
-            .is_some_and(|(seq, sent)| *sent == state && !peer.stream.lost(seq))
+        if !combat_sample
+            && peer
+                .stream
+                .in_flight(entry.entity)
+                .is_some_and(|(seq, sent)| *sent == state && !peer.stream.lost(seq))
         {
             continue;
         }

@@ -3,6 +3,14 @@
 //! accept a client origin, target selection, damage amount, range or weapon state.
 use serde::{Deserialize, Serialize};
 
+/// Shared game policy for remote playback, network admission and pose queries.
+pub const REMOTE_INTERPOLATION_DELAY_MILLIS: u64 = 100;
+pub const MAXIMUM_EXECUTION_LEAD_MILLIS: u64 = 200;
+/// Rewind starts at execution, including command lead and remote display delay.
+pub const MAXIMUM_COMBAT_REWIND_TICKS: u32 =
+    ((MAXIMUM_EXECUTION_LEAD_MILLIS + REMOTE_INTERPOLATION_DELAY_MILLIS) * crate::TICK_HZ as u64)
+        .div_ceil(1000) as u32;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RayActionKey {

@@ -280,7 +280,9 @@ impl RemotePoses {
                 connection,
                 Config {
                     rate: TickRate::new(dreamwake_sim::TICK_HZ).unwrap(),
-                    delay: Duration::from_millis(100),
+                    delay: Duration::from_millis(
+                        dreamwake_protocol::live::REMOTE_INTERPOLATION_DELAY_MILLIS,
+                    ),
                     // Public replicas carry authoritative capability motion. Its
                     // positional projection remains bounded during starvation.
                     extrapolation_cap: Duration::from_millis(100),

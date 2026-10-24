@@ -157,14 +157,20 @@ fn ticks(millis: u64) -> u64 {
     (millis * u64::from(dreamwake_sim::TICK_HZ)).div_ceil(1000)
 }
 fn policy() -> TimingPolicy {
+    let maximum_execution_lead = ticks(dreamwake_sim::combat::MAXIMUM_EXECUTION_LEAD_MILLIS);
     TimingPolicy {
         maximum_sample_age: ticks(250),
         maximum_future_sample: 2,
         minimum_execution_lead: 0,
-        maximum_execution_lead: 12,
+        maximum_execution_lead,
         minimum_presentation_age: 0,
+        // The normal display delay is a target, not a strict age ceiling:
+        // sampling phase and briefly starved playback can produce older views.
+        // Those views must still fit the total execution-to-query rewind cap.
         maximum_presentation_age: ticks(200),
-        maximum_rewind: ticks(150),
+        // Rewind is measured from execution, so it must include both the
+        // permitted command lead and the client's normal display delay.
+        maximum_rewind: u64::from(dreamwake_sim::combat::MAXIMUM_COMBAT_REWIND_TICKS),
         maximum_reference_advance: ticks(150),
     }
 }
@@ -231,6 +237,56 @@ mod tests {
         assert!(clock.bounds(1).is_none());
         assert_eq!(clock.at(2, ServerTick(21)), Some(0));
     }
+    #[test]
+    fn normal_display_delay_fits_the_permitted_execution_lead() {
+        let mut peer = PeerCombat::default();
+        peer.sent(5, ServerTick(90), ServerTick(90));
+        peer.acknowledge(ack(5));
+        let mut clock = GameplayClock::default();
+        for tick in 90..=112 {
+            clock.record(1, ServerTick(tick), tick as u32);
+        }
+        let view = live::CombatViewStamp {
+            sampled_at: ServerTick(100),
+            sampled_fraction: 32768,
+            viewed_at: ServerTick(94),
+            viewed_fraction: 32768,
+            reference: 5,
+        };
+        for lead in [3, 4, policy().maximum_execution_lead] {
+            let mut history = GameplayClock::default();
+            for tick in 90..=100 + lead {
+                history.record(1, ServerTick(tick), tick as u32);
+            }
+            assert_eq!(
+                peer.validate(
+                    CONNECTION,
+                    view,
+                    ServerTick(101),
+                    ServerTick(100 + lead),
+                    &history,
+                    1
+                ),
+                Ok((ServerTick(94), 94, 32768, false))
+            );
+        }
+        let older = live::CombatViewStamp {
+            viewed_at: ServerTick(93),
+            ..view
+        };
+        assert_eq!(
+            peer.validate(
+                CONNECTION,
+                older,
+                ServerTick(101),
+                ServerTick(112),
+                &clock,
+                1
+            ),
+            Err(TimingError::OutsidePolicy)
+        );
+    }
+
     #[test]
     fn fractional_clock_mapping_requires_exact_neighbors_and_never_clamps() {
         let mut peer = PeerCombat::default();

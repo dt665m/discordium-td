@@ -392,7 +392,7 @@ impl Session {
         let previous = self.lead.lead();
         if self
             .lead
-            .observe_arrival_slack(i32::from(sample.slack))
+            .observe_arrival_slack(sample.signed_slack())
             .is_ok()
             && self.lead.lead() != previous
         {
